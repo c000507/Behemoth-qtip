@@ -1,0 +1,10 @@
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+# gather-only on the sorted stream (gate shape, 22020096 entries)
+layout R=32 G=2048 DB=2: chunks=745339 dummies=8.31% bytes/entry=2.438 decode=ok
+  sorted  DB=2 blocks= 1024 :   0.087 ms   274.88 Ggather/s  2B-code-equiv  549.8 GB/s  gathers/clk/CU=1.83
+  sorted  DB=2 blocks= 4096 :   0.086 ms   276.54 Ggather/s  2B-code-equiv  553.1 GB/s  gathers/clk/CU=1.84
+  random  DB=2 blocks= 1024 :   0.409 ms    58.28 Ggather/s  2B-code-equiv  116.6 GB/s  gathers/clk/CU=0.39
+  random  DB=2 blocks= 4096 :   0.373 ms    63.91 Ggather/s  2B-code-equiv  127.8 GB/s  gathers/clk/CU=0.42
+layout R=32 G=2048 DB=3: chunks=690895 dummies=0.40% bytes/entry=2.386 decode=ok
+  sorted  DB=3 blocks= 1024 :   0.107 ms   206.62 Ggather/s  2B-code-equiv  413.2 GB/s  gathers/clk/CU=1.37
+  sorted  DB=3 blocks= 4096 :   0.106 ms   207.71 Ggather/s  2B-code-equiv  415.4 GB/s  gathers/clk/CU=1.38
