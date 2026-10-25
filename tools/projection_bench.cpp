@@ -89,11 +89,7 @@ int main(int argc, char **argv) {
                                              {"code_layout", code_layout_name(layout)},
                                              {"apply_row_scale", column},
                                              {"logical_code_bytes", projection.codes.bytes()},
-                                             {"sorted_layout_bytes",
-                                              projection.sorted_idx.bytes() +
-                                                  projection.sorted_planes.bytes() +
-                                                  projection.sorted_segment_codes.bytes() +
-                                                  projection.sorted_tiles.bytes()},
+                                             {"sorted_layout_bytes", projection.sorted_bytes()},
                                              {"sorted_dummy_fraction",
                                               projection.has_sorted()
                                                   ? double(projection.sorted_dummies) /

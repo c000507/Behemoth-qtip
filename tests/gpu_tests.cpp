@@ -214,11 +214,11 @@ static void projections(hipStream_t stream) {
     std::vector<Shape> shapes;
     for (int width : {128, 1032, 2048})
         for (int outputs : {32, 37, 64, 65, 128})
-            shapes.push_back({width, outputs, {1, 2, 7, 16, 33}});
+            shapes.push_back({width, outputs, {1, 2, 7, 16, 33, 64}});
     // Cover multiple 2048-input partitions and 128-column output tiles,
     // plus simultaneous K/N tails, without expanding the whole Cartesian suite.
-    shapes.push_back({4096, 256, {1, 7}});
-    shapes.push_back({4104, 129, {1, 7}});
+    shapes.push_back({4096, 256, {1, 7, 65}});
+    shapes.push_back({4104, 129, {1, 7, 130}});
     for (const auto &shape : shapes) {
         const int width = shape.width, outputs = shape.outputs;
         HostProjection p;

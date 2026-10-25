@@ -155,23 +155,28 @@ struct GpuProjection {
     CodeLayout code_layout = CodeLayout::GroupMajor;
     // Codebook-major ("sorted") layout, see sorted_layout.hpp. Present when
     // sorted_tile_count > 0; with CodeLayout::Sorted it replaces `codes`.
-    DeviceBuffer<uint16_t> sorted_idx, sorted_segment_codes;
+    // 16-row tiles, 4-bit deltas, per-chunk base codes (the kernels never
+    // use the segment table).
+    DeviceBuffer<uint16_t> sorted_idx, sorted_chunk_codes;
     DeviceBuffer<uint32_t> sorted_planes;
     DeviceBuffer<SortedTileDesc> sorted_tiles;
-    int sorted_tile_count = 0, sorted_chunks_per_segment = 0, sorted_delta_bits = 0;
+    int sorted_tile_count = 0, sorted_delta_bits = 0;
     size_t sorted_entries = 0, sorted_dummies = 0;
     bool has_sorted() const {
         return sorted_tile_count > 0;
     }
-    void upload_sorted(const HostProjection &p) {
+    size_t sorted_bytes() const {
+        return sorted_idx.bytes() + sorted_planes.bytes() + sorted_chunk_codes.bytes() +
+               sorted_tiles.bytes();
+    }
+    void upload_sorted(const HostProjection &p, int delta_bits = sorted_default_delta_bits) {
         auto l = sorted_layout(p.in, p.out, p.codes.data(), sorted_rows_per_tile,
-                               sorted_groups_per_tile, 3, sorted_default_chunks_per_segment);
+                               sorted_groups_per_tile, delta_bits, sorted_default_chunks_per_segment);
         sorted_idx.upload(l.idx);
         sorted_planes.upload(l.planes);
-        sorted_segment_codes.upload(l.segment_codes);
+        sorted_chunk_codes.upload(l.chunk_codes);
         sorted_tiles.upload(l.tiles);
         sorted_tile_count = int(l.tiles.size());
-        sorted_chunks_per_segment = l.chunks_per_segment;
         sorted_delta_bits = l.delta_bits;
         sorted_entries = l.entries;
         sorted_dummies = l.dummies;
@@ -184,7 +189,7 @@ struct GpuProjection {
         codes = {};
         sorted_idx = {};
         sorted_planes = {};
-        sorted_segment_codes = {};
+        sorted_chunk_codes = {};
         sorted_tiles = {};
         sorted_tile_count = 0;
         if (layout == CodeLayout::GroupMajor)
@@ -199,8 +204,7 @@ struct GpuProjection {
     }
     size_t bytes() const {
         return codes.bytes() + codebook.bytes() + dense.bytes() + row_scale.bytes() +
-               sorted_idx.bytes() + sorted_planes.bytes() + sorted_segment_codes.bytes() +
-               sorted_tiles.bytes();
+               sorted_bytes();
     }
 };
 struct ProjectionWorkspace {
@@ -232,13 +236,16 @@ enum class ProjectionMode {
     PipelinedR4K64,
     PipelinedR4K128,
     // Codebook-major layout (GpuProjection::has_sorted()). sorted-sN: one pass
-    // per batch row, each 32-row stream cut into N segment splits. sorted-dense:
-    // stream the sorted layout once into a dense FP8 scratch, then the dense
-    // pipelined WMMA kernels (for rows > 2).
+    // per batch row (exact int64 accumulation), each 16-row tile stream cut
+    // into N chunk splits. sorted-lds: per tile, decode the stream into an LDS
+    // code tile, then gather + WMMA over up to 64 batch rows per pass (the
+    // batched decode kernel). sorted-dense: decode + coalesced dense FP8
+    // scratch, then the dense pipelined WMMA kernels (prefill-sized batches).
     SortedS4,
     SortedS8,
     SortedS16,
     SortedDense,
+    SortedLds,
     Count
 };
 bool projection_mode_is_sorted(ProjectionMode);
