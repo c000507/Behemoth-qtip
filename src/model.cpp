@@ -287,7 +287,7 @@ struct Shard {
     ProjectionWorkspace projection;
     DeviceBuffer<uint8_t> query;
     DeviceBuffer<float> query_scale, raw, gathered;
-    DeviceBuffer<int> tokens, sample_rows;
+    DeviceBuffer<int> sample_rows;
     DeviceBuffer<std::byte> attention_workspace;
     GpuMetadata metadata;
     GpuTimes timings;
@@ -374,7 +374,6 @@ struct Shard {
         query_scale.resize(rows * 48);
         raw.resize(rows * 16384);
         gathered.resize(rows * 32768);
-        tokens.resize(rows);
         sample_rows.resize(rows);
         projection.input.resize(rows * 14336);
         projection.input_scale.resize(rows);
@@ -386,10 +385,6 @@ struct Shard {
         // check in forward() falls back to the 1024-key partition or to a
         // single partition. The old flat 256 MB bought nothing (item 1).
         attention_workspace.resize(32 * 1024 * 1024);
-        metadata.offsets.resize(rows + 1);
-        metadata.positions.resize(rows);
-        metadata.lengths.resize(rows);
-        metadata.table.resize(rows * 8192);
     }
     int page_capacity(double fraction) {
         HIP_CHECK(hipSetDevice(device));
@@ -411,13 +406,12 @@ struct Shard {
                  int only_layer = -1, const std::vector<BFloat16> *injected = nullptr) {
         HIP_CHECK(hipSetDevice(device));
         timings.reset();
-        metadata.upload(batch.layout);
-        tokens.upload(batch.tokens);
+        metadata.upload(batch.layout, batch.tokens, stream);
         int rows = int(batch.tokens.size());
         if (injected)
             state.upload(*injected);
         else
-            embed(embeddings.data(), tokens.data(), state.data(), rows, 12288, stream);
+            embed(embeddings.data(), metadata.tokens, state.data(), rows, 12288, stream);
         // Fused elementwise path (PERF_ROUND2_REPORT.md): the normed input is
         // quantised once into the projection workspace and shared by q/k/v
         // (gate/up); column projections write bf16 from their merge kernel;
@@ -478,7 +472,7 @@ struct Shard {
             project(l.k, k.data());
             project(l.v, v.data());
             timings.measure("attention_and_cache_ms", stream, [&] {
-                rope_quantize(q.data(), k.data(), metadata.positions.data(), rows, 48, 4, 1000000,
+                rope_quantize(q.data(), k.data(), metadata.positions, rows, 48, 4, 1000000,
                               query.data(), query_scale.data(), stream);
                 AttentionDeviceView view{query.data(),     query_scale.data(), l.cache_k.data(),
                                          l.cache_v.data(), l.k_scale.data(),   l.v_scale.data(),
@@ -673,10 +667,6 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
     for (int rank = 0; rank < 2; ++rank)
         impl_->shards[size_t(rank)] =
             std::make_unique<Shard>(options.devices[size_t(rank)], rank, checkpoint, options);
-    impl_->pages = std::min(impl_->shards[0]->page_capacity(options.memory_fraction),
-                            impl_->shards[1]->page_capacity(options.memory_fraction));
-    for (auto &shard : impl_->shards)
-        shard->allocate_cache(impl_->pages);
     if (options.rccl_shared_memory)
         RCCL_CHECK(ncclCommInitAll(impl_->comm.data(), 2, options.devices.data()));
     else
@@ -685,6 +675,92 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
             options.zero_copy_transport ? options.zero_copy_rows * 16384 : 0, options.devices);
     for (auto &worker : impl_->workers)
         worker = std::make_unique<RankWorker>();
+    {
+        // Autotuner pre-warm (PERF_ROUND3 item 3): first use of a row count
+        // re-tunes the whole 616-weight set (~1.3 s stall inside the first
+        // forward). Walk the expected decode row counts plus the prefill
+        // chunk through synthetic batches at startup, on a small temporary
+        // cache, so the final cache sizing also sees the fully grown tuning
+        // scratch (partial/weight buffers) before pages are computed.
+        static const bool prewarm_enabled = [] {
+            const char *v = std::getenv("BEHEMOTH_PREWARM");
+            return !v || std::atoi(v) != 0;
+        }();
+        // Decode row counts the scheduler produces (rows = active requests,
+        // bounded by the realistic concurrency). Prefill-sized row counts are
+        // prompt-length dependent and their tuning candidates reconstruct
+        // dense weights (~20 s per row count), so they stay lazy: a new
+        // prompt length still pays one tuning pass inside its prefill.
+        // BEHEMOTH_PREWARM_ROWS="1,2,..." overrides the set.
+        std::vector<int> rows_list;
+        if (const char *v = std::getenv("BEHEMOTH_PREWARM_ROWS")) {
+            std::istringstream stream(v);
+            std::string item;
+            while (std::getline(stream, item, ','))
+                if (int r = std::atoi(item.c_str()); r >= 1 && size_t(r) <= options.token_budget)
+                    rows_list.push_back(r);
+        } else
+            for (int r = 1; r <= 4; ++r)
+                if (size_t(r) <= options.token_budget)
+                    rows_list.push_back(r);
+        const size_t chunk = options.prefill_chunk;
+        if (prewarm_enabled && !rows_list.empty()) {
+            const auto started = std::chrono::steady_clock::now();
+            const int warm_pages = int(std::max<size_t>(64, ceil_div(chunk, 16)));
+            for (auto &shard : impl_->shards)
+                shard->allocate_cache(warm_pages);
+            auto run_batch = [&](InferenceBatch &batch) {
+                batch.layout.physical_pages = warm_pages;
+                batch.layout.validate();
+                std::array<std::future<void>, 2> jobs;
+                for (int rank = 0; rank < 2; ++rank)
+                    jobs[size_t(rank)] = impl_->workers[size_t(rank)]->submit([&, rank] {
+                        try {
+                            impl_->shards[size_t(rank)]->forward(
+                                batch, impl_->comm[size_t(rank)], impl_->transport.get());
+                        } catch (...) {
+                            impl_->abort();
+                            throw;
+                        }
+                    });
+                std::exception_ptr error;
+                for (auto &job : jobs)
+                    try {
+                        job.get();
+                    } catch (...) {
+                        error = std::current_exception();
+                    }
+                if (error)
+                    std::rethrow_exception(error);
+            };
+            // Decode-shaped: rows requests x one query, sampling every row
+            // (tunes the layer set at `rows` and lm_head at `rows`).
+            for (int rows : rows_list) {
+                InferenceBatch batch;
+                auto &l = batch.layout;
+                l.table_stride = 1;
+                l.query_offsets.push_back(0);
+                for (int r = 0; r < rows; ++r) {
+                    l.lengths.push_back(1);
+                    l.positions.push_back(0);
+                    l.page_table.push_back(r);
+                    l.query_offsets.push_back(r + 1);
+                    batch.tokens.push_back(1);
+                    batch.sample_rows.push_back(r);
+                    batch.sample_ids.push_back(0);
+                }
+                run_batch(batch);
+            }
+            double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            std::cerr << "Autotuner pre-warm: " << rows_list.size() << " decode row counts in "
+                      << seconds << " s\n";
+        }
+    }
+    impl_->pages = std::min(impl_->shards[0]->page_capacity(options.memory_fraction),
+                            impl_->shards[1]->page_capacity(options.memory_fraction));
+    for (auto &shard : impl_->shards)
+        shard->allocate_cache(impl_->pages);
     impl_->logits_capacity = options.token_budget * 32768;
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->logits_host),
                             impl_->logits_capacity * sizeof(float), hipHostMallocPortable));

@@ -94,9 +94,24 @@ struct GpuMetadata {
     AttentionLayout host_;
     int max_queries_ = 0, max_length_ = 0;
     bool valid_ = false;
+    // One packed device buffer plus a pinned host mirror: a step uploads
+    // offsets/positions/lengths/page-table/tokens with a single async copy
+    // instead of five blocking pageable hipMemcpy calls (PERF_ROUND3 item 3).
+    DeviceBuffer<int> device_;
+    int *staging_ = nullptr;
+    size_t staging_capacity_ = 0; // ints
+    void ensure_staging(size_t ints, hipStream_t stream);
 
   public:
-    DeviceBuffer<int> offsets, positions, lengths, table;
+    GpuMetadata() = default;
+    ~GpuMetadata();
+    GpuMetadata(const GpuMetadata &) = delete;
+    GpuMetadata &operator=(const GpuMetadata &) = delete;
+    // Device pointers of the packed upload (offsets: requests()+1 ints,
+    // positions/lengths: requests() ints, table: requests()*table_stride ints,
+    // tokens: queries() ints).
+    const int *offsets = nullptr, *positions = nullptr, *lengths = nullptr, *table = nullptr,
+              *tokens = nullptr;
     const AttentionLayout &layout() const {
         if (!valid_)
             throw std::logic_error("Attention metadata has not been uploaded");
@@ -108,22 +123,14 @@ struct GpuMetadata {
     int max_length() const {
         return max_length_;
     }
+    // Tests / host-side use: blocking upload on the null stream, no tokens.
     void upload(const AttentionLayout &l) {
-        valid_ = false;
-        l.validate();
-        host_ = l;
-        max_queries_ = max_length_ = 0;
-        for (int r = 0; r < l.requests(); ++r) {
-            max_queries_ =
-                std::max(max_queries_, l.query_offsets[size_t(r + 1)] - l.query_offsets[size_t(r)]);
-            max_length_ = std::max(max_length_, l.lengths[size_t(r)]);
-        }
-        offsets.upload(l.query_offsets);
-        positions.upload(l.positions);
-        lengths.upload(l.lengths);
-        table.upload(l.page_table);
-        valid_ = true;
+        upload(l, {}, nullptr);
     }
+    // Production: single pinned-staging async copy on the rank stream. The
+    // caller must not overwrite the staging (upload again) before the copy
+    // completes; stream ordering handles it inside one forward pass.
+    void upload(const AttentionLayout &l, std::span<const int> tokens, hipStream_t stream);
 };
 struct AttentionDeviceView {
     const uint8_t *q{};

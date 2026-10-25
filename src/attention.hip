@@ -1,6 +1,7 @@
 #include "behemoth/gpu.hpp"
 #include "device_numeric.hpp"
 #include <algorithm>
+#include <cstring>
 #include <rocwmma/rocwmma.hpp>
 #if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
 static_assert(rocwmma::Constants::AMDGCN_WAVE_SIZE == 32, "rocWMMA must use Wave32");
@@ -20,11 +21,11 @@ struct Meta {
 Meta meta(const GpuMetadata &m) {
     const auto &l = m.layout();
     return {l.query_heads,      l.kv_heads,       l.physical_pages, l.table_stride,
-            l.requests(),       l.queries(),      m.max_queries(),  m.offsets.data(),
-            m.positions.data(), m.lengths.data(), m.table.data()};
+            l.requests(),       l.queries(),      m.max_queries(),  m.offsets,
+            m.positions,        m.lengths,        m.table};
 }
 __global__ void attention_kernel(Meta m, AttentionDeviceView a, float *partial, int parts,
-                                 int partition_keys) {
+                                  int partition_keys) {
     const int lane = int(threadIdx.x), req = int(blockIdx.x), head = int(blockIdx.y),
               part = int(blockIdx.z) % parts;
     const int tile = int(blockIdx.z) / parts, first = m.offsets[req] + tile * 16,
@@ -274,6 +275,61 @@ void verify_device() {
     for (size_t i = 0; i < source.size(); ++i)
         if (values[i] != encode_e4m3(source[i]))
             throw std::runtime_error("OCP E4M3 smoke test failed (saturation/signed zero/NaN/RNE)");
+}
+GpuMetadata::~GpuMetadata() {
+    if (staging_)
+        (void)hipHostFree(staging_);
+}
+void GpuMetadata::ensure_staging(size_t ints, hipStream_t) {
+    if (ints <= staging_capacity_)
+        return;
+    if (staging_)
+        (void)hipHostFree(staging_);
+    staging_capacity_ = ints * 2; // one-time headroom for typical batch growth
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&staging_),
+                            staging_capacity_ * sizeof(int), hipHostMallocPortable));
+}
+void GpuMetadata::upload(const AttentionLayout &l, std::span<const int> tokens_in,
+                         hipStream_t stream) {
+    valid_ = false;
+    l.validate();
+    host_ = l;
+    max_queries_ = max_length_ = 0;
+    for (int r = 0; r < l.requests(); ++r) {
+        max_queries_ =
+            std::max(max_queries_, l.query_offsets[size_t(r + 1)] - l.query_offsets[size_t(r)]);
+        max_length_ = std::max(max_length_, l.lengths[size_t(r)]);
+    }
+    const size_t r = size_t(l.requests()), queries = size_t(l.queries()),
+                 stride = size_t(l.table_stride);
+    const size_t ints = (r + 1) + queries + r + r * stride + queries;
+    ensure_staging(ints, stream);
+    device_.resize(ints);
+    size_t o = 0;
+    auto put = [&](const int *src, size_t n) {
+        if (n)
+            std::memcpy(staging_ + o, src, n * sizeof(int));
+        o += n;
+    };
+    put(l.query_offsets.data(), r + 1);
+    put(l.positions.data(), queries);
+    put(l.lengths.data(), r);
+    put(l.page_table.data(), r * stride);
+    put(tokens_in.data(), tokens_in.size());
+    offsets = device_.data();
+    positions = offsets + (r + 1);
+    lengths = positions + queries;
+    table = lengths + r;
+    tokens = table + r * stride;
+    if (ints) {
+        if (stream)
+            HIP_CHECK(hipMemcpyAsync(device_.data(), staging_, ints * sizeof(int),
+                                     hipMemcpyHostToDevice, stream));
+        else
+            HIP_CHECK(hipMemcpy(device_.data(), staging_, ints * sizeof(int),
+                                hipMemcpyHostToDevice));
+    }
+    valid_ = true;
 }
 size_t attention_workspace_bytes(const AttentionLayout &l, int partition) {
     l.validate();
