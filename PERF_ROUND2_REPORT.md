@@ -3,7 +3,8 @@
 Date: 2026-10-26. Machine: 2x Radeon AI PRO R9700 (gfx1201, Wave32, 32 WGPs, 64 KiB LDS),
 TP=2, kernel 7.0.0-38, amdgpu DKMS 7.1.9, ROCm 10.1 (HIP 7.16, clang 24). Baseline: commit
 `a12a658` (sorted layout + `sorted-lds`, `BATCHED_SORTED_REPORT.md`). Commits of this round:
-`b0b3d7e` (lane layout + kernels), `f66ba14` (fused elementwise), plus the report/results commit.
+`b0b3d7e` (lane layout + kernels), `f66ba14` (fused elementwise), `0d22074` (attention partition,
+report, scripts, results), `49228e2` (lane stream policy default, R=1 slot fix).
 Raw numbers: `perf/results/round2/` (bench JSON `final_rows*.json`, e2e `*_c{1,4}.json`,
 `launch_rocm10.txt`), scripts `perf/e2e_round2.sh`, `perf/server_cycle.sh`, `perf/bench_sweep.sh`,
 `perf/summarize_round2.py`.
