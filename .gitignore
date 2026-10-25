@@ -1,0 +1,4 @@
+/build*/
+/benchmark-results/
+build*/
+perf/results/*.json
