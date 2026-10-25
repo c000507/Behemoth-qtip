@@ -23,11 +23,17 @@ namespace behemoth {
 //
 // Chunks are grouped into segments of S chunks; segment_codes holds the code
 // of the first (real) entry of each segment so that independent waves/blocks
-// can start anywhere without a serial scan.
-// Runtime configuration: one Wave32 owns a 32-row stream; 2048 > 1792 groups
-// covers every projection of the model (group 2047 is the dummy slot).
-constexpr int sorted_rows_per_tile = 32, sorted_groups_per_tile = 2048,
-              sorted_default_chunks_per_segment = 16;
+// can start anywhere without a serial scan. chunk_codes holds the running
+// code at the start of every chunk (code of an entry = chunk code + inclusive
+// delta prefix), so any chunk decodes independently: the batched kernels
+// decode 8 chunks per wave step without a serial scan (+2 B per 32 entries).
+// Runtime configuration: tiles of 16 output rows (a 16 x 1792-group code tile
+// is 56 KiB, so one tile's codes fit in LDS for the batched kernels; code
+// density 16*groups/65536 >= 0.375 keeps the gather near-streaming); 2048 >
+// 1792 groups covers every projection of the model (group 2047 is the dummy
+// slot).
+constexpr int sorted_rows_per_tile = 16, sorted_groups_per_tile = 2048,
+              sorted_default_chunks_per_segment = 16, sorted_default_delta_bits = 4;
 struct SortedTileDesc {
     uint32_t chunk_begin, chunk_count, segment_begin, segment_count;
 };
@@ -37,11 +43,12 @@ struct SortedLayout {
     std::vector<uint16_t> idx;           // 32 per chunk
     std::vector<uint32_t> planes;        // delta_bits per chunk
     std::vector<uint16_t> segment_codes; // one per segment
+    std::vector<uint16_t> chunk_codes;   // one per chunk (running code at chunk start)
     std::vector<SortedTileDesc> tiles;   // row_tiles * group_tiles, tile = rt * group_tiles + gt
     size_t entries = 0, dummies = 0;
     size_t bytes() const {
         return idx.size() * 2 + planes.size() * 4 + segment_codes.size() * 2 +
-               tiles.size() * sizeof(SortedTileDesc);
+               chunk_codes.size() * 2 + tiles.size() * sizeof(SortedTileDesc);
     }
     size_t chunks() const {
         return idx.size() / 32;

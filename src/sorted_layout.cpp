@@ -16,10 +16,12 @@ struct Emitter {
     bool segment_open = false;
     Emitter(SortedLayout &layout) : l(layout), S(layout.chunks_per_segment), DB(layout.delta_bits),
                                     MAXD((1 << layout.delta_bits) - 1) {}
-    void put(uint16_t index, int delta) {
+    // code_before: the running code before this entry's delta is applied.
+    void put(uint16_t index, int delta, uint32_t code_before) {
         if (fill == 0) {
             l.idx.resize(size_t(chunk + 1) * 32, 0);
             l.planes.resize(size_t(chunk + 1) * size_t(DB), 0);
+            l.chunk_codes.push_back(uint16_t(code_before));
         }
         l.idx[size_t(chunk) * 32 + size_t(fill)] = index;
         for (int k = 0; k < DB; ++k)
@@ -42,13 +44,13 @@ struct Emitter {
             l.segment_codes.push_back(uint16_t(code));
             running = code;
             segment_open = true;
-            put(index, 0);
+            put(index, 0, code);
             ++l.entries;
             return;
         }
         uint32_t gap = code - running;
         while (gap > uint32_t(MAXD)) {
-            put(dummy_index, MAXD);
+            put(dummy_index, MAXD, running);
             ++l.dummies;
             running += uint32_t(MAXD);
             gap -= uint32_t(MAXD);
@@ -56,18 +58,18 @@ struct Emitter {
                 l.segment_codes.push_back(uint16_t(code));
                 running = code;
                 segment_open = true;
-                put(index, 0);
+                put(index, 0, code);
                 ++l.entries;
                 return;
             }
         }
-        put(index, int(gap));
+        put(index, int(gap), running);
         running = code;
         ++l.entries;
     }
     SortedTileDesc end_tile() {
         while (fill != 0) { // pad the last chunk with dummy entries (no code advance)
-            put(dummy_index, 0);
+            put(dummy_index, 0, running);
             ++l.dummies;
         }
         SortedTileDesc d{};
@@ -147,6 +149,7 @@ SortedLayout sorted_layout(int in, int out, const uint16_t *codes, int R, int G,
     l.idx.reserve(chunks * 32);
     l.planes.reserve(chunks * size_t(DB));
     l.segment_codes.reserve(segments);
+    l.chunk_codes.reserve(chunks);
     l.tiles.reserve(tiles.size());
     for (auto &t : tiles) {
         SortedTileDesc d = t.desc;
@@ -156,6 +159,8 @@ SortedLayout sorted_layout(int in, int out, const uint16_t *codes, int R, int G,
         l.planes.insert(l.planes.end(), t.part.planes.begin(), t.part.planes.end());
         l.segment_codes.insert(l.segment_codes.end(), t.part.segment_codes.begin(),
                                t.part.segment_codes.end());
+        l.chunk_codes.insert(l.chunk_codes.end(), t.part.chunk_codes.begin(),
+                             t.part.chunk_codes.end());
         l.tiles.push_back(d);
         l.entries += t.part.entries;
         l.dummies += t.part.dummies;
@@ -168,7 +173,8 @@ SortedLayout sorted_layout(int in, int out, const uint16_t *codes, int R, int G,
 bool sorted_layout_decode(const SortedLayout &l, int in, int out, std::vector<uint16_t> &codes) {
     const int groups = in / 8, R = l.rows_per_tile, G = l.groups_per_tile, DB = l.delta_bits;
     const int gbits = std::countr_zero(unsigned(G));
-    if (l.tiles.size() != size_t(l.row_tiles) * size_t(l.group_tiles))
+    if (l.tiles.size() != size_t(l.row_tiles) * size_t(l.group_tiles) ||
+        l.chunk_codes.size() != l.chunks())
         return false;
     codes.assign(size_t(out) * size_t(groups), 0);
     std::vector<uint8_t> seen(codes.size(), 0);
@@ -181,7 +187,9 @@ bool sorted_layout_decode(const SortedLayout &l, int in, int out, std::vector<ui
                 const uint32_t c0 = t.chunk_begin + s * uint32_t(l.chunks_per_segment),
                                c1 = std::min(t.chunk_begin + t.chunk_count,
                                              c0 + uint32_t(l.chunks_per_segment));
-                for (uint32_t c = c0; c < c1; ++c)
+                for (uint32_t c = c0; c < c1; ++c) {
+                    if (l.chunk_codes[c] != uint16_t(running))
+                        return false;
                     for (int lane = 0; lane < 32; ++lane) {
                         int d = 0;
                         for (int k = 0; k < DB; ++k)
@@ -201,6 +209,7 @@ bool sorted_layout_decode(const SortedLayout &l, int in, int out, std::vector<ui
                         codes[at] = uint16_t(running);
                         ++real;
                     }
+                }
             }
         }
     return real == codes.size();
