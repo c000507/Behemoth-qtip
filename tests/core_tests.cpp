@@ -285,6 +285,93 @@ static void sampling_tests() {
         parse_chat({{"messages", {{{"role", "user"}, {"content", "x"}}}}, {"max_tokens", -1}});
     });
 }
+// Reference: the pre-PERF_ROUND3 sampler (fresh vectors, full-vocab
+// std::sort per call). The rewritten sampler must draw IDENTICAL tokens
+// for the same RNG stream, including temperature/top-k/top-p paths.
+static int reference_sample_logits(std::span<const float> logits, const SamplingOptions &p,
+                                   std::mt19937_64 &rng) {
+    validate_sampling(p);
+    if (logits.empty())
+        throw std::invalid_argument("Empty logits");
+    for (float v : logits)
+        if (!std::isfinite(v))
+            throw std::runtime_error("Nonfinite model logits");
+    if (p.temperature == 0)
+        return int(std::max_element(logits.begin(), logits.end()) - logits.begin());
+    std::vector<size_t> order(logits.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
+    });
+    if (p.top_k > 0 && size_t(p.top_k) < order.size())
+        order.resize(size_t(p.top_k));
+    std::vector<double> probabilities;
+    double total = 0;
+    for (size_t i : order) {
+        double v = std::exp((double(logits[i]) - double(logits[order[0]])) / p.temperature);
+        probabilities.push_back(v);
+        total += v;
+    }
+    double cumulative = 0;
+    size_t keep = 0;
+    do {
+        cumulative += probabilities[keep++];
+    } while (keep < order.size() && cumulative < p.top_p * total);
+    probabilities.resize(keep);
+    std::discrete_distribution<size_t> dist(probabilities.begin(), probabilities.end());
+    return int(order[dist(rng)]);
+}
+static void sampler_equivalence_tests() {
+    std::mt19937_64 logits_rng(20261026);
+    auto make = [&](size_t n, int flavor) {
+        std::vector<float> x(n);
+        std::uniform_real_distribution<float> u(-20.f, 20.f);
+        for (float &v : x)
+            switch (flavor) {
+            case 1: // heavy ties: quantise to half-integers
+                v = std::round(u(logits_rng) * 2) / 2;
+                break;
+            case 2: // sharp distribution with outliers
+                v = u(logits_rng) * .01f;
+                break;
+            default:
+                v = u(logits_rng);
+            }
+        if (flavor == 2 && n > 8)
+            for (int i : {0, 3, 7})
+                x[size_t(i)] += 25.f + float(i);
+        return x;
+    };
+    size_t checked = 0;
+    for (int flavor : {0, 1, 2})
+        for (double temperature : {0., .7, 1.})
+            for (int top_k : {0, 1, 2, 40, 1000, 32768})
+                for (double top_p : {.05, .5, .9, 1.}) {
+                    SamplingOptions p;
+                    p.temperature = float(temperature);
+                    p.top_k = top_k;
+                    p.top_p = float(top_p);
+                    for (size_t n : {size_t(513), size_t(32768)}) {
+                        auto logits = make(n, flavor);
+                        // Split-vocabulary form: rank halves in device order.
+                        size_t half = n / 2;
+                        std::span<const float> low(logits.data(), half),
+                            high(logits.data() + half, n - half);
+                        for (uint64_t seed : {1u, 42u}) {
+                            std::mt19937_64 reference(seed), rewritten(seed), split(seed);
+                            for (int draw = 0; draw < 3; ++draw) {
+                                int a = reference_sample_logits(logits, p, reference);
+                                int b = sample_logits(logits, p, rewritten);
+                                int c = sample_logits(low, high, p, split);
+                                CHECK(a == b);
+                                CHECK(a == c);
+                                ++checked;
+                            }
+                        }
+                    }
+                }
+    CHECK(checked == 3 * 3 * 6 * 4 * 2 * 2 * 3);
+}
 static void tuning_tests() {
     // Identical selection reports must compare equal before serialization.
     nlohmann::json report = {{"blas_ms", timing_json(NAN)},
@@ -426,8 +513,9 @@ int main() {
                  {"numeric", numeric_tests},
                  {"attention", attention_tests},
                  {"scheduler", scheduler_tests},
-                 {"sampling", sampling_tests},
-                 {"tuning", tuning_tests},
+                  {"sampling", sampling_tests},
+                  {"sampler_equivalence", sampler_equivalence_tests},
+                  {"tuning", tuning_tests},
                  {"checkpoint", checkpoint_tests}}) {
             fn();
             std::cout << "PASS " << name << '\n';

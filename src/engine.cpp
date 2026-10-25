@@ -90,7 +90,8 @@ struct Engine::Impl {
                 continue;
             try {
                 auto start = std::chrono::steady_clock::now();
-                auto logits = model.forward(input);
+                const size_t sample_count = input.sample_rows.size();
+                const auto logits = model.forward(input);
                 double elapsed =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
                 {
@@ -100,9 +101,17 @@ struct Engine::Impl {
                     size_t index = 0;
                     for (const auto &request : step.requests) {
                         const auto &r = scheduler.request(request.id);
-                        int token = request.sample ? sample_logits(logits.at(index++), r.sampling,
-                                                                   rng.at(request.id))
-                                                   : -1;
+                        // Logits are rank-blocked; sample without an interleave copy.
+                        const size_t row = index++;
+                        int token =
+                            request.sample
+                                ? sample_logits(
+                                      std::span<const float>(logits.data() + row * 16384, 16384),
+                                      std::span<const float>(
+                                          logits.data() + sample_count * 16384 + row * 16384,
+                                          16384),
+                                      r.sampling, rng.at(request.id))
+                                : -1;
                         scheduler.complete(request, token, token == 2);
                         const auto &after = scheduler.request(request.id);
                         if (token >= 0) {

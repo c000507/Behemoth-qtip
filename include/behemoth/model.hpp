@@ -36,7 +36,11 @@ class TensorParallelModel {
     int cache_pages() const;
     nlohmann::json last_profile() const;
     nlohmann::json projection_tuning(int layer = 0) const;
-    std::vector<std::vector<float>> forward(const InferenceBatch &);
+    // Full-vocab logits for the batch's sampled rows in a persistent pinned
+    // host buffer, rank-blocked: [rank0 n x 16384 | rank1 n x 16384]. The
+    // span is valid until the next forward call. Sampling uses the split
+    // sample_logits overload; no per-step host staging vectors exist.
+    std::span<const float> forward(const InferenceBatch &);
     std::vector<BFloat16> block_for_validation(int layer, std::span<const BFloat16> input);
 };
 InferenceBatch make_inference_batch(const Scheduler &, const ScheduledBatch &);

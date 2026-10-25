@@ -18,15 +18,18 @@ int main(int argc, char **argv) {
         auto id = scheduler.submit(std::vector<int>{1, 2}, 2);
         auto scheduled = scheduler.schedule();
         auto batch = make_inference_batch(scheduler, scheduled);
-        auto first = model.forward(batch), repeat = model.forward(batch);
+        auto first = model.forward(batch);
+        std::vector<float> first_copy(first.begin(), first.end()); // staging is reused
+        auto repeat = model.forward(batch);
         auto tuning = model.projection_tuning();
         if (tuning.at("last_step_query_rows") != 2 || tuning.at("last_step_sample_rows") != 1 ||
             tuning.at("ranks").size() != 2)
             throw std::runtime_error("Tuning snapshot has wrong prefill dimensions");
-        if (first.size() != 1 || first[0].size() != 32768)
+        if (first_copy.size() != 32768)
             throw std::runtime_error("Wrong logits shape");
         for (size_t i = 0; i < 32768; ++i)
-            if (!std::isfinite(first[0][i]) || std::abs(first[0][i] - repeat[0][i]) > 1e-5f)
+            if (!std::isfinite(first_copy[i]) ||
+                std::abs(first_copy[i] - repeat[i]) > 1e-5f)
                 throw std::runtime_error("Nonfinite/nondeterministic full-model logits");
         scheduler.complete(scheduled.requests[0], 7);
         auto next = scheduler.schedule();
@@ -45,7 +48,7 @@ int main(int argc, char **argv) {
                     throw std::runtime_error("Tuning snapshot has wrong weight labels");
             }
         }
-        for (float v : decoded[0])
+        for (float v : decoded)
             if (!std::isfinite(v))
                 throw std::runtime_error("Nonfinite decode logits");
         scheduler.complete(next.requests[0], 8);

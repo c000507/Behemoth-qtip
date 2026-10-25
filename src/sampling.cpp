@@ -48,6 +48,10 @@ std::pair<std::string, size_t> utf8_prefix(std::string_view x, bool final) {
     }
     return {out, i};
 }
+// Reused per-thread buffers: the decode path calls this once per token and
+// must not allocate (PERF_ROUND3 item 2).
+thread_local std::vector<size_t> order_buffer;
+thread_local std::vector<double> probability_buffer;
 } // namespace
 void validate_sampling(const SamplingOptions &p) {
     if (!std::isfinite(p.temperature) || p.temperature < 0 || p.top_k < 0 || p.top_k > 32768 ||
@@ -55,25 +59,47 @@ void validate_sampling(const SamplingOptions &p) {
         throw std::invalid_argument("Invalid sampling parameters");
 }
 int sample_logits(std::span<const float> logits, const SamplingOptions &p, std::mt19937_64 &rng) {
+    return sample_logits(logits, {}, p, rng);
+}
+int sample_logits(std::span<const float> low, std::span<const float> high, const SamplingOptions &p,
+                  std::mt19937_64 &rng) {
     validate_sampling(p);
-    if (logits.empty())
+    const size_t n = low.size() + high.size();
+    if (!n)
         throw std::invalid_argument("Empty logits");
-    for (float v : logits)
-        if (!std::isfinite(v))
+    auto value = [&](size_t i) -> float { return i < low.size() ? low[i] : high[i - low.size()]; };
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(value(i)))
             throw std::runtime_error("Nonfinite model logits");
-    if (p.temperature == 0)
-        return int(std::max_element(logits.begin(), logits.end()) - logits.begin());
-    std::vector<size_t> order(logits.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
-    });
-    if (p.top_k > 0 && size_t(p.top_k) < order.size())
+    if (p.temperature == 0) {
+        size_t best = 0;
+        for (size_t i = 1; i < n; ++i)
+            if (value(i) > value(best))
+                best = i;
+        return int(best);
+    }
+    auto &order = order_buffer;
+    order.resize(n);
+    std::iota(order.begin(), order.end(), size_t(0));
+    auto descending = [&](size_t a, size_t b) {
+        return value(a) == value(b) ? a < b : value(a) > value(b);
+    };
+    if (p.top_k > 0 && size_t(p.top_k) < n) {
+        // partial_sort yields exactly the first top_k entries of the full sort
+        // (the comparator is a total order), at O(n log k) instead of a
+        // full-vocab std::sort per token.
+        std::partial_sort(order.begin(), order.begin() + p.top_k, order.end(), descending);
         order.resize(size_t(p.top_k));
-    std::vector<double> probabilities;
+    } else {
+        // Exact path (no top-k cut): keep the full sort; the buffers are
+        // still reused and the probability math below is unchanged.
+        std::sort(order.begin(), order.end(), descending);
+    }
+    auto &probabilities = probability_buffer;
+    probabilities.clear();
     double total = 0;
     for (size_t i : order) {
-        double v = std::exp((double(logits[i]) - double(logits[order[0]])) / p.temperature);
+        double v = std::exp((double(value(i)) - double(value(order[0]))) / p.temperature);
         probabilities.push_back(v);
         total += v;
     }

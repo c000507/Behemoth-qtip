@@ -631,6 +631,11 @@ struct TensorParallelModel::Impl {
     nlohmann::json last;
     int last_query_rows = 0, last_sample_rows = 0;
     int pages = 0;
+    // Persistent pinned logits staging (PERF_ROUND3 item 2): one portable
+    // pinned buffer sized for the token budget replaces the per-step pageable
+    // vector, blocking pageable D2H and rank-interleave copy.
+    float *logits_host = nullptr;
+    size_t logits_capacity = 0;
     ~Impl() {
         for (auto &worker : workers)
             worker.reset();
@@ -638,6 +643,8 @@ struct TensorParallelModel::Impl {
             for (auto c : comm)
                 if (c)
                     ncclCommDestroy(c);
+        if (logits_host)
+            (void)hipHostFree(logits_host);
     }
     void abort() {
         if (!aborted.exchange(true)) {
@@ -678,6 +685,9 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
             options.zero_copy_transport ? options.zero_copy_rows * 16384 : 0, options.devices);
     for (auto &worker : impl_->workers)
         worker = std::make_unique<RankWorker>();
+    impl_->logits_capacity = options.token_budget * 32768;
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->logits_host),
+                            impl_->logits_capacity * sizeof(float), hipHostMallocPortable));
     std::cerr << "KV pages=" << impl_->pages << ", aggregate token capacity=" << impl_->pages * 16
               << ", bytes/token/GPU=" << PagePool::bytes_per_page() / 16 << '\n';
 }
@@ -782,7 +792,7 @@ std::vector<BFloat16> TensorParallelModel::block_for_validation(int layer,
             throw std::runtime_error("Tensor-parallel residual streams diverged");
     return first;
 }
-std::vector<std::vector<float>> TensorParallelModel::forward(const InferenceBatch &batch) {
+std::span<const float> TensorParallelModel::forward(const InferenceBatch &batch) {
     std::lock_guard execution_lock(impl_->execution_mutex);
     const auto started = std::chrono::steady_clock::now();
     batch.layout.validate();
@@ -810,16 +820,16 @@ std::vector<std::vector<float>> TensorParallelModel::forward(const InferenceBatc
     if (error)
         std::rethrow_exception(error);
     size_t n = batch.sample_rows.size();
-    std::vector<std::vector<float>> result(n, std::vector<float>(32768));
+    std::span<const float> result{};
     if (n) {
+        // Single async D2H into pinned staging; the split sample_logits reads
+        // the rank halves directly, so no interleave copy exists.
         HIP_CHECK(hipSetDevice(impl_->shards[0]->device));
-        std::vector<float> logits(n * 32768);
-        HIP_CHECK(hipMemcpy(logits.data(), impl_->shards[0]->gathered.data(),
-                            logits.size() * sizeof(float), hipMemcpyDeviceToHost));
-        for (size_t row = 0; row < n; ++row)
-            for (size_t rank = 0; rank < 2; ++rank)
-                std::copy_n(logits.begin() + std::ptrdiff_t((rank * n + row) * 16384), 16384,
-                            result[row].begin() + std::ptrdiff_t(rank * 16384));
+        HIP_CHECK(hipMemcpyAsync(impl_->logits_host, impl_->shards[0]->gathered.data(),
+                                 n * 32768 * sizeof(float), hipMemcpyDeviceToHost,
+                                 impl_->shards[0]->stream));
+        HIP_CHECK(hipStreamSynchronize(impl_->shards[0]->stream));
+        result = {impl_->logits_host, n * 32768};
     }
     if (impl_->profiling) {
         const auto execution_finished = std::chrono::steady_clock::now();
