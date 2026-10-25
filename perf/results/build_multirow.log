@@ -1,0 +1,14 @@
+[1/14] Building CXX object CMakeFiles/behemoth_bench.dir/tools/gpu_bench.cpp.o
+[2/14] Building CXX object CMakeFiles/behemoth_gpu_tests.dir/tests/gpu_tests.cpp.o
+[3/14] Building CXX object CMakeFiles/behemoth_projection_bench.dir/tools/projection_bench.cpp.o
+[4/14] Building HIP object CMakeFiles/behemoth_gpu.dir/src/ops.hip.o
+[5/14] Building CXX object CMakeFiles/behemoth_gpu.dir/src/model.cpp.o
+[6/14] Building HIP object CMakeFiles/behemoth_gpu.dir/src/attention.hip.o
+[7/14] Building HIP object CMakeFiles/behemoth_gpu.dir/src/projection.hip.o
+[8/14] Linking HIP static library libbehemoth_gpu.a
+[9/14] Linking HIP executable behemoth_bench
+[10/14] Linking HIP executable behemoth_gpu_tests
+[11/14] Linking HIP executable behemoth_block_tests
+[12/14] Linking HIP executable behemoth_projection_bench
+[13/14] Linking HIP executable behemoth_model_tests
+[14/14] Linking HIP executable behemoth_server

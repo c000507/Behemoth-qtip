@@ -1,0 +1,25 @@
+[0/1] Re-running CMake...
+-- Using the multi-header code from /home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm/_deps/json-src/include/
+-- VERSION: 0.2.1
+-- Configuring done (0.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm
+[1/19] Building CXX object CMakeFiles/behemoth_block_tests.dir/tests/block_tests.cpp.o
+[2/19] Building CXX object CMakeFiles/behemoth_model_tests.dir/tests/model_tests.cpp.o
+[3/19] Building CXX object CMakeFiles/behemoth_gpu.dir/src/engine.cpp.o
+[4/19] Building CXX object CMakeFiles/behemoth_bench.dir/tools/gpu_bench.cpp.o
+[5/19] Building CXX object CMakeFiles/behemoth_gpu_tests.dir/tests/gpu_tests.cpp.o
+[6/19] Building CXX object CMakeFiles/behemoth_projection_bench.dir/tools/projection_bench.cpp.o
+[7/19] Building HIP object CMakeFiles/behemoth_gpu.dir/src/transport.hip.o
+[8/19] Building HIP object CMakeFiles/behemoth_gpu.dir/src/ops.hip.o
+[9/19] Building CXX object CMakeFiles/behemoth_gpu.dir/src/model.cpp.o
+[10/19] Building HIP object CMakeFiles/behemoth_gpu.dir/src/attention.hip.o
+[11/19] Building HIP object CMakeFiles/behemoth_gpu.dir/src/projection.hip.o
+[12/19] Linking HIP static library libbehemoth_gpu.a
+[13/19] Linking HIP executable behemoth_projection_bench
+[14/19] Linking HIP executable behemoth_bench
+[15/19] Linking HIP executable behemoth_model_tests
+[16/19] Linking HIP executable behemoth_block_tests
+[17/19] Linking HIP executable behemoth_gpu_tests
+[18/19] Building CXX object CMakeFiles/behemoth_server.dir/src/server.cpp.o
+[19/19] Linking HIP executable behemoth_server

@@ -57,6 +57,14 @@ const char *projection_mode_name(ProjectionMode m) {
         return "pipelined-s2048-64";
     case ProjectionMode::PipelinedSplit2048K128:
         return "pipelined-s2048-128";
+    case ProjectionMode::PipelinedR2K64:
+        return "pipelined-r2-64";
+    case ProjectionMode::PipelinedR2K128:
+        return "pipelined-r2-128";
+    case ProjectionMode::PipelinedR4K64:
+        return "pipelined-r4-64";
+    case ProjectionMode::PipelinedR4K128:
+        return "pipelined-r4-128";
     case ProjectionMode::Count:
         break;
     }
@@ -102,6 +110,7 @@ SelectionKey selection_key(const GpuProjection &p, int rows, bool apply_rows) {
 struct PipelineGeometry {
     ProjectionMode mode;
     int ktile, columns, split;
+    int row_tiles = 1; // 16-row WMMA tiles sharing one weight-tile lookup
 };
 constexpr std::array pipeline_geometries{
     PipelineGeometry{ProjectionMode::Pipelined64, 64, 64, 1024},
@@ -113,7 +122,13 @@ constexpr std::array pipeline_geometries{
     PipelineGeometry{ProjectionMode::PipelinedSplit512K64, 64, 64, 512},
     PipelineGeometry{ProjectionMode::PipelinedSplit512K128, 128, 64, 512},
     PipelineGeometry{ProjectionMode::PipelinedSplit2048K64, 64, 64, 2048},
-    PipelineGeometry{ProjectionMode::PipelinedSplit2048K128, 128, 64, 2048}};
+    PipelineGeometry{ProjectionMode::PipelinedSplit2048K128, 128, 64, 2048},
+    // Multi-row variants: one codebook lookup per weight tile feeds 2 or 4
+    // row tiles (32 / 64 batch rows) so lookup cost is shared across rows.
+    PipelineGeometry{ProjectionMode::PipelinedR2K64, 64, 64, 1024, 2},
+    PipelineGeometry{ProjectionMode::PipelinedR2K128, 128, 64, 1024, 2},
+    PipelineGeometry{ProjectionMode::PipelinedR4K64, 64, 64, 1024, 4},
+    PipelineGeometry{ProjectionMode::PipelinedR4K128, 128, 64, 1024, 4}};
 const PipelineGeometry *pipeline_geometry(ProjectionMode mode) {
     for (const auto &g : pipeline_geometries)
         if (g.mode == mode)
@@ -142,6 +157,14 @@ template <typename F> void dispatch_pipeline(ProjectionMode mode, F &&f) {
         return f.template operator()<64, 64, 2048>();
     case ProjectionMode::PipelinedSplit2048K128:
         return f.template operator()<128, 64, 2048>();
+    case ProjectionMode::PipelinedR2K64:
+        return f.template operator()<64, 64, 1024, 2>();
+    case ProjectionMode::PipelinedR2K128:
+        return f.template operator()<128, 64, 1024, 2>();
+    case ProjectionMode::PipelinedR4K64:
+        return f.template operator()<64, 64, 1024, 4>();
+    case ProjectionMode::PipelinedR4K128:
+        return f.template operator()<128, 64, 1024, 4>();
     default:
         throw std::logic_error("Not a pipelined projection mode");
     }
@@ -245,6 +268,7 @@ nlohmann::json choice_report(const SelectionKey &selection, const Choice &choice
             candidate["output_columns"] = g->columns;
             candidate["threads"] = g->columns * 2;
             candidate["k_partition"] = g->split;
+            candidate["row_tiles"] = g->row_tiles;
             candidate["aligned"] = compressed && layout == CodeLayout::GroupMajor &&
                                    out % g->columns == 0 && in % g->ktile == 0 &&
                                    size_t(out) * size_t(in / 8) <= UINT32_MAX;
@@ -449,8 +473,8 @@ __global__ void tiled_projection(const uint8_t *x, const uint16_t *codes, const 
 }
 // Hold the next tile in registers. Separate index loads from dependent book
 // loads so each wave can have several independent lookup chains in flight.
-template <int ktile, bool aligned, int columns = 64> struct ProjectionPrefetch {
-    static constexpr int threads = columns * 2, activation_count = 16 * ktile / 8;
+template <int ktile, bool aligned, int columns = 64, int row_tiles = 1> struct ProjectionPrefetch {
+    static constexpr int threads = columns * 2, activation_count = 16 * row_tiles * ktile / 8;
     static constexpr bool activation_tail = activation_count % threads != 0;
     static constexpr int weight_packs = ktile / 16,
                          activation_packs = (activation_count + threads - 1) / threads;
@@ -521,27 +545,34 @@ template <int ktile, bool aligned, int columns = 64> struct ProjectionPrefetch {
 };
 // aligned is restricted at dispatch to compressed, group-major weights whose
 // K and N are whole tiles. Generic variants retain dense/layout/tail support.
-template <int ktile, bool aligned, int columns = 64, int split = tiled_split_width>
+// row_tiles > 1: the block owns 16*row_tiles batch rows. The weight tile is
+// looked up and staged once, then multiplied against each 16-row activation
+// tile, so the codebook gather cost is shared by up to 64 rows.
+template <int ktile, bool aligned, int columns = 64, int split = tiled_split_width,
+          int row_tiles = 1>
 __global__ void
 pipelined_projection(const uint8_t *__restrict__ x, const uint16_t *__restrict__ codes,
                      const uint8_t *__restrict__ book, const uint8_t *__restrict__ dense,
                      float *__restrict__ partial, int rows, int in, int out, bool group_major) {
     static_assert(columns == 32 || columns == 64 || columns == 128);
     static_assert(split >= split_width && split % ktile == 0);
-    constexpr int threads = columns * 2, b_stride = ktile + 16;
-    constexpr int operand_bytes = 16 * ktile + columns * b_stride;
-    constexpr int result_bytes = 16 * columns * sizeof(float);
+    static_assert(row_tiles == 1 || row_tiles == 2 || row_tiles == 4);
+    constexpr int threads = columns * 2, b_stride = ktile + 16, block_rows = 16 * row_tiles;
+    constexpr int operand_bytes = block_rows * ktile + columns * b_stride;
+    constexpr int result_bytes = block_rows * columns * sizeof(float);
     constexpr int shared_bytes = operand_bytes > result_bytes ? operand_bytes : result_bytes;
     __shared__ __attribute__((aligned(16))) uint8_t storage[shared_bytes];
     F8 *a = reinterpret_cast<F8 *>(storage);
-    F8 *b = reinterpret_cast<F8 *>(storage + 16 * ktile);
+    F8 *b = reinterpret_cast<F8 *>(storage + block_rows * ktile);
     float *c = reinterpret_cast<float *>(storage);
     const int tid = int(threadIdx.x), wave = tid / device::wave_size;
-    const int row0 = int(blockIdx.y) * 16, col0 = int(blockIdx.x) * columns, part = int(blockIdx.z),
-              begin = part * split, end = min(in, begin + split);
-    rocwmma::fragment<rocwmma::accumulator, 16, 16, 32, float> acc;
-    rocwmma::fill_fragment(acc, 0.f);
-    ProjectionPrefetch<ktile, aligned, columns> next;
+    const int row0 = int(blockIdx.y) * block_rows, col0 = int(blockIdx.x) * columns,
+              part = int(blockIdx.z), begin = part * split, end = min(in, begin + split);
+    rocwmma::fragment<rocwmma::accumulator, 16, 16, 32, float> acc[row_tiles];
+#pragma unroll
+    for (int r = 0; r < row_tiles; ++r)
+        rocwmma::fill_fragment(acc[r], 0.f);
+    ProjectionPrefetch<ktile, aligned, columns, row_tiles> next;
     next.load(x, codes, book, dense, tid, row0, col0, begin, end, rows, in, out, group_major);
     for (int base = begin; base < end; base += ktile) {
         next.stage(a, b, tid);
@@ -551,17 +582,23 @@ pipelined_projection(const uint8_t *__restrict__ x, const uint16_t *__restrict__
                       group_major);
 #pragma unroll 1
         for (int k = 0; k < ktile && (aligned || base + k < end); k += 32) {
-            rocwmma::fragment<rocwmma::matrix_a, 16, 16, 32, F8, rocwmma::row_major> ma;
             rocwmma::fragment<rocwmma::matrix_b, 16, 16, 32, F8, rocwmma::col_major> mb;
-            rocwmma::load_matrix_sync(ma, a + k, ktile);
             rocwmma::load_matrix_sync(mb, b + wave * 16 * b_stride + k, b_stride);
-            rocwmma::mma_sync(acc, ma, mb, acc);
+#pragma unroll
+            for (int r = 0; r < row_tiles; ++r) {
+                rocwmma::fragment<rocwmma::matrix_a, 16, 16, 32, F8, rocwmma::row_major> ma;
+                rocwmma::load_matrix_sync(ma, a + r * 16 * ktile + k, ktile);
+                rocwmma::mma_sync(acc[r], ma, mb, acc[r]);
+            }
         }
         projection_lds_barrier();
     }
-    rocwmma::store_matrix_sync(c + wave * 16, acc, columns, rocwmma::mem_row_major);
+#pragma unroll
+    for (int r = 0; r < row_tiles; ++r)
+        rocwmma::store_matrix_sync(c + r * 16 * columns + wave * 16, acc[r], columns,
+                                   rocwmma::mem_row_major);
     projection_lds_barrier();
-    for (int i = tid; i < 16 * columns; i += threads) {
+    for (int i = tid; i < block_rows * columns; i += threads) {
         int row = row0 + i / columns, col = col0 + i % columns;
         if (row < rows && (aligned || col < out))
             partial[(size_t(part) * size_t(rows) + size_t(row)) * size_t(out) + size_t(col)] = c[i];
@@ -636,12 +673,13 @@ nlohmann::json ProjectionRunner::resources() const {
     add("tiled-lds-64", reinterpret_cast<const void *>(tiled_projection<64, true>), 128);
     add("tiled-lds-128", reinterpret_cast<const void *>(tiled_projection<128, true>), 128);
     for (const auto &g : pipeline_geometries)
-        dispatch_pipeline(g.mode, [&]<int k, int n, int split>() {
+        dispatch_pipeline(g.mode, [&]<int k, int n, int split, int rt = 1>() {
             const auto name = std::string(projection_mode_name(g.mode));
             add(name + "-aligned",
-                reinterpret_cast<const void *>(pipelined_projection<k, true, n, split>), n * 2);
+                reinterpret_cast<const void *>(pipelined_projection<k, true, n, split, rt>), n * 2);
             add(name + "-generic",
-                reinterpret_cast<const void *>(pipelined_projection<k, false, n, split>), n * 2);
+                reinterpret_cast<const void *>(pipelined_projection<k, false, n, split, rt>),
+                n * 2);
         });
     return s.resources;
 }
@@ -752,8 +790,10 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                    geometry) {
             const int partition = geometry ? geometry->split : tiled_split_width;
             const int columns = geometry ? geometry->columns : 64;
+            const int block_rows = 16 * (geometry ? geometry->row_tiles : 1);
             int parts = int(ceil_div(size_t(p.in), size_t(partition)));
             grid.x = unsigned(ceil_div(size_t(p.out), size_t(columns)));
+            grid.y = unsigned(ceil_div(size_t(rows), size_t(block_rows)));
             grid.z = unsigned(parts);
             w.partial.resize(size_t(rows) * size_t(p.out) * size_t(parts));
             if (mode == ProjectionMode::Tiled64)
@@ -773,15 +813,15 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                     w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
                     w.partial.data(), rows, p.in, p.out, parts, group_major);
             else {
-                dispatch_pipeline(mode, [&]<int k, int n, int split>() {
+                dispatch_pipeline(mode, [&]<int k, int n, int split, int rt = 1>() {
                     const bool aligned = !p.dense.size() && group_major && p.out % n == 0 &&
                                          p.in % k == 0 && p.codes.size() <= UINT32_MAX;
                     if (aligned)
-                        pipelined_projection<k, true, n, split><<<grid, n * 2, 0, stream>>>(
+                        pipelined_projection<k, true, n, split, rt><<<grid, n * 2, 0, stream>>>(
                             w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
                             w.partial.data(), rows, p.in, p.out, group_major);
                     else
-                        pipelined_projection<k, false, n, split><<<grid, n * 2, 0, stream>>>(
+                        pipelined_projection<k, false, n, split, rt><<<grid, n * 2, 0, stream>>>(
                             w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
                             w.partial.data(), rows, p.in, p.out, group_major);
                 });
@@ -832,12 +872,22 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                 candidates.push_back(ProjectionMode::Fused);
             if (rows >= 4 && plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
+        } else if (!p.dense.size() && rows <= 64) {
+            // Lookup cost is shared across 32/64 rows; still compare BLAS.
+            candidates = rows <= 32 ? std::vector{ProjectionMode::PipelinedR2K128,
+                                                  ProjectionMode::PipelinedR2K64,
+                                                  ProjectionMode::PipelinedR4K128}
+                                    : std::vector{ProjectionMode::PipelinedR4K128,
+                                                  ProjectionMode::PipelinedR4K64};
+            if (plan.has_blas)
+                candidates.push_back(ProjectionMode::Blas);
+            candidates.push_back(ProjectionMode::Fused);
         } else {
             if (plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
             candidates.push_back(ProjectionMode::Fused);
         }
-        if (state.search == ProjectionSearch::Exhaustive && rows <= 16)
+        if (state.search == ProjectionSearch::Exhaustive && rows <= 64)
             for (auto mode : projection_modes()) {
                 if (mode == ProjectionMode::Auto ||
                     (mode == ProjectionMode::Blas && !plan.has_blas) ||

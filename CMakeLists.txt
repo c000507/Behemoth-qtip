@@ -38,7 +38,7 @@ if(BEHEMOTH_ROCM)
   find_package(rocwmma REQUIRED CONFIG)
   find_package(hipblaslt REQUIRED CONFIG)
   find_package(rccl REQUIRED CONFIG)
-  add_library(behemoth_gpu src/attention.hip src/projection.hip src/ops.hip src/model.cpp src/engine.cpp)
+  add_library(behemoth_gpu src/attention.hip src/projection.hip src/ops.hip src/transport.hip src/model.cpp src/engine.cpp)
   # rocWMMA is header-only. Its packaged target exports unconditional '-x hip'
   # flags, which must not leak into host C++ sources or downstream executables.
   get_target_property(ROCWMMA_HEADERS roc::rocwmma INTERFACE_INCLUDE_DIRECTORIES)

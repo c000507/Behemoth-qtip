@@ -18,6 +18,8 @@ struct RuntimeOptions {
     double memory_fraction = .9;
     size_t token_budget = 1024, prefill_chunk = 256;
     bool rccl_shared_memory = false; // default: explicit pinned-host staging, no P2P assumptions
+    bool zero_copy_transport = false; // --transport zerocopy: kernel-driven host-memory exchange
+    size_t zero_copy_rows = 8;        // largest batch (rows) exchanged by the zero-copy path
     bool profile = false;
     std::string projection_mode = "auto";
     std::string projection_search = "conservative";

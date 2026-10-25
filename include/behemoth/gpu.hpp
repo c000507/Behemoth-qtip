@@ -193,6 +193,10 @@ enum class ProjectionMode {
     PipelinedSplit512K128,
     PipelinedSplit2048K64,
     PipelinedSplit2048K128,
+    PipelinedR2K64,
+    PipelinedR2K128,
+    PipelinedR4K64,
+    PipelinedR4K128,
     Count
 };
 std::span<const ProjectionMode> projection_modes();
@@ -221,6 +225,14 @@ class ProjectionRunner {
 };
 void cast_scaled(const float *, const float *row_scale, BFloat16 *, int rows, int width,
                  hipStream_t);
+// Stream-ordered two-rank exchange through fine-grained pinned host memory (transport.hip).
+void zero_copy_publish(const float *values, float *mine_host_device_pointer, size_t n,
+                       unsigned *flag_device_pointer, unsigned *counter, unsigned seq, hipStream_t);
+void zero_copy_reduce(float *values, const float *peer_host_device_pointer, size_t n,
+                      const unsigned *peer_flag_device_pointer, unsigned seq, hipStream_t);
+void zero_copy_gather(const float *local, const float *peer_host_device_pointer, float *all,
+                      size_t n, int rank, const unsigned *peer_flag_device_pointer, unsigned seq,
+                      hipStream_t);
 void rms_norm(const BFloat16 *, const BFloat16 *, BFloat16 *, int rows, int width, float epsilon,
               hipStream_t);
 void residual_add(BFloat16 *, const BFloat16 *, size_t n, hipStream_t);

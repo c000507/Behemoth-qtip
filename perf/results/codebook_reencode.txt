@@ -1,0 +1,10 @@
+model.layers.44.mlp.down_proj: used=65536 fp8(1x16 runtime) rel err=0.0264
+  M=2x8 (K=256, 16 bits/8 weights = 2 bpw): weighted rel err=0.3110 unweighted=0.3162  fit 10s
+  M=3x8 (K=256, 24 bits/8 weights = 3 bpw): weighted rel err=0.1755 unweighted=0.1867  fit 15s
+  M=4x8 (K=256, 32 bits/8 weights = 4 bpw): weighted rel err=0.1018 unweighted=0.1187  fit 20s
+model.layers.0.self_attn.q_proj: used=59306 fp8(1x16 runtime) rel err=0.0267
+  M=2x8 (K=256, 16 bits/8 weights = 2 bpw): weighted rel err=0.1778 unweighted=0.3345  fit 10s
+  M=3x8 (K=256, 24 bits/8 weights = 3 bpw): weighted rel err=0.0953 unweighted=0.1925  fit 15s
+model.layers.87.mlp.gate_proj: used=65536 fp8(1x16 runtime) rel err=0.0264
+  M=2x8 (K=256, 16 bits/8 weights = 2 bpw): weighted rel err=0.3106 unweighted=0.3108  fit 10s
+  M=3x8 (K=256, 24 bits/8 weights = 3 bpw): weighted rel err=0.1754 unweighted=0.1776  fit 15s

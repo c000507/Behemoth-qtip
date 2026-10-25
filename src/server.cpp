@@ -324,9 +324,10 @@ int main(int argc, char **argv) {
                 options.devices = {std::stoi(value.substr(0, comma)),
                                    std::stoi(value.substr(comma + 1))};
             } else if (key == "--transport") {
-                if (value != "host" && value != "rccl-shm")
-                    throw std::invalid_argument("Transport must be host or rccl-shm");
+                if (value != "host" && value != "rccl-shm" && value != "zerocopy")
+                    throw std::invalid_argument("Transport must be host, zerocopy or rccl-shm");
                 options.rccl_shared_memory = value == "rccl-shm";
+                options.zero_copy_transport = value == "zerocopy";
             } else if (key == "--projection-mode") {
                 options.projection_mode = value;
             } else if (key == "--projection-search") {
@@ -356,7 +357,10 @@ int main(int argc, char **argv) {
             io.stop();
         });
         std::cerr << "Listening on http://" << host << ':' << port
-                  << "; transport=" << (options.rccl_shared_memory ? "rccl-shm" : "pinned-host")
+                  << "; transport="
+                  << (options.rccl_shared_memory  ? "rccl-shm"
+                      : options.zero_copy_transport ? "zerocopy"
+                                                    : "pinned-host")
                   << "; P2P disabled\n";
         std::vector<std::thread> pool;
         for (int i = 1; i < threads; ++i)

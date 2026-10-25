@@ -2,6 +2,7 @@
 #include "behemoth/gpu.hpp"
 #include "behemoth/worker.hpp"
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -60,6 +61,37 @@ class HostTransport {
     std::condition_variable cv_;
     unsigned arrived_ = 0, generation_ = 0;
     bool aborted_ = false;
+    // Zero-copy path: per-rank double-buffered fine-grained host buffers plus a
+    // sequence flag, exchanged by stream-ordered kernels (see transport.hip).
+    // Decode-sized messages avoid the three host rendezvous and two stream
+    // synchronisations of the staged path; large prefill messages keep it.
+    bool zero_copy_ = false;
+    size_t zero_copy_limit_ = 0;
+    std::array<std::array<float *, 2>, 2> zc_host_{};
+    std::array<unsigned *, 2> zc_flag_{};
+    std::array<unsigned *, 2> zc_counter_{}; // device memory, owned by each rank
+    std::array<unsigned, 2> zc_seq_{};
+    struct DevicePointers {
+        bool valid = false;
+        std::array<std::array<float *, 2>, 2> host{}; // [owner][parity]
+        std::array<unsigned *, 2> flag{};
+    };
+    std::array<DevicePointers, 2> zc_dev_{}; // indexed by the accessing rank
+    const DevicePointers &device_pointers(int rank) {
+        auto &d = zc_dev_[size_t(rank)];
+        if (!d.valid) {
+            for (int owner = 0; owner < 2; ++owner) {
+                for (int parity = 0; parity < 2; ++parity)
+                    HIP_CHECK(hipHostGetDevicePointer(
+                        reinterpret_cast<void **>(&d.host[size_t(owner)][size_t(parity)]),
+                        zc_host_[size_t(owner)][size_t(parity)], 0));
+                HIP_CHECK(hipHostGetDevicePointer(reinterpret_cast<void **>(&d.flag[size_t(owner)]),
+                                                  zc_flag_[size_t(owner)], 0));
+            }
+            d.valid = true;
+        }
+        return d;
+    }
     void barrier() {
         std::unique_lock lock(mutex_);
         if (aborted_)
@@ -74,17 +106,53 @@ class HostTransport {
         if (aborted_)
             throw std::runtime_error("Host transport aborted");
     }
+    void release_zero_copy() noexcept {
+        for (auto &r : zc_host_)
+            for (auto &p : r)
+                if (p)
+                    (void)hipHostFree(p);
+        for (auto p : zc_flag_)
+            if (p)
+                (void)hipHostFree(p);
+        for (auto p : zc_counter_)
+            if (p)
+                (void)hipFree(p);
+    }
 
   public:
-    explicit HostTransport(size_t capacity) : capacity_(capacity) {
+    // zero_copy_limit: largest message (floats) exchanged through host memory
+    // by kernels; 0 disables the path. devices: the two ranks' HIP devices.
+    explicit HostTransport(size_t capacity, size_t zero_copy_limit = 0,
+                           std::array<int, 2> devices = {0, 1})
+        : capacity_(capacity) {
         try {
             for (auto &p : host_)
                 HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&p), capacity * sizeof(float),
                                         hipHostMallocPortable));
+            if (zero_copy_limit) {
+                zero_copy_ = true;
+                zero_copy_limit_ = std::min(zero_copy_limit, capacity);
+                int current = 0;
+                HIP_CHECK(hipGetDevice(&current));
+                for (int rank = 0; rank < 2; ++rank) {
+                    for (auto &p : zc_host_[size_t(rank)])
+                        HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&p),
+                                                zero_copy_limit_ * sizeof(float),
+                                                hipHostMallocCoherent | hipHostMallocPortable));
+                    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&zc_flag_[size_t(rank)]), 256,
+                                            hipHostMallocCoherent | hipHostMallocPortable));
+                    std::memset(zc_flag_[size_t(rank)], 0, 256);
+                    HIP_CHECK(hipSetDevice(devices[size_t(rank)]));
+                    HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&zc_counter_[size_t(rank)]), 4));
+                    HIP_CHECK(hipMemset(zc_counter_[size_t(rank)], 0, 4));
+                }
+                HIP_CHECK(hipSetDevice(current));
+            }
         } catch (...) {
             for (auto p : host_)
                 if (p)
                     (void)hipHostFree(p);
+            release_zero_copy();
             throw;
         }
     }
@@ -92,6 +160,10 @@ class HostTransport {
         for (auto p : host_)
             if (p)
                 (void)hipHostFree(p);
+        release_zero_copy();
+    }
+    bool zero_copy() const {
+        return zero_copy_;
     }
     void abort() {
         std::lock_guard lock(mutex_);
@@ -101,6 +173,15 @@ class HostTransport {
     void reduce(int rank, float *values, size_t n, hipStream_t stream) {
         if (n > capacity_)
             throw std::invalid_argument("Host transport capacity exceeded");
+        if (zero_copy_ && n <= zero_copy_limit_ && n % 4 == 0) {
+            const auto &d = device_pointers(rank);
+            const unsigned seq = ++zc_seq_[size_t(rank)];
+            zero_copy_publish(values, d.host[size_t(rank)][seq & 1], n, d.flag[size_t(rank)],
+                              zc_counter_[size_t(rank)], seq, stream);
+            zero_copy_reduce(values, d.host[size_t(1 - rank)][seq & 1], n,
+                             d.flag[size_t(1 - rank)], seq, stream);
+            return;
+        }
         HIP_CHECK(hipMemcpyAsync(host_[size_t(rank)], values, n * sizeof(float),
                                  hipMemcpyDeviceToHost, stream));
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -117,6 +198,15 @@ class HostTransport {
     void gather(int rank, const float *local, float *all, size_t n, hipStream_t stream) {
         if (n > capacity_)
             throw std::invalid_argument("Host transport capacity exceeded");
+        if (zero_copy_ && n <= zero_copy_limit_ && n % 4 == 0) {
+            const auto &d = device_pointers(rank);
+            const unsigned seq = ++zc_seq_[size_t(rank)];
+            zero_copy_publish(local, d.host[size_t(rank)][seq & 1], n, d.flag[size_t(rank)],
+                              zc_counter_[size_t(rank)], seq, stream);
+            zero_copy_gather(local, d.host[size_t(1 - rank)][seq & 1], all, n, rank,
+                             d.flag[size_t(1 - rank)], seq, stream);
+            return;
+        }
         HIP_CHECK(hipMemcpyAsync(host_[size_t(rank)], local, n * sizeof(float),
                                  hipMemcpyDeviceToHost, stream));
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -259,7 +349,7 @@ struct Shard {
                              options.projection_mode.starts_with("tiled-") ||
                              options.projection_mode.starts_with("pipelined-"))
                                 ? options.token_budget
-                                : std::min(options.token_budget, size_t(16));
+                                : std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);
     }
     ~Shard() {
@@ -557,7 +647,9 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
     if (options.rccl_shared_memory)
         RCCL_CHECK(ncclCommInitAll(impl_->comm.data(), 2, options.devices.data()));
     else
-        impl_->transport = std::make_unique<HostTransport>(options.token_budget * 16384);
+        impl_->transport = std::make_unique<HostTransport>(
+            options.token_budget * 16384,
+            options.zero_copy_transport ? options.zero_copy_rows * 16384 : 0, options.devices);
     for (auto &worker : impl_->workers)
         worker = std::make_unique<RankWorker>();
     std::cerr << "KV pages=" << impl_->pages << ", aggregate token capacity=" << impl_->pages * 16

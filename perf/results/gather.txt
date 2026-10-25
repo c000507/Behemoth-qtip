@@ -1,0 +1,44 @@
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+# gather: code stream 2B/code + 8B random gather from table of given size
+global        table=     4 KB U= 4 blocks= 2048 thr=256 :   0.242 ms   277.64 Ggather/s  codes  555.3 GB/s  gathers/clk/CU=1.85
+global        table=     4 KB U= 8 blocks= 2048 thr=256 :   0.236 ms   284.85 Ggather/s  codes  569.7 GB/s  gathers/clk/CU=1.89
+global        table=     4 KB U=16 blocks= 1024 thr=256 :   0.265 ms   253.59 Ggather/s  codes  507.2 GB/s  gathers/clk/CU=1.69
+global        table=     4 KB U=16 blocks= 4096 thr=256 :   0.219 ms   306.72 Ggather/s  codes  613.4 GB/s  gathers/clk/CU=2.04
+lds           table=     4 KB U= 8 blocks= 2048 thr=256 :   0.243 ms   276.35 Ggather/s  codes  552.7 GB/s  gathers/clk/CU=1.84
+lds           table=     4 KB U=16 blocks= 2048 thr=256 :   0.231 ms   290.47 Ggather/s  codes  580.9 GB/s  gathers/clk/CU=1.93
+global        table=     8 KB U= 4 blocks= 2048 thr=256 :   0.237 ms   283.12 Ggather/s  codes  566.2 GB/s  gathers/clk/CU=1.88
+global        table=     8 KB U= 8 blocks= 2048 thr=256 :   0.238 ms   281.93 Ggather/s  codes  563.9 GB/s  gathers/clk/CU=1.87
+global        table=     8 KB U=16 blocks= 1024 thr=256 :   0.266 ms   252.22 Ggather/s  codes  504.4 GB/s  gathers/clk/CU=1.68
+global        table=     8 KB U=16 blocks= 4096 thr=256 :   0.219 ms   305.99 Ggather/s  codes  612.0 GB/s  gathers/clk/CU=2.03
+lds           table=     8 KB U= 8 blocks= 2048 thr=256 :   0.254 ms   264.17 Ggather/s  codes  528.3 GB/s  gathers/clk/CU=1.76
+lds           table=     8 KB U=16 blocks= 2048 thr=256 :   0.232 ms   288.97 Ggather/s  codes  577.9 GB/s  gathers/clk/CU=1.92
+global        table=    16 KB U= 4 blocks= 2048 thr=256 :   0.238 ms   281.59 Ggather/s  codes  563.2 GB/s  gathers/clk/CU=1.87
+global        table=    16 KB U= 8 blocks= 2048 thr=256 :   0.240 ms   279.30 Ggather/s  codes  558.6 GB/s  gathers/clk/CU=1.86
+global        table=    16 KB U=16 blocks= 1024 thr=256 :   0.266 ms   252.48 Ggather/s  codes  505.0 GB/s  gathers/clk/CU=1.68
+global        table=    16 KB U=16 blocks= 4096 thr=256 :   0.220 ms   304.77 Ggather/s  codes  609.5 GB/s  gathers/clk/CU=2.03
+lds           table=    16 KB U= 8 blocks= 2048 thr=256 :   0.258 ms   260.16 Ggather/s  codes  520.3 GB/s  gathers/clk/CU=1.73
+lds           table=    16 KB U=16 blocks= 2048 thr=256 :   0.234 ms   286.99 Ggather/s  codes  574.0 GB/s  gathers/clk/CU=1.91
+global        table=    32 KB U= 4 blocks= 2048 thr=256 :   0.299 ms   224.54 Ggather/s  codes  449.1 GB/s  gathers/clk/CU=1.49
+global        table=    32 KB U= 8 blocks= 2048 thr=256 :   0.273 ms   245.50 Ggather/s  codes  491.0 GB/s  gathers/clk/CU=1.63
+global        table=    32 KB U=16 blocks= 1024 thr=256 :   0.304 ms   220.41 Ggather/s  codes  440.8 GB/s  gathers/clk/CU=1.47
+global        table=    32 KB U=16 blocks= 4096 thr=256 :   0.254 ms   264.09 Ggather/s  codes  528.2 GB/s  gathers/clk/CU=1.76
+lds           table=    32 KB U= 8 blocks= 2048 thr=256 :   0.289 ms   232.41 Ggather/s  codes  464.8 GB/s  gathers/clk/CU=1.55
+lds           table=    32 KB U=16 blocks= 2048 thr=256 :   0.270 ms   248.85 Ggather/s  codes  497.7 GB/s  gathers/clk/CU=1.65
+global        table=    64 KB U= 4 blocks= 2048 thr=256 :   0.548 ms   122.40 Ggather/s  codes  244.8 GB/s  gathers/clk/CU=0.81
+global        table=    64 KB U= 8 blocks= 2048 thr=256 :   0.555 ms   120.98 Ggather/s  codes  242.0 GB/s  gathers/clk/CU=0.80
+global        table=    64 KB U=16 blocks= 1024 thr=256 :   0.571 ms   117.60 Ggather/s  codes  235.2 GB/s  gathers/clk/CU=0.78
+global        table=    64 KB U=16 blocks= 4096 thr=256 :   0.559 ms   119.97 Ggather/s  codes  239.9 GB/s  gathers/clk/CU=0.80
+lds           table=    64 KB U= 8 blocks= 2048 thr=256 :   0.389 ms   172.68 Ggather/s  codes  345.4 GB/s  gathers/clk/CU=1.15
+lds           table=    64 KB U=16 blocks= 2048 thr=256 :   0.327 ms   205.33 Ggather/s  codes  410.7 GB/s  gathers/clk/CU=1.37
+global        table=   128 KB U= 4 blocks= 2048 thr=256 :   0.799 ms    83.98 Ggather/s  codes  168.0 GB/s  gathers/clk/CU=0.56
+global        table=   128 KB U= 8 blocks= 2048 thr=256 :   0.796 ms    84.36 Ggather/s  codes  168.7 GB/s  gathers/clk/CU=0.56
+global        table=   128 KB U=16 blocks= 1024 thr=256 :   0.805 ms    83.35 Ggather/s  codes  166.7 GB/s  gathers/clk/CU=0.55
+global        table=   128 KB U=16 blocks= 4096 thr=256 :   0.798 ms    84.11 Ggather/s  codes  168.2 GB/s  gathers/clk/CU=0.56
+global        table=   256 KB U= 4 blocks= 2048 thr=256 :   0.927 ms    72.38 Ggather/s  codes  144.8 GB/s  gathers/clk/CU=0.48
+global        table=   256 KB U= 8 blocks= 2048 thr=256 :   0.924 ms    72.64 Ggather/s  codes  145.3 GB/s  gathers/clk/CU=0.48
+global        table=   256 KB U=16 blocks= 1024 thr=256 :   0.931 ms    72.09 Ggather/s  codes  144.2 GB/s  gathers/clk/CU=0.48
+global        table=   256 KB U=16 blocks= 4096 thr=256 :   0.925 ms    72.58 Ggather/s  codes  145.2 GB/s  gathers/clk/CU=0.48
+global        table=   512 KB U= 4 blocks= 2048 thr=256 :   0.992 ms    67.63 Ggather/s  codes  135.3 GB/s  gathers/clk/CU=0.45
+global        table=   512 KB U= 8 blocks= 2048 thr=256 :   0.991 ms    67.70 Ggather/s  codes  135.4 GB/s  gathers/clk/CU=0.45
+global        table=   512 KB U=16 blocks= 1024 thr=256 :   0.998 ms    67.22 Ggather/s  codes  134.4 GB/s  gathers/clk/CU=0.45
+global        table=   512 KB U=16 blocks= 4096 thr=256 :   0.990 ms    67.77 Ggather/s  codes  135.5 GB/s  gathers/clk/CU=0.45
