@@ -17,6 +17,8 @@ const char *code_layout_name(CodeLayout layout) {
         return "group-major";
     case CodeLayout::Sorted:
         return "sorted";
+    case CodeLayout::Lane:
+        return "lane";
     }
     throw std::invalid_argument("Invalid code layout");
 }
@@ -27,7 +29,9 @@ CodeLayout parse_code_layout(std::string_view name) {
         return CodeLayout::GroupMajor;
     if (name == "sorted")
         return CodeLayout::Sorted;
-    throw std::invalid_argument("Code layout must be row-major, group-major or sorted");
+    if (name == "lane")
+        return CodeLayout::Lane;
+    throw std::invalid_argument("Code layout must be row-major, group-major, sorted or lane");
 }
 std::vector<uint16_t> group_major_codes(const HostProjection &p) {
     if (p.in <= 0 || p.in % 8 || p.out <= 0 ||

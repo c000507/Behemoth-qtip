@@ -21,7 +21,10 @@ int main(int argc, char **argv) {
         if (requested == "both")
             layouts = {CodeLayout::RowMajor, CodeLayout::GroupMajor};
         else if (requested == "all")
-            layouts = {CodeLayout::RowMajor, CodeLayout::GroupMajor, CodeLayout::Sorted};
+            layouts = {CodeLayout::RowMajor, CodeLayout::GroupMajor, CodeLayout::Sorted,
+                       CodeLayout::Lane};
+        else if (requested == "sorted-lane")
+            layouts = {CodeLayout::Sorted, CodeLayout::Lane};
         else
             layouts = {parse_code_layout(requested)};
         auto search = parse_projection_search(argc > 6 ? argv[6] : "conservative");
@@ -60,10 +63,12 @@ int main(int argc, char **argv) {
                 GpuProjection projection;
                 // "sorted" benchmarks keep the group-major codes as well so that
                 // every mode (and the fused baseline) runs on the same weight.
-                projection.upload(host, layout == CodeLayout::Sorted ? CodeLayout::GroupMajor
-                                                                      : layout);
+                const bool codebook_major = layout == CodeLayout::Sorted || layout == CodeLayout::Lane;
+                projection.upload(host, codebook_major ? CodeLayout::GroupMajor : layout);
                 if (layout == CodeLayout::Sorted)
                     projection.upload_sorted(host);
+                else if (layout == CodeLayout::Lane)
+                    projection.upload_lane(host);
                 auto execute = [&](ProjectionMode mode) {
                     runner.set_mode(mode);
                     runner.run(projection, input.data(), output.data(), rows, workspace, stream,

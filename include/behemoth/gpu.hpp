@@ -157,19 +157,40 @@ struct GpuProjection {
     // sorted_tile_count > 0; with CodeLayout::Sorted it replaces `codes`.
     // 16-row tiles, 4-bit deltas, per-chunk base codes (the kernels never
     // use the segment table).
-    DeviceBuffer<uint16_t> sorted_idx, sorted_chunk_codes;
+    // The "lane" (lane-owns-row) variant shares idx/tiles, stores its delta
+    // nibbles in sorted_planes and adds per-segment per-lane codes;
+    // sorted_lane tells the kernels which encoding the buffers hold
+    // (CodeLayout::Lane replaces `codes` too).
+    DeviceBuffer<uint16_t> sorted_idx, sorted_chunk_codes, sorted_segment_codes;
     DeviceBuffer<uint32_t> sorted_planes;
     DeviceBuffer<SortedTileDesc> sorted_tiles;
     int sorted_tile_count = 0, sorted_delta_bits = 0;
+    bool sorted_lane = false;
+    int lane_groups_per_tile = 0, lane_group_tiles = 0;
     size_t sorted_entries = 0, sorted_dummies = 0;
     bool has_sorted() const {
         return sorted_tile_count > 0;
     }
+    bool has_lane() const {
+        return has_sorted() && sorted_lane;
+    }
     size_t sorted_bytes() const {
         return sorted_idx.bytes() + sorted_planes.bytes() + sorted_chunk_codes.bytes() +
-               sorted_tiles.bytes();
+               sorted_segment_codes.bytes() + sorted_tiles.bytes();
+    }
+    void clear_sorted() {
+        sorted_idx = {};
+        sorted_planes = {};
+        sorted_chunk_codes = {};
+        sorted_segment_codes = {};
+        sorted_tiles = {};
+        sorted_tile_count = 0;
+        sorted_lane = false;
+        lane_groups_per_tile = lane_group_tiles = 0;
+        sorted_entries = sorted_dummies = 0;
     }
     void upload_sorted(const HostProjection &p, int delta_bits = sorted_default_delta_bits) {
+        clear_sorted();
         auto l = sorted_layout(p.in, p.out, p.codes.data(), sorted_rows_per_tile,
                                sorted_groups_per_tile, delta_bits, sorted_default_chunks_per_segment);
         sorted_idx.upload(l.idx);
@@ -181,23 +202,38 @@ struct GpuProjection {
         sorted_entries = l.entries;
         sorted_dummies = l.dummies;
     }
+    void upload_lane(const HostProjection &p, int max_groups_per_tile = lane_max_groups_per_tile,
+                     int drift_limit = 0) {
+        clear_sorted();
+        auto l = lane_layout(p.in, p.out, p.codes.data(), max_groups_per_tile, drift_limit);
+        sorted_idx.upload(l.idx);
+        sorted_planes.upload(l.hi);
+        sorted_segment_codes.upload(l.segment_codes);
+        sorted_tiles.upload(l.tiles);
+        sorted_tile_count = int(l.tiles.size());
+        sorted_delta_bits = lane_delta_bits;
+        sorted_lane = true;
+        lane_groups_per_tile = l.groups_per_tile;
+        lane_group_tiles = l.group_tiles;
+
+        sorted_entries = l.entries;
+        sorted_dummies = l.dummies;
+    }
     void upload(const HostProjection &p, CodeLayout layout = CodeLayout::GroupMajor) {
         tuning_identity = next_projection_identity();
         in = p.in;
         out = p.out;
         code_layout = layout;
         codes = {};
-        sorted_idx = {};
-        sorted_planes = {};
-        sorted_chunk_codes = {};
-        sorted_tiles = {};
-        sorted_tile_count = 0;
+        clear_sorted();
         if (layout == CodeLayout::GroupMajor)
             codes.upload(group_major_codes(p));
         else if (layout == CodeLayout::RowMajor)
             codes.upload(p.codes);
-        else
+        else if (layout == CodeLayout::Sorted)
             upload_sorted(p);
+        else
+            upload_lane(p);
         codebook.upload(p.codebook);
         row_scale.upload(p.row_scale);
         codebook_scale = p.codebook_scale;
@@ -246,8 +282,17 @@ enum class ProjectionMode {
     SortedS16,
     SortedDense,
     SortedLds,
+    // Lane layout (GpuProjection::has_lane()): register accumulation, up to 4
+    // batch rows per pass (passes = ceil(rows / 4)), lane streams cut into N
+    // segment splits. sorted-lds / sorted-dense decode either encoding.
+    LaneS1,
+    LaneS2,
+    LaneS4,
+    LaneS8,
     Count
 };
+// Layout the mode needs: 0 none (codes/dense), 1 sorted, 2 lane, 3 either.
+int projection_mode_layout(ProjectionMode);
 bool projection_mode_is_sorted(ProjectionMode);
 std::span<const ProjectionMode> projection_modes();
 ProjectionMode parse_projection_mode(std::string_view);
@@ -272,6 +317,20 @@ class ProjectionRunner {
     nlohmann::json resources() const;
     void run(const GpuProjection &, const BFloat16 *, float *output, int rows,
              ProjectionWorkspace &, hipStream_t, bool apply_row_scale = true);
+    // Fused variants (PERF_ROUND2_REPORT.md): the quantised activations may be
+    // produced directly into the workspace (prepare_input + rms_norm_quantized),
+    // shared by several projections of the same input, and the result may be
+    // written as bf16 by the merge kernel instead of a separate cast.
+    struct Call {
+        const BFloat16 *input = nullptr; // nullptr: workspace already holds rows x in fp8 + scales
+        float *output = nullptr;         // fp32 result; also scratch when bf16_output is set
+        BFloat16 *bf16_output = nullptr; // optional bf16 result
+        bool apply_row_scale = true;
+    };
+    void run(const GpuProjection &, const Call &, int rows, ProjectionWorkspace &, hipStream_t);
+    // Sizes/pads the quantised-input buffers for rows x in and returns them.
+    static std::pair<uint8_t *, float *> prepare_input(ProjectionWorkspace &, int rows, int in,
+                                                      hipStream_t);
 };
 void cast_scaled(const float *, const float *row_scale, BFloat16 *, int rows, int width,
                  hipStream_t);
@@ -285,7 +344,18 @@ void zero_copy_gather(const float *local, const float *peer_host_device_pointer,
                       hipStream_t);
 void rms_norm(const BFloat16 *, const BFloat16 *, BFloat16 *, int rows, int width, float epsilon,
               hipStream_t);
+// rms_norm followed by per-row fp8 quantisation (identical rounding to
+// rms_norm + quantize_rows), written straight into projection input buffers.
+void rms_norm_quantized(const BFloat16 *, const BFloat16 *w, uint8_t *q, float *scales, int rows,
+                        int width, float epsilon, hipStream_t);
 void residual_add(BFloat16 *, const BFloat16 *, size_t n, hipStream_t);
+// state = bf16(state + bf16(x * row_scale[col])): cast_scaled + residual_add in one pass.
+void residual_add_scaled(BFloat16 *state, const float *x, const float *row_scale, int rows,
+                         int width, hipStream_t);
+// rope on q (heads x 128) and k (kv_heads x 128) plus per-head fp8 quantisation of
+// the rotated q: replaces rope(q), rope(k), quantize_rows(q).
+void rope_quantize(BFloat16 *q, BFloat16 *k, const int *positions, int rows, int heads,
+                   int kv_heads, float theta, uint8_t *q8, float *q_scale, hipStream_t);
 void silu_multiply(const BFloat16 *, const BFloat16 *, BFloat16 *, size_t n, hipStream_t);
 void rope(BFloat16 *, const int *positions, int rows, int heads, float theta, hipStream_t);
 void embed(const BFloat16 *, const int *tokens, BFloat16 *, int rows, int width, hipStream_t);

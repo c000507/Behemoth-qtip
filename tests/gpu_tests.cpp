@@ -244,9 +244,13 @@ static void projections(hipStream_t stream) {
             for (bool dense : {false, true}) {
                 GpuProjection gpu;
                 gpu.upload(p, layout);
-                // Also exercise the codebook-major layout (tails in rows and groups).
-                if (!dense)
+                // Also exercise the codebook-major layouts (tails in rows and
+                // groups): the chunk-code "sorted" encoding with the row-major
+                // codes, the lane-owns-row encoding with the group-major codes.
+                if (!dense && layout == CodeLayout::RowMajor)
                     gpu.upload_sorted(p);
+                if (!dense && layout == CodeLayout::GroupMajor)
+                    gpu.upload_lane(p);
                 if (dense) {
                     std::vector<uint8_t> weights(size_t(p.out) * size_t(p.in));
                     for (int o = 0; o < p.out; ++o)
@@ -289,8 +293,11 @@ static void projections(hipStream_t stream) {
                         try {
                             runner.run(gpu, in.data(), out.data() + guard, rows, workspace, stream);
                         } catch (const ProjectionUnavailable &) {
+                            const int needs = projection_mode_layout(mode);
                             check(mode == ProjectionMode::Blas ||
-                                      (projection_mode_is_sorted(mode) && !gpu.has_sorted()),
+                                      (needs && (!gpu.has_sorted() ||
+                                                 (needs == 1 && gpu.sorted_lane) ||
+                                                 (needs == 2 && !gpu.sorted_lane))),
                                   "Mandatory projection path unavailable");
                             continue;
                         }

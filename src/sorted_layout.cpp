@@ -1,5 +1,6 @@
 #include "behemoth/sorted_layout.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <stdexcept>
 
@@ -201,6 +202,208 @@ bool sorted_layout_decode(const SortedLayout &l, int in, int out, std::vector<ui
                             continue; // dummy
                         const int r = rt * R + (e >> gbits), g = gt * G + (e & (G - 1));
                         if (r >= out || g >= groups || running > 65535)
+                            return false;
+                        const size_t at = size_t(r) * size_t(groups) + size_t(g);
+                        if (seen[at])
+                            return false;
+                        seen[at] = 1;
+                        codes[at] = uint16_t(running);
+                        ++real;
+                    }
+                }
+            }
+        }
+    return real == codes.size();
+}
+// ---------------------------------------------------------------- lane layout
+namespace {
+struct LaneItem {
+    uint16_t group; // lane_dummy_group for dummies
+    uint16_t delta;
+    uint16_t code; // code after the delta (real entries only; informational)
+};
+struct LaneTile {
+    LaneLayout part; // idx / planes / segment_codes of one tile, local chunk indices
+    SortedTileDesc desc{};
+};
+LaneTile encode_lane_tile(const uint16_t *codes, int groups, int out, int gt_size, int D, int rt,
+                          int gt) {
+    LaneTile t;
+    auto &l = t.part;
+    constexpr int S = lane_chunks_per_segment, MAXD = (1 << lane_delta_bits) - 1;
+    const int g0 = gt * gt_size, g1 = std::min(groups, g0 + gt_size);
+    constexpr int R = sorted_rows_per_tile;
+    // Per-lane item streams: real entries with gap escapes.
+    std::array<std::vector<LaneItem>, 32> items;
+    std::vector<uint16_t> sorted;
+    for (int r = 0; r < R; ++r) {
+        const int row = rt * R + r;
+        if (row >= out)
+            continue;
+        sorted.assign(codes + size_t(row) * size_t(groups) + size_t(g0),
+                      codes + size_t(row) * size_t(groups) + size_t(g1));
+        std::vector<uint16_t> order(sorted.size());
+        for (size_t i = 0; i < order.size(); ++i)
+            order[i] = uint16_t(i);
+        std::stable_sort(order.begin(), order.end(),
+                         [&](uint16_t a, uint16_t b) { return sorted[a] < sorted[b]; });
+        std::array<uint32_t, 2> running{0, 0};
+        for (size_t i = 0; i < order.size(); ++i) {
+            const int lane = 2 * r + int(i & 1);
+            auto &run = running[i & 1];
+            const uint32_t code = sorted[order[i]];
+            uint32_t gap = code - run; // sorted: code >= run
+            while (gap >= uint32_t(MAXD)) {
+                items[size_t(lane)].push_back({uint16_t(lane_dummy_group), uint16_t(MAXD), 0});
+                run = (run + uint32_t(MAXD)) & 0xffffu;
+                gap -= uint32_t(MAXD);
+                ++l.dummies;
+            }
+            items[size_t(lane)].push_back({order[i], uint16_t(gap), uint16_t(code)});
+            run = code;
+            ++l.entries;
+        }
+    }
+    // Chunking: one item per lane per chunk, dummies for waits and tails. The
+    // last segment of a tile is padded with dummies (delta 0) to S chunks.
+    std::array<size_t, 32> pos{};
+    std::array<uint32_t, 32> run{};
+    uint32_t chunk = 0;
+    auto remaining = [&] {
+        for (int lane = 0; lane < 32; ++lane)
+            if (pos[size_t(lane)] < items[size_t(lane)].size())
+                return true;
+        return false;
+    };
+    auto store = [&](uint32_t c, int lane, const LaneItem &it) {
+        const size_t seg = c / uint32_t(S), j = c % uint32_t(S);
+        const size_t need = (seg + 1) * 32 * size_t(S);
+        if (l.idx.size() < need) {
+            l.idx.resize(need, uint16_t(lane_dummy_group));
+            l.hi.resize((seg + 1) * 32 * size_t(S / 8), 0);
+        }
+        l.idx[(seg * 32 + size_t(lane)) * size_t(S) + j] =
+            uint16_t(it.group | ((it.delta & 31u) << lane_group_bits));
+        l.hi[(seg * 32 + size_t(lane)) * size_t(S / 8) + j / 8] |=
+            uint32_t(it.delta >> lane_delta_low_bits) << (4 * (j % 8));
+    };
+    while (remaining()) {
+        if (chunk % uint32_t(S) == 0)
+            for (int lane = 0; lane < 32; ++lane)
+                l.segment_codes.push_back(uint16_t(run[size_t(lane)]));
+        uint32_t frontier = 65536;
+        if (D > 0)
+            for (int lane = 0; lane < 32; ++lane) {
+                const auto &v = items[size_t(lane)];
+                for (size_t i = pos[size_t(lane)]; i < v.size(); ++i)
+                    if (v[i].group != lane_dummy_group) {
+                        frontier = std::min<uint32_t>(frontier, v[i].code);
+                        break;
+                    }
+            }
+        for (int lane = 0; lane < 32; ++lane) {
+            auto &v = items[size_t(lane)];
+            auto &p = pos[size_t(lane)];
+            LaneItem it{uint16_t(lane_dummy_group), 0, 0};
+            if (p < v.size()) {
+                it = v[p];
+                if (D > 0 && it.group != lane_dummy_group && it.code > frontier + uint32_t(D)) {
+                    it = {uint16_t(lane_dummy_group), 0, 0}; // wait for the laggards
+                    ++l.dummies;
+                } else
+                    ++p;
+            } else
+                ++l.dummies;
+            store(chunk, lane, it);
+            run[size_t(lane)] = (run[size_t(lane)] + it.delta) & 0xffffu;
+        }
+        ++chunk;
+    }
+    if (chunk % uint32_t(S)) {
+        const uint32_t pad = uint32_t(S) - chunk % uint32_t(S);
+        l.dummies += size_t(pad) * 32;
+        chunk += pad;
+    }
+    t.desc.chunk_count = chunk;
+    t.desc.segment_count = uint32_t(l.segment_codes.size() / 32);
+    return t;
+}
+} // namespace
+LaneLayout lane_layout(int in, int out, const uint16_t *codes, int max_groups, int D) {
+    if (in <= 0 || in % 8 || out <= 0 || max_groups < 1 || max_groups > lane_max_groups_per_tile ||
+        D < 0)
+        throw std::invalid_argument("Invalid lane layout parameters");
+    LaneLayout l;
+    l.drift_limit = D;
+    const int groups = in / 8;
+    l.group_tiles = (groups + max_groups - 1) / max_groups;
+    l.groups_per_tile = (groups + l.group_tiles - 1) / l.group_tiles;
+    l.row_tiles = (out + sorted_rows_per_tile - 1) / sorted_rows_per_tile;
+    std::vector<LaneTile> tiles(size_t(l.row_tiles) * size_t(l.group_tiles));
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int i = 0; i < int(tiles.size()); ++i)
+        tiles[size_t(i)] = encode_lane_tile(codes, groups, out, l.groups_per_tile, D,
+                                            i % l.row_tiles, i / l.row_tiles);
+    size_t chunks = 0, segments = 0;
+    for (const auto &t : tiles) {
+        chunks += t.part.chunks();
+        segments += t.part.segment_codes.size();
+    }
+    l.idx.reserve(chunks * 32);
+    l.hi.reserve(chunks * 4);
+    l.segment_codes.reserve(segments);
+    l.tiles.reserve(tiles.size());
+    for (auto &t : tiles) {
+        SortedTileDesc d = t.desc;
+        d.chunk_begin = uint32_t(l.chunks());
+        d.segment_begin = uint32_t(l.segments());
+        l.idx.insert(l.idx.end(), t.part.idx.begin(), t.part.idx.end());
+        l.hi.insert(l.hi.end(), t.part.hi.begin(), t.part.hi.end());
+        l.segment_codes.insert(l.segment_codes.end(), t.part.segment_codes.begin(),
+                               t.part.segment_codes.end());
+        l.tiles.push_back(d);
+        l.entries += t.part.entries;
+        l.dummies += t.part.dummies;
+        t = {};
+    }
+    if (l.chunks() > size_t(UINT32_MAX) / 32)
+        throw std::overflow_error("Lane layout exceeds 32-bit chunk addressing");
+    return l;
+}
+bool lane_layout_decode(const LaneLayout &l, int in, int out, std::vector<uint16_t> &codes) {
+    const int groups = in / 8, R = sorted_rows_per_tile;
+    constexpr int S = lane_chunks_per_segment;
+    if (l.tiles.size() != size_t(l.row_tiles) * size_t(l.group_tiles) ||
+        l.hi.size() != l.segments() * 32 * (S / 8) || l.idx.size() != l.segments() * 32 * S)
+        return false;
+    codes.assign(size_t(out) * size_t(groups), 0);
+    std::vector<uint8_t> seen(codes.size(), 0);
+    size_t real = 0;
+    for (int gt = 0; gt < l.group_tiles; ++gt)
+        for (int rt = 0; rt < l.row_tiles; ++rt) {
+            const auto &t = l.tiles[size_t(gt) * size_t(l.row_tiles) + size_t(rt)];
+            const int g0 = gt * l.groups_per_tile, g1 = std::min(groups, g0 + l.groups_per_tile);
+            if (t.segment_count * uint32_t(S) != t.chunk_count ||
+                t.chunk_begin != t.segment_begin * uint32_t(S) ||
+                size_t(t.segment_begin) + t.segment_count > l.segments())
+                return false;
+            for (int lane = 0; lane < 32; ++lane) {
+                uint32_t running = 0;
+                for (uint32_t sg = 0; sg < t.segment_count; ++sg) {
+                    const size_t seg = size_t(t.segment_begin) + sg;
+                    if (l.segment_codes[seg * 32 + size_t(lane)] != running)
+                        return false;
+                    for (int j = 0; j < S; ++j) {
+                        const uint16_t e = l.idx[(seg * 32 + size_t(lane)) * S + size_t(j)];
+                        const uint32_t hi =
+                            (l.hi[(seg * 32 + size_t(lane)) * (S / 8) + size_t(j / 8)] >> (4 * (j % 8))) & 15u;
+                        const uint32_t d = (e >> lane_group_bits) | (hi << lane_delta_low_bits);
+                        running = (running + d) & 0xffffu;
+                        const int group = int(e & ((1 << lane_group_bits) - 1));
+                        if (group == lane_dummy_group)
+                            continue;
+                        const int r = rt * R + lane / 2, g = g0 + group;
+                        if (r >= out || g >= g1)
                             return false;
                         const size_t at = size_t(r) * size_t(groups) + size_t(g);
                         if (seen[at])

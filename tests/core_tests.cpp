@@ -2,12 +2,14 @@
 #include "behemoth/checkpoint.hpp"
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
+#include "behemoth/sorted_layout.hpp"
 #include "behemoth/tuning.hpp"
 #include "behemoth/worker.hpp"
 #include "fixtures.hpp"
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <tuple>
 #include <iostream>
 #include <unistd.h>
 
@@ -347,6 +349,38 @@ static void checkpoint_tests() {
             CHECK(transposed[g * 67 + o] == matrix.codes[o * 35 + g]);
     CHECK(parse_code_layout("row-major") == CodeLayout::RowMajor);
     CHECK(parse_code_layout("group-major") == CodeLayout::GroupMajor);
+    CHECK(parse_code_layout("sorted") == CodeLayout::Sorted);
+    CHECK(parse_code_layout("lane") == CodeLayout::Lane);
+    {
+        // Codebook-major layouts round-trip exactly (tails in rows and groups,
+        // clustered codes forcing gap escapes, several group tiles, drift limiter).
+        std::mt19937 rng(5);
+        for (auto [in, out, max_groups, drift] : std::vector<std::tuple<int, int, int, int>>{
+                 {1032, 37, 2047, 0}, {4104, 129, 300, 0}, {2048, 64, 2047, 1000}, {128, 16, 2047, 0}}) {
+            HostProjection q;
+            q.in = in;
+            q.out = out;
+            q.codes.resize(size_t(out) * size_t(in / 8));
+            for (size_t i = 0; i < q.codes.size(); ++i)
+                q.codes[i] = i % 7 ? uint16_t(rng()) : uint16_t(rng() % 300 + 60000);
+            q.codes[0] = 0;
+            q.codes[1] = 65535;
+            auto lane = lane_layout(in, out, q.codes.data(), max_groups, drift);
+            std::vector<uint16_t> back;
+            CHECK(lane_layout_decode(lane, in, out, back));
+            CHECK(back == q.codes);
+            CHECK(lane.entries == q.codes.size());
+            CHECK(lane.group_tiles == (in / 8 + max_groups - 1) / max_groups);
+            auto sorted = sorted_layout(in, out, q.codes.data(), sorted_rows_per_tile,
+                                        sorted_groups_per_tile, sorted_default_delta_bits);
+            CHECK(sorted_layout_decode(sorted, in, out, back));
+            CHECK(back == q.codes);
+        }
+        rejects([] {
+            uint16_t c[16]{};
+            lane_layout(128, 1, c, 4096);
+        });
+    }
     rejects([] { parse_code_layout("invalid"); });
     auto bad_matrix = matrix;
     bad_matrix.codes.pop_back();

@@ -1,10 +1,12 @@
 #include "behemoth/gpu.hpp"
 #include "device_numeric.hpp"
 #include <array>
+#include <cstdlib>
 #include <hipblaslt/hipblaslt.h>
 #include <map>
 #include <rocwmma/rocwmma.hpp>
 #include <tuple>
+#include <type_traits>
 #if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
 static_assert(rocwmma::Constants::AMDGCN_WAVE_SIZE == 32, "rocWMMA must use Wave32");
 #endif
@@ -75,15 +77,39 @@ const char *projection_mode_name(ProjectionMode m) {
         return "sorted-dense";
     case ProjectionMode::SortedLds:
         return "sorted-lds";
+    case ProjectionMode::LaneS1:
+        return "lane-s1";
+    case ProjectionMode::LaneS2:
+        return "lane-s2";
+    case ProjectionMode::LaneS4:
+        return "lane-s4";
+    case ProjectionMode::LaneS8:
+        return "lane-s8";
     case ProjectionMode::Count:
         break;
     }
     throw std::invalid_argument("Invalid projection mode");
 }
+int projection_mode_layout(ProjectionMode m) {
+    switch (m) {
+    case ProjectionMode::SortedS4:
+    case ProjectionMode::SortedS8:
+    case ProjectionMode::SortedS16:
+        return 1;
+    case ProjectionMode::SortedDense:
+    case ProjectionMode::SortedLds:
+        return 3;
+    case ProjectionMode::LaneS1:
+    case ProjectionMode::LaneS2:
+    case ProjectionMode::LaneS4:
+    case ProjectionMode::LaneS8:
+        return 2;
+    default:
+        return 0;
+    }
+}
 bool projection_mode_is_sorted(ProjectionMode m) {
-    return m == ProjectionMode::SortedS4 || m == ProjectionMode::SortedS8 ||
-           m == ProjectionMode::SortedS16 || m == ProjectionMode::SortedDense ||
-           m == ProjectionMode::SortedLds;
+    return projection_mode_layout(m) != 0;
 }
 ProjectionMode parse_projection_mode(std::string_view name) {
     for (auto m : projection_modes())
@@ -795,6 +821,151 @@ sorted_decode_tile(uint16_t *ct, const SortedTileDesc &t, const uint16_t *__rest
         }
     }
 }
+// Device view of either codebook-major encoding (sorted_layout.hpp).
+// sorted: codes = per-chunk base codes, one tile per 16 output rows.
+// lane:   codes = per-segment per-lane running codes, tiles = group_tiles x
+//         row_tiles (tile = gt * row_tiles + rt); planes holds the delta nibbles.
+struct SortedArgs {
+    const uint16_t *idx;
+    const uint32_t *planes;
+    const uint16_t *codes;
+    const SortedTileDesc *tiles;
+    int row_tiles, gt_size, group_tiles;
+};
+constexpr int lane_G = 1 << lane_group_bits, lane_S = lane_chunks_per_segment;
+static_assert(lane_S == 32, "lane kernels assume 32-chunk segments (4 idx vectors, 1 nibble vector)");
+__device__ __forceinline__ SortedTileDesc uniform_tile(const SortedTileDesc *tiles, int index) {
+    // Tile descriptors are wave-uniform; keep them (and everything derived) in SGPRs.
+    const SortedTileDesc t = tiles[__builtin_amdgcn_readfirstlane(index)];
+    SortedTileDesc u;
+    u.chunk_begin = __builtin_amdgcn_readfirstlane(t.chunk_begin);
+    u.chunk_count = __builtin_amdgcn_readfirstlane(t.chunk_count);
+    u.segment_begin = __builtin_amdgcn_readfirstlane(t.segment_begin);
+    u.segment_count = __builtin_amdgcn_readfirstlane(t.segment_count);
+    return u;
+}
+// One lane's segment: 32 idx words (four 16-byte loads) and 32 delta nibbles
+// (one 16-byte load), all lane-private; no scalar or cross-lane loads.
+// gfx12 cache policy of the stream loads (immediate): bits 0-2 temporal hint
+// (0 regular, 1 non-temporal, 3 last-use), bits 3-4 scope (0 CU, 1 SE, 2 DEV,
+// 3 SYS). policy 24 = SYS scope keeps the stream out of the caches that serve
+// the codebook gathers. BEHEMOTH_LANE_POLICY overrides it (measurement).
+__device__ __forceinline__ sorted_u32x4 lane_load(__amdgpu_buffer_rsrc_t r, int off, int policy) {
+    switch (policy) {
+    case 0:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 0);
+    case 1:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 1);
+    case 3:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 3);
+    case 8:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 8);
+    case 16:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 16);
+    case 17:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 17);
+    case 25:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 25);
+    default:
+        return __builtin_amdgcn_raw_buffer_load_b128(r, off, 0, 24);
+    }
+}
+struct LaneSeg {
+    sorted_u32x4 v[4], h;
+    __device__ __forceinline__ void load(__amdgpu_buffer_rsrc_t ridx, __amdgpu_buffer_rsrc_t rhi,
+                                         uint32_t seg, int lane, int policy) {
+        const size_t base = size_t(seg) * 32 + size_t(lane);
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+            v[b] = lane_load(ridx, int((base * lane_S + size_t(b) * 8) * 2), policy);
+        h = lane_load(rhi, int(base * 16), policy);
+    }
+    // Batch b (uniform) = chunks 8b..8b+7: idx words and the nibble word.
+    __device__ __forceinline__ void batch(int b, sorted_u32x4 &words, uint32_t &nib) const {
+        switch (b) {
+        case 0:
+            words = v[0];
+            nib = h[0];
+            return;
+        case 1:
+            words = v[1];
+            nib = h[1];
+            return;
+        case 2:
+            words = v[2];
+            nib = h[2];
+            return;
+        default:
+            words = v[3];
+            nib = h[3];
+            return;
+        }
+    }
+    // Entry jj of a batch: idx word and full 9-bit delta.
+    static __device__ __forceinline__ void entry(sorted_u32x4 words, uint32_t nib, int jj,
+                                                 uint32_t &e, uint32_t &d) {
+        e = (words[(jj >> 1) & 3] >> (16 * (jj & 1))) & 0xffffu;
+        d = (e >> lane_group_bits) | (((nib >> (4 * jj)) & 15u) << lane_delta_low_bits);
+    }
+};
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t lane_rsrc(const void *p) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(p), 0, 0x7fffffff,
+                                             sorted_buffer_flags);
+}
+// Lane layout: ct[(g + gshift) * 16 + lane/2] = code for the tile's entries
+// whose shifted group falls in [0, groups). Lane l walks its own stream of
+// the segments assigned to this wave (U segments in flight).
+template <int U>
+__device__ __forceinline__ void
+lane_decode_tile(uint16_t *ct, const SortedTileDesc &t, const uint16_t *__restrict__ idx,
+                 const uint32_t *__restrict__ hi, const uint16_t *__restrict__ seg_codes, int gshift,
+                 int groups, int wave, int waves, int lane) {
+    const __amdgpu_buffer_rsrc_t ridx = lane_rsrc(idx), rhi = lane_rsrc(hi);
+    const int r = lane >> 1;
+    for (uint32_t s = uint32_t(wave); s < t.segment_count; s += uint32_t(waves) * U) {
+        uint32_t code[U];
+        bool valid[U];
+        LaneSeg sv[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const uint32_t rel = s + uint32_t(u * waves);
+            valid[u] = rel < t.segment_count;
+            const uint32_t seg = t.segment_begin + (valid[u] ? rel : 0);
+            code[u] = seg_codes[size_t(seg) * 32 + size_t(lane)];
+            sv[u].load(ridx, rhi, seg, lane, sorted_stream_policy);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (!valid[u])
+                continue;
+#pragma unroll 1
+            for (int b = 0; b < 4; ++b) {
+                sorted_u32x4 words;
+                uint32_t nib;
+                sv[u].batch(b, words, nib);
+#pragma unroll
+                for (int jj = 0; jj < 8; ++jj) {
+                    uint32_t e, d;
+                    LaneSeg::entry(words, nib, jj, e, d);
+                    code[u] = (code[u] + d) & 0xffffu;
+                    const int g = int(e & (lane_G - 1)) + gshift;
+                    if ((e & (lane_G - 1)) != lane_dummy_group && g >= 0 && g < groups)
+                        ct[g * TR + r] = uint16_t(code[u]);
+                }
+            }
+        }
+    }
+}
+// Decodes every group tile of row tile `rt` that intersects the K window
+// [gbeg, gbeg + groups) into ct (window-relative groups).
+__device__ __forceinline__ void lane_decode_window(uint16_t *ct, const SortedArgs &a, int rt,
+                                                   int gbeg, int groups, int wave, int waves,
+                                                   int lane) {
+    const int gt0 = gbeg / a.gt_size, gt1 = min(a.group_tiles - 1, (gbeg + groups - 1) / a.gt_size);
+    for (int gt = gt0; gt <= gt1; ++gt)
+        lane_decode_tile<2>(ct, uniform_tile(a.tiles, gt * a.row_tiles + rt), a.idx, a.planes,
+                            a.codes, gt * a.gt_size - gbeg, groups, wave, waves, lane);
+}
 // gfx12 Wave32 v_wmma_f32_16x16x16_fp8_fp8 operand layout: lane l holds
 // A[row l%16][k 8*(l/16)..+8] (8 activations of one batch row: one 8-byte
 // load) and B[k 8*(l/16)..+8][col l%16] (one codebook entry of output column
@@ -830,11 +1001,9 @@ SortedLdsGeometry sorted_lds_geometry(int groups, int unit) {
 // LDS = sorted_lds_bytes(window, RT). window is a multiple of 2*U; x must stay
 // readable for 16*RT*gridDim.y rows and windows*window*8 columns (the runner
 // pads its quantised activation buffer).
-template <int RT, int U, int DB>
+template <int RT, int U, int DB, bool LANE>
 __global__ void __launch_bounds__(sorted_lds_threads)
-sorted_lds_gemm(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
-                const uint32_t *__restrict__ planes, const uint16_t *__restrict__ chunk_codes,
-                const SortedTileDesc *__restrict__ tiles, const uint8_t *__restrict__ book,
+sorted_lds_gemm(const uint8_t *__restrict__ x, const SortedArgs a, const uint8_t *__restrict__ book,
                 float *__restrict__ y, const float *__restrict__ xs, const float *__restrict__ ws,
                 float bs, bool apply_rows, int rows, int in, int out, int window) {
     static_assert(RT == 1 || RT == 2 || RT == 4);
@@ -845,8 +1014,11 @@ sorted_lds_gemm(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
     const int tile = int(blockIdx.x), row0 = int(blockIdx.y) * (TR * RT);
     const int gbeg = int(blockIdx.z) * window, groups = min(in / 8 - gbeg, window);
     const bool direct = gridDim.z == 1;
-    const SortedTileDesc t = tiles[tile];
-    sorted_decode_tile<DB, 4>(ct, t, idx, planes, chunk_codes, gbeg, groups, wave, waves, lane);
+    if constexpr (LANE)
+        lane_decode_window(ct, a, tile, gbeg, groups, wave, waves, lane);
+    else
+        sorted_decode_tile<DB, 4>(ct, a.tiles[tile], a.idx, a.planes, a.codes, gbeg, groups, wave,
+                                  waves, lane);
     __syncthreads();
     const int col = lane & 15, gh = lane >> 4;
     const uint64_t *b64 = reinterpret_cast<const uint64_t *>(book);
@@ -926,18 +1098,19 @@ sorted_lds_gemm(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
 // Dense FP8 weight from the sorted layout: row-major [out][in] (hipBLASLt) or
 // group-major [in/8][out] x 8 (coalesced for the dense pipelined kernels).
 // grid = tile_count, block = 512, dynamic LDS = gpad * 32.
-template <int DB>
+template <int DB, bool LANE>
 __global__ void __launch_bounds__(sorted_lds_threads)
-sorted_lds_reconstruct(const uint16_t *__restrict__ idx, const uint32_t *__restrict__ planes,
-                       const uint16_t *__restrict__ chunk_codes,
-                       const SortedTileDesc *__restrict__ tiles, const uint8_t *__restrict__ book,
+sorted_lds_reconstruct(const SortedArgs a, const uint8_t *__restrict__ book,
                        uint8_t *__restrict__ weight, int in, int out, bool group_major) {
     extern __shared__ __attribute__((aligned(16))) uint8_t sorted_lds[];
     uint16_t *ct = reinterpret_cast<uint16_t *>(sorted_lds);
     const int tid = int(threadIdx.x), lane = tid & 31, wave = tid >> 5, waves = int(blockDim.x) >> 5;
     const int tile = int(blockIdx.x), groups = in / 8;
-    const SortedTileDesc t = tiles[tile];
-    sorted_decode_tile<DB, 4>(ct, t, idx, planes, chunk_codes, 0, groups, wave, waves, lane);
+    if constexpr (LANE)
+        lane_decode_window(ct, a, tile, 0, groups, wave, waves, lane);
+    else
+        sorted_decode_tile<DB, 4>(ct, a.tiles[tile], a.idx, a.planes, a.codes, 0, groups, wave,
+                                  waves, lane);
     __syncthreads();
     const uint64_t *b64 = reinterpret_cast<const uint64_t *>(book);
     uint64_t *w64 = reinterpret_cast<uint64_t *>(weight);
@@ -954,32 +1127,242 @@ sorted_lds_reconstruct(const uint16_t *__restrict__ idx, const uint32_t *__restr
                 w64[size_t(tile * TR + r) * size_t(groups) + size_t(g)] = b64[ct[g * TR + r]];
     }
 }
-template <typename F> void dispatch_sorted_db(int delta_bits, F &&f) {
+// DB: delta bits of the resident encoding (sorted: 3/4; lane: 7/9).
+template <typename F> void dispatch_sorted_db(const GpuProjection &p, F &&f) {
+    const int delta_bits = p.sorted_delta_bits;
+    if (p.sorted_lane) {
+        if (delta_bits == lane_delta_bits)
+            return f.template operator()<lane_delta_bits, true>();
+        throw std::invalid_argument("Lane layout delta bits must be 9");
+    }
     if (delta_bits == 3)
-        return f.template operator()<3>();
+        return f.template operator()<3, false>();
     if (delta_bits == 4)
-        return f.template operator()<4>();
+        return f.template operator()<4, false>();
     throw std::invalid_argument("Sorted layout delta bits must be 3 or 4");
 }
-template <typename F> void dispatch_sorted_rows(int rows, int delta_bits, F &&f) {
-    dispatch_sorted_db(delta_bits, [&]<int DB>() {
+template <typename F> void dispatch_sorted_rows(int rows, const GpuProjection &p, F &&f) {
+    dispatch_sorted_db(p, [&]<int DB, bool LANE>() {
         if (rows <= 16)
-            f.template operator()<1, 8, DB>();
+            f.template operator()<1, 8, DB, LANE>();
         else if (rows <= 32)
-            f.template operator()<2, 4, DB>();
+            f.template operator()<2, 4, DB, LANE>();
         else
-            f.template operator()<4, 4, DB>();
+            f.template operator()<4, 4, DB, LANE>();
     });
 }
+SortedArgs sorted_args(const GpuProjection &p) {
+    SortedArgs a{};
+    a.idx = p.sorted_idx.data();
+    a.planes = p.sorted_planes.data();
+    a.codes = p.sorted_lane ? p.sorted_segment_codes.data() : p.sorted_chunk_codes.data();
+    a.tiles = p.sorted_tiles.data();
+    a.row_tiles = int(ceil_div(size_t(p.out), size_t(TR)));
+    a.gt_size = p.sorted_lane ? p.lane_groups_per_tile : lane_G;
+    a.group_tiles = p.sorted_lane ? p.lane_group_tiles : 1;
+    return a;
+}
+// ---------------------------------------------------------------------------
+// Lane layout GEMV (rows <= R per pass): lane l owns output row l/2 of its
+// 16-row tile and accumulates R batch rows in registers (fp32, via the dot4
+// accumulator operand). Per chunk: the lane-private idx word and delta nibble
+// (loaded a whole segment ahead: 80 bytes per lane per segment in flight), the
+// per-lane code chain (VALU only), one 8-byte codebook gather (L0: the 32
+// lanes of a chunk stay within a few tens of KiB and the W tiles of a block
+// run in lock-step at the same code position), R x 8 bytes of activations
+// from LDS (xs[group][R], slot `groups` is zero for dummies), 2R dot4. No LDS
+// atomics, no fixed-point split, no scalar loads in the hot loop.
+// Persistent blocks: grid.x blocks loop over (group tile, tile group, split)
+// items in stride, reloading the activation tile only when the group tile
+// changes and prefetching the next item's first segment; grid.y = passes of
+// R rows. partial[(gt*splits+split)][rows][out].
+template <int R, int W>
+__global__ void __launch_bounds__(W * 32)
+lane_projection(const uint8_t *__restrict__ x, const SortedArgs a, const uint8_t *__restrict__ book,
+                float *__restrict__ partial, int rows, int in, int out, int splits, int items,
+                int diag, int policy) {
+    // diag (BEHEMOTH_LANE_DIAG, measurement only): 2 no codebook gather,
+    // 4 no activation read, 8 single-line gather.
+    static_assert(R == 1 || R == 2 || R == 4);
+    extern __shared__ __attribute__((aligned(16))) uint64_t lane_xs[];
+    constexpr int THREADS = W * 32;
+    const int tid = int(threadIdx.x), lane = tid & 31, wave = tid >> 5;
+    const int groups = in / 8, r0 = int(blockIdx.y) * R;
+    const int block_groups = (a.row_tiles + W - 1) / W;
+    const uint64_t *x64 = reinterpret_cast<const uint64_t *>(x);
+    const __amdgpu_buffer_rsrc_t ridx = lane_rsrc(a.idx), rhi = lane_rsrc(a.planes);
+    // This wave's segment range for an item (empty when the tile does not exist).
+    struct Range {
+        uint32_t seg_begin, s0, s1;
+    };
+    auto range_of = [&](int item) {
+        Range rg{0, 0, 0};
+        const int gt = item / (block_groups * splits), rem = item % (block_groups * splits);
+        const int bg = rem / splits, split = rem % splits, rt = bg * W + wave;
+        if (rt < a.row_tiles) {
+            const SortedTileDesc t = uniform_tile(a.tiles, gt * a.row_tiles + rt);
+            rg.seg_begin = t.segment_begin;
+            rg.s0 = (t.segment_count * uint32_t(split)) / uint32_t(splits);
+            rg.s1 = (t.segment_count * uint32_t(split + 1)) / uint32_t(splits);
+        }
+        return rg;
+    };
+    int loaded_gt = -1;
+    LaneSeg nxt;
+    bool have_next = false;
+    for (int item = int(blockIdx.x); item < items; item += int(gridDim.x)) {
+        const int gt = item / (block_groups * splits), rem = item % (block_groups * splits);
+        const int bg = rem / splits, split = rem % splits;
+        const int g0 = gt * a.gt_size, gn = min(groups - g0, a.gt_size);
+        if (gt != loaded_gt) {
+            if (loaded_gt >= 0)
+                __syncthreads(); // every wave finished reading the previous tile
+            // xs[(r/2) * (gn+1) + g] holds rows 2(r/2), 2(r/2)+1 of group g (16
+            // bytes): the two 16-byte reads of an R=4 entry then spread over all
+            // eight 4-bank LDS groups instead of four.
+            for (int i = tid; i < (gn + 1) * R; i += THREADS) {
+                const int g = i / R, r = i % R;
+                lane_xs[size_t(r >> 1) * size_t(gn + 1) * 2 + size_t(g) * 2 + size_t(r & 1)] =
+                    (g < gn && r0 + r < rows)
+                        ? x64[size_t(r0 + r) * size_t(groups) + size_t(g0 + g)]
+                        : 0;
+            }
+            __syncthreads();
+            loaded_gt = gt;
+        }
+        const int rt = bg * W + wave;
+        const Range rg = range_of(item);
+        float acc[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            acc[r] = 0.f;
+        if (rg.s1 > rg.s0) {
+            uint32_t code = a.codes[(size_t(rg.seg_begin) + rg.s0) * 32 + size_t(lane)];
+            LaneSeg cur;
+            if (have_next)
+                cur = nxt;
+            else
+                cur.load(ridx, rhi, rg.seg_begin + rg.s0, lane, policy);
+            have_next = false;
+            for (uint32_t sg = rg.s0; sg < rg.s1; ++sg) {
+                // Prefetch: the next segment of this item, or the first one of
+                // this wave's next item (so the stream never drains).
+                if (sg + 1 < rg.s1)
+                    nxt.load(ridx, rhi, rg.seg_begin + sg + 1, lane, policy);
+                else {
+                    const int next_item = item + int(gridDim.x);
+                    if (next_item < items) {
+                        const Range nr = range_of(next_item);
+                        if (nr.s1 > nr.s0) {
+                            nxt.load(ridx, rhi, nr.seg_begin + nr.s0, lane, policy);
+                            have_next = true;
+                        }
+                    }
+                }
+#pragma unroll 1
+                for (int b = 0; b < 4; ++b) {
+                    sorted_u32x4 words;
+                    uint32_t nib;
+                    cur.batch(b, words, nib);
+                    uint32_t off[8], g[8];
+#pragma unroll
+                    for (int jj = 0; jj < 8; ++jj) {
+                        uint32_t e, d;
+                        LaneSeg::entry(words, nib, jj, e, d);
+                        code = (code + d) & 0xffffu;
+                        off[jj] = (diag & 8 ? (code & 63u) : code) << 3;
+                        g[jj] = min(e & uint32_t(lane_G - 1), uint32_t(gn)) * (R == 1 ? 1 : 2);
+                    }
+                    uint2 w[8];
+#pragma unroll
+                    for (int jj = 0; jj < 8; ++jj)
+                        w[jj] = diag & 2 ? make_uint2(off[jj], g[jj])
+                                         : *reinterpret_cast<const uint2 *>(book + off[jj]);
+#pragma unroll
+                    for (int jj = 0; jj < 8; ++jj) {
+                        // R x 8 activation bytes per entry: 16-byte LDS reads.
+                        uint32_t xv[2 * R];
+                        if (diag & 4) {
+#pragma unroll
+                            for (int i = 0; i < 2 * R; ++i)
+                                xv[i] = g[jj] + uint32_t(i);
+                        } else if constexpr (R == 1) {
+                            const uint2 v = *reinterpret_cast<const uint2 *>(lane_xs + g[jj]);
+                            xv[0] = v.x;
+                            xv[1] = v.y;
+                        } else {
+#pragma unroll
+                            for (int q = 0; q < R / 2; ++q) {
+                                const uint4 v = *reinterpret_cast<const uint4 *>(
+                                    lane_xs + size_t(q) * size_t(gn + 1) * 2 + g[jj]);
+                                xv[4 * q] = v.x;
+                                xv[4 * q + 1] = v.y;
+                                xv[4 * q + 2] = v.z;
+                                xv[4 * q + 3] = v.w;
+                            }
+                        }
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            acc[r] = __builtin_amdgcn_dot4_f32_fp8_fp8(w[jj].x, xv[2 * r], acc[r]);
+                            acc[r] = __builtin_amdgcn_dot4_f32_fp8_fp8(w[jj].y, xv[2 * r + 1], acc[r]);
+                        }
+                    }
+                }
+                if (sg + 1 < rg.s1)
+                    cur = nxt;
+            }
+        }
+        if (rt >= a.row_tiles)
+            continue;
+        // The two lanes of a row hold its two half-streams.
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            acc[r] += __shfl_xor(acc[r], 1);
+        const int row_out = rt * TR + (lane >> 1);
+        if ((lane & 1) == 0 && row_out < out) {
+            const size_t part = size_t(gt * splits + split);
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                if (r0 + r < rows)
+                    partial[(part * size_t(rows) + size_t(r0 + r)) * size_t(out) + size_t(row_out)] =
+                        acc[r];
+        }
+    }
+}
+template <typename F> void dispatch_lane_rows(int rows, F &&f) {
+    if (rows <= 1)
+        f.template operator()<1, 8>();
+    else if (rows <= 2)
+        f.template operator()<2, 8>();
+    else
+        f.template operator()<4, 16>();
+}
+// Persistent-block count: at most `cap`, and a divisor of `items` when one
+// exists in [cap/2, cap] so every block does the same number of items.
+int lane_blocks(int items, int cap) {
+    if (items <= cap)
+        return items;
+    for (int g = cap; g >= cap / 2; --g)
+        if (items % g == 0)
+            return g;
+    return cap;
+}
+// Sums the split/window/tile partials and applies the scales; writes fp32 or
+// bf16 (the fused cast of the projection's consumer).
+template <typename T>
 __global__ void merge_projection(const float *partial, const float *xs, const float *ws, float bs,
-                                 float *y, int rows, int out, int parts, bool apply_rows) {
+                                 T *y, int rows, int out, int parts, bool apply_rows) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * size_t(out))
         return;
     float sum = 0;
     for (int part = 0; part < parts; ++part)
         sum += partial[size_t(part) * size_t(rows) * size_t(out) + i];
-    y[i] = sum * xs[i / size_t(out)] * bs * (apply_rows ? ws[i % size_t(out)] : 1.f);
+    const float v = sum * xs[i / size_t(out)] * bs * (apply_rows ? ws[i % size_t(out)] : 1.f);
+    if constexpr (std::is_same_v<T, float>)
+        y[i] = v;
+    else
+        y[i] = device::bf16(v);
 }
 } // namespace
 ProjectionRunner::ProjectionRunner() {
@@ -1043,14 +1426,21 @@ nlohmann::json ProjectionRunner::resources() const {
         reinterpret_cast<const void *>(
             sorted_projection<sorted_waves, sorted_unroll, sorted_copies, 4>),
         sorted_waves * 32);
-    add("sorted-dense (reconstruct)", reinterpret_cast<const void *>(sorted_lds_reconstruct<4>),
+    add("sorted-dense (reconstruct)",
+        reinterpret_cast<const void *>(sorted_lds_reconstruct<4, false>), sorted_lds_threads);
+    add("sorted-dense (reconstruct, lane layout)",
+        reinterpret_cast<const void *>(sorted_lds_reconstruct<9, true>), sorted_lds_threads);
+    add("sorted-lds (rows<=16)", reinterpret_cast<const void *>(sorted_lds_gemm<1, 8, 4, false>),
         sorted_lds_threads);
-    add("sorted-lds (rows<=16)", reinterpret_cast<const void *>(sorted_lds_gemm<1, 8, 4>),
+    add("sorted-lds (rows<=32)", reinterpret_cast<const void *>(sorted_lds_gemm<2, 4, 4, false>),
         sorted_lds_threads);
-    add("sorted-lds (rows<=32)", reinterpret_cast<const void *>(sorted_lds_gemm<2, 4, 4>),
-        sorted_lds_threads);
-    add("sorted-lds (rows<=64 per pass)", reinterpret_cast<const void *>(sorted_lds_gemm<4, 4, 4>),
-        sorted_lds_threads);
+    add("sorted-lds (rows<=64 per pass)",
+        reinterpret_cast<const void *>(sorted_lds_gemm<4, 4, 4, false>), sorted_lds_threads);
+    add("sorted-lds (rows<=16, lane layout)",
+        reinterpret_cast<const void *>(sorted_lds_gemm<1, 8, 9, true>), sorted_lds_threads);
+    add("lane-sN (rows=1)", reinterpret_cast<const void *>(lane_projection<1, 8>), 256);
+    add("lane-sN (rows=2)", reinterpret_cast<const void *>(lane_projection<2, 8>), 256);
+    add("lane-sN (rows<=4 per pass)", reinterpret_cast<const void *>(lane_projection<4, 16>), 512);
     for (const auto &g : pipeline_geometries)
         dispatch_pipeline(g.mode, [&]<int k, int n, int split, int rt = 1>() {
             const auto name = std::string(projection_mode_name(g.mode));
@@ -1126,10 +1516,41 @@ nlohmann::json ProjectionRunner::profile(bool detailed) const {
     state.compact_profile = result;
     return result;
 }
+std::pair<uint8_t *, float *> ProjectionRunner::prepare_input(ProjectionWorkspace &w, int rows,
+                                                               int in, hipStream_t stream) {
+    if (rows < 1 || in < 8 || in % 8)
+        throw std::invalid_argument("Invalid projection input shape");
+    // The quantised activations are padded to whole 64-row groups plus one
+    // K step: sorted-lds reads whole 16-row WMMA tiles and whole group units
+    // past the real rows/columns (their weights are zero, so any finite
+    // padding contributes nothing). Fresh allocations are zeroed once; stale
+    // rows hold earlier finite activations.
+    const size_t padded = size_t(ceil_div(size_t(rows), size_t(64))) * 64 * size_t(in) + 4096;
+    const uint8_t *before = w.input.data();
+    w.input.resize(padded);
+    if (w.input.data() != before)
+        HIP_CHECK(hipMemsetAsync(w.input.data(), 0, w.input.bytes(), stream));
+    w.input_scale.resize(size_t(rows));
+    return {w.input.data(), w.input_scale.data()};
+}
 void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float *output, int rows,
                            ProjectionWorkspace &w, hipStream_t stream, bool apply_rows) {
+    if (!input)
+        throw std::invalid_argument("Projection input missing");
+    Call call;
+    call.input = input;
+    call.output = output;
+    call.apply_row_scale = apply_rows;
+    run(p, call, rows, w, stream);
+}
+void ProjectionRunner::run(const GpuProjection &p, const Call &call, int rows,
+                           ProjectionWorkspace &w, hipStream_t stream) {
+    const BFloat16 *input = call.input;
+    float *output = call.output;
+    BFloat16 *bf16_output = call.bf16_output;
+    const bool apply_rows = call.apply_row_scale;
     const bool has_codes = p.codes.size() == size_t(p.out) * size_t(p.in / 8);
-    if (rows < 1 || p.in < 1 || p.out < 1 || p.in % 8 || !input || !output ||
+    if (rows < 1 || p.in < 1 || p.out < 1 || p.in % 8 || !output ||
         p.row_scale.size() != size_t(p.out) ||
         (p.dense.size() != size_t(p.in) * size_t(p.out) &&
          ((!has_codes && !p.has_sorted()) || p.codebook.size() != 65536 * 8)))
@@ -1141,20 +1562,25 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
         state.compact_profile = nullptr;
     auto &choice = choice_it->second;
     const bool group_major = p.code_layout == CodeLayout::GroupMajor;
-    // The quantised activations are padded to whole 64-row groups plus one
-    // K step: sorted-lds reads whole 16-row WMMA tiles and whole group units
-    // past the real rows/columns (their weights are zero, so any finite
-    // padding contributes nothing). Fresh allocations are zeroed once; stale
-    // rows hold earlier finite activations.
-    {
-        const size_t padded =
-            size_t(ceil_div(size_t(rows), size_t(64))) * 64 * size_t(p.in) + 4096;
-        const uint8_t *before = w.input.data();
-        w.input.resize(padded);
-        if (w.input.data() != before)
-            HIP_CHECK(hipMemsetAsync(w.input.data(), 0, w.input.bytes(), stream));
-    }
-    w.input_scale.resize(size_t(rows));
+    if (input)
+        prepare_input(w, rows, p.in, stream);
+    else if (w.input.size() < size_t(rows) * size_t(p.in) || w.input_scale.size() < size_t(rows))
+        throw std::invalid_argument("Projection workspace holds no quantised input");
+    // Merge-based modes write the bf16 result directly; the others cast after.
+    bool merged_bf16 = false;
+    auto merge = [&](const float *partial, int parts) {
+        const unsigned blocks = unsigned(ceil_div(size_t(rows) * size_t(p.out), 256));
+        if (bf16_output) {
+            merge_projection<uint16_t><<<blocks, 256, 0, stream>>>(
+                partial, w.input_scale.data(), p.row_scale.data(), p.codebook_scale,
+                reinterpret_cast<uint16_t *>(bf16_output), rows, p.out, parts, apply_rows);
+            merged_bf16 = true;
+        } else
+            merge_projection<float><<<blocks, 256, 0, stream>>>(
+                partial, w.input_scale.data(), p.row_scale.data(), p.codebook_scale, output, rows,
+                p.out, parts, apply_rows);
+        HIP_CHECK(hipGetLastError());
+    };
     // Dense FP8 weights for the BLAS / sorted-dense paths: stored dense, or
     // reconstructed from the group-major codes (random gather) or the sorted
     // layout (streaming) into the shared scratch.
@@ -1168,21 +1594,20 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             reconstruct_kernel<<<unsigned(ceil_div(w.weight.size(), 256)), 256, 0, stream>>>(
                 p.codes.data(), p.codebook.data(), w.weight.data(), p.in, p.out, group_major);
         else if (p.has_sorted())
-            dispatch_sorted_db(p.sorted_delta_bits, [&]<int DB>() {
+            dispatch_sorted_db(p, [&]<int DB, bool LANE>() {
                 const int gpad = int(ceil_div(size_t(p.in / 8), size_t(sorted_lds_group_pad))) *
                                  sorted_lds_group_pad;
                 static bool attribute_set = false;
                 if (!attribute_set) {
                     HIP_CHECK(hipFuncSetAttribute(
-                        reinterpret_cast<const void *>(sorted_lds_reconstruct<DB>),
+                        reinterpret_cast<const void *>(sorted_lds_reconstruct<DB, LANE>),
                         hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
                     attribute_set = true;
                 }
-                sorted_lds_reconstruct<DB>
-                    <<<unsigned(p.sorted_tile_count), sorted_lds_threads, size_t(gpad) * TR * 2,
-                       stream>>>(p.sorted_idx.data(), p.sorted_planes.data(),
-                                 p.sorted_chunk_codes.data(), p.sorted_tiles.data(),
-                                 p.codebook.data(), w.weight.data(), p.in, p.out, dense_gm);
+                const auto args = sorted_args(p);
+                sorted_lds_reconstruct<DB, LANE>
+                    <<<unsigned(args.row_tiles), sorted_lds_threads, size_t(gpad) * TR * 2,
+                       stream>>>(args, p.codebook.data(), w.weight.data(), p.in, p.out, dense_gm);
             });
         else
             throw ProjectionUnavailable("No source for a dense weight");
@@ -1197,6 +1622,48 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
         if (projection_mode_is_sorted(mode)) {
             if (!p.has_sorted())
                 throw ProjectionUnavailable("Projection has no codebook-major (sorted) layout");
+            const int needs = projection_mode_layout(mode);
+            if (needs == 1 && p.sorted_lane)
+                throw ProjectionUnavailable("sorted-sN modes need the sorted (chunk-code) layout");
+            if (needs == 2 && !p.sorted_lane)
+                throw ProjectionUnavailable("lane-sN modes need the lane layout");
+            if (needs == 2) {
+                const int splits = mode == ProjectionMode::LaneS1   ? 1
+                                   : mode == ProjectionMode::LaneS2 ? 2
+                                   : mode == ProjectionMode::LaneS4 ? 4
+                                                                    : 8;
+                const auto args = sorted_args(p);
+                const int parts = args.group_tiles * splits;
+                w.partial.resize(size_t(rows) * size_t(p.out) * size_t(parts));
+                dispatch_lane_rows(rows, [&]<int R, int W>() {
+                    static bool attribute_set = false; // one per instantiation
+                    if (!attribute_set) {
+                        HIP_CHECK(hipFuncSetAttribute(
+                            reinterpret_cast<const void *>(lane_projection<R, W>),
+                            hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
+                        attribute_set = true;
+                    }
+                    const int block_groups = int(ceil_div(size_t(args.row_tiles), size_t(W)));
+                    const int items = args.group_tiles * block_groups * splits;
+                    dim3 grid(unsigned(lane_blocks(items, R == 4 ? 64 : 128)),
+                              unsigned(ceil_div(size_t(rows), size_t(R))));
+                    const size_t lds = size_t(args.gt_size + 1) * R * sizeof(uint64_t);
+                    static const int diag = [] {
+                        const char *v = std::getenv("BEHEMOTH_LANE_DIAG");
+                        return v ? std::atoi(v) : 0;
+                    }();
+                    static const int policy = [] {
+                        const char *v = std::getenv("BEHEMOTH_LANE_POLICY");
+                        return v ? std::atoi(v) : sorted_stream_policy;
+                    }();
+                    lane_projection<R, W><<<grid, W * 32, lds, stream>>>(
+                        w.input.data(), args, p.codebook.data(), w.partial.data(), rows, p.in,
+                        p.out, splits, items, diag, policy);
+                });
+                HIP_CHECK(hipGetLastError());
+                merge(w.partial.data(), parts);
+                return;
+            }
             if (mode == ProjectionMode::SortedDense) {
                 dense = dense_weight(true);
                 kernel_gm = true;
@@ -1204,17 +1671,18 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                        : rows <= 32 ? ProjectionMode::PipelinedR2K64
                                     : ProjectionMode::PipelinedR4K64;
             } else if (mode == ProjectionMode::SortedLds) {
-                dispatch_sorted_rows(rows, p.sorted_delta_bits, [&]<int RT, int U, int DB>() {
+                dispatch_sorted_rows(rows, p, [&]<int RT, int U, int DB, bool LANE>() {
                     const auto g = sorted_lds_geometry(p.in / 8, 2 * U);
                     const size_t lds = size_t(sorted_lds_bytes(g.window, RT));
                     static bool attribute_set = false; // one per instantiation
                     if (!attribute_set) {
                         HIP_CHECK(hipFuncSetAttribute(
-                            reinterpret_cast<const void *>(sorted_lds_gemm<RT, U, DB>),
+                            reinterpret_cast<const void *>(sorted_lds_gemm<RT, U, DB, LANE>),
                             hipFuncAttributeMaxDynamicSharedMemorySize, 65536));
                         attribute_set = true;
                     }
-                    dim3 grid(unsigned(p.sorted_tile_count),
+                    const auto args = sorted_args(p);
+                    dim3 grid(unsigned(args.row_tiles),
                               unsigned(ceil_div(size_t(rows), size_t(TR * RT))),
                               unsigned(g.windows));
                     float *target = output;
@@ -1222,19 +1690,13 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                         w.partial.resize(size_t(rows) * size_t(p.out) * size_t(g.windows));
                         target = w.partial.data();
                     }
-                    sorted_lds_gemm<RT, U, DB><<<grid, sorted_lds_threads, lds, stream>>>(
-                        w.input.data(), p.sorted_idx.data(), p.sorted_planes.data(),
-                        p.sorted_chunk_codes.data(), p.sorted_tiles.data(), p.codebook.data(),
-                        target, w.input_scale.data(), p.row_scale.data(), p.codebook_scale,
-                        apply_rows, rows, p.in, p.out, g.window);
+                    sorted_lds_gemm<RT, U, DB, LANE><<<grid, sorted_lds_threads, lds, stream>>>(
+                        w.input.data(), args, p.codebook.data(), target, w.input_scale.data(),
+                        p.row_scale.data(), p.codebook_scale, apply_rows, rows, p.in, p.out,
+                        g.window);
                     HIP_CHECK(hipGetLastError());
-                    if (g.windows > 1) {
-                        merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)),
-                                           256, 0, stream>>>(
-                            w.partial.data(), w.input_scale.data(), p.row_scale.data(),
-                            p.codebook_scale, output, rows, p.out, g.windows, apply_rows);
-                        HIP_CHECK(hipGetLastError());
-                    }
+                    if (g.windows > 1)
+                        merge(w.partial.data(), g.windows);
                 });
                 return;
             } else {
@@ -1244,7 +1706,10 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                 const int block_groups = int(ceil_div(size_t(p.sorted_tile_count), sorted_waves));
                 dim3 grid(unsigned(block_groups * splits), unsigned(rows));
                 w.partial.resize(size_t(rows) * size_t(p.out) * size_t(splits));
-                dispatch_sorted_db(p.sorted_delta_bits, [&]<int DB>() {
+                dispatch_sorted_db(p, [&]<int DB, bool LANE>() {
+                    if constexpr (LANE)
+                        throw std::logic_error("sorted-sN dispatched on the lane layout");
+                    else
                     sorted_projection<sorted_waves, sorted_unroll, sorted_copies, DB>
                         <<<grid, sorted_waves * 32, 0, stream>>>(
                             w.input.data(), p.sorted_idx.data(), p.sorted_planes.data(),
@@ -1252,11 +1717,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                             w.partial.data(), rows, p.in, p.out, p.sorted_tile_count, splits);
                 });
                 HIP_CHECK(hipGetLastError());
-                merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
-                                   stream>>>(w.partial.data(), w.input_scale.data(),
-                                             p.row_scale.data(), p.codebook_scale, output, rows,
-                                             p.out, splits, apply_rows);
-                HIP_CHECK(hipGetLastError());
+                merge(w.partial.data(), splits);
                 return;
             }
         } else if (!dense && !has_codes && mode != ProjectionMode::Blas) {
@@ -1279,10 +1740,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                 dense, p.row_scale.data(), p.codebook_scale, w.partial.data(), rows, p.in,
                 p.out, apply_rows, parts, kernel_gm);
             HIP_CHECK(hipGetLastError());
-            merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
-                               stream>>>(w.partial.data(), w.input_scale.data(), p.row_scale.data(),
-                                         p.codebook_scale, output, rows, p.out, parts, apply_rows);
-            HIP_CHECK(hipGetLastError());
+            merge(w.partial.data(), parts);
         } else if (mode == ProjectionMode::Tiled64 || mode == ProjectionMode::Tiled128 ||
                    mode == ProjectionMode::TiledLds64 || mode == ProjectionMode::TiledLds128 ||
                    geometry) {
@@ -1325,10 +1783,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                 });
             }
             HIP_CHECK(hipGetLastError());
-            merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
-                               stream>>>(w.partial.data(), w.input_scale.data(), p.row_scale.data(),
-                                         p.codebook_scale, output, rows, p.out, parts, apply_rows);
-            HIP_CHECK(hipGetLastError());
+            merge(w.partial.data(), parts);
         } else if (mode == ProjectionMode::Blas) {
             ensure_blas(state, plan, p.in, p.out, rows);
             if (!plan.has_blas)
@@ -1347,8 +1802,12 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
         }
     };
     auto execute = [&](ProjectionMode mode) {
-        quantize_rows(input, w.input.data(), w.input_scale.data(), rows, p.in, stream);
+        if (input)
+            quantize_rows(input, w.input.data(), w.input_scale.data(), rows, p.in, stream);
+        merged_bf16 = false;
         launch(mode);
+        if (bf16_output && !merged_bf16)
+            cast_scaled(output, nullptr, bf16_output, rows, p.out, stream);
     };
     if (state.override_mode != ProjectionMode::Auto) {
         execute(state.override_mode);
@@ -1361,7 +1820,16 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             // sorted-sN streams the layout once per row (exact int64): the
             // batch-1/2 choice; sorted-lds decodes once and shares the gather
             // across the batch rows.
-            if (p.has_sorted()) {
+            if (p.has_lane()) {
+                // Register-accumulating lane kernel: one pass per 4 rows.
+                candidates.push_back(ProjectionMode::LaneS2);
+                candidates.push_back(ProjectionMode::LaneS4);
+                candidates.push_back(ProjectionMode::LaneS8);
+                if (rows <= 4)
+                    candidates.push_back(ProjectionMode::LaneS1);
+                if (rows >= 5) // two or more 4-row passes: compare the batched kernel
+                    candidates.push_back(ProjectionMode::SortedLds);
+            } else if (p.has_sorted()) {
                 candidates.push_back(ProjectionMode::SortedLds);
                 if (rows <= 8) {
                     candidates.push_back(ProjectionMode::SortedS8);
@@ -1389,6 +1857,8 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             if (p.has_sorted()) {
                 candidates.push_back(ProjectionMode::SortedLds);
                 candidates.push_back(ProjectionMode::SortedDense);
+                if (p.has_lane() && rows <= 32)
+                    candidates.push_back(ProjectionMode::LaneS4); // ceil(rows/4) passes
             }
             if (plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
@@ -1417,6 +1887,8 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
                     (mode == ProjectionMode::Blas && !plan.has_blas) ||
                     (mode == ProjectionMode::SplitK && p.in <= split_width) ||
                     (projection_mode_is_sorted(mode) && !p.has_sorted()) ||
+                    (projection_mode_layout(mode) == 1 && p.sorted_lane) ||
+                    (projection_mode_layout(mode) == 2 && !p.sorted_lane) ||
                     (projection_mode_is_sorted(mode) && mode != ProjectionMode::SortedDense &&
                      mode != ProjectionMode::SortedLds && rows > 16) ||
                     (!projection_mode_is_sorted(mode) && mode != ProjectionMode::Blas &&

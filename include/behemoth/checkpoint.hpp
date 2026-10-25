@@ -46,7 +46,7 @@ struct HostProjection {
     std::vector<float> row_scale;
     float codebook_scale = 1;
 };
-enum class CodeLayout { RowMajor, GroupMajor, Sorted };
+enum class CodeLayout { RowMajor, GroupMajor, Sorted, Lane };
 CodeLayout parse_code_layout(std::string_view);
 const char *code_layout_name(CodeLayout);
 std::vector<uint16_t> group_major_codes(const HostProjection &);
