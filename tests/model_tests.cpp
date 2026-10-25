@@ -13,6 +13,10 @@ int main(int argc, char **argv) {
         o.model = argv[1];
         o.token_budget = 2;
         o.prefill_chunk = 2;
+        // Exercise the production zero-copy transport incl. the fused
+        // publish-in-merge reduce/residual path (PERF_ROUND3 item 4).
+        o.zero_copy_transport = true;
+        o.zero_copy_rows = 8;
         TensorParallelModel model(o);
         Scheduler scheduler(model.cache_pages(), 2, 2);
         auto id = scheduler.submit(std::vector<int>{1, 2}, 2);

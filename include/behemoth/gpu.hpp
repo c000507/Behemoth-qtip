@@ -334,7 +334,7 @@ class ProjectionRunner {
         BFloat16 *bf16_output = nullptr; // optional bf16 result
         bool apply_row_scale = true;
     };
-    void run(const GpuProjection &, const Call &, int rows, ProjectionWorkspace &, hipStream_t);
+    void run(const GpuProjection &, Call &, int rows, ProjectionWorkspace &, hipStream_t);
     // Sizes/pads the quantised-input buffers for rows x in and returns them.
     static std::pair<uint8_t *, float *> prepare_input(ProjectionWorkspace &, int rows, int in,
                                                       hipStream_t);
@@ -343,12 +343,20 @@ void cast_scaled(const float *, const float *row_scale, BFloat16 *, int rows, in
                  hipStream_t);
 // Stream-ordered two-rank exchange through fine-grained pinned host memory (transport.hip).
 void zero_copy_publish(const float *values, float *mine_host_device_pointer, size_t n,
-                       unsigned *flag_device_pointer, unsigned *counter, unsigned seq, hipStream_t);
+                        unsigned *flag_device_pointer, unsigned *counter, unsigned seq, hipStream_t);
 void zero_copy_reduce(float *values, const float *peer_host_device_pointer, size_t n,
                       const unsigned *peer_flag_device_pointer, unsigned seq, hipStream_t);
 void zero_copy_gather(const float *local, const float *peer_host_device_pointer, float *all,
                       size_t n, int rank, const unsigned *peer_flag_device_pointer, unsigned seq,
                       hipStream_t);
+// Fused all-reduce + scaled residual (PERF_ROUND3 item 4): after summing the
+// rank partials, state = bf16(bf16(state) + bf16(x * row_scale[row])) is
+// applied in the same kernel — identical rounding to zero_copy_reduce
+// followed by residual_add_scaled, one launch and one full device pass less.
+void zero_copy_reduce_residual_dev(float *values, const float *peer_host, BFloat16 *state,
+                                   const float *row_scale, size_t n, int width,
+                                   const unsigned *peer_flag_device_pointer, unsigned seq,
+                                   hipStream_t);
 void rms_norm(const BFloat16 *, const BFloat16 *, BFloat16 *, int rows, int width, float epsilon,
               hipStream_t);
 // rms_norm followed by per-row fp8 quantisation (identical rounding to
@@ -364,6 +372,10 @@ void residual_add_scaled(BFloat16 *state, const float *x, const float *row_scale
 void rope_quantize(BFloat16 *q, BFloat16 *k, const int *positions, int rows, int heads,
                    int kv_heads, float theta, uint8_t *q8, float *q_scale, hipStream_t);
 void silu_multiply(const BFloat16 *, const BFloat16 *, BFloat16 *, size_t n, hipStream_t);
+// silu(gate)*up with per-row fp8 quantisation written straight into the
+// projection input workspace; bit-identical to silu_multiply + quantize_rows.
+void silu_multiply_quantized(const BFloat16 *gate, const BFloat16 *up, uint8_t *q, float *scales,
+                             int rows, int width, hipStream_t);
 void rope(BFloat16 *, const int *positions, int rows, int heads, float theta, hipStream_t);
 void embed(const BFloat16 *, const int *tokens, BFloat16 *, int rows, int width, hipStream_t);
 void select_rows(const BFloat16 *, const int *, BFloat16 *, int rows, int width, hipStream_t);

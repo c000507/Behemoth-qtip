@@ -166,6 +166,53 @@ class HostTransport {
     bool zero_copy() const {
         return zero_copy_;
     }
+    // A prepared zero-copy exchange slot (PERF_ROUND3 item 4): the caller may
+    // let a projection kernel publish its partials straight into mine (the
+    // device pointer of a pinned host buffer) and then consume peer+mine in
+    // one fused reduce+residual kernel.
+    struct Exchange {
+        float *mine{}, *peer{};       // device pointers of pinned host buffers
+        unsigned *flag{}, *peer_flag{}, *counter{};
+        unsigned seq{};
+        bool valid = false;
+    };
+    bool zero_copy_eligible(size_t n) const {
+        return zero_copy_ && n <= zero_copy_limit_ && n % 4 == 0;
+    }
+    Exchange begin_exchange(int rank, size_t n) {
+        if (!zero_copy_eligible(n))
+            return {};
+        const auto &d = device_pointers(rank);
+        const unsigned seq = ++zc_seq_[size_t(rank)];
+        Exchange e;
+        e.mine = d.host[size_t(rank)][seq & 1];
+        e.peer = d.host[size_t(1 - rank)][seq & 1];
+        e.flag = d.flag[size_t(rank)];
+        e.peer_flag = d.flag[size_t(1 - rank)];
+        e.counter = zc_counter_[size_t(rank)];
+        e.seq = seq;
+        e.valid = true;
+        return e;
+    }
+    // Device partials: classic publish then one fused reduce+residual kernel.
+    void reduce_residual_dev(int rank, const Exchange &e, float *values, BFloat16 *state,
+                             const float *row_scale, size_t n, int width, hipStream_t stream) {
+        zero_copy_publish(values, e.mine, n, e.flag, e.counter, e.seq, stream);
+        zero_copy_reduce_residual_dev(values, e.peer, state, row_scale, n, width, e.peer_flag,
+                                      e.seq, stream);
+    }
+    // Full fallback (staged transport or ineligible size): reduce, then the
+    // separate scaled-residual pass with identical rounding.
+    void reduce_residual(int rank, float *values, BFloat16 *state, const float *row_scale, size_t n,
+                         int width, hipStream_t stream) {
+        if (zero_copy_eligible(n)) {
+            const auto e = begin_exchange(rank, n);
+            reduce_residual_dev(rank, e, values, state, row_scale, n, width, stream);
+            return;
+        }
+        reduce(rank, values, n, stream);
+        residual_add_scaled(state, values, row_scale, int(n / size_t(width)), width, stream);
+    }
     void abort() {
         std::lock_guard lock(mutex_);
         aborted_ = true;
@@ -282,7 +329,7 @@ struct Shard {
     std::unique_ptr<ProjectionRunner> runner;
     std::vector<Layer> layers;
     DeviceBuffer<BFloat16> embeddings, final_norm, state, norm, tmp, q, k, v, attention, gate, up,
-        mlp, selected;
+        selected;
     GpuProjection head;
     ProjectionWorkspace projection;
     DeviceBuffer<uint8_t> query;
@@ -369,7 +416,6 @@ struct Shard {
         attention.resize(rows * 6144);
         gate.resize(rows * 14336);
         up.resize(rows * 14336);
-        mlp.resize(rows * 14336);
         query.resize(rows * 6144);
         query_scale.resize(rows * 48);
         raw.resize(rows * 16384);
@@ -428,21 +474,49 @@ struct Shard {
                 runner->run(p, call, rows, projection, stream);
             });
         };
-        auto row_project = [&](const GpuProjection &p, const BFloat16 *x) {
+        // Row projections (o/down) end in the collective + scaled residual.
+        // Zero-copy path (PERF_ROUND3 item 4): the classic publish kernel
+        // copies the device partials to the pinned host exchange buffer and
+        // ONE fused kernel reduces both ranks and updates the residual —
+        // a launch and a full device pass per layer saved, with identical
+        // rounding. The prepared variant consumes an already-quantised
+        // workspace input.
+        auto row_project_common = [&](const GpuProjection &p, ProjectionRunner::Call &call) {
+            const size_t n = size_t(rows) * 12288;
+            HostTransport::Exchange exchange{};
+            if (transport && transport->zero_copy_eligible(n))
+                exchange = transport->begin_exchange(rank, n);
             timings.measure("projections_ms", stream, [&] {
-                runner->run(p, x, raw.data(), rows, projection, stream, false);
+                runner->run(p, call, rows, projection, stream);
             });
             timings.measure("collectives_ms", stream, [&] {
-                if (transport)
-                    transport->reduce(rank, raw.data(), size_t(rows) * 12288, stream);
-                else
-                    RCCL_CHECK(ncclAllReduce(raw.data(), raw.data(), size_t(rows) * 12288,
-                                             ncclFloat, ncclSum, comm, stream));
+                if (transport) {
+                    if (exchange.valid)
+                        transport->reduce_residual_dev(rank, exchange, raw.data(), state.data(),
+                                                       p.row_scale.data(), n, 12288, stream);
+                    else
+                        transport->reduce_residual(rank, raw.data(), state.data(),
+                                                   p.row_scale.data(), n, 12288, stream);
+                } else {
+                    RCCL_CHECK(ncclAllReduce(raw.data(), raw.data(), n, ncclFloat, ncclSum, comm,
+                                             stream));
+                    residual_add_scaled(state.data(), raw.data(), p.row_scale.data(), rows, 12288,
+                                        stream);
+                }
             });
-            timings.measure("elementwise_ms", stream, [&] {
-                residual_add_scaled(state.data(), raw.data(), p.row_scale.data(), rows, 12288,
-                                    stream);
-            });
+        };
+        auto row_project = [&](const GpuProjection &p, const BFloat16 *x) {
+            ProjectionRunner::Call call;
+            call.input = x;
+            call.output = raw.data();
+            call.apply_row_scale = false;
+            row_project_common(p, call);
+        };
+        auto row_project_prepared = [&](const GpuProjection &p) {
+            ProjectionRunner::Call call;
+            call.output = raw.data();
+            call.apply_row_scale = false;
+            row_project_common(p, call);
         };
         int partition = 0;
         bool decode = true;
@@ -487,9 +561,15 @@ struct Shard {
             project(l.gate, gate.data());
             project(l.up, up.data());
             timings.measure("elementwise_ms", stream, [&] {
-                silu_multiply(gate.data(), up.data(), mlp.data(), size_t(rows) * 14336, stream);
+                // Fused silu + per-row quantisation straight into the
+                // projection workspace (item 4): no bf16 intermediate round
+                // trip, bit-identical values (bf16 rounding before the row
+                // maximum, exactly like the stored-and-reread path).
+                auto [q8, scales] = ProjectionRunner::prepare_input(projection, rows, 14336,
+                                                                    stream);
+                silu_multiply_quantized(gate.data(), up.data(), q8, scales, rows, 14336, stream);
             });
-            row_project(l.down, mlp.data());
+            row_project_prepared(l.down);
         }
         if (only_layer >= 0) {
             HIP_CHECK(hipStreamSynchronize(stream));

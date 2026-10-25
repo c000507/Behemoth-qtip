@@ -136,6 +136,48 @@ __global__ void silu_kernel(const uint16_t *gate, const uint16_t *up, uint16_t *
         y[i] = device::bf16(x / (1 + expf(-x)) * device::bf16(up[i]));
     }
 }
+// silu(gate)*up quantised straight into the projection workspace: bit-identical
+// to silu_multiply into a bf16 buffer followed by quantize_rows (the value
+// rounds to bf16 before the row maximum, exactly like the stored-and-reread
+// path), but without the intermediate bf16 round-trip (PERF_ROUND3 item 4).
+template <int PER_THREAD>
+__global__ void silu_quantize_kernel(const uint16_t *gate, const uint16_t *up, uint8_t *q,
+                                     float *scales, int width) {
+    const int row = int(blockIdx.x), lane = int(threadIdx.x);
+    __shared__ float red[256];
+    float v[PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i) {
+        const int d = lane + i * 256;
+        if (d < width) {
+            const float x = device::bf16(gate[size_t(row) * size_t(width) + size_t(d)]);
+            const uint16_t bits =
+                device::bf16(x / (1 + expf(-x)) * device::bf16(up[size_t(row) * size_t(width) + size_t(d)]));
+            v[i] = device::bf16(bits);
+        } else
+            v[i] = 0.f;
+    }
+    float m = 0;
+#pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i)
+        m = fmaxf(m, fabsf(v[i]));
+    red[lane] = m;
+    __syncthreads();
+    for (int n = 128; n; n /= 2) {
+        if (lane < n)
+            red[lane] = fmaxf(red[lane], red[lane + n]);
+        __syncthreads();
+    }
+    const float scale = device::scale(red[0]);
+    if (lane == 0)
+        scales[row] = scale;
+#pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i) {
+        const int d = lane + i * 256;
+        if (d < width)
+            q[size_t(row) * size_t(width) + size_t(d)] = device::fp8(v[i] / scale);
+    }
+}
 __global__ void rope_kernel(uint16_t *x, const int *positions, int rows, int heads, float theta) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * size_t(heads) * 64)
@@ -232,6 +274,30 @@ void silu_multiply(const BFloat16 *gate, const BFloat16 *up, BFloat16 *y, size_t
             reinterpret_cast<uint16_t *>(y), n);
         HIP_CHECK(hipGetLastError());
     }
+}
+void silu_multiply_quantized(const BFloat16 *gate, const BFloat16 *up, uint8_t *q, float *scales,
+                             int rows, int width, hipStream_t stream) {
+    if (width < 1 || width > 256 * 64 || !gate || !up || !q || !scales)
+        throw std::invalid_argument("Invalid fused silu/quantisation buffers or width");
+    if (rows < 1)
+        return;
+    auto launch = [&]<int PER>() {
+        silu_quantize_kernel<PER><<<unsigned(rows), 256, 0, stream>>>(
+            reinterpret_cast<const uint16_t *>(gate), reinterpret_cast<const uint16_t *>(up), q,
+            scales, width);
+    };
+    const int per = (width + 255) / 256;
+    if (per <= 8)
+        launch.template operator()<8>();
+    else if (per <= 16)
+        launch.template operator()<16>();
+    else if (per <= 32)
+        launch.template operator()<32>();
+    else if (per <= 48)
+        launch.template operator()<48>();
+    else
+        launch.template operator()<64>();
+    HIP_CHECK(hipGetLastError());
 }
 void rope(BFloat16 *x, const int *pos, int rows, int heads, float theta, hipStream_t stream) {
     size_t n = size_t(rows) * size_t(heads) * 64;

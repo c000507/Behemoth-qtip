@@ -1356,7 +1356,7 @@ int lane_blocks(int items, int cap) {
 // bf16 (the fused cast of the projection's consumer).
 template <typename T>
 __global__ void merge_projection(const float *partial, const float *xs, const float *ws, float bs,
-                                 T *y, int rows, int out, int parts, bool apply_rows) {
+                                  T *y, int rows, int out, int parts, bool apply_rows) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * size_t(out))
         return;
@@ -1548,8 +1548,8 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
     call.apply_row_scale = apply_rows;
     run(p, call, rows, w, stream);
 }
-void ProjectionRunner::run(const GpuProjection &p, const Call &call, int rows,
-                           ProjectionWorkspace &w, hipStream_t stream) {
+void ProjectionRunner::run(const GpuProjection &p, Call &call, int rows,
+                            ProjectionWorkspace &w, hipStream_t stream) {
     const BFloat16 *input = call.input;
     float *output = call.output;
     BFloat16 *bf16_output = call.bf16_output;
