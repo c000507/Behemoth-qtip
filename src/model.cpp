@@ -348,7 +348,8 @@ struct Shard {
         size_t split_rows = (options.projection_mode == "split-k" ||
                              options.projection_mode.starts_with("tiled-") ||
                              options.projection_mode.starts_with("pipelined-") ||
-                             options.projection_mode.starts_with("sorted-"))
+                             options.projection_mode.starts_with("sorted-") ||
+                             options.projection_mode.starts_with("lane-"))
                                 ? options.token_budget
                                 : std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);
@@ -413,10 +414,20 @@ struct Shard {
             state.upload(*injected);
         else
             embed(embeddings.data(), tokens.data(), state.data(), rows, 12288, stream);
-        auto project = [&](const GpuProjection &p, const BFloat16 *x, BFloat16 *y) {
+        // Fused elementwise path (PERF_ROUND2_REPORT.md): the normed input is
+        // quantised once into the projection workspace and shared by q/k/v
+        // (gate/up); column projections write bf16 from their merge kernel;
+        // row projections end in one scaled residual add.
+        auto normed_input = [&](const BFloat16 *x, const BFloat16 *weight) {
+            auto [q8, scales] = ProjectionRunner::prepare_input(projection, rows, 12288, stream);
+            rms_norm_quantized(x, weight, q8, scales, rows, 12288, 1e-5f, stream);
+        };
+        auto project = [&](const GpuProjection &p, BFloat16 *y) {
             timings.measure("projections_ms", stream, [&] {
-                runner->run(p, x, raw.data(), rows, projection, stream);
-                cast_scaled(raw.data(), nullptr, y, rows, p.out, stream);
+                ProjectionRunner::Call call;
+                call.output = raw.data();
+                call.bf16_output = y;
+                runner->run(p, call, rows, projection, stream);
             });
         };
         auto row_project = [&](const GpuProjection &p, const BFloat16 *x) {
@@ -431,8 +442,8 @@ struct Shard {
                                              ncclFloat, ncclSum, comm, stream));
             });
             timings.measure("elementwise_ms", stream, [&] {
-                cast_scaled(raw.data(), p.row_scale.data(), tmp.data(), rows, 12288, stream);
-                residual_add(state.data(), tmp.data(), size_t(rows) * 12288, stream);
+                residual_add_scaled(state.data(), raw.data(), p.row_scale.data(), rows, 12288,
+                                    stream);
             });
         };
         int partition = 0;
@@ -447,17 +458,14 @@ struct Shard {
         for (int index = only_layer < 0 ? 0 : only_layer;
              index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
             auto &l = layers[size_t(index)];
-            timings.measure("elementwise_ms", stream, [&] {
-                rms_norm(state.data(), l.input_norm.data(), norm.data(), rows, 12288, 1e-5f,
-                         stream);
-            });
-            project(l.q, norm.data(), q.data());
-            project(l.k, norm.data(), k.data());
-            project(l.v, norm.data(), v.data());
+            timings.measure("elementwise_ms", stream,
+                            [&] { normed_input(state.data(), l.input_norm.data()); });
+            project(l.q, q.data());
+            project(l.k, k.data());
+            project(l.v, v.data());
             timings.measure("attention_and_cache_ms", stream, [&] {
-                rope(q.data(), metadata.positions.data(), rows, 48, 1000000, stream);
-                rope(k.data(), metadata.positions.data(), rows, 4, 1000000, stream);
-                quantize_rows(q.data(), query.data(), query_scale.data(), rows * 48, 128, stream);
+                rope_quantize(q.data(), k.data(), metadata.positions.data(), rows, 48, 4, 1000000,
+                              query.data(), query_scale.data(), stream);
                 AttentionDeviceView view{query.data(),     query_scale.data(), l.cache_k.data(),
                                          l.cache_v.data(), l.k_scale.data(),   l.v_scale.data(),
                                          attention.data()};
@@ -466,11 +474,10 @@ struct Shard {
                                 attention_workspace.size(), partition, stream);
             });
             row_project(l.o, attention.data());
-            timings.measure("elementwise_ms", stream, [&] {
-                rms_norm(state.data(), l.post_norm.data(), norm.data(), rows, 12288, 1e-5f, stream);
-            });
-            project(l.gate, norm.data(), gate.data());
-            project(l.up, norm.data(), up.data());
+            timings.measure("elementwise_ms", stream,
+                            [&] { normed_input(state.data(), l.post_norm.data()); });
+            project(l.gate, gate.data());
+            project(l.up, up.data());
             timings.measure("elementwise_ms", stream, [&] {
                 silu_multiply(gate.data(), up.data(), mlp.data(), size_t(rows) * 14336, stream);
             });
@@ -485,10 +492,14 @@ struct Shard {
             sample_rows.upload(batch.sample_rows);
             timings.measure("elementwise_ms", stream, [&] {
                 select_rows(state.data(), sample_rows.data(), selected.data(), n, 12288, stream);
-                rms_norm(selected.data(), final_norm.data(), norm.data(), n, 12288, 1e-5f, stream);
+                auto [q8, scales] = ProjectionRunner::prepare_input(projection, n, 12288, stream);
+                rms_norm_quantized(selected.data(), final_norm.data(), q8, scales, n, 12288, 1e-5f,
+                                   stream);
             });
             timings.measure("lm_head_ms", stream, [&] {
-                runner->run(head, norm.data(), raw.data(), n, projection, stream);
+                ProjectionRunner::Call call;
+                call.output = raw.data();
+                runner->run(head, call, n, projection, stream);
             });
             timings.measure("collectives_ms", stream, [&] {
                 if (transport)
