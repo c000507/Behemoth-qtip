@@ -1,0 +1,215 @@
+=== KERNEL/CMDLINE ===
+6.17.0-35-generic
+BOOT_IMAGE=/vmlinuz-6.17.0-35-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro quiet splash iommu=pt vt.handoff=7
+=== BIOS ===
+1.1a
+08/09/2021
+X12DAi-N6
+X12DAi-N6
+=== ASPM POLICY ===
+[default] performance powersave powersupersave 
+=== LSPCI GPU0 TREE ===
+-+-[0000:00]-+-00.0
+ |           +-00.1
+ |           +-00.2
+ |           +-00.4
+ |           +-01.0
+ |           +-01.1
+ |           +-01.2
+ |           +-01.3
+ |           +-01.4
+ |           +-01.5
+ |           +-01.6
+ |           +-01.7
+ |           +-02.0
+ |           +-02.1
+ |           +-02.4
+ |           +-11.0
+ |           +-11.1
+ |           +-14.0
+ |           +-14.2
+ |           +-16.0
+ |           +-16.1
+ |           +-16.4
+ |           +-17.0
+ |           +-1c.0-[01]--
+ |           +-1c.5-[02-03]----00.0-[03]----00.0
+ |           +-1c.6-[04]----00.0
+ |           +-1c.7-[05]----00.0
+ |           +-1d.0-[06]--
+ |           +-1d.2-[07]----00.0
+ |           +-1f.0
+=== LSPCI -vvv 33 ===
+=== LSPCI -vvv cc ===
+=== ROOT PORT 30:02.0 ===
+	Capabilities: [40] Express (v2) Root Port (Slot+), MSI 00
+		DevSta:	CorrErr+ NonFatalErr+ FatalErr- UnsupReq- AuxPwr- TransPend-
+		LnkCap:	Port #5, Speed 16GT/s, Width x16, ASPM not supported
+			ClockPM- Surprise+ LLActRep+ BwNot+ ASPMOptComp+
+		LnkCtl:	ASPM Disabled; RCB 64 bytes, Disabled- CommClk+
+		LnkSta:	Speed 16GT/s, Width x16
+			TrErr- Train- SlotClk+ DLActive+ BWMgmt- ABWMgmt-
+			Slot #85, PowerLimit 75W; Interlock- NoCompl-
+		LnkCap2: Supported Link Speeds: 2.5-16GT/s, Crosslink- Retimer+ 2Retimers+ DRS-
+		LnkCtl2: Target Link Speed: 16GT/s, EnterCompliance- SpeedDis-
+		LnkSta2: Current De-emphasis Level: -3.5dB, EqualizationComplete+ EqualizationPhase1+
+	Capabilities: [200 v1] Secondary PCI Express
+		LnkCtl3: LnkEquIntrruptEn- PerformEqu-
+=== ROOT PORT c9:02.0 ===
+	Capabilities: [40] Express (v2) Root Port (Slot+), MSI 00
+		DevSta:	CorrErr+ NonFatalErr+ FatalErr- UnsupReq- AuxPwr- TransPend-
+		LnkCap:	Port #13, Speed 16GT/s, Width x16, ASPM not supported
+			ClockPM- Surprise+ LLActRep+ BwNot+ ASPMOptComp+
+		LnkCtl:	ASPM Disabled; RCB 64 bytes, Disabled- CommClk+
+		LnkSta:	Speed 16GT/s, Width x16
+			TrErr- Train- SlotClk+ DLActive+ BWMgmt- ABWMgmt-
+			Slot #114, PowerLimit 75W; Interlock- NoCompl-
+		LnkCap2: Supported Link Speeds: 2.5-16GT/s, Crosslink- Retimer+ 2Retimers+ DRS-
+		LnkCtl2: Target Link Speed: 16GT/s, EnterCompliance- SpeedDis-
+		LnkSta2: Current De-emphasis Level: -3.5dB, EqualizationComplete+ EqualizationPhase1+
+	Capabilities: [200 v1] Secondary PCI Express
+		LnkCtl3: LnkEquIntrruptEn- PerformEqu-
+=== SWITCH PORTS 32:/cb: ===
+=== AER ===
+32
+[    2.273981] acpi PNP0A08:00: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+[    2.275412] acpi PNP0A08:00: _OSC: platform does not support [SHPCHotplug AER LTR DPC]
+[    2.275681] acpi PNP0A08:00: _OSC: OS now controls [PCIeHotplug PME PCIeCapability]
+[    2.285101] acpi PNP0A08:01: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+[    2.286044] acpi PNP0A08:01: _OSC: platform does not support [SHPCHotplug AER DPC]
+[    2.286359] acpi PNP0A08:01: _OSC: OS now controls [PCIeHotplug PME PCIeCapability LTR]
+[    2.286934] acpi PNP0A08:02: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+[    2.288127] acpi PNP0A08:02: _OSC: platform does not support [SHPCHotplug AER DPC]
+[    2.288443] acpi PNP0A08:02: _OSC: OS now controls [PCIeHotplug PME PCIeCapability LTR]
+[    2.290736] acpi PNP0A08:04: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+=== RUNTIME PM ===
+0000:33:00.0 control=auto status=active
+0000:33:00.1 control=auto status=suspended
+0000:cc:00.0 control=auto status=active
+0000:cc:00.1 control=auto status=suspended
+0000:30:02.0 control=auto status=active
+0000:c9:02.0 control=auto status=active
+=== AMDGPU PARAMS ===
+aspm=-1
+async_gfx_ring=1
+dcdebugmask=0
+dcfeaturemask=2
+debug_evictions=N
+debug_mask=0
+deep_color=0
+disable_cu=(null)
+discovery=-1
+disp_priority=0
+enforce_isolation=-1
+force_asic_type=-1
+forcelongtraining=0
+freesync_video=0
+gpu_recovery=-1
+halt_if_hws_hang=0
+hws_gws_support=N
+hws_max_conc_proc=-1
+lockup_timeout=
+mcbp=-1
+mes=0
+mes_kiq=0
+mes_log_enable=0
+pcie_gen2=-1
+pcie_gen_cap=0
+pcie_lane_cap=0
+pcie_p2p=Y
+ppfeaturemask=0xfff7bfff
+queue_preemption_timeout_ms=9000
+runpm=-1
+sdma_phase_quantum=32
+sg_display=-1
+timeout_fatal_disable=N
+timeout_period=0
+uni_mes=1
+user_partt_mode=4294967294
+user_queue=-1
+virtual_display=(null)
+=== DKMS ===
+amdgpu/6.16.13-2341068.24.04, 6.17.0-35-generic, x86_64: installed (Original modules exist)
+nvidia/580.178.04, 6.17.0-35-generic, x86_64: installed
+filename:       /lib/modules/6.17.0-35-generic/updates/dkms/amdgpu.ko.zst
+version:        6.16.13
+vermagic:       6.17.0-35-generic SMP preempt mod_unload modversions 
+filename:       /lib/modules/6.17.0-35-generic/updates/dkms/amdkcl.ko.zst
+version:        1.0
+=== ROCM ===
+7.2.4
+=== FIRMWARE ===
+-- /sys/kernel/debug/dri/0000:03:00.0/
+-- /sys/kernel/debug/dri/0000:33:00.0/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/0000:cc:00.0/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/1/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/128/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/129/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/2/
+MC feature version: 0, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00684b00 (104.75.0)
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x0a000601
+MES_KIQ feature version: 1, firmware version: 0x00000084
+MES feature version: 1, firmware version: 0x00000084
+VBIOS version: 113-48WD6SHD1-P02
+-- /sys/kernel/debug/dri/3/
+-- /sys/kernel/debug/dri/client-15/
+-- /sys/kernel/debug/dri/client-2/
+-- /sys/kernel/debug/dri/client-29/
+-- /sys/kernel/debug/dri/client-3/
+-- /sys/kernel/debug/dri/client-30/
+-- /sys/kernel/debug/dri/client-4/
+-- /sys/kernel/debug/dri/client-5/
+=== IOMMU ===
+[    0.000000] Command line: BOOT_IMAGE=/vmlinuz-6.17.0-35-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro quiet splash iommu=pt vt.handoff=7
+[    0.014399] ACPI: DMAR 0x000000006A644000 0002B8 (v01 ALASKA SMCI--MB 00000001 INTL 20091013)
+[    0.014439] ACPI: Reserving DMAR table memory at [mem 0x6a644000-0x6a6442b7]
+[    0.663683] Kernel command line: BOOT_IMAGE=/vmlinuz-6.17.0-35-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro quiet splash iommu=pt vt.handoff=7
+[    1.618389] DMAR: Host address width 46
+[    1.618391] DMAR: DRHD base: 0x000000d0ffc000 flags: 0x0
+[    1.618403] DMAR: dmar0: reg_base_addr d0ffc000 ver 4:0 cap 8ed008c40780466 ecap 60000f050df
+[    1.618406] DMAR: DRHD base: 0x000000dbbfc000 flags: 0x0
+[    1.618414] DMAR: dmar1: reg_base_addr dbbfc000 ver 4:0 cap 8ed008c40780466 ecap 60000f050df
+[    1.618416] DMAR: DRHD base: 0x000000e67fc000 flags: 0x0
+=== MCE/EDAC ===
+Oct 25 15:37:09 charles-PowerEdge-T440 kernel: EDAC MC: Ver: 3.0.0
+Oct 25 15:37:10 charles-PowerEdge-T440 kernel: EDAC i10nm: No hbm memory
+Oct 25 15:37:10 charles-PowerEdge-T440 kernel: EDAC MC0: Giving out device to module i10nm_edac controller Intel_10nm Socket#0 IMC#0: DEV 0000:7e:0c.0 (INTERRUPT)
+Oct 25 15:37:10 charles-PowerEdge-T440 kernel: EDAC MC1: Giving out device to module i10nm_edac controller Intel_10nm Socket#0 IMC#1: DEV 0000:7e:0d.0 (INTERRUPT)
+Oct 25 15:37:10 charles-PowerEdge-T440 kernel: EDAC MC2: Giving out device to module i10nm_edac controller Intel_10nm Socket#0 IMC#2: DEV 0000:7e:0e.0 (INTERRUPT)
