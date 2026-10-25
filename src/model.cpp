@@ -346,13 +346,11 @@ struct Shard {
         head.dense.upload(weights);
         head.row_scale.upload(scales);
         reserve(options.token_budget);
-        size_t split_rows = (options.projection_mode == "split-k" ||
-                             options.projection_mode.starts_with("tiled-") ||
-                             options.projection_mode.starts_with("pipelined-") ||
-                             options.projection_mode.starts_with("sorted-") ||
-                             options.projection_mode.starts_with("lane-"))
-                                ? options.token_budget
-                                : std::min(options.token_budget, size_t(64));
+        // Split-K scratch: decode (rows <= 64) needs <= 64*14336*16*4 B ~ 59 MB
+        // and a 256-row prefill chunk needs ~205 MB; the launch path grows the
+        // buffer on demand, so one fat prefill pays a single transient realloc
+        // instead of a permanent reservation for the whole token budget.
+        size_t split_rows = std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);
     }
     ~Shard() {
@@ -382,7 +380,12 @@ struct Shard {
         projection.input_scale.resize(rows);
         projection.weight.resize(size_t(12288) * 14336);
         projection.blas.resize(64 * 1024 * 1024);
-        attention_workspace.resize(256 * 1024 * 1024);
+        // Decode split-K attention partials: partition-32 at c=4 fits contexts
+        // up to ~10k tokens in 32 MB; longer contexts (and prefill, which runs
+        // unpartitioned) need no workspace at all — the per-run candidate
+        // check in forward() falls back to the 1024-key partition or to a
+        // single partition. The old flat 256 MB bought nothing (item 1).
+        attention_workspace.resize(32 * 1024 * 1024);
         metadata.offsets.resize(rows + 1);
         metadata.positions.resize(rows);
         metadata.lengths.resize(rows);
