@@ -164,7 +164,122 @@ __device__ __forceinline__ uint64_t exact_fixed18(float v) {
     const uint32_t lo = (uint32_t(a) << 16) | b, hi = uint32_t(a >> 16);
     return (uint64_t(hi) << 32) | lo;
 }
-template <int G, int DB, int M, int W, int UNROLL, int KIND, int C = 1>
+// Software-pipelined variant: idx/planes of group i+2 are loaded while the
+// codebook gathers of group i+1 are in flight and group i does LDS work.
+template <int W, int UNROLL, int C>
+__global__ void __launch_bounds__(W * 32)
+sorted_gemv_pipe(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
+                 const uint32_t *__restrict__ planes, const uint16_t *__restrict__ seg_codes,
+                 const SortedTileDesc *__restrict__ tiles, const uint8_t *__restrict__ book,
+                 float *__restrict__ partial, int in, int out, int tile_count, int splits,
+                 int chunks_per_segment) {
+    constexpr int G = 2048, GB = 11, THREADS = W * 32, DB = 3, S = 16; // chunks per segment
+    (void)chunks_per_segment;
+    __shared__ uint64_t xs[G];
+    __shared__ uint64_t ys[W * 32 * C];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int tg = blockIdx.x / splits, split = blockIdx.x % splits, groups = in / 8;
+    const int tile = tg * W + wave;
+    for (int i = tid; i < G; i += THREADS)
+        xs[i] = i < groups ? reinterpret_cast<const uint64_t *>(x)[i] : 0;
+    for (int i = tid; i < W * 32 * C; i += THREADS)
+        ys[i] = 0;
+    __syncthreads();
+    if (tile < tile_count) {
+        const SortedTileDesc t = tiles[tile];
+        const uint32_t le = (2u << lane) - 1;
+        const uint32_t s0 = (t.segment_count * uint32_t(split)) / uint32_t(splits),
+                       s1 = (t.segment_count * uint32_t(split + 1)) / uint32_t(splits);
+        uint64_t *yi = ys + wave * (32 * C) + (lane & (C - 1)) * 32;
+        // Flatten the segment loop: chunk range of this split is contiguous.
+        const uint32_t cbeg = __builtin_amdgcn_readfirstlane(t.chunk_begin + s0 * S),
+                       cend = __builtin_amdgcn_readfirstlane(
+                           min(t.chunk_begin + t.chunk_count, t.chunk_begin + s1 * S));
+        const uint32_t cbase = __builtin_amdgcn_readfirstlane(t.chunk_begin),
+                       sbase = __builtin_amdgcn_readfirstlane(t.segment_begin);
+        if (cbeg < cend) {
+            // Stage A: raw loads for a group of UNROLL chunks (clamped to valid chunks).
+            struct Raw {
+                uint32_t e[UNROLL];
+                uint32_t pl[UNROLL][DB];
+            };
+            auto loadA = [&](uint32_t c0) {
+                Raw r;
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u) {
+                    const uint32_t cc = __builtin_amdgcn_readfirstlane(min(c0 + u, cend - 1));
+                    r.e[u] = idx[cc * 32 + lane];
+#pragma unroll
+                    for (int k = 0; k < DB; ++k)
+                        r.pl[u][k] = planes[cc * DB + k];
+                }
+                return r;
+            };
+            // Stage B: codes + codebook gathers. `running` is advanced here; the
+            // segment start code is reloaded whenever a chunk starts a segment.
+            struct Gathered {
+                uint32_t e[UNROLL];
+                uint2 w[UNROLL];
+            };
+            uint32_t running = 0;
+            auto stageB = [&](const Raw &r, uint32_t c0) {
+                Gathered g;
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u) {
+                    const uint32_t rel = __builtin_amdgcn_readfirstlane(c0 + u - cbase);
+                    if ((rel & (S - 1)) == 0)
+                        running = seg_codes[sbase + (rel >> 4)];
+                    uint32_t incl = 0, tot = 0;
+#pragma unroll
+                    for (int k = 0; k < DB; ++k) {
+                        incl += __builtin_popcount(r.pl[u][k] & le) << k;
+                        tot += __builtin_popcount(r.pl[u][k]) << k;
+                    }
+                    g.e[u] = r.e[u];
+                    g.w[u] = *reinterpret_cast<const uint2 *>(book + ((running + incl) << 3));
+                    running += tot;
+                }
+                return g;
+            };
+            auto stageC = [&](const Gathered &g, uint32_t c0) {
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u) {
+                    if (c0 + u >= cend)
+                        break;
+                    const int row = int(g.e[u] >> GB), grp = int(g.e[u] & (G - 1));
+                    const uint64_t xv = xs[grp];
+                    float v = __builtin_amdgcn_dot4_f32_fp8_fp8(g.w[u].x, uint32_t(xv), 0.f);
+                    v = __builtin_amdgcn_dot4_f32_fp8_fp8(g.w[u].y, uint32_t(xv >> 32), v);
+                    __hip_atomic_fetch_add(&yi[row], exact_fixed18(v), __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_WORKGROUP);
+                }
+            };
+            uint32_t c = cbeg;
+            Raw rA = loadA(c);
+            Raw rB = loadA(c + UNROLL);
+            Gathered gA = stageB(rA, c);
+            for (; c < cend; c += UNROLL) {
+                Raw rC = loadA(c + 2 * UNROLL);          // in flight: group i+2
+                Gathered gB = stageB(rB, c + UNROLL);    // in flight: gathers of group i+1
+                stageC(gA, c);                           // LDS work: group i
+                rB = rC;
+                gA = gB;
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+        int64_t acc = 0;
+        const uint64_t *base = ys + wave * (32 * C);
+#pragma unroll
+        for (int k = 0; k < C; ++k)
+            acc += int64_t(base[k * 32 + lane]);
+        const int r = tile * 32 + lane;
+        if (r < out)
+            partial[size_t(split) * size_t(out) + r] = float(double(acc) * (1.0 / 262144.0));
+    }
+}
+template <int G, int DB, int M, int W, int UNROLL, int KIND, int C = 1, bool DYN = false>
 __global__ void __launch_bounds__(W * 32)
 sorted_gemv(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
             const uint32_t *__restrict__ planes, const uint16_t *__restrict__ seg_codes,
@@ -173,13 +288,18 @@ sorted_gemv(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
             int chunks_per_segment) {
     constexpr int GB = 11, THREADS = W * 32;
     static_assert(G <= 2048 && (G & (G - 1)) == 0 && (C & (C - 1)) == 0 && C <= 32);
-    __shared__ uint64_t xs[G * M];
+    const int groups_arg = in / 8;
+    const uint64_t *xg = reinterpret_cast<const uint64_t *>(x); // KIND 5: x padded with a zero group
+    __shared__ uint64_t xs_static[DYN ? 1 : G * M];
+    extern __shared__ uint64_t xs_dyn[];
+    uint64_t *xs = DYN ? xs_dyn : xs_static;
+    const int xslots = DYN ? groups_arg + 1 : G;
     __shared__ float ysf[KIND == 0 ? W * 32 * M * 32 : 1];
-    __shared__ uint64_t ysi[KIND == 1 ? W * 32 * M * C : 1];
+    __shared__ uint64_t ysi[KIND >= 1 ? W * 32 * M * C : 1];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int tg = blockIdx.x / splits, split = blockIdx.x % splits, groups = in / 8;
     const int tile = tg * W + wave;
-    for (int i = tid; i < G * M; i += THREADS) {
+    for (int i = tid; i < xslots * M; i += THREADS) {
         const int g = i / M, m = i % M;
         xs[i] = g < groups ? reinterpret_cast<const uint64_t *>(x)[size_t(m) * groups + g] : 0;
     }
@@ -231,14 +351,20 @@ sorted_gemv(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
                 for (int u = 0; u < UNROLL; ++u) {
                     if (u >= n)
                         break;
-                    const int row = int(e[u] >> GB), grp = int(e[u] & (G - 1));
+                    const int row = int(e[u] >> GB);
+                    const int grp = DYN ? min(int(e[u] & (G - 1)), groups_arg) : int(e[u] & (G - 1));
 #pragma unroll
                     for (int m = 0; m < M; ++m) {
-                        const uint64_t xv = xs[grp * M + m];
+                        const uint64_t xv = KIND == 5 ? xg[min(grp, groups_arg)] : xs[grp * M + m];
                         float v = __builtin_amdgcn_dot4_f32_fp8_fp8(w[u].x, uint32_t(xv), 0.f);
                         v = __builtin_amdgcn_dot4_f32_fp8_fp8(w[u].y, uint32_t(xv >> 32), v);
                         if constexpr (KIND == 0) {
                             yw[(row * M + m) * 32 + lane] += v;
+                        } else if constexpr (KIND == 5) {
+                            __hip_atomic_fetch_add(&yi[row * M + m], exact_fixed18(v),
+                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+                        } else if constexpr (KIND == 3) {
+                            yi[(lane + m) & 31] = exact_fixed18(v) + uint64_t(row); // diagnostic: no atomics
                         } else {
                             __hip_atomic_fetch_add(&yi[row * M + m], exact_fixed18(v),
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
@@ -469,22 +595,40 @@ int main(int argc, char **argv) {
             float *partial, *y;
             CK(hipMalloc(&partial, size_t(64) * MMAX * s.out * 4));
             CK(hipMalloc(&y, size_t(MMAX) * s.out * 4));
-            auto run = [&]<int G, int DB, int M, int W, int UNROLL, int KIND, int C>(int splits) {
+            // x padded with one zero group (dummy slot for the x-from-L0 variant)
+            std::vector<uint8_t> hxpad(size_t(groups + 1) * 8, 0);
+            std::copy(hx.begin(), hx.begin() + s.in, hxpad.begin());
+            uint8_t *dxpad = upload(hxpad);
+            const int NCOPY = getenv("NCOPY") ? atoi(getenv("NCOPY")) : 1; // >1: defeat MALL reuse
+            auto run = [&]<int G, int DB, int M, int W, int UNROLL, int KIND, int C, bool DYN = false>(int splits) {
                 auto L = behemoth::sorted_layout(s.in, s.out, codes.data(), 32, G, DB, 64);
                 if (L.group_tiles != 1)
                     throw std::runtime_error("G must cover all groups");
-                auto *didx = upload(L.idx);
-                auto *dpl = upload(L.planes);
-                auto *dseg = upload(L.segment_codes);
-                auto *dt = upload(L.tiles);
+                std::vector<uint16_t *> didxs, dsegs;
+                std::vector<uint32_t *> dpls;
+                std::vector<SortedTileDesc *> dts;
+                for (int k = 0; k < NCOPY; ++k) {
+                    didxs.push_back(upload(L.idx));
+                    dpls.push_back(upload(L.planes));
+                    dsegs.push_back(upload(L.segment_codes));
+                    dts.push_back(upload(L.tiles));
+                }
+                auto *didx = didxs[0];
+                auto *dpl = dpls[0];
+                auto *dseg = dsegs[0];
+                auto *dt = dts[0];
                 const int tiles = int(L.tiles.size());
                 const int blocks = (tiles + W - 1) / W * splits;
+                int iter = 0;
                 auto launch = [&] {
-                    sorted_gemv<G, DB, M, W, UNROLL, KIND, C><<<blocks, W * 32>>>(
-                        dx, didx, dpl, dseg, dt, reinterpret_cast<const uint8_t *>(book), partial,
-                        s.in, s.out, tiles, splits, 64);
+                    const int k = (iter++) % NCOPY;
+                    sorted_gemv<G, DB, M, W, UNROLL, KIND, C, DYN><<<blocks, W * 32, DYN ? (s.in / 8 + 1) * 8 * M : 0>>>(
+                        KIND == 5 ? dxpad : dx, didxs[k], dpls[k], dsegs[k], dts[k],
+                        reinterpret_cast<const uint8_t *>(book), partial, s.in, s.out, tiles, splits, 64);
                 };
                 double ms = T.ms(launch);
+                iter = 0;
+                launch();
                 merge<<<(M * s.out + 255) / 256, 256>>>(partial, y, M * s.out, splits);
                 std::vector<float> hy(size_t(M) * s.out);
                 CK(hipMemcpy(hy.data(), y, hy.size() * 4, hipMemcpyDeviceToHost));
@@ -494,29 +638,79 @@ int main(int argc, char **argv) {
                     maxref = std::max(maxref, double(std::fabs(ref[i])));
                 }
                 const double bytes = double(L.bytes());
-                printf("  %s C=%d G=%4d DB=%d M=%d W=%d U=%d splits=%2d blocks=%5d dummies=%.2f%%: %7.4f ms  "
+                printf("  %s%s C=%d G=%4d DB=%d M=%d W=%2d U=%d splits=%2d blocks=%5d dummies=%.2f%%: %7.4f ms  "
                        "logical(2B) %6.1f GB/s  actual %6.1f GB/s  %.3f B/entry  %.3f ms/row "
                        "maxerr=%.3g/%.3g\n",
-                       KIND == 0 ? "fp32-lane" : "int64-atm", C, G, DB, M, W, UNROLL, splits, blocks,
+                       KIND == 0 ? "fp32-lane" : KIND == 3 ? "DIAG-noatomic" : KIND == 5 ? "int64-xL0" : "int64-atm", DYN ? "-dyn" : "", C, G, DB, M, W, UNROLL, splits, blocks,
                        100. * L.dummies / L.entries, ms, codes.size() * 2 / ms / 1e6,
                        bytes / ms / 1e6, bytes / codes.size(), ms / M, maxerr, maxref);
-                CK(hipFree(didx));
-                CK(hipFree(dpl));
-                CK(hipFree(dseg));
-                CK(hipFree(dt));
+                for (int k = 0; k < NCOPY; ++k) {
+                    CK(hipFree(didxs[k]));
+                    CK(hipFree(dpls[k]));
+                    CK(hipFree(dsegs[k]));
+                    CK(hipFree(dts[k]));
+                }
             };
-            run.template operator()<2048, 3, 1, 8, 4, 0, 1>(8);
-            run.template operator()<2048, 3, 1, 8, 4, 1, 1>(8);
+            auto run_pipe = [&]<int W, int UNROLL, int C>(int splits) {
+                auto L = behemoth::sorted_layout(s.in, s.out, codes.data(), 32, 2048, 3, 16);
+                std::vector<uint16_t *> didxs, dsegs;
+                std::vector<uint32_t *> dpls;
+                std::vector<SortedTileDesc *> dts;
+                for (int k = 0; k < NCOPY; ++k) {
+                    didxs.push_back(upload(L.idx));
+                    dpls.push_back(upload(L.planes));
+                    dsegs.push_back(upload(L.segment_codes));
+                    dts.push_back(upload(L.tiles));
+                }
+                auto *didx = didxs[0];
+                auto *dpl = dpls[0];
+                auto *dseg = dsegs[0];
+                auto *dt = dts[0];
+                const int tiles = int(L.tiles.size());
+                const int blocks = (tiles + W - 1) / W * splits;
+                int iter = 0;
+                auto launch = [&] {
+                    const int k = (iter++) % NCOPY;
+                    sorted_gemv_pipe<W, UNROLL, C><<<blocks, W * 32>>>(
+                        dx, didxs[k], dpls[k], dsegs[k], dts[k], reinterpret_cast<const uint8_t *>(book), partial,
+                        s.in, s.out, tiles, splits, 16);
+                };
+                double ms = T.ms(launch);
+                iter = 0;
+                launch();
+                merge<<<(s.out + 255) / 256, 256>>>(partial, y, s.out, splits);
+                std::vector<float> hy(size_t(s.out));
+                CK(hipMemcpy(hy.data(), y, hy.size() * 4, hipMemcpyDeviceToHost));
+                double maxerr = 0, maxref = 0;
+                for (size_t i = 0; i < hy.size(); ++i) {
+                    maxerr = std::max(maxerr, double(std::fabs(hy[i] - ref[i])));
+                    maxref = std::max(maxref, double(std::fabs(ref[i])));
+                }
+                const double bytes = double(L.bytes());
+                printf("  PIPE C=%d W=%2d U=%d splits=%2d blocks=%5d S=16: %7.4f ms  logical(2B) %6.1f GB/s  "
+                       "actual %6.1f GB/s  maxerr=%.3g/%.3g\n",
+                       C, W, UNROLL, splits, blocks, ms, codes.size() * 2 / ms / 1e6,
+                       bytes / ms / 1e6, maxerr, maxref);
+                for (int k = 0; k < NCOPY; ++k) {
+                    CK(hipFree(didxs[k]));
+                    CK(hipFree(dpls[k]));
+                    CK(hipFree(dsegs[k]));
+                    CK(hipFree(dts[k]));
+                }
+            };
             run.template operator()<2048, 3, 1, 8, 4, 1, 2>(8);
-            run.template operator()<2048, 3, 1, 8, 4, 1, 4>(8);
-            run.template operator()<2048, 3, 1, 8, 2, 1, 2>(8);
-            run.template operator()<2048, 3, 1, 8, 8, 1, 2>(8);
-            run.template operator()<2048, 3, 1, 8, 4, 1, 2>(4);
             run.template operator()<2048, 3, 1, 8, 4, 1, 2>(16);
-            run.template operator()<2048, 3, 1, 4, 4, 1, 2>(16);
-            run.template operator()<2048, 2, 1, 8, 4, 1, 2>(8);
-            run.template operator()<2048, 4, 1, 8, 4, 1, 2>(8);
-            run.template operator()<2048, 3, 2, 8, 4, 1, 2>(8);
+            run.template operator()<2048, 3, 1, 16, 4, 1, 2>(8);
+            run.template operator()<2048, 3, 1, 8, 4, 3, 2>(8);
+            run.template operator()<2048, 3, 1, 8, 4, 5, 2>(8);
+            run.template operator()<2048, 3, 1, 16, 4, 5, 2>(8);
+            run_pipe.template operator()<8, 4, 2>(8);
+            run_pipe.template operator()<8, 4, 2>(16);
+            run_pipe.template operator()<8, 2, 2>(16);
+            run_pipe.template operator()<16, 4, 2>(8);
+            run_pipe.template operator()<16, 4, 2>(16);
+            run_pipe.template operator()<16, 2, 2>(16);
+            CK(hipFree(dxpad));
             CK(hipFree(dx));
             CK(hipFree(partial));
             CK(hipFree(y));

@@ -371,9 +371,9 @@ __global__ void fused_projection(const uint8_t *x, const float *xs, const uint16
             int k = k0 + (group / 16) * 8, col = col0 + group % 16;
             uint64_t packed = 0;
             if (k < end && col < out) {
-                if (dense)
+                if (dense) // dense layout follows the group_major flag (see run())
                     packed = reinterpret_cast<const uint64_t *>(
-                        dense)[size_t(col) * size_t(in / 8) + size_t(k / 8)];
+                        dense)[code_index(k / 8, col, in / 8, out, group_major)];
                 else
                     packed = reinterpret_cast<const uint64_t *>(
                         book)[codes[code_index(k / 8, col, in / 8, out, group_major)]];
@@ -457,7 +457,7 @@ __global__ void tiled_projection(const uint8_t *x, const uint16_t *codes, const 
             if (col0 + col < out && base + k < end) {
                 if (dense)
                     value = reinterpret_cast<const uint64_t *>(
-                        dense)[size_t(col0 + col) * size_t(in / 8) + size_t((base + k) / 8)];
+                        dense)[code_index((base + k) / 8, col0 + col, in / 8, out, group_major)];
                 else
                     value = reinterpret_cast<const uint64_t *>(book)[codes[code_index(
                         (base + k) / 8, col0 + col, in / 8, out, group_major)]];
@@ -522,7 +522,7 @@ template <int ktile, bool aligned, int columns = 64, int row_tiles = 1> struct P
                 uint64_t value = 0;
                 if (col < out && k < end)
                     value = dense ? reinterpret_cast<const uint64_t *>(
-                                        dense)[size_t(col) * size_t(in / 8) + size_t(k / 8)]
+                                        dense)[code_index(k / 8, col, in / 8, out, group_major)]
                                   : reinterpret_cast<const uint64_t *>(book)[index[i]];
                 weight[i] = value;
             }
@@ -729,14 +729,15 @@ sorted_projection(const uint8_t *__restrict__ x, const uint16_t *__restrict__ id
                 float(double(acc) * (1.0 / 262144.0));
     }
 }
-// Streams the sorted layout once into a dense FP8 weight [out][in] (for the
-// dense pipelined/BLAS paths with many rows). grid = tile_count, 256 threads.
+// Streams the sorted layout once into a dense FP8 weight, row-major [out][in]
+// (BLAS) or group-major [in/8][out] x 8 (coalesced for the pipelined dense
+// kernels). grid = tile_count, 256 threads.
 __global__ void sorted_reconstruct(const uint16_t *__restrict__ idx,
                                    const uint32_t *__restrict__ planes,
                                    const uint16_t *__restrict__ seg_codes,
                                    const SortedTileDesc *__restrict__ tiles,
                                    const uint8_t *__restrict__ book, uint8_t *__restrict__ weight,
-                                   int in, int out, int chunks_per_segment) {
+                                   int in, int out, int chunks_per_segment, bool group_major) {
     constexpr int G = sorted_groups_per_tile, GB = sorted_group_bits, DB = 3, W = 8;
     const int lane = int(threadIdx.x) & 31, wave = int(threadIdx.x) >> 5, groups = in / 8;
     const int tile = int(blockIdx.x);
@@ -759,7 +760,7 @@ __global__ void sorted_reconstruct(const uint16_t *__restrict__ idx,
             running += tot;
             const int r = tile * 32 + int(e >> GB), grp = int(e & (G - 1));
             if (grp < groups && r < out)
-                reinterpret_cast<uint64_t *>(weight)[size_t(r) * size_t(groups) + size_t(grp)] =
+                reinterpret_cast<uint64_t *>(weight)[code_index(grp, r, groups, out, group_major)] =
                     reinterpret_cast<const uint64_t *>(book)[code];
         }
     }
@@ -932,28 +933,36 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
     // Dense FP8 weights for the BLAS / sorted-dense paths: stored dense, or
     // reconstructed from the group-major codes (random gather) or the sorted
     // layout (streaming) into the shared scratch.
-    auto dense_weight = [&]() -> const uint8_t * {
+    // `dense_gm` selects the scratch layout: row-major [out][in] for hipBLASLt,
+    // group-major for the pipelined dense kernels (coalesced column loads).
+    auto dense_weight = [&](bool dense_gm) -> const uint8_t * {
         if (p.dense.size())
             return p.dense.data();
         w.weight.resize(size_t(p.out) * size_t(p.in));
-        if (has_codes)
+        if (has_codes && !dense_gm)
             reconstruct_kernel<<<unsigned(ceil_div(w.weight.size(), 256)), 256, 0, stream>>>(
                 p.codes.data(), p.codebook.data(), w.weight.data(), p.in, p.out, group_major);
-        else
+        else if (p.has_sorted())
             sorted_reconstruct<<<unsigned(p.sorted_tile_count), 256, 0, stream>>>(
                 p.sorted_idx.data(), p.sorted_planes.data(), p.sorted_segment_codes.data(),
                 p.sorted_tiles.data(), p.codebook.data(), w.weight.data(), p.in, p.out,
-                p.sorted_chunks_per_segment);
+                p.sorted_chunks_per_segment, dense_gm);
+        else
+            throw ProjectionUnavailable("No source for a dense weight");
         HIP_CHECK(hipGetLastError());
         return w.weight.data();
     };
     auto launch = [&](ProjectionMode mode) {
         const uint8_t *dense = p.dense.data();
+        bool kernel_gm = group_major; // code layout, or the dense scratch layout when dense
+        if (dense)
+            kernel_gm = false; // stored dense weights (lm_head) are row-major
         if (projection_mode_is_sorted(mode)) {
             if (!p.has_sorted())
                 throw ProjectionUnavailable("Projection has no codebook-major (sorted) layout");
             if (mode == ProjectionMode::SortedDense) {
-                dense = dense_weight();
+                dense = dense_weight(true);
+                kernel_gm = true;
                 mode = rows <= 16   ? ProjectionMode::Pipelined64
                        : rows <= 32 ? ProjectionMode::PipelinedR2K64
                                     : ProjectionMode::PipelinedR4K64;
@@ -987,7 +996,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             fused_projection<false><<<grid, device::wave_size, 0, stream>>>(
                 w.input.data(), w.input_scale.data(), p.codes.data(), p.codebook.data(),
                 dense, p.row_scale.data(), p.codebook_scale, output, rows, p.in, p.out,
-                apply_rows, 1, group_major);
+                apply_rows, 1, kernel_gm);
             HIP_CHECK(hipGetLastError());
         } else if (mode == ProjectionMode::SplitK) {
             int parts = int(ceil_div(size_t(p.in), split_width));
@@ -996,7 +1005,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             fused_projection<true><<<grid, device::wave_size, 0, stream>>>(
                 w.input.data(), w.input_scale.data(), p.codes.data(), p.codebook.data(),
                 dense, p.row_scale.data(), p.codebook_scale, w.partial.data(), rows, p.in,
-                p.out, apply_rows, parts, group_major);
+                p.out, apply_rows, parts, kernel_gm);
             HIP_CHECK(hipGetLastError());
             merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
                                stream>>>(w.partial.data(), w.input_scale.data(), p.row_scale.data(),
@@ -1016,31 +1025,31 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             if (mode == ProjectionMode::Tiled64)
                 tiled_projection<64><<<grid, 128, 0, stream>>>(
                     w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                    w.partial.data(), rows, p.in, p.out, parts, group_major);
+                    w.partial.data(), rows, p.in, p.out, parts, kernel_gm);
             else if (mode == ProjectionMode::Tiled128)
                 tiled_projection<128><<<grid, 128, 0, stream>>>(
                     w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                    w.partial.data(), rows, p.in, p.out, parts, group_major);
+                    w.partial.data(), rows, p.in, p.out, parts, kernel_gm);
             else if (mode == ProjectionMode::TiledLds64)
                 tiled_projection<64, true><<<grid, 128, 0, stream>>>(
                     w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                    w.partial.data(), rows, p.in, p.out, parts, group_major);
+                    w.partial.data(), rows, p.in, p.out, parts, kernel_gm);
             else if (mode == ProjectionMode::TiledLds128)
                 tiled_projection<128, true><<<grid, 128, 0, stream>>>(
                     w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                    w.partial.data(), rows, p.in, p.out, parts, group_major);
+                    w.partial.data(), rows, p.in, p.out, parts, kernel_gm);
             else {
                 dispatch_pipeline(mode, [&]<int k, int n, int split, int rt = 1>() {
-                    const bool aligned = !dense && group_major && p.out % n == 0 &&
+                    const bool aligned = !dense && kernel_gm && p.out % n == 0 &&
                                          p.in % k == 0 && p.codes.size() <= UINT32_MAX;
                     if (aligned)
                         pipelined_projection<k, true, n, split, rt><<<grid, n * 2, 0, stream>>>(
                             w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                            w.partial.data(), rows, p.in, p.out, group_major);
+                            w.partial.data(), rows, p.in, p.out, kernel_gm);
                     else
                         pipelined_projection<k, false, n, split, rt><<<grid, n * 2, 0, stream>>>(
                             w.input.data(), p.codes.data(), p.codebook.data(), dense,
-                            w.partial.data(), rows, p.in, p.out, group_major);
+                            w.partial.data(), rows, p.in, p.out, kernel_gm);
                 });
             }
             HIP_CHECK(hipGetLastError());
@@ -1052,7 +1061,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             ensure_blas(state, plan, p.in, p.out, rows);
             if (!plan.has_blas)
                 throw ProjectionUnavailable("No native FP8 hipBLASLt algorithm for this shape");
-            const uint8_t *weight = dense_weight();
+            const uint8_t *weight = dense_weight(false);
             w.blas.resize(plan.algorithm.workspaceSize);
             auto &d = *plan.descriptors;
             float one = 1, zero = 0;

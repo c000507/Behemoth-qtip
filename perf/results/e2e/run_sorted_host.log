@@ -1,0 +1,4 @@
+=== sorted_host (/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm/behemoth_server --transport host)
+{"healthy":true}sorted_host concurrency 1 load_bench tok/s=10.03 p50 latency=9.6s server inter_token p50=82.5 ms p95=87.1 ms ttft p50=1641 ms
+sorted_host concurrency 8 load_bench tok/s=10.16 p50 latency=36.5s server inter_token p50=337.6 ms p95=344.4 ms ttft p50=4049 ms
+DONE
