@@ -1,0 +1,526 @@
+# GPU fault during perf/e2e.sh CONFIGS=batched_zerocopy c=1 warmup, 2026-10-25 (uptime 0 = 12:28:53 AEST)
+# server Listening 15:11:27 (uptime ~9755 s); first request hung immediately; load_bench timeout 15:21:29; kill -> MES failure + lost from bus at 10388 s
+[ 9758.154634] snd_hda_intel 0000:33:00.1: Unable to change power state from D3hot to D0, device inaccessible
+[ 9758.216286] snd_hda_intel 0000:cc:00.1: Unable to change power state from D3hot to D0, device inaccessible
+[ 9758.381267] snd_hda_intel 0000:cc:00.1: CORB reset timeout#2, CORBRP = 65535
+[ 9758.391446] snd_hda_intel 0000:33:00.1: CORB reset timeout#2, CORBRP = 65535
+[ 9758.610559] workqueue: pm_runtime_work hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+[10388.219349] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10388.219610] amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1216
+[10388.219817] amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10388.219985] amdgpu 0000:33:00.0: amdgpu: Failed to evict queue 9
+[10388.220039] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+[10388.220150] amdgpu 0000:33:00.0: amdgpu: Failed to evict process queues
+[10388.220157] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10388.220525] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10390.388757] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10390.388922] amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1216
+[10390.389084] amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10390.389249] amdgpu 0000:cc:00.0: amdgpu: Failed to evict queue 8
+[10390.389306] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+[10390.389423] amdgpu 0000:cc:00.0: amdgpu: Failed to evict process queues
+[10390.389430] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10390.389596] amdgpu: Failed to quiesce KFD
+[10390.389781] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10392.555168] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10392.555342] amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1004
+[10392.555503] amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10392.555667] amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 6
+[10392.555723] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+[10392.555836] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10392.556014] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10394.722650] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10394.722876] amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1202
+[10394.723114] amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10394.723306] amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 5
+[10394.723393] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+[10394.723488] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10394.723751] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10396.893610] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10396.893816] amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+[10396.894001] amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10396.894175] amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 1
+[10396.894261] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+[10396.894364] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10396.894643] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10399.061023] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10399.061205] amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1000
+[10399.061398] amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10399.061567] amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 0
+[10399.061589] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+[10399.061733] amdgpu: Resetting wave fronts (cpsch) on dev 000000004303c120
+[10399.061736] amdgpu 0000:33:00.0: amdgpu: no vmid pasid mapping supported
+[10399.061740] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10399.061969] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10399.062144] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10399.062383] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:8 param:0x00000400 message:EnableSmuFeaturesLow?
+[10399.062562] amdgpu 0000:33:00.0: amdgpu: Failed to enable GFXCLK DS!
+[10399.062726] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10399.062883] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:36 param:0x00000000 message:SetWorkloadMask?
+[10399.063047] amdgpu 0000:33:00.0: amdgpu: Failed to set workload mask 0x00000000
+[10401.229280] amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=MISC (SET_SHADER_DEBUGGER)
+[10401.229447] amdgpu 0000:33:00.0: amdgpu: failed to set_shader_debugger
+[10401.229629] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10401.229836] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10401.230039] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10403.399245] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10403.399406] amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1004
+[10403.399566] amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10403.399727] amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 7
+[10403.399815] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+[10403.399891] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10403.400136] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10405.565377] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10405.565548] amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1202
+[10405.565711] amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10405.565882] amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 4
+[10405.565970] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+[10405.566051] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10405.566324] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10407.731597] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10407.731769] amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+[10407.731929] amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10407.732095] amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 3
+[10407.732183] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+[10407.732262] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10407.732515] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10409.901345] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+[10409.901517] amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1000
+[10409.901679] amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[10409.901838] amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 2
+[10409.901927] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+[10409.901996] amdgpu: Resetting wave fronts (cpsch) on dev 0000000066c18a0f
+[10409.901999] amdgpu 0000:cc:00.0: amdgpu: no vmid pasid mapping supported
+[10409.902002] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10409.902196] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10409.902438] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10409.902957] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:8 param:0x00000400 message:EnableSmuFeaturesLow?
+[10409.903423] amdgpu 0000:cc:00.0: amdgpu: Failed to enable GFXCLK DS!
+[10409.903917] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10409.904101] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:36 param:0x00000000 message:SetWorkloadMask?
+[10409.904268] amdgpu 0000:cc:00.0: amdgpu: Failed to set workload mask 0x00000000
+[10412.070132] amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=MISC (SET_SHADER_DEBUGGER)
+[10412.070302] amdgpu 0000:cc:00.0: amdgpu: failed to set_shader_debugger
+[10412.070599] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10412.070806] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10412.071018] amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+[10414.240028] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10414.240197] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10416.406457] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10416.406632] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10418.576426] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10418.576602] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10420.742323] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10420.742498] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10422.908271] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10422.908446] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10425.077887] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10425.078057] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10427.244382] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10427.244555] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10429.414875] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10429.415042] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10431.580771] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10431.580941] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10433.746630] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10433.746817] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10435.915992] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10435.916160] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10438.083220] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10438.083391] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10440.253831] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10440.254000] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10442.420240] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10442.420420] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10444.586762] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10444.586934] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10446.757275] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10446.757445] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10448.927585] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10448.927755] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10451.097224] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10451.097396] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10453.263212] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10453.263388] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10455.429130] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10455.429303] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10457.534439] amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+[10457.534822] amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+[10457.534867] amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10457.534868] amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[10457.534870] amdgpu 0000:33:00.0: amdgpu: ring sdma0 timeout, signaled seq=22914, emitted seq=22918
+[10457.535123] amdgpu 0000:33:00.0: amdgpu: Starting sdma0 ring reset
+[10457.638395] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10457.638587] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10457.638758] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10457.656161] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10457.656398] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10457.802705] amdgpu 0000:33:00.0: amdgpu: reset sdma queue (0:0:0)
+[10457.948875] amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+[10457.949111] amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+[10457.949289] amdgpu 0000:33:00.0: amdgpu: Ring sdma0 reset failed
+[10457.949469] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+[10457.949472] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10457.949636] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10457.949637] amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+[10459.966411] amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+[10459.966793] amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+[10459.966800] amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10459.966801] amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[10459.966802] amdgpu 0000:33:00.0: amdgpu: ring sdma0 timeout, signaled seq=22914, emitted seq=22918
+[10459.966970] amdgpu 0000:33:00.0: amdgpu: Starting sdma0 ring reset
+[10460.114240] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10460.114469] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10460.115068] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10460.115229] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10460.115410] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10460.260712] amdgpu 0000:33:00.0: amdgpu: reset sdma queue (0:0:0)
+[10460.406837] amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+[10460.407065] amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+[10460.407242] amdgpu 0000:33:00.0: amdgpu: Ring sdma0 reset failed
+[10460.407413] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+[10460.407416] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10460.407577] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10460.407579] amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+[10462.572200] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10462.572421] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10464.746299] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10464.746464] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10466.920317] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10466.920503] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[10469.116621] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10471.312794] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10473.505638] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10475.711240] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10477.905957] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10479.934113] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+[10479.934555] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+[10479.934602] amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10479.934604] amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+[10479.934606] amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=14383, emitted seq=14387
+[10479.934860] amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+[10480.040031] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10480.040199] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10480.040363] amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+[10480.079921] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10480.080136] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10480.232293] amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+[10480.384471] amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+[10480.384697] amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+[10480.384855] amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+[10480.385004] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+[10480.385007] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10480.385169] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10480.385171] amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+[10482.430074] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+[10482.430510] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+[10482.430514] amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10482.430515] amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+[10482.430516] amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=14383, emitted seq=14387
+[10482.430665] amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+[10482.534992] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10482.535132] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10482.535271] amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+[10482.549852] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10482.550060] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10482.702219] amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+[10482.854371] amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+[10482.854596] amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+[10482.854750] amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+[10482.854895] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+[10482.854898] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[10482.855049] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[10482.855051] amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+[10485.019670] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10485.019871] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10487.193490] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10487.193638] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10489.367738] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[10489.367886] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[10491.563956] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10493.756499] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10495.947363] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10498.150917] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10500.341659] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10502.537903] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10504.733897] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[10506.929995] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10509.120435] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[10509.237627] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10509.237849] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10509.238028] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10511.165652] amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+[10511.166124] amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+[10511.166139] amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10511.166140] amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[10511.166142] amdgpu 0000:33:00.0: amdgpu: ring sdma1 timeout, signaled seq=910, emitted seq=912
+[10511.166348] amdgpu 0000:33:00.0: amdgpu: Starting sdma1 ring reset
+[10511.316425] amdgpu 0000:33:00.0: amdgpu: reset sdma queue (1:0:0)
+[10511.462623] amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+[10511.462761] amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+[10511.462895] amdgpu 0000:33:00.0: amdgpu: Ring sdma1 reset failed
+[10511.463028] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+[10511.463031] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10511.463160] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10511.463162] amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+[10511.471618] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10511.471746] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10511.471876] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10513.469563] amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+[10513.470031] amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+[10513.470038] amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[10513.470039] amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[10513.470041] amdgpu 0000:33:00.0: amdgpu: ring sdma1 timeout, signaled seq=910, emitted seq=912
+[10513.470216] amdgpu 0000:33:00.0: amdgpu: Starting sdma1 ring reset
+[10513.619873] amdgpu 0000:33:00.0: amdgpu: reset sdma queue (1:0:0)
+[10513.766307] amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+[10513.766442] amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+[10513.766580] amdgpu 0000:33:00.0: amdgpu: Ring sdma1 reset failed
+[10513.766709] amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+[10513.766711] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10513.766836] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[10513.766838] amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+[10513.766973] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[10513.767099] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[10513.767226] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[10692.987045] INFO: task kworker/u261:0:13294 blocked for more than 122 seconds.
+[10692.987400]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.987684] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.987904] task:kworker/u261:0  state:D stack:0     pid:13294 tgid:13294 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.987911] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.987936] Call Trace:
+[10692.987939]  <TASK>
+[10692.987943]  __schedule+0x30d/0x7a0
+[10692.987951]  schedule+0x27/0x90
+[10692.987954]  schedule_timeout+0x104/0x110
+[10692.987959]  dma_fence_default_wait+0x1f0/0x250
+[10692.987965]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.987969]  dma_fence_wait_timeout+0x13a/0x170
+[10692.987973]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.987980]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.987987]  process_one_work+0x191/0x3e0
+[10692.987993]  worker_thread+0x2e3/0x420
+[10692.987996]  ? __pfx_worker_thread+0x10/0x10
+[10692.987998]  kthread+0x10d/0x230
+[10692.988003]  ? __pfx_kthread+0x10/0x10
+[10692.988005]  ret_from_fork+0x121/0x140
+[10692.988012]  ? __pfx_kthread+0x10/0x10
+[10692.988014]  ret_from_fork_asm+0x1a/0x30
+[10692.988022]  </TASK>
+[10692.988026] INFO: task kworker/u261:6:15924 blocked for more than 122 seconds.
+[10692.988225]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.988410] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.988593] task:kworker/u261:6  state:D stack:0     pid:15924 tgid:15924 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.988598] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.988610] Call Trace:
+[10692.988611]  <TASK>
+[10692.988613]  __schedule+0x30d/0x7a0
+[10692.988617]  schedule+0x27/0x90
+[10692.988620]  schedule_timeout+0x104/0x110
+[10692.988622]  dma_fence_default_wait+0x1f0/0x250
+[10692.988626]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.988629]  dma_fence_wait_timeout+0x13a/0x170
+[10692.988631]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.988636]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.988641]  process_one_work+0x191/0x3e0
+[10692.988646]  worker_thread+0x2e3/0x420
+[10692.988649]  ? __pfx_worker_thread+0x10/0x10
+[10692.988651]  kthread+0x10d/0x230
+[10692.988654]  ? __pfx_kthread+0x10/0x10
+[10692.988656]  ret_from_fork+0x121/0x140
+[10692.988660]  ? __pfx_kthread+0x10/0x10
+[10692.988662]  ret_from_fork_asm+0x1a/0x30
+[10692.988666]  </TASK>
+[10692.988682] INFO: task kworker/u260:1:27013 blocked for more than 122 seconds.
+[10692.988883]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.989079] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.989268] task:kworker/u260:1  state:D stack:0     pid:27013 tgid:27013 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.989273] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.989283] Call Trace:
+[10692.989284]  <TASK>
+[10692.989288]  __schedule+0x30d/0x7a0
+[10692.989293]  schedule+0x27/0x90
+[10692.989295]  schedule_timeout+0x104/0x110
+[10692.989299]  dma_fence_default_wait+0x1f0/0x250
+[10692.989302]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.989306]  dma_fence_wait_timeout+0x13a/0x170
+[10692.989308]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.989312]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.989318]  process_one_work+0x191/0x3e0
+[10692.989322]  worker_thread+0x2e3/0x420
+[10692.989326]  ? __pfx_worker_thread+0x10/0x10
+[10692.989329]  kthread+0x10d/0x230
+[10692.989331]  ? __pfx_kthread+0x10/0x10
+[10692.989334]  ret_from_fork+0x121/0x140
+[10692.989336]  ? __pfx_kthread+0x10/0x10
+[10692.989339]  ret_from_fork_asm+0x1a/0x30
+[10692.989343]  </TASK>
+[10692.989350] INFO: task kworker/u260:7:29837 blocked for more than 122 seconds.
+[10692.989543]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.989730] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.989925] task:kworker/u260:7  state:D stack:0     pid:29837 tgid:29837 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.989930] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.989938] Call Trace:
+[10692.989940]  <TASK>
+[10692.989942]  __schedule+0x30d/0x7a0
+[10692.989946]  schedule+0x27/0x90
+[10692.989948]  schedule_timeout+0x104/0x110
+[10692.989951]  dma_fence_default_wait+0x1f0/0x250
+[10692.989955]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.989957]  dma_fence_wait_timeout+0x13a/0x170
+[10692.989959]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.989963]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.989969]  process_one_work+0x191/0x3e0
+[10692.989973]  worker_thread+0x2e3/0x420
+[10692.989976]  ? __pfx_worker_thread+0x10/0x10
+[10692.989979]  kthread+0x10d/0x230
+[10692.989981]  ? __pfx_kthread+0x10/0x10
+[10692.989984]  ret_from_fork+0x121/0x140
+[10692.989986]  ? __pfx_kthread+0x10/0x10
+[10692.989988]  ret_from_fork_asm+0x1a/0x30
+[10692.989993]  </TASK>
+[10692.990005] INFO: task kworker/u260:0:32334 blocked for more than 122 seconds.
+[10692.990193]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.990374] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.990554] task:kworker/u260:0  state:D stack:0     pid:32334 tgid:32334 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.990558] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.990566] Call Trace:
+[10692.990568]  <TASK>
+[10692.990569]  __schedule+0x30d/0x7a0
+[10692.990573]  schedule+0x27/0x90
+[10692.990575]  schedule_timeout+0x104/0x110
+[10692.990578]  dma_fence_default_wait+0x1f0/0x250
+[10692.990582]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.990584]  dma_fence_wait_timeout+0x13a/0x170
+[10692.990586]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.990590]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.990595]  process_one_work+0x191/0x3e0
+[10692.990599]  worker_thread+0x2e3/0x420
+[10692.990602]  ? __pfx_worker_thread+0x10/0x10
+[10692.990604]  kthread+0x10d/0x230
+[10692.990607]  ? __pfx_kthread+0x10/0x10
+[10692.990609]  ret_from_fork+0x121/0x140
+[10692.990612]  ? __pfx_kthread+0x10/0x10
+[10692.990614]  ret_from_fork_asm+0x1a/0x30
+[10692.990617]  </TASK>
+[10692.990619] INFO: task kworker/u260:2:32336 blocked for more than 122 seconds.
+[10692.990813]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.991011] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.991208] task:kworker/u260:2  state:D stack:0     pid:32336 tgid:32336 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.991213] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.991221] Call Trace:
+[10692.991222]  <TASK>
+[10692.991224]  __schedule+0x30d/0x7a0
+[10692.991228]  schedule+0x27/0x90
+[10692.991230]  schedule_timeout+0x104/0x110
+[10692.991233]  dma_fence_default_wait+0x1f0/0x250
+[10692.991237]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.991240]  dma_fence_wait_timeout+0x13a/0x170
+[10692.991242]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.991246]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.991251]  process_one_work+0x191/0x3e0
+[10692.991255]  worker_thread+0x2e3/0x420
+[10692.991258]  ? __pfx_worker_thread+0x10/0x10
+[10692.991260]  kthread+0x10d/0x230
+[10692.991263]  ? __pfx_kthread+0x10/0x10
+[10692.991265]  ret_from_fork+0x121/0x140
+[10692.991267]  ? __pfx_kthread+0x10/0x10
+[10692.991269]  ret_from_fork_asm+0x1a/0x30
+[10692.991273]  </TASK>
+[10692.991274] INFO: task kworker/u260:3:32337 blocked for more than 122 seconds.
+[10692.991490]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.991700] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.991924] task:kworker/u260:3  state:D stack:0     pid:32337 tgid:32337 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.991928] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.991936] Call Trace:
+[10692.991937]  <TASK>
+[10692.991939]  __schedule+0x30d/0x7a0
+[10692.991943]  schedule+0x27/0x90
+[10692.991945]  schedule_timeout+0x104/0x110
+[10692.991948]  dma_fence_default_wait+0x1f0/0x250
+[10692.991952]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.991954]  dma_fence_wait_timeout+0x13a/0x170
+[10692.991956]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.991960]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.991965]  process_one_work+0x191/0x3e0
+[10692.991969]  worker_thread+0x2e3/0x420
+[10692.991972]  ? __pfx_worker_thread+0x10/0x10
+[10692.991975]  kthread+0x10d/0x230
+[10692.991978]  ? __pfx_kthread+0x10/0x10
+[10692.991980]  ret_from_fork+0x121/0x140
+[10692.991983]  ? __pfx_kthread+0x10/0x10
+[10692.991985]  ret_from_fork_asm+0x1a/0x30
+[10692.991989]  </TASK>
+[10692.991991] INFO: task kworker/u260:4:32338 blocked for more than 122 seconds.
+[10692.992221]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.992442] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.992661] task:kworker/u260:4  state:D stack:0     pid:32338 tgid:32338 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.992667] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.992674] Call Trace:
+[10692.992676]  <TASK>
+[10692.992677]  __schedule+0x30d/0x7a0
+[10692.992681]  schedule+0x27/0x90
+[10692.992683]  schedule_timeout+0x104/0x110
+[10692.992686]  dma_fence_default_wait+0x1f0/0x250
+[10692.992690]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.992693]  dma_fence_wait_timeout+0x13a/0x170
+[10692.992694]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.992698]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.992703]  process_one_work+0x191/0x3e0
+[10692.992707]  worker_thread+0x2e3/0x420
+[10692.992710]  ? __pfx_worker_thread+0x10/0x10
+[10692.992712]  kthread+0x10d/0x230
+[10692.992715]  ? __pfx_kthread+0x10/0x10
+[10692.992717]  ret_from_fork+0x121/0x140
+[10692.992720]  ? __pfx_kthread+0x10/0x10
+[10692.992722]  ret_from_fork_asm+0x1a/0x30
+[10692.992725]  </TASK>
+[10692.992727] INFO: task kworker/u260:5:32339 blocked for more than 122 seconds.
+[10692.992963]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.993191] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.993415] task:kworker/u260:5  state:D stack:0     pid:32339 tgid:32339 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.993419] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.993427] Call Trace:
+[10692.993428]  <TASK>
+[10692.993429]  __schedule+0x30d/0x7a0
+[10692.993433]  schedule+0x27/0x90
+[10692.993436]  schedule_timeout+0x104/0x110
+[10692.993438]  dma_fence_default_wait+0x1f0/0x250
+[10692.993442]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.993445]  dma_fence_wait_timeout+0x13a/0x170
+[10692.993447]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.993450]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.993455]  process_one_work+0x191/0x3e0
+[10692.993459]  worker_thread+0x2e3/0x420
+[10692.993462]  ? __pfx_worker_thread+0x10/0x10
+[10692.993464]  kthread+0x10d/0x230
+[10692.993466]  ? __pfx_kthread+0x10/0x10
+[10692.993469]  ret_from_fork+0x121/0x140
+[10692.993471]  ? __pfx_kthread+0x10/0x10
+[10692.993473]  ret_from_fork_asm+0x1a/0x30
+[10692.993477]  </TASK>
+[10692.993480] INFO: task kworker/u260:6:32368 blocked for more than 122 seconds.
+[10692.993704]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[10692.993942] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[10692.994174] task:kworker/u260:6  state:D stack:0     pid:32368 tgid:32368 ppid:2      task_flags:0x4208060 flags:0x00004000
+[10692.994177] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[10692.994185] Call Trace:
+[10692.994187]  <TASK>
+[10692.994188]  __schedule+0x30d/0x7a0
+[10692.994193]  schedule+0x27/0x90
+[10692.994195]  schedule_timeout+0x104/0x110
+[10692.994198]  dma_fence_default_wait+0x1f0/0x250
+[10692.994201]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[10692.994204]  dma_fence_wait_timeout+0x13a/0x170
+[10692.994206]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[10692.994210]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[10692.994215]  process_one_work+0x191/0x3e0
+[10692.994219]  worker_thread+0x2e3/0x420
+[10692.994222]  ? __pfx_worker_thread+0x10/0x10
+[10692.994225]  kthread+0x10d/0x230
+[10692.994227]  ? __pfx_kthread+0x10/0x10
+[10692.994229]  ret_from_fork+0x121/0x140
+[10692.994233]  ? __pfx_kthread+0x10/0x10
+[10692.994235]  ret_from_fork_asm+0x1a/0x30
+[10692.994239]  </TASK>
+[10692.994240] Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings
