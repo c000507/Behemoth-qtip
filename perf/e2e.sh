@@ -4,7 +4,7 @@
 set -u
 ROOT=/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime
 MODEL=/mnt/nvme/models/Behemoth-R1-123B-v2-aqlm-output
-OUT=$ROOT/perf/results/e2e
+OUT=${OUT:-$ROOT/perf/results/e2e}
 mkdir -p $OUT
 PROMPT=$OUT/prompt.txt
 echo "Write a short, vivid paragraph about a lighthouse keeper who discovers that the fog has started to whisper names. Keep it under 150 words." > $PROMPT
@@ -49,6 +49,9 @@ for cfg in $CONFIGS; do
     proto_zerocopy) run_config proto_zerocopy $ROOT/build-rocm/behemoth_server zerocopy ;;
     sorted_host) run_config sorted_host $ROOT/build-rocm/behemoth_server host sorted ;;
     sorted_zerocopy) run_config sorted_zerocopy $ROOT/build-rocm/behemoth_server zerocopy sorted ;;
+    # 16-row-tile layout with the sorted-lds batched kernel (BATCHED_SORTED_REPORT.md)
+    batched_host) run_config batched_host $ROOT/build-rocm/behemoth_server host sorted ;;
+    batched_zerocopy) run_config batched_zerocopy $ROOT/build-rocm/behemoth_server zerocopy sorted ;;
   esac
 done
 echo DONE

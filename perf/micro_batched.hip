@@ -368,6 +368,7 @@ sorted_lds_gemm2(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx
     uint16_t *ct = reinterpret_cast<uint16_t *>(lds);
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, waves = blockDim.x >> 5;
     const int tile = blockIdx.x, row0 = blockIdx.y * (TR * RT);
+    const int ldx = (PHASE & (1 << 21)) ? in + 64 : in; // bit 21: padded activation stride
     // PHASE bit 20: K windows of gpad groups each (blockIdx.z), outputs atomically added.
     const int gbeg = (PHASE & (1 << 20)) ? int(blockIdx.z) * gpad : 0;
     const int groups = min(in / 8 - gbeg, gpad);
@@ -434,7 +435,7 @@ sorted_lds_gemm2(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx
         if (!(PHASE & 8)) {
 #pragma unroll
             for (int r = 0; r < RT; ++r) {
-                const uint64_t *xr = x64 + (size_t(row0 + r * 16 + col) * size_t(in) >> 3) + size_t(gbeg + g0);
+                const uint64_t *xr = x64 + (size_t(row0 + r * 16 + col) * size_t(ldx) >> 3) + size_t(gbeg + g0);
                 if constexpr (U % 2 == 0) {
 #pragma unroll
                     for (int i = 0; i < U; i += 2) {
@@ -647,9 +648,14 @@ int main(int argc, char **argv) {
             c = uint16_t(rng());
         const int rows_pad = MMAX;
         const int gpad16 = (groups + 15) / 16 * 16;
-        std::vector<uint8_t> hx(size_t(rows_pad) * s.in + size_t(gpad16) * 8 + 256, 0);
+        std::vector<uint8_t> hx(size_t(rows_pad) * (s.in + 64) + size_t(gpad16) * 8 + 256, 0);
         for (size_t i = 0; i < size_t(MMAX) * s.in; ++i)
             hx[i] = f_to_fp8(nd(rng) * 0.3f);
+        // padded-stride copy (bit 21 variants): row m at m*(in+64)
+        std::vector<uint8_t> hxp(hx.size(), 0);
+        for (int m = 0; m < MMAX; ++m)
+            std::copy_n(&hx[size_t(m) * s.in], s.in, &hxp[size_t(m) * (s.in + 64)]);
+        uint8_t *dxp = upload(hxp);
         uint8_t *dx = upload(hx);
         std::vector<float> xf(size_t(MMAX) * s.in);
         for (size_t i = 0; i < xf.size(); ++i)
@@ -819,7 +825,7 @@ int main(int argc, char **argv) {
                     if (PHASE & (1 << 20))
                         CK(hipMemsetAsync(y, 0, size_t(M) * s.out * 4));
                     sorted_lds_gemm2<RT, U, DBT, PHASE><<<grid, W * 32, lds>>>(
-                        dx, (PHASE & 128) ? dgm[k] : d.idx, d.pl, d.cc, d.tiles, book, y, dxs, dws,
+                        (PHASE & (1 << 21)) ? dxp : dx, (PHASE & 128) ? dgm[k] : d.idx, d.pl, d.cc, d.tiles, book, y, dxs, dws,
                         1.f, false, M, s.in, s.out, gpad);
                 };
                 CK(hipFuncSetAttribute(reinterpret_cast<const void *>(sorted_lds_gemm2<RT, U, DBT, PHASE>),
@@ -827,7 +833,7 @@ int main(int argc, char **argv) {
                 double ms = T.ms(launch);
                 printf("  gemm2%s%s%s M=%2d RT=%d U=%2d W=%2d lds=%5zu vgpr=%d spill=%zu: %7.4f ms  logical(2B) %6.1f GB/s  "
                        "stream %6.1f GB/s  %.4f ms/row\n",
-                       (PHASE & (1 << 20)) ? (std::string("-WIN") + std::to_string(windows)).c_str() : "",
+                       (std::string((PHASE & (1 << 20)) ? "-WIN" + std::to_string(windows) : "") + ((PHASE & (1 << 21)) ? "-XPAD" : "")).c_str(),
                        (PHASE & 8192) ? "-HALFSTREAM" : (PHASE & (1 << 14)) ? (std::string("-AUX") + std::to_string((PHASE >> 15) & 31)).c_str() : "",
                        (PHASE & 1023) == 1 ? "-decode" : PHASE == 2 ? "-gemmonly" : PHASE == 4 ? "-hitgather" : PHASE == 8 ? "-nox" : PHASE == 12 ? "-hit-nox" : PHASE == 16 ? "-NT" : PHASE == 17 ? "-NT-decode" : (PHASE & 1023) == 512 ? "-HASH" : (PHASE & 1535) == 1536 ? "-HASH+decode" : PHASE == 1536 + 2048 ? "-HASH+decode8" : PHASE == 1536 + 4096 ? "-HASH+decode2" : PHASE == 1 + 2048 ? "-decode8" : PHASE == 1 + 4096 ? "-decode2" : PHASE == 1152 ? "-GMCODES+decode" : PHASE == 34 ? "-gemm+stream" : PHASE == 38 ? "-hit+stream" : PHASE == 258 ? "-gemmonly-64K" : PHASE == 290 ? "-gemm+stream-64K" : PHASE == 256 ? "-full-64K" : PHASE == 384 ? "-GMCODES-64K" : PHASE == 128 ? "-GMCODES" : PHASE == 192 ? "-GMCODES-ring3" : (PHASE & 64) ? "-ring3" : "", M, RT, U, W, lds, fa.numRegs, fa.localSizeBytes, ms, codes.size() * 2 / ms / 1e6, L.bytes() / ms / 1e6,
                        ms / M);
@@ -838,6 +844,21 @@ int main(int argc, char **argv) {
                     check(M, "gemm2");
                 }
             };
+            if (what == "phase10") {
+                constexpr int A24 = (1 << 14) + (24 << 15), WN = 1 << 20, XP = 1 << 21;
+                for (int W : {16}) {
+                    gemm2.template operator()<1, 8, 3, A24 + WN>(W, 16);
+                    gemm2.template operator()<1, 8, 3, A24 + WN + XP>(W, 16);
+                    gemm2.template operator()<1, 8, 3, 512>(W, 16);
+                    gemm2.template operator()<1, 8, 3, 512 + XP>(W, 16);
+                    gemm2.template operator()<2, 4, 3, A24 + WN>(W, 32);
+                    gemm2.template operator()<2, 4, 3, A24 + WN + XP>(W, 32);
+                    gemm2.template operator()<4, 4, 3, A24 + WN>(W, 64);
+                    gemm2.template operator()<4, 4, 3, A24 + WN + XP>(W, 64);
+                    gemm2.template operator()<4, 2, 3, A24 + WN + XP>(W, 64);
+                    gemm2.template operator()<4, 4, 3, 512 + XP>(W, 64);
+                }
+            }
             if (what == "phase9") {
                 constexpr int A24 = (1 << 14) + (24 << 15), WN = 1 << 20;
                 for (int W : {8, 16}) {
@@ -971,6 +992,7 @@ int main(int argc, char **argv) {
                 CK(hipFree(g));
         }
         CK(hipFree(dx));
+        CK(hipFree(dxp));
         CK(hipFree(y));
         CK(hipFree(partial));
         CK(hipFree(dxs));
