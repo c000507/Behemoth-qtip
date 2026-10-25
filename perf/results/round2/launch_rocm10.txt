@@ -1,0 +1,5 @@
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+1000 back-to-back empty kernels (blocks=1, 256 thr): 2.367 ms -> 2.37 us/launch
+1000 back-to-back empty kernels (blocks=48, 256 thr): 2.279 ms -> 2.28 us/launch
+1000 back-to-back empty kernels (blocks=1152, 256 thr): 2.751 ms -> 2.75 us/launch
+hipGraph of 1000 empty kernels: 2.319 ms -> 2.32 us/kernel

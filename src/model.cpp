@@ -2,6 +2,7 @@
 #include "behemoth/gpu.hpp"
 #include "behemoth/worker.hpp"
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <condition_variable>
@@ -451,9 +452,19 @@ struct Shard {
         for (size_t r = 0; r < batch.layout.lengths.size(); ++r)
             decode &= batch.layout.query_offsets[r + 1] - batch.layout.query_offsets[r] == 1;
         if (decode) {
-            size_t needed = attention_workspace_bytes(batch.layout, 1024);
-            if (needed <= attention_workspace.size())
-                partition = 1024;
+            // Decode attention runs one wave per (request, head, key partition):
+            // short partitions give the 48 heads of a single request enough
+            // blocks to fill the GPU (PERF_ROUND2_REPORT.md).
+            // 32 keys: c=1 step 79.9 -> 76.4 ms, c=4 124.6 -> 121.6 ms (128: no gain).
+            static const int decode_partition = [] {
+                const char *v = std::getenv("BEHEMOTH_ATTN_PARTITION");
+                return v ? std::atoi(v) : 32;
+            }();
+            for (int candidate : {decode_partition, 1024})
+                if (attention_workspace_bytes(batch.layout, candidate) <= attention_workspace.size()) {
+                    partition = candidate;
+                    break;
+                }
         }
         for (int index = only_layer < 0 ? 0 : only_layer;
              index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
