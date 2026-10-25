@@ -24,6 +24,10 @@ namespace behemoth {
 // Chunks are grouped into segments of S chunks; segment_codes holds the code
 // of the first (real) entry of each segment so that independent waves/blocks
 // can start anywhere without a serial scan.
+// Runtime configuration: one Wave32 owns a 32-row stream; 2048 > 1792 groups
+// covers every projection of the model (group 2047 is the dummy slot).
+constexpr int sorted_rows_per_tile = 32, sorted_groups_per_tile = 2048,
+              sorted_default_chunks_per_segment = 16;
 struct SortedTileDesc {
     uint32_t chunk_begin, chunk_count, segment_begin, segment_count;
 };
@@ -46,7 +50,8 @@ struct SortedLayout {
 // codes: row-major [out][in/8] uint16 (the checkpoint layout).
 // R and G must be powers of two with R * G <= 65536 and in/8 < G; delta_bits in 1..4.
 SortedLayout sorted_layout(int in, int out, const uint16_t *row_major_codes, int rows_per_tile,
-                           int groups_per_tile, int delta_bits, int chunks_per_segment = 64);
+                           int groups_per_tile, int delta_bits,
+                           int chunks_per_segment = sorted_default_chunks_per_segment);
 // Decodes a layout back to row-major codes (verification). Returns false on
 // malformed input or if an entry is missing/duplicated.
 bool sorted_layout_decode(const SortedLayout &, int in, int out, std::vector<uint16_t> &codes);

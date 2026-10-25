@@ -11,16 +11,16 @@ echo "Write a short, vivid paragraph about a lighthouse keeper who discovers tha
 # wait for GPU tests to finish
 while pgrep -f behemoth_gpu_tests > /dev/null; do sleep 5; done
 run_config() {
-  local name=$1 bin=$2 transport=$3
+  local name=$1 bin=$2 transport=$3 layout=${4:-group-major}
   echo "=== $name ($bin --transport $transport)" 
   cd $ROOT
-  setsid nohup $bin --model $MODEL --devices 0,1 --transport $transport --memory-fraction 0.9 \
+  setsid nohup $bin --model $MODEL --devices 0,1 --transport $transport --code-layout $layout --memory-fraction 0.9 \
       --token-budget 1024 --prefill-chunk 256 --host 127.0.0.1 --port 8080 --threads 4 --profile false \
       > $OUT/server_$name.log 2>&1 < /dev/null &
   local pid=$!
   for i in $(seq 1 240); do curl -sf http://127.0.0.1:8080/health > /dev/null 2>&1 && break; sleep 2; done
   curl -sf http://127.0.0.1:8080/health || { echo "server $name failed to start"; kill $pid; return; }
-  for c in 1 8 32 16; do
+  for c in $CONCURRENCIES; do
     [ -f $OUT/${name}_c${c}.json ] && [ -s $OUT/${name}_c${c}.json ] && { echo "skip existing $name c$c"; continue; }
     # warm (first-use autotuning for this batch size), then measure; a hang aborts this config
     timeout 600 build-rocm/behemoth_load_bench $PROMPT $c $c 24 > /dev/null 2>&1 || { echo "$name c$c HANG/timeout in warmup"; curl -s http://127.0.0.1:8080/metrics > $OUT/${name}_c${c}_hang_metrics.json; break; }
@@ -39,7 +39,16 @@ PY
   kill $pid; for i in $(seq 1 30); do kill -0 $pid 2>/dev/null || break; sleep 1; done; kill -9 $pid 2>/dev/null
   sleep 3
 }
-run_config baseline /home/charles/Development/behemoth-perf/cpp_runtime/build-rocm/behemoth_server host
-run_config proto_host $ROOT/build-rocm/behemoth_server host
-run_config proto_zerocopy $ROOT/build-rocm/behemoth_server zerocopy
+# Concurrency list: keep <= 8 (both GPUs fell off the PCIe bus during a c=16 run).
+CONCURRENCIES=${CONCURRENCIES:-"1 8"}
+CONFIGS=${CONFIGS:-"baseline proto_host proto_zerocopy sorted_zerocopy"}
+for cfg in $CONFIGS; do
+  case $cfg in
+    baseline) run_config baseline /home/charles/Development/behemoth-perf/cpp_runtime/build-rocm/behemoth_server host ;;
+    proto_host) run_config proto_host $ROOT/build-rocm/behemoth_server host ;;
+    proto_zerocopy) run_config proto_zerocopy $ROOT/build-rocm/behemoth_server zerocopy ;;
+    sorted_host) run_config sorted_host $ROOT/build-rocm/behemoth_server host sorted ;;
+    sorted_zerocopy) run_config sorted_zerocopy $ROOT/build-rocm/behemoth_server zerocopy sorted ;;
+  esac
+done
 echo DONE

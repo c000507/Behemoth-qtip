@@ -347,7 +347,8 @@ struct Shard {
         reserve(options.token_budget);
         size_t split_rows = (options.projection_mode == "split-k" ||
                              options.projection_mode.starts_with("tiled-") ||
-                             options.projection_mode.starts_with("pipelined-"))
+                             options.projection_mode.starts_with("pipelined-") ||
+                             options.projection_mode.starts_with("sorted-"))
                                 ? options.token_budget
                                 : std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);

@@ -79,6 +79,49 @@ struct Emitter {
     }
 };
 } // namespace
+namespace {
+struct TileEncoding {
+    SortedLayout part; // idx/planes/segment_codes of one tile, local chunk indices
+    SortedTileDesc desc{};
+};
+TileEncoding encode_tile(const uint16_t *codes, int groups, int out, int R, int G, int DB, int S,
+                         int rt) {
+    TileEncoding t;
+    t.part.rows_per_tile = R;
+    t.part.groups_per_tile = G;
+    t.part.delta_bits = DB;
+    t.part.chunks_per_segment = S;
+    const int gbits = std::countr_zero(unsigned(G));
+    const int r0 = rt * R, r1 = std::min(out, r0 + R);
+    std::vector<uint32_t> count(65537, 0u);
+    std::vector<uint16_t> local_codes;
+    local_codes.reserve(size_t(r1 - r0) * size_t(groups));
+    for (int r = r0; r < r1; ++r)
+        for (int g = 0; g < groups; ++g) {
+            uint16_t c = codes[size_t(r) * size_t(groups) + size_t(g)];
+            local_codes.push_back(c);
+            ++count[size_t(c) + 1];
+        }
+    for (size_t c = 0; c < 65536; ++c)
+        count[c + 1] += count[c];
+    std::vector<uint16_t> order(local_codes.size()); // counting sort by code, stable
+    {
+        size_t k = 0;
+        for (int r = r0; r < r1; ++r)
+            for (int g = 0; g < groups; ++g, ++k)
+                order[count[local_codes[k]]++] = uint16_t(((r - r0) << gbits) | g);
+    }
+    Emitter e(t.part);
+    e.dummy_index = uint16_t(G - 1);
+    e.begin_tile();
+    size_t pos = 0;
+    for (uint32_t c = 0; c < 65536 && pos < order.size(); ++c)
+        for (; pos < count[c]; ++pos)
+            e.entry(order[pos], c);
+    t.desc = e.end_tile();
+    return t;
+}
+} // namespace
 SortedLayout sorted_layout(int in, int out, const uint16_t *codes, int R, int G, int DB, int S) {
     if (in <= 0 || in % 8 || out <= 0 || R <= 0 || G <= 0 || !std::has_single_bit(unsigned(R)) ||
         !std::has_single_bit(unsigned(G)) || size_t(R) * size_t(G) > 65536 || DB < 1 || DB > 4 ||
@@ -91,44 +134,35 @@ SortedLayout sorted_layout(int in, int out, const uint16_t *codes, int R, int G,
     l.chunks_per_segment = S;
     const int groups = in / 8;
     l.row_tiles = (out + R - 1) / R;
-    l.group_tiles = (groups + G - 1) / G;
-    const int gbits = std::countr_zero(unsigned(G));
-    Emitter e(l);
-    e.dummy_index = uint16_t(G - 1);
-    std::vector<uint32_t> count(65537);
-    std::vector<uint16_t> order; // tile entries sorted by code (counting sort)
-    std::vector<uint16_t> local_codes;
-    l.idx.reserve(size_t(out) * size_t(groups) * 12 / 10);
+    l.group_tiles = 1;
+    std::vector<TileEncoding> tiles(size_t(l.row_tiles));
+#pragma omp parallel for schedule(dynamic, 4)
     for (int rt = 0; rt < l.row_tiles; ++rt)
-        for (int gt = 0; gt < l.group_tiles; ++gt) {
-            const int r0 = rt * R, r1 = std::min(out, r0 + R), g0 = gt * G,
-                      g1 = std::min(groups, g0 + G);
-            std::fill(count.begin(), count.end(), 0u);
-            local_codes.clear();
-            for (int r = r0; r < r1; ++r)
-                for (int g = g0; g < g1; ++g) {
-                    uint16_t c = codes[size_t(r) * size_t(groups) + size_t(g)];
-                    local_codes.push_back(c);
-                    ++count[size_t(c) + 1];
-                }
-            for (size_t c = 0; c < 65536; ++c)
-                count[c + 1] += count[c];
-            order.resize(local_codes.size());
-            {
-                size_t k = 0;
-                for (int r = r0; r < r1; ++r)
-                    for (int g = g0; g < g1; ++g, ++k)
-                        order[count[local_codes[k]]++] =
-                            uint16_t(((r - r0) << gbits) | (g - g0));
-            }
-            // count[c] now holds the end of bucket c; walk buckets in order.
-            e.begin_tile();
-            size_t pos = 0;
-            for (uint32_t c = 0; c < 65536 && pos < order.size(); ++c)
-                for (; pos < count[c]; ++pos)
-                    e.entry(order[pos], c);
-            l.tiles.push_back(e.end_tile());
-        }
+        tiles[size_t(rt)] = encode_tile(codes, groups, out, R, G, DB, S, rt);
+    size_t chunks = 0, segments = 0;
+    for (const auto &t : tiles) {
+        chunks += t.part.chunks();
+        segments += t.part.segment_codes.size();
+    }
+    l.idx.reserve(chunks * 32);
+    l.planes.reserve(chunks * size_t(DB));
+    l.segment_codes.reserve(segments);
+    l.tiles.reserve(tiles.size());
+    for (auto &t : tiles) {
+        SortedTileDesc d = t.desc;
+        d.chunk_begin = uint32_t(l.chunks());
+        d.segment_begin = uint32_t(l.segment_codes.size());
+        l.idx.insert(l.idx.end(), t.part.idx.begin(), t.part.idx.end());
+        l.planes.insert(l.planes.end(), t.part.planes.begin(), t.part.planes.end());
+        l.segment_codes.insert(l.segment_codes.end(), t.part.segment_codes.begin(),
+                               t.part.segment_codes.end());
+        l.tiles.push_back(d);
+        l.entries += t.part.entries;
+        l.dummies += t.part.dummies;
+        t = {};
+    }
+    if (l.chunks() > size_t(UINT32_MAX) / 32)
+        throw std::overflow_error("Sorted layout exceeds 32-bit chunk addressing");
     return l;
 }
 bool sorted_layout_decode(const SortedLayout &l, int in, int out, std::vector<uint16_t> &codes) {

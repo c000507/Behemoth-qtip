@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     try {
         if (argc < 2) {
             std::cerr << "Usage: behemoth_projection_bench MODEL_DIRECTORY [ROWS=1] [LAYER=0] "
-                         "[DEVICE=0] [LAYOUT=both|row-major|group-major] "
+                         "[DEVICE=0] [LAYOUT=both|all|row-major|group-major|sorted] "
                          "[SEARCH=conservative|exhaustive]\n";
             return 2;
         }
@@ -20,6 +20,8 @@ int main(int argc, char **argv) {
         std::string requested = argc > 5 ? argv[5] : "both";
         if (requested == "both")
             layouts = {CodeLayout::RowMajor, CodeLayout::GroupMajor};
+        else if (requested == "all")
+            layouts = {CodeLayout::RowMajor, CodeLayout::GroupMajor, CodeLayout::Sorted};
         else
             layouts = {parse_code_layout(requested)};
         auto search = parse_projection_search(argc > 6 ? argv[6] : "conservative");
@@ -56,7 +58,12 @@ int main(int argc, char **argv) {
             std::vector<float> baseline;
             for (auto layout : layouts) {
                 GpuProjection projection;
-                projection.upload(host, layout);
+                // "sorted" benchmarks keep the group-major codes as well so that
+                // every mode (and the fused baseline) runs on the same weight.
+                projection.upload(host, layout == CodeLayout::Sorted ? CodeLayout::GroupMajor
+                                                                      : layout);
+                if (layout == CodeLayout::Sorted)
+                    projection.upload_sorted(host);
                 auto execute = [&](ProjectionMode mode) {
                     runner.set_mode(mode);
                     runner.run(projection, input.data(), output.data(), rows, workspace, stream,
@@ -82,6 +89,16 @@ int main(int argc, char **argv) {
                                              {"code_layout", code_layout_name(layout)},
                                              {"apply_row_scale", column},
                                              {"logical_code_bytes", projection.codes.bytes()},
+                                             {"sorted_layout_bytes",
+                                              projection.sorted_idx.bytes() +
+                                                  projection.sorted_planes.bytes() +
+                                                  projection.sorted_segment_codes.bytes() +
+                                                  projection.sorted_tiles.bytes()},
+                                             {"sorted_dummy_fraction",
+                                              projection.has_sorted()
+                                                  ? double(projection.sorted_dummies) /
+                                                        double(projection.sorted_entries)
+                                                  : 0.},
                                              {"weight_identity", projection.tuning_identity}};
                     try {
                         HIP_CHECK(hipMemsetAsync(output.data(), 0xff, output.bytes(), stream));

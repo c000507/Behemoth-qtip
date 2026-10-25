@@ -244,6 +244,9 @@ static void projections(hipStream_t stream) {
             for (bool dense : {false, true}) {
                 GpuProjection gpu;
                 gpu.upload(p, layout);
+                // Also exercise the codebook-major layout (tails in rows and groups).
+                if (!dense)
+                    gpu.upload_sorted(p);
                 if (dense) {
                     std::vector<uint8_t> weights(size_t(p.out) * size_t(p.in));
                     for (int o = 0; o < p.out; ++o)
@@ -286,7 +289,8 @@ static void projections(hipStream_t stream) {
                         try {
                             runner.run(gpu, in.data(), out.data() + guard, rows, workspace, stream);
                         } catch (const ProjectionUnavailable &) {
-                            check(mode == ProjectionMode::Blas,
+                            check(mode == ProjectionMode::Blas ||
+                                      (projection_mode_is_sorted(mode) && !gpu.has_sorted()),
                                   "Mandatory projection path unavailable");
                             continue;
                         }

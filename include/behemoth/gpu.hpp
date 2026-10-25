@@ -1,6 +1,7 @@
 #pragma once
 #include "attention.hpp"
 #include "checkpoint.hpp"
+#include "sorted_layout.hpp"
 #include "tuning.hpp"
 #include <cstring>
 #include <hip/hip_runtime.h>
@@ -152,21 +153,54 @@ struct GpuProjection {
     DeviceBuffer<float> row_scale;
     float codebook_scale = 1;
     CodeLayout code_layout = CodeLayout::GroupMajor;
+    // Codebook-major ("sorted") layout, see sorted_layout.hpp. Present when
+    // sorted_tile_count > 0; with CodeLayout::Sorted it replaces `codes`.
+    DeviceBuffer<uint16_t> sorted_idx, sorted_segment_codes;
+    DeviceBuffer<uint32_t> sorted_planes;
+    DeviceBuffer<SortedTileDesc> sorted_tiles;
+    int sorted_tile_count = 0, sorted_chunks_per_segment = 0, sorted_delta_bits = 0;
+    size_t sorted_entries = 0, sorted_dummies = 0;
+    bool has_sorted() const {
+        return sorted_tile_count > 0;
+    }
+    void upload_sorted(const HostProjection &p) {
+        auto l = sorted_layout(p.in, p.out, p.codes.data(), sorted_rows_per_tile,
+                               sorted_groups_per_tile, 3, sorted_default_chunks_per_segment);
+        sorted_idx.upload(l.idx);
+        sorted_planes.upload(l.planes);
+        sorted_segment_codes.upload(l.segment_codes);
+        sorted_tiles.upload(l.tiles);
+        sorted_tile_count = int(l.tiles.size());
+        sorted_chunks_per_segment = l.chunks_per_segment;
+        sorted_delta_bits = l.delta_bits;
+        sorted_entries = l.entries;
+        sorted_dummies = l.dummies;
+    }
     void upload(const HostProjection &p, CodeLayout layout = CodeLayout::GroupMajor) {
         tuning_identity = next_projection_identity();
         in = p.in;
         out = p.out;
         code_layout = layout;
+        codes = {};
+        sorted_idx = {};
+        sorted_planes = {};
+        sorted_segment_codes = {};
+        sorted_tiles = {};
+        sorted_tile_count = 0;
         if (layout == CodeLayout::GroupMajor)
             codes.upload(group_major_codes(p));
-        else
+        else if (layout == CodeLayout::RowMajor)
             codes.upload(p.codes);
+        else
+            upload_sorted(p);
         codebook.upload(p.codebook);
         row_scale.upload(p.row_scale);
         codebook_scale = p.codebook_scale;
     }
     size_t bytes() const {
-        return codes.bytes() + codebook.bytes() + dense.bytes() + row_scale.bytes();
+        return codes.bytes() + codebook.bytes() + dense.bytes() + row_scale.bytes() +
+               sorted_idx.bytes() + sorted_planes.bytes() + sorted_segment_codes.bytes() +
+               sorted_tiles.bytes();
     }
 };
 struct ProjectionWorkspace {
@@ -197,8 +231,17 @@ enum class ProjectionMode {
     PipelinedR2K128,
     PipelinedR4K64,
     PipelinedR4K128,
+    // Codebook-major layout (GpuProjection::has_sorted()). sorted-sN: one pass
+    // per batch row, each 32-row stream cut into N segment splits. sorted-dense:
+    // stream the sorted layout once into a dense FP8 scratch, then the dense
+    // pipelined WMMA kernels (for rows > 2).
+    SortedS4,
+    SortedS8,
+    SortedS16,
+    SortedDense,
     Count
 };
+bool projection_mode_is_sorted(ProjectionMode);
 std::span<const ProjectionMode> projection_modes();
 ProjectionMode parse_projection_mode(std::string_view);
 const char *projection_mode_name(ProjectionMode);

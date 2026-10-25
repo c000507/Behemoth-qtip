@@ -65,10 +65,22 @@ const char *projection_mode_name(ProjectionMode m) {
         return "pipelined-r4-64";
     case ProjectionMode::PipelinedR4K128:
         return "pipelined-r4-128";
+    case ProjectionMode::SortedS4:
+        return "sorted-s4";
+    case ProjectionMode::SortedS8:
+        return "sorted-s8";
+    case ProjectionMode::SortedS16:
+        return "sorted-s16";
+    case ProjectionMode::SortedDense:
+        return "sorted-dense";
     case ProjectionMode::Count:
         break;
     }
     throw std::invalid_argument("Invalid projection mode");
+}
+bool projection_mode_is_sorted(ProjectionMode m) {
+    return m == ProjectionMode::SortedS4 || m == ProjectionMode::SortedS8 ||
+           m == ProjectionMode::SortedS16 || m == ProjectionMode::SortedDense;
 }
 ProjectionMode parse_projection_mode(std::string_view name) {
     for (auto m : projection_modes())
@@ -604,6 +616,154 @@ pipelined_projection(const uint8_t *__restrict__ x, const uint16_t *__restrict__
             partial[(size_t(part) * size_t(rows) + size_t(row)) * size_t(out) + size_t(col)] = c[i];
     }
 }
+// ------------------------------------------------------------------------
+// Codebook-major ("sorted") layout kernels, see include/behemoth/sorted_layout.hpp
+// and CODEBOOK_GATHER_REPORT.md. A wave owns a 32-row stream whose entries are
+// sorted by codebook index, so consecutive lanes read consecutive codebook
+// entries (L0 hits instead of one L2 line request per 8-byte gather). Each
+// lane decodes its code from the running segment code plus an inclusive
+// prefix of 3 delta bit-planes (popcounts), reads x[group] from LDS and adds
+// the exact fixed-point (2^-18 units) dot product into one of C int64 LDS
+// accumulators per row with ds_add_u64 (fp32 LDS atomics are serialised on
+// gfx1201; int64 atomics run near bank rate). Dummy entries address group
+// 2047, whose LDS activation slot is zero.
+__device__ __forceinline__ uint64_t sorted_exact_fixed18(float v) {
+    // v is a sum of products of e4m3 values: an integer multiple of 2^-18 with
+    // |v| < 2^21, so n = v*2^18 is an integer-valued float below 2^39. Split
+    // n = a*2^16 + b with 0 <= b < 2^16: a = floor(v*4) (|a| < 2^23, exact),
+    // b = n - a*2^16 (< 2^16, exact in fp32). No rounding anywhere.
+    const float a_f = floorf(v * 4.f);
+    const float b_f = fmaf(a_f, -65536.f, v * 262144.f);
+    const int32_t a = int32_t(a_f);
+    const uint32_t b = uint32_t(b_f);
+    const uint32_t lo = (uint32_t(a) << 16) | b, hi = uint32_t(a >> 16);
+    return (uint64_t(hi) << 32) | lo;
+}
+constexpr int sorted_waves = 8, sorted_unroll = 4, sorted_copies = 2;
+constexpr int sorted_group_bits = 11; // log2(sorted_groups_per_tile)
+static_assert(sorted_groups_per_tile == 1 << sorted_group_bits && sorted_rows_per_tile == 32);
+// x: fp8 [rows][in]; partial: [splits][rows][out]. grid = (block_groups * splits, rows).
+template <int W, int UNROLL, int C>
+__global__ void __launch_bounds__(W * 32)
+sorted_projection(const uint8_t *__restrict__ x, const uint16_t *__restrict__ idx,
+                  const uint32_t *__restrict__ planes, const uint16_t *__restrict__ seg_codes,
+                  const SortedTileDesc *__restrict__ tiles, const uint8_t *__restrict__ book,
+                  float *__restrict__ partial, int rows, int in, int out, int tile_count,
+                  int splits, int chunks_per_segment) {
+    constexpr int G = sorted_groups_per_tile, GB = sorted_group_bits, THREADS = W * 32, DB = 3;
+    static_assert((C & (C - 1)) == 0 && C <= 32);
+    __shared__ uint64_t xs[G];
+    __shared__ uint64_t ys[W * 32 * C];
+    const int tid = int(threadIdx.x), lane = tid & 31, wave = tid >> 5;
+    const int tg = int(blockIdx.x) / splits, split = int(blockIdx.x) % splits, groups = in / 8;
+    const int row = int(blockIdx.y), tile = tg * W + wave;
+    const uint64_t *xr = reinterpret_cast<const uint64_t *>(x) + size_t(row) * size_t(groups);
+    for (int i = tid; i < G; i += THREADS)
+        xs[i] = i < groups ? xr[i] : 0;
+    for (int i = tid; i < W * 32 * C; i += THREADS)
+        ys[i] = 0;
+    __syncthreads();
+    if (tile < tile_count) {
+        const SortedTileDesc t = tiles[tile];
+        const uint32_t le = (2u << lane) - 1; // lanes <= this one
+        const uint32_t s0 = (t.segment_count * uint32_t(split)) / uint32_t(splits),
+                       s1 = (t.segment_count * uint32_t(split + 1)) / uint32_t(splits);
+        uint64_t *yi = ys + wave * (32 * C) + (lane & (C - 1)) * 32;
+        for (uint32_t seg = s0; seg < s1; ++seg) {
+            uint32_t running = seg_codes[t.segment_begin + seg];
+            const uint32_t c0 = __builtin_amdgcn_readfirstlane(
+                                   t.chunk_begin + seg * uint32_t(chunks_per_segment)),
+                           c1 = __builtin_amdgcn_readfirstlane(min(
+                               t.chunk_begin + t.chunk_count, c0 + uint32_t(chunks_per_segment)));
+            auto step = [&](uint32_t cc, int n) {
+                uint32_t e[UNROLL], off[UNROLL];
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u) {
+                    if (u >= n)
+                        break;
+                    e[u] = idx[size_t(cc + u) * 32 + lane];
+                    uint32_t incl = 0, tot = 0;
+#pragma unroll
+                    for (int k = 0; k < DB; ++k) {
+                        const uint32_t pl = planes[size_t(cc + u) * DB + k];
+                        incl += uint32_t(__builtin_popcount(pl & le)) << k;
+                        tot += uint32_t(__builtin_popcount(pl)) << k;
+                    }
+                    off[u] = (running + incl) << 3; // byte offset into the codebook
+                    running += tot;
+                }
+                uint2 w[UNROLL];
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u)
+                    if (u < n)
+                        w[u] = *reinterpret_cast<const uint2 *>(book + off[u]);
+#pragma unroll
+                for (int u = 0; u < UNROLL; ++u) {
+                    if (u >= n)
+                        break;
+                    const int r = int(e[u] >> GB), grp = int(e[u] & (G - 1));
+                    const uint64_t xv = xs[grp];
+                    float v = __builtin_amdgcn_dot4_f32_fp8_fp8(w[u].x, uint32_t(xv), 0.f);
+                    v = __builtin_amdgcn_dot4_f32_fp8_fp8(w[u].y, uint32_t(xv >> 32), v);
+                    __hip_atomic_fetch_add(&yi[r], sorted_exact_fixed18(v), __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_WORKGROUP);
+                }
+            };
+            uint32_t c = c0;
+            for (; c + UNROLL <= c1; c += UNROLL)
+                step(c, UNROLL);
+            for (; c < c1; ++c)
+                step(c, 1);
+        }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+        int64_t acc = 0;
+        const uint64_t *base = ys + wave * (32 * C);
+#pragma unroll
+        for (int k = 0; k < C; ++k)
+            acc += int64_t(base[k * 32 + lane]);
+        const int r = tile * 32 + lane;
+        if (r < out)
+            partial[(size_t(split) * size_t(rows) + size_t(row)) * size_t(out) + size_t(r)] =
+                float(double(acc) * (1.0 / 262144.0));
+    }
+}
+// Streams the sorted layout once into a dense FP8 weight [out][in] (for the
+// dense pipelined/BLAS paths with many rows). grid = tile_count, 256 threads.
+__global__ void sorted_reconstruct(const uint16_t *__restrict__ idx,
+                                   const uint32_t *__restrict__ planes,
+                                   const uint16_t *__restrict__ seg_codes,
+                                   const SortedTileDesc *__restrict__ tiles,
+                                   const uint8_t *__restrict__ book, uint8_t *__restrict__ weight,
+                                   int in, int out, int chunks_per_segment) {
+    constexpr int G = sorted_groups_per_tile, GB = sorted_group_bits, DB = 3, W = 8;
+    const int lane = int(threadIdx.x) & 31, wave = int(threadIdx.x) >> 5, groups = in / 8;
+    const int tile = int(blockIdx.x);
+    const SortedTileDesc t = tiles[tile];
+    const uint32_t le = (2u << lane) - 1;
+    for (uint32_t seg = uint32_t(wave); seg < t.segment_count; seg += W) {
+        uint32_t running = seg_codes[t.segment_begin + seg];
+        const uint32_t c0 = t.chunk_begin + seg * uint32_t(chunks_per_segment),
+                       c1 = min(t.chunk_begin + t.chunk_count, c0 + uint32_t(chunks_per_segment));
+        for (uint32_t c = c0; c < c1; ++c) {
+            const uint32_t e = idx[size_t(c) * 32 + lane];
+            uint32_t incl = 0, tot = 0;
+#pragma unroll
+            for (int k = 0; k < DB; ++k) {
+                const uint32_t pl = planes[size_t(c) * DB + k];
+                incl += uint32_t(__builtin_popcount(pl & le)) << k;
+                tot += uint32_t(__builtin_popcount(pl)) << k;
+            }
+            const uint32_t code = running + incl;
+            running += tot;
+            const int r = tile * 32 + int(e >> GB), grp = int(e & (G - 1));
+            if (grp < groups && r < out)
+                reinterpret_cast<uint64_t *>(weight)[size_t(r) * size_t(groups) + size_t(grp)] =
+                    reinterpret_cast<const uint64_t *>(book)[code];
+        }
+    }
+}
 __global__ void merge_projection(const float *partial, const float *xs, const float *ws, float bs,
                                  float *y, int rows, int out, int parts, bool apply_rows) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -672,6 +832,11 @@ nlohmann::json ProjectionRunner::resources() const {
     add("tiled-128", reinterpret_cast<const void *>(tiled_projection<128>), 128);
     add("tiled-lds-64", reinterpret_cast<const void *>(tiled_projection<64, true>), 128);
     add("tiled-lds-128", reinterpret_cast<const void *>(tiled_projection<128, true>), 128);
+    add("sorted-s4/s8/s16",
+        reinterpret_cast<const void *>(
+            sorted_projection<sorted_waves, sorted_unroll, sorted_copies>),
+        sorted_waves * 32);
+    add("sorted-dense (reconstruct)", reinterpret_cast<const void *>(sorted_reconstruct), 256);
     for (const auto &g : pipeline_geometries)
         dispatch_pipeline(g.mode, [&]<int k, int n, int split, int rt = 1>() {
             const auto name = std::string(projection_mode_name(g.mode));
@@ -749,10 +914,11 @@ nlohmann::json ProjectionRunner::profile(bool detailed) const {
 }
 void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float *output, int rows,
                            ProjectionWorkspace &w, hipStream_t stream, bool apply_rows) {
+    const bool has_codes = p.codes.size() == size_t(p.out) * size_t(p.in / 8);
     if (rows < 1 || p.in < 1 || p.out < 1 || p.in % 8 || !input || !output ||
         p.row_scale.size() != size_t(p.out) ||
         (p.dense.size() != size_t(p.in) * size_t(p.out) &&
-         (p.codes.size() != size_t(p.out) * size_t(p.in / 8) || p.codebook.size() != 65536 * 8)))
+         ((!has_codes && !p.has_sorted()) || p.codebook.size() != 65536 * 8)))
         throw std::invalid_argument("Invalid FP8 projection");
     auto &state = *static_cast<RunnerState *>(handle_);
     auto &plan = state.plans[shape_key(p, rows)];
@@ -763,13 +929,64 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
     const bool group_major = p.code_layout == CodeLayout::GroupMajor;
     w.input.resize(size_t(rows) * size_t(p.in));
     w.input_scale.resize(size_t(rows));
+    // Dense FP8 weights for the BLAS / sorted-dense paths: stored dense, or
+    // reconstructed from the group-major codes (random gather) or the sorted
+    // layout (streaming) into the shared scratch.
+    auto dense_weight = [&]() -> const uint8_t * {
+        if (p.dense.size())
+            return p.dense.data();
+        w.weight.resize(size_t(p.out) * size_t(p.in));
+        if (has_codes)
+            reconstruct_kernel<<<unsigned(ceil_div(w.weight.size(), 256)), 256, 0, stream>>>(
+                p.codes.data(), p.codebook.data(), w.weight.data(), p.in, p.out, group_major);
+        else
+            sorted_reconstruct<<<unsigned(p.sorted_tile_count), 256, 0, stream>>>(
+                p.sorted_idx.data(), p.sorted_planes.data(), p.sorted_segment_codes.data(),
+                p.sorted_tiles.data(), p.codebook.data(), w.weight.data(), p.in, p.out,
+                p.sorted_chunks_per_segment);
+        HIP_CHECK(hipGetLastError());
+        return w.weight.data();
+    };
     auto launch = [&](ProjectionMode mode) {
+        const uint8_t *dense = p.dense.data();
+        if (projection_mode_is_sorted(mode)) {
+            if (!p.has_sorted())
+                throw ProjectionUnavailable("Projection has no codebook-major (sorted) layout");
+            if (mode == ProjectionMode::SortedDense) {
+                dense = dense_weight();
+                mode = rows <= 16   ? ProjectionMode::Pipelined64
+                       : rows <= 32 ? ProjectionMode::PipelinedR2K64
+                                    : ProjectionMode::PipelinedR4K64;
+            } else {
+                const int splits = mode == ProjectionMode::SortedS4    ? 4
+                                   : mode == ProjectionMode::SortedS8  ? 8
+                                                                       : 16;
+                const int block_groups = int(ceil_div(size_t(p.sorted_tile_count), sorted_waves));
+                dim3 grid(unsigned(block_groups * splits), unsigned(rows));
+                w.partial.resize(size_t(rows) * size_t(p.out) * size_t(splits));
+                sorted_projection<sorted_waves, sorted_unroll, sorted_copies>
+                    <<<grid, sorted_waves * 32, 0, stream>>>(
+                        w.input.data(), p.sorted_idx.data(), p.sorted_planes.data(),
+                        p.sorted_segment_codes.data(), p.sorted_tiles.data(), p.codebook.data(),
+                        w.partial.data(), rows, p.in, p.out, p.sorted_tile_count, splits,
+                        p.sorted_chunks_per_segment);
+                HIP_CHECK(hipGetLastError());
+                merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
+                                   stream>>>(w.partial.data(), w.input_scale.data(),
+                                             p.row_scale.data(), p.codebook_scale, output, rows,
+                                             p.out, splits, apply_rows);
+                HIP_CHECK(hipGetLastError());
+                return;
+            }
+        } else if (!dense && !has_codes && mode != ProjectionMode::Blas) {
+            throw ProjectionUnavailable("Projection has no codes for this mode (sorted layout only)");
+        }
         const auto *geometry = pipeline_geometry(mode);
         dim3 grid(unsigned(ceil_div(size_t(p.out), 16)), unsigned(ceil_div(size_t(rows), 16)));
         if (mode == ProjectionMode::Fused) {
             fused_projection<false><<<grid, device::wave_size, 0, stream>>>(
                 w.input.data(), w.input_scale.data(), p.codes.data(), p.codebook.data(),
-                p.dense.data(), p.row_scale.data(), p.codebook_scale, output, rows, p.in, p.out,
+                dense, p.row_scale.data(), p.codebook_scale, output, rows, p.in, p.out,
                 apply_rows, 1, group_major);
             HIP_CHECK(hipGetLastError());
         } else if (mode == ProjectionMode::SplitK) {
@@ -778,7 +995,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             w.partial.resize(size_t(rows) * size_t(p.out) * size_t(parts));
             fused_projection<true><<<grid, device::wave_size, 0, stream>>>(
                 w.input.data(), w.input_scale.data(), p.codes.data(), p.codebook.data(),
-                p.dense.data(), p.row_scale.data(), p.codebook_scale, w.partial.data(), rows, p.in,
+                dense, p.row_scale.data(), p.codebook_scale, w.partial.data(), rows, p.in,
                 p.out, apply_rows, parts, group_major);
             HIP_CHECK(hipGetLastError());
             merge_projection<<<unsigned(ceil_div(size_t(rows) * size_t(p.out), 256)), 256, 0,
@@ -798,31 +1015,31 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             w.partial.resize(size_t(rows) * size_t(p.out) * size_t(parts));
             if (mode == ProjectionMode::Tiled64)
                 tiled_projection<64><<<grid, 128, 0, stream>>>(
-                    w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                    w.input.data(), p.codes.data(), p.codebook.data(), dense,
                     w.partial.data(), rows, p.in, p.out, parts, group_major);
             else if (mode == ProjectionMode::Tiled128)
                 tiled_projection<128><<<grid, 128, 0, stream>>>(
-                    w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                    w.input.data(), p.codes.data(), p.codebook.data(), dense,
                     w.partial.data(), rows, p.in, p.out, parts, group_major);
             else if (mode == ProjectionMode::TiledLds64)
                 tiled_projection<64, true><<<grid, 128, 0, stream>>>(
-                    w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                    w.input.data(), p.codes.data(), p.codebook.data(), dense,
                     w.partial.data(), rows, p.in, p.out, parts, group_major);
             else if (mode == ProjectionMode::TiledLds128)
                 tiled_projection<128, true><<<grid, 128, 0, stream>>>(
-                    w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                    w.input.data(), p.codes.data(), p.codebook.data(), dense,
                     w.partial.data(), rows, p.in, p.out, parts, group_major);
             else {
                 dispatch_pipeline(mode, [&]<int k, int n, int split, int rt = 1>() {
-                    const bool aligned = !p.dense.size() && group_major && p.out % n == 0 &&
+                    const bool aligned = !dense && group_major && p.out % n == 0 &&
                                          p.in % k == 0 && p.codes.size() <= UINT32_MAX;
                     if (aligned)
                         pipelined_projection<k, true, n, split, rt><<<grid, n * 2, 0, stream>>>(
-                            w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                            w.input.data(), p.codes.data(), p.codebook.data(), dense,
                             w.partial.data(), rows, p.in, p.out, group_major);
                     else
                         pipelined_projection<k, false, n, split, rt><<<grid, n * 2, 0, stream>>>(
-                            w.input.data(), p.codes.data(), p.codebook.data(), p.dense.data(),
+                            w.input.data(), p.codes.data(), p.codebook.data(), dense,
                             w.partial.data(), rows, p.in, p.out, group_major);
                 });
             }
@@ -835,14 +1052,7 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
             ensure_blas(state, plan, p.in, p.out, rows);
             if (!plan.has_blas)
                 throw ProjectionUnavailable("No native FP8 hipBLASLt algorithm for this shape");
-            const uint8_t *weight = p.dense.data();
-            if (!weight) {
-                w.weight.resize(size_t(p.out) * size_t(p.in));
-                reconstruct_kernel<<<unsigned(ceil_div(w.weight.size(), 256)), 256, 0, stream>>>(
-                    p.codes.data(), p.codebook.data(), w.weight.data(), p.in, p.out, group_major);
-                HIP_CHECK(hipGetLastError());
-                weight = w.weight.data();
-            }
+            const uint8_t *weight = dense_weight();
             w.blas.resize(plan.algorithm.workspaceSize);
             auto &d = *plan.descriptors;
             float one = 1, zero = 0;
@@ -867,31 +1077,54 @@ void ProjectionRunner::run(const GpuProjection &p, const BFloat16 *input, float 
         ensure_blas(state, plan, p.in, p.out, rows);
         std::vector<ProjectionMode> candidates;
         if (!p.dense.size() && rows <= 16) {
-            candidates = {ProjectionMode::Pipelined64, ProjectionMode::Pipelined128};
-            if (p.in < 1024 || p.out < 512)
-                candidates.push_back(ProjectionMode::Fused);
+            // The sorted kernel reads the whole layout once per row: a strong
+            // batch-1/2 candidate, measured up to 8 rows against sorted-dense.
+            if (p.has_sorted() && rows <= 8)
+                candidates = {ProjectionMode::SortedS8, ProjectionMode::SortedS16};
+            if (p.has_sorted() && rows <= 2)
+                candidates.push_back(ProjectionMode::SortedS4);
+            if (p.has_sorted() && rows >= 3)
+                candidates.push_back(ProjectionMode::SortedDense);
+            if (has_codes) {
+                candidates.push_back(ProjectionMode::Pipelined64);
+                candidates.push_back(ProjectionMode::Pipelined128);
+                if (p.in < 1024 || p.out < 512)
+                    candidates.push_back(ProjectionMode::Fused);
+            }
             if (rows >= 4 && plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
         } else if (!p.dense.size() && rows <= 64) {
             // Lookup cost is shared across 32/64 rows; still compare BLAS.
-            candidates = rows <= 32 ? std::vector{ProjectionMode::PipelinedR2K128,
-                                                  ProjectionMode::PipelinedR2K64,
-                                                  ProjectionMode::PipelinedR4K128}
-                                    : std::vector{ProjectionMode::PipelinedR4K128,
-                                                  ProjectionMode::PipelinedR4K64};
+            if (has_codes)
+                candidates = rows <= 32 ? std::vector{ProjectionMode::PipelinedR2K128,
+                                                      ProjectionMode::PipelinedR2K64,
+                                                      ProjectionMode::PipelinedR4K128}
+                                        : std::vector{ProjectionMode::PipelinedR4K128,
+                                                      ProjectionMode::PipelinedR4K64};
+            if (p.has_sorted())
+                candidates.push_back(ProjectionMode::SortedDense);
             if (plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
-            candidates.push_back(ProjectionMode::Fused);
+            if (has_codes)
+                candidates.push_back(ProjectionMode::Fused);
         } else {
             if (plan.has_blas)
                 candidates.push_back(ProjectionMode::Blas);
-            candidates.push_back(ProjectionMode::Fused);
+            if (has_codes || p.dense.size())
+                candidates.push_back(ProjectionMode::Fused);
+            else
+                candidates.push_back(ProjectionMode::SortedDense);
         }
         if (state.search == ProjectionSearch::Exhaustive && rows <= 64)
             for (auto mode : projection_modes()) {
                 if (mode == ProjectionMode::Auto ||
                     (mode == ProjectionMode::Blas && !plan.has_blas) ||
-                    (mode == ProjectionMode::SplitK && p.in <= split_width))
+                    (mode == ProjectionMode::SplitK && p.in <= split_width) ||
+                    (projection_mode_is_sorted(mode) && !p.has_sorted()) ||
+                    (projection_mode_is_sorted(mode) && mode != ProjectionMode::SortedDense &&
+                     rows > 16) ||
+                    (!projection_mode_is_sorted(mode) && mode != ProjectionMode::Blas &&
+                     !has_codes && !p.dense.size()))
                     continue;
                 if (std::find(candidates.begin(), candidates.end(), mode) == candidates.end())
                     candidates.push_back(mode);
