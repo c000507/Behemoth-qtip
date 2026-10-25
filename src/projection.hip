@@ -846,10 +846,13 @@ __device__ __forceinline__ SortedTileDesc uniform_tile(const SortedTileDesc *til
 }
 // One lane's segment: 32 idx words (four 16-byte loads) and 32 delta nibbles
 // (one 16-byte load), all lane-private; no scalar or cross-lane loads.
-// gfx12 cache policy of the stream loads (immediate): bits 0-2 temporal hint
-// (0 regular, 1 non-temporal, 3 last-use), bits 3-4 scope (0 CU, 1 SE, 2 DEV,
-// 3 SYS). policy 24 = SYS scope keeps the stream out of the caches that serve
-// the codebook gathers. BEHEMOTH_LANE_POLICY overrides it (measurement).
+// gfx12 cache policy of the lane stream loads (immediate): bits 0-2 temporal
+// hint (0 regular, 1 non-temporal, 3 last-use), bits 3-4 scope (0 CU, 1 SE,
+// 2 DEV, 3 SYS). Measured end to end (PERF_ROUND2_REPORT.md): regular loads
+// (0) and DEV scope (16) are equal and ~8 % faster than SYS scope (24), which
+// the batched sorted-lds decode still uses; non-temporal hints are 25 %
+// slower. BEHEMOTH_LANE_POLICY overrides the default (measurement).
+constexpr int lane_stream_policy = 0;
 __device__ __forceinline__ sorted_u32x4 lane_load(__amdgpu_buffer_rsrc_t r, int off, int policy) {
     switch (policy) {
     case 0:
@@ -1222,10 +1225,12 @@ lane_projection(const uint8_t *__restrict__ x, const SortedArgs a, const uint8_t
             // eight 4-bank LDS groups instead of four.
             for (int i = tid; i < (gn + 1) * R; i += THREADS) {
                 const int g = i / R, r = i % R;
-                lane_xs[size_t(r >> 1) * size_t(gn + 1) * 2 + size_t(g) * 2 + size_t(r & 1)] =
-                    (g < gn && r0 + r < rows)
-                        ? x64[size_t(r0 + r) * size_t(groups) + size_t(g0 + g)]
-                        : 0;
+                const size_t slot = R == 1 ? size_t(g)
+                                           : size_t(r >> 1) * size_t(gn + 1) * 2 + size_t(g) * 2 +
+                                                 size_t(r & 1);
+                lane_xs[slot] = (g < gn && r0 + r < rows)
+                                    ? x64[size_t(r0 + r) * size_t(groups) + size_t(g0 + g)]
+                                    : 0;
             }
             __syncthreads();
             loaded_gt = gt;
@@ -1654,7 +1659,7 @@ void ProjectionRunner::run(const GpuProjection &p, const Call &call, int rows,
                     }();
                     static const int policy = [] {
                         const char *v = std::getenv("BEHEMOTH_LANE_POLICY");
-                        return v ? std::atoi(v) : sorted_stream_policy;
+                        return v ? std::atoi(v) : lane_stream_policy;
                     }();
                     lane_projection<R, W><<<grid, W * 32, lds, stream>>>(
                         w.input.data(), args, p.codebook.data(), w.partial.data(), rows, p.in,
