@@ -5,6 +5,7 @@
   prefix_cache_bench.py shared --sys 8000 --tag on
   prefix_cache_bench.py save --long 16000 --streams 4 --tag on
   prefix_cache_bench.py fill --size 2000 --n 12 --tag on
+  prefix_cache_bench.py restore --long 32000 --streams 4 --tag host   (server: --prefix-cache-gpu false)
 Prompts: /home/charles/qtip_server_bench/prompts.json ({size: {content, tokens}}). Every
 conversation starts with a unique session line so different runs/sizes never share a prefix.
 Raw results append to OUT/<tag>_<mode>.jsonl. Streaming client, per-token timestamps.
@@ -181,7 +182,9 @@ def cmd_save(a, P):
     save_wall = (after.get("save_wall_ms_last") or 0) / 1e3 if after.get("saves", 0) > before.get("saves", 0) else 0
 
     def window(lo, hi):
-        return [x for r in res for (t1, x) in zip(r["times"][1:], gaps_ms(r["times"])) if lo <= t1 < hi]
+        # gaps that start inside [lo, hi): a gap ending just after t_done that started before
+        # it spans the long request's last prefill step, not the save
+        return [x for r in res for (t0, x) in zip(r["times"][:-1], gaps_ms(r["times"])) if lo <= t0 < hi]
     base = window(t_sub - a.lead + 2, t_sub)
     # the save is issued right after the long request's last step; its completion is seen at
     # the next step boundary, so [t_done, t_done + save_wall + 0.5 s] covers it
@@ -197,6 +200,51 @@ def cmd_save(a, P):
            "itl_after_p50_ms": pct(after_w, .5), "itl_after_max_ms": max(after_w) if after_w else None,
            "errors": [r["error"] for r in res if r["error"]] + ([L["error"]] if L["error"] else [])}
     save(a.tag, "save", rec)
+
+
+def cmd_restore(a, P):
+    """Turn 2 of a long conversation restored (host tier) while other streams decode."""
+    u1 = {"role": "user", "content": session() + P[a.long]["content"]}
+    r1 = stream([u1], 16)
+    wait_idle()
+    stop = threading.Event()
+    res = [None] * a.streams
+
+    def w(i):
+        res[i] = stream([{"role": "user", "content": P["100"]["content"]}], 4000, stop_flag=stop,
+                        temperature=0.8, seed=4000 + i)
+    th = [threading.Thread(target=w, args=(i,)) for i in range(a.streams)]
+    for t in th:
+        t.start()
+        time.sleep(0.05)
+    time.sleep(a.lead)
+    before = pc()
+    t_sub = time.time()
+    r2 = stream([u1, {"role": "assistant", "content": r1["text"]},
+                 {"role": "user", "content": "Summarize the story so far in one sentence."}], 16)
+    time.sleep(a.tail)
+    stop.set()
+    for t in th:
+        t.join()
+    after = pc()
+
+    def window(lo, hi):
+        return [x for r in res for (t0, x) in zip(r["times"][:-1], gaps_ms(r["times"])) if lo <= t0 < hi]
+    base = window(t_sub - a.lead + 2, t_sub)
+    restore_s = (after.get("restore_wall_ms_last") or 0) / 1e3
+    during = window(t_sub, t_sub + restore_s + 0.2)
+    rec = {"tag": a.tag, "long": a.long, "streams": a.streams, "turn2_cached": cached(r2),
+           "turn2_prompt": (r2["usage"] or {}).get("prompt_tokens"), "turn2_ttft_s": r2.get("ttft_s"),
+           "host_restores": [before.get("host_restores"), after.get("host_restores")],
+           "restore_ms": after.get("restore_ms_last"), "restore_wall_ms": after.get("restore_wall_ms_last"),
+           "restore_gbps": [after.get("restore_gbps_rank0_last"), after.get("restore_gbps_rank1_last")],
+           "issue_ms_max": after.get("issue_ms_max"),
+           "itl_base_p50_ms": pct(base, .5), "itl_base_p95_ms": pct(base, .95),
+           "itl_base_max_ms": max(base) if base else None,
+           "itl_restore_window_p50_ms": pct(during, .5), "itl_restore_window_max_ms": max(during) if during else None,
+           "n_restore_window": len(during),
+           "errors": [r["error"] for r in res if r["error"]] + [x for x in (r1["error"], r2["error"]) if x]}
+    save(a.tag, "restore", rec)
 
 
 def cmd_fill(a, P):
@@ -239,4 +287,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     PORT = a.port
     P = json.load(open(PROMPTS))
-    {"turn2": cmd_turn2, "shared": cmd_shared, "save": cmd_save, "fill": cmd_fill}[a.cmd](a, P)
+    {"turn2": cmd_turn2, "shared": cmd_shared, "save": cmd_save, "fill": cmd_fill,
+     "restore": cmd_restore}[a.cmd](a, P)

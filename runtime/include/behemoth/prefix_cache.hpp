@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -116,7 +117,8 @@ class PrefixCache {
   private:
     PrefixCacheOptions options_;
     std::vector<SlotPtr> index_;
-    std::vector<int> refs_, free_;
+    std::vector<int> refs_;
+    std::set<int> free_; // lowest index first: consecutive allocations stay contiguous
     size_t used_ = 0, high_water_ = 0;
     uint64_t clock_ = 0, next_id_ = 1;
     Stats stats_;

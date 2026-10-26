@@ -374,6 +374,8 @@ int main(int argc, char **argv) {
                 if (value != "true" && value != "false" && value != "1" && value != "0")
                     throw std::invalid_argument("--prefix-cache-gpu expects true or false");
                 options.prefix_cache.gpu_tier = value == "true" || value == "1";
+            } else if (key == "--prefix-cache-restore-pace") {
+                options.prefix_cache_restore_pace = std::stoul(value);
             } else if (key == "--prefix-cache-staging-pages") {
                 options.kv_transfer_pages = std::stoi(value);
                 if (options.kv_transfer_pages < 1 || options.kv_transfer_pages > 64)

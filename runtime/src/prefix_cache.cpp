@@ -21,13 +21,13 @@ void PrefixCache::unref(int page) {
         throw std::logic_error("Prefix cache host page released twice");
     if (--r == 0) {
         --used_;
-        free_.push_back(page);
+        free_.insert(page);
     }
 }
 int PrefixCache::allocate() {
     if (!free_.empty()) {
-        int p = free_.back();
-        free_.pop_back();
+        int p = *free_.begin();
+        free_.erase(free_.begin());
         return p;
     }
     if (high_water_ >= options_.host_pages)

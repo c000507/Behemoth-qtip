@@ -1747,6 +1747,16 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
         shard->allocate_cache(impl_->pages);
         shard->kv_bind();
     }
+    // Transfer events are created up front (no runtime allocations while serving).
+    for (int i = 0; options.kv_transfer_pages > 0 && i < 32; ++i) {
+        Impl::KvTransfer t;
+        for (int rank = 0; rank < 2; ++rank) {
+            HIP_CHECK(hipSetDevice(impl_->shards[size_t(rank)]->device));
+            HIP_CHECK(hipEventCreate(&t.start[size_t(rank)]));
+            HIP_CHECK(hipEventCreate(&t.done[size_t(rank)]));
+        }
+        impl_->kv_event_pool.push_back(t);
+    }
     impl_->logits_capacity = sampled_capacity(options) * 32768;
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->logits_host),
                             impl_->logits_capacity * sizeof(float), hipHostMallocPortable));
@@ -1962,43 +1972,57 @@ void TensorParallelModel::kv_host_reserve(size_t pages) {
         const char *v = std::getenv("BEHEMOTH_KV_NUMA");
         return !v || std::atoi(v) != 0;
     }();
-    for (;;) {
-        {
-            std::lock_guard lock(impl_->kv_mutex);
-            if (impl_->kv_arena_pages >= pages)
-                return;
-        }
-        const size_t bytes = Impl::kv_block_pages * Shard::kv_page_bytes();
-        std::array<std::byte *, 2> block{};
-        try {
-            for (int rank = 0; rank < 2; ++rank) {
-                const int device = impl_->shards[size_t(rank)]->device;
-                HIP_CHECK(hipSetDevice(device));
-                // Bind this thread's allocations to the GPU's NUMA node for the allocation
-                // (hipHostMallocNumaUser follows the calling thread's memory policy).
-                const int node = numa ? device_numa_node(device) : -1;
-                unsigned long mask = node >= 0 && node < 64 ? 1UL << node : 0;
-                const bool bound =
-                    mask && syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, &mask, 65UL) == 0;
-                void *p = nullptr;
-                hipError_t e = hipHostMalloc(
-                    &p, bytes, hipHostMallocPortable | (bound ? hipHostMallocNumaUser : 0));
-                if (bound)
-                    (void)syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, nullptr, 0UL);
-                HIP_CHECK(e);
-                block[size_t(rank)] = static_cast<std::byte *>(p);
-            }
-        } catch (...) {
-            for (auto *b : block)
-                if (b)
-                    (void)hipHostFree(b);
-            throw;
-        }
+    size_t have = 0;
+    {
         std::lock_guard lock(impl_->kv_mutex);
-        for (int rank = 0; rank < 2; ++rank)
-            impl_->kv_blocks[size_t(rank)].push_back(block[size_t(rank)]);
-        impl_->kv_arena_pages += Impl::kv_block_pages;
+        have = impl_->kv_arena_pages;
     }
+    if (have >= pages)
+        return;
+    const size_t blocks = ceil_div(pages - have, Impl::kv_block_pages);
+    const size_t bytes = Impl::kv_block_pages * Shard::kv_page_bytes();
+    // One thread per rank (each bound to its GPU's NUMA node; hipHostMallocNumaUser follows the
+    // calling thread's memory policy), allocating outside the transfer lock.
+    std::array<std::vector<std::byte *>, 2> fresh;
+    std::array<std::exception_ptr, 2> errors;
+    auto allocate = [&](int rank) {
+        try {
+            const int device = impl_->shards[size_t(rank)]->device;
+            HIP_CHECK(hipSetDevice(device));
+            const int node = numa ? device_numa_node(device) : -1;
+            unsigned long mask = node >= 0 && node < 64 ? 1UL << node : 0;
+            const bool bound =
+                mask && syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, &mask, 65UL) == 0;
+            hipError_t e = hipSuccess;
+            for (size_t b = 0; b < blocks && e == hipSuccess; ++b) {
+                void *p = nullptr;
+                e = hipHostMalloc(&p, bytes,
+                                  hipHostMallocPortable | (bound ? hipHostMallocNumaUser : 0));
+                if (e == hipSuccess)
+                    fresh[size_t(rank)].push_back(static_cast<std::byte *>(p));
+            }
+            if (bound)
+                (void)syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, nullptr, 0UL);
+            HIP_CHECK(e);
+        } catch (...) {
+            errors[size_t(rank)] = std::current_exception();
+        }
+    };
+    std::thread second(allocate, 1);
+    allocate(0);
+    second.join();
+    for (auto &e : errors)
+        if (e) {
+            for (auto &f : fresh)
+                for (auto *p : f)
+                    (void)hipHostFree(p);
+            std::rethrow_exception(e);
+        }
+    std::lock_guard lock(impl_->kv_mutex);
+    for (int rank = 0; rank < 2; ++rank)
+        impl_->kv_blocks[size_t(rank)].insert(impl_->kv_blocks[size_t(rank)].end(),
+                                              fresh[size_t(rank)].begin(), fresh[size_t(rank)].end());
+    impl_->kv_arena_pages += blocks * Impl::kv_block_pages;
 }
 uint64_t TensorParallelModel::kv_start(bool save, std::span<const int> gpu,
                                        std::span<const int> host) {

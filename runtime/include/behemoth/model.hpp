@@ -43,6 +43,7 @@ struct RuntimeOptions {
     int kv_transfer_pages = 0;
     PrefixCacheOptions prefix_cache{0, 0, 64, true}; // slots 0: disabled (server default 10)
     double prefix_cache_gb = 64;                     // host memory cap (both ranks), 1e9 bytes
+    size_t prefix_cache_restore_pace = 0; // restore pages issued per step while decoding (0: all)
 };
 void tensor_parallel_smoke(std::array<int, 2> devices = {0, 1}, bool rccl_shared_memory = false);
 class TensorParallelModel {
@@ -67,8 +68,11 @@ class TensorParallelModel {
     // 16-token KV page of both ranks (kv_page_bytes() each) in a pinned, NUMA-local arena that
     // grows in 64-page blocks and is reused, never freed before shutdown.
     size_t kv_page_bytes() const;
-    // Grows the arena to >= pages (allocates outside the transfer lock, so copies can be issued
-    // meanwhile; ~50 ms per 64-page block per rank here). Thread-safe.
+    // Grows the arena to >= pages (both ranks in parallel, outside the transfer lock;
+    // ~50 ms per 64-page block per rank here). Thread-safe. Call it while the GPUs are idle:
+    // mapping pinned memory while kernels run triggered "MES failed to respond to
+    // msg=INVALIDATE_TLBS" on this machine (PREFIX_CACHE_REPORT.md); the engine reserves the
+    // whole cap at startup.
     void kv_host_reserve(size_t pages);
     size_t kv_host_pages() const; // host pages backed by the arena
     size_t kv_host_bytes() const; // pinned bytes allocated, both ranks

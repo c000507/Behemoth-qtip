@@ -117,16 +117,26 @@ struct Engine::Impl {
     // Prefix cache (PREFIX_CACHE_REPORT.md). All state below is guarded by `mutex`; HIP copies
     // are issued by the engine thread outside the lock.
     std::unique_ptr<PrefixCache> cache;
+    size_t restore_pace = 0; // pages per step while decoding (0: whole restore at once)
     std::map<uint64_t, PrefixCache::Lease> leases; // request -> matched prefix, until erased
     std::deque<uint64_t> awaiting;                 // hits waiting for slot readiness / pages
     struct SaveWork {
         PrefixCache::SavePlan plan;
         std::vector<int> gpu;
     };
+    // A restore may be issued in pieces (--prefix-cache-restore-pace while requests decode); the
+    // pieces share one progress record and the request finishes with the last piece.
+    struct RestoreProgress {
+        Clock::time_point first_issue{};
+        std::array<double, 2> gpu_ms{};
+        bool started = false;
+    };
     struct RestoreWork {
         uint64_t request;
         size_t tokens;
         std::vector<int> host, gpu;
+        size_t offset = 0;
+        std::shared_ptr<RestoreProgress> progress = std::make_shared<RestoreProgress>();
     };
     std::vector<SaveWork> to_save;
     std::vector<RestoreWork> to_restore;
@@ -138,14 +148,18 @@ struct Engine::Impl {
         PrefixCache::SavePlan plan;
         std::vector<int> gpu;
         Clock::time_point issued;
+        std::shared_ptr<RestoreProgress> progress; // restores
+        bool last_piece = true;
     };
     std::vector<Inflight> inflight;
+    size_t issuing = 0; // copies taken out of to_save/to_restore, being issued (metrics)
     std::set<uint64_t> restoring_inflight;
     struct CacheCounters {
         uint64_t gpu_hits = 0, host_hits = 0, partial_restores = 0, restored_tokens = 0,
                  saves = 0, saved_pages = 0, shared_pages = 0, save_failures = 0,
                  cancelled_saves = 0;
-        double restore_wall_ms = 0, save_wall_ms = 0, save_issue_ms = 0, alloc_ms = 0;
+        double restore_wall_ms = 0, save_wall_ms = 0, save_issue_ms = 0, issue_max_ms = 0,
+               alloc_ms = 0;
         // *_ms: GPU time of the copy (slower rank); *_wall_ms: issue -> completion seen by the
         // engine loop (polled at step boundaries, so it includes waiting for a running step).
         std::deque<double> restore_ms, restore_gbps0, restore_gbps1, save_ms, save_gbps0,
@@ -163,69 +177,36 @@ struct Engine::Impl {
             if (!co.host_pages)
                 throw std::invalid_argument("Prefix cache memory cap below one page");
             cache = std::make_unique<PrefixCache>(co);
+            restore_pace = o.prefix_cache_restore_pace;
             scheduler.set_retain_finished(true);
             scheduler.set_reclaim([this](size_t need) {
                 std::vector<int> pages;
                 cache->reclaim_gpu(need, pages);
                 return pages;
             });
+            // The whole pinned arena is allocated now, while the GPUs are idle: mapping pinned
+            // memory during serving triggered MES INVALIDATE_TLBS failures here.
+            const auto t0 = Clock::now();
+            model.kv_host_reserve(co.host_pages);
+            cc.alloc_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::cerr << "Prefix cache: pinned " << double(model.kv_host_bytes()) / 1e9
+                      << " GB host arena in " << cc.alloc_ms / 1e3 << " s\n";
             std::cerr << "Prefix cache: slots=" << co.slots << " cap=" << o.prefix_cache_gb
                       << " GB (" << co.host_pages << " host pages, "
                       << double(2 * model.kv_page_bytes()) / 1e6 << " MB each for both ranks)"
                       << " min_tokens=" << co.min_tokens << " gpu_tier=" << co.gpu_tier << '\n';
         }
         worker = std::thread([this] { loop(); });
-        if (cache)
-            arena_worker = std::thread([this] { arena_loop(); });
     }
     std::thread worker;
-    // Pinned arena growth runs on its own thread (hipHostMalloc of a 64-page block takes ~50 ms
-    // per rank here), keeping the arena `arena_headroom` pages ahead of the cache's high water;
-    // a save whose host pages are not backed yet waits in to_save. Guarded by `mutex`.
-    static constexpr size_t arena_headroom = 1024;
-    std::condition_variable arena_cv;
-    size_t arena_target = 0;
-    bool arena_failed = false;
-    std::thread arena_worker;
-    void arena_loop() {
-        for (;;) {
-            size_t target = 0;
-            {
-                std::unique_lock lock(mutex);
-                arena_cv.wait(lock, [&] {
-                    return stop || (!arena_failed && arena_target > model.kv_host_pages());
-                });
-                if (stop)
-                    return;
-                target = arena_target;
-            }
-            const auto t0 = Clock::now();
-            try {
-                model.kv_host_reserve(std::min(target, model.kv_host_pages() + 1));
-            } catch (const std::exception &e) {
-                std::cerr << "Prefix cache: pinned host arena allocation failed: " << e.what()
-                          << '\n';
-                std::lock_guard lock(mutex);
-                arena_failed = true;
-            }
-            {
-                std::lock_guard lock(mutex);
-                cc.alloc_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            }
-            cv.notify_one();
-        }
-    }
     void shutdown() {
         {
             std::lock_guard lock(mutex);
             stop = true;
         }
         cv.notify_all();
-        arena_cv.notify_all();
         if (worker.joinable())
             worker.join();
-        if (arena_worker.joinable())
-            arena_worker.join();
     }
     ~Impl() {
         shutdown();
@@ -311,16 +292,27 @@ struct Engine::Impl {
                 push_sample(cc.save_gbps0, gbps(ms[0]));
                 push_sample(cc.save_gbps1, gbps(ms[1]));
             } else {
-                scheduler.finish_restore(it->request, it->tokens);
-                restoring_inflight.erase(it->request);
-                cc.restored_tokens += it->tokens;
-                cc.restore_wall_ms += wall;
-                cc.last_restore_ms = std::max(ms[0], ms[1]);
-                cc.last_restore_wall = wall;
-                push_sample(cc.restore_ms, cc.last_restore_ms);
-                push_sample(cc.restore_wall, wall);
-                push_sample(cc.restore_gbps0, gbps(ms[0]));
-                push_sample(cc.restore_gbps1, gbps(ms[1]));
+                auto &p = *it->progress;
+                p.gpu_ms[0] += double(ms[0]);
+                p.gpu_ms[1] += double(ms[1]);
+                if (it->last_piece) {
+                    const double total_wall = std::chrono::duration<double, std::milli>(
+                                                  Clock::now() - p.first_issue)
+                                                  .count();
+                    const double total_bytes = double(ceil_div(it->tokens, 16)) *
+                                               double(model.kv_page_bytes());
+                    auto rate = [&](double m) { return m > 0 ? total_bytes / (m * 1e6) : 0.; };
+                    scheduler.finish_restore(it->request, it->tokens);
+                    restoring_inflight.erase(it->request);
+                    cc.restored_tokens += it->tokens;
+                    cc.restore_wall_ms += total_wall;
+                    cc.last_restore_ms = std::max(p.gpu_ms[0], p.gpu_ms[1]);
+                    cc.last_restore_wall = total_wall;
+                    push_sample(cc.restore_ms, cc.last_restore_ms);
+                    push_sample(cc.restore_wall, total_wall);
+                    push_sample(cc.restore_gbps0, rate(p.gpu_ms[0]));
+                    push_sample(cc.restore_gbps1, rate(p.gpu_ms[1]));
+                }
             }
             it = inflight.erase(it);
         }
@@ -381,32 +373,51 @@ struct Engine::Impl {
     }
     // Engine thread, lock NOT held: issue the copies collected under the lock.
     void issue_transfers(std::vector<SaveWork> &saves, std::vector<RestoreWork> &restores,
-                         size_t arena_pages, bool arena_failed_now, std::vector<Inflight> &issued,
-                         std::vector<SaveWork> &deferred, std::vector<SaveWork> &failed_saves,
+                         size_t arena_pages, bool decoding, std::vector<Inflight> &issued,
+                         std::vector<RestoreWork> &remaining, std::vector<SaveWork> &failed_saves,
                          std::vector<RestoreWork> &failed_restores) {
         if (saves.empty() && restores.empty())
             return;
-        // saves whose host pages the arena does not back yet wait for the arena thread
+        // the arena (reserved at startup) backs every host page the cache hands out
         for (auto it = saves.begin(); it != saves.end();) {
             const auto &h = it->plan.slot->host;
             const int top = *std::max_element(h.begin() + std::ptrdiff_t(it->plan.first_page), h.end());
             if (size_t(top) < arena_pages)
                 ++it;
             else {
-                (arena_failed_now ? failed_saves : deferred).push_back(std::move(*it));
+                failed_saves.push_back(std::move(*it));
                 it = saves.erase(it);
             }
         }
         const auto started = Clock::now();
         for (auto &r : restores)
             try {
+                // Host -> GPU copies compete with the decode steps' zero-copy reads of host memory
+                // on the same link; with requests decoding, at most restore_pace pages per step.
+                const size_t left = r.gpu.size() - r.offset;
+                const size_t n = decoding && restore_pace ? std::min(left, restore_pace) : left;
                 Inflight f;
-                f.ticket = model.kv_restore(r.host, r.gpu);
+                f.issued = Clock::now();
+                if (!r.progress->started) {
+                    r.progress->started = true;
+                    r.progress->first_issue = f.issued;
+                }
+                f.ticket = model.kv_restore(
+                    std::span<const int>(r.host.data() + r.offset, n),
+                    std::span<const int>(r.gpu.data() + r.offset, n));
+                cc_issue_max = std::max(cc_issue_max, std::chrono::duration<double, std::milli>(
+                                                          Clock::now() - f.issued)
+                                                          .count());
                 f.request = r.request;
                 f.tokens = r.tokens;
-                f.pages = r.gpu.size();
-                f.issued = Clock::now();
+                f.pages = n;
+                f.progress = r.progress;
+                f.last_piece = n == left;
                 issued.push_back(std::move(f));
+                if (n < left) {
+                    r.offset += n;
+                    remaining.push_back(std::move(r));
+                }
             } catch (const std::exception &e) {
                 std::cerr << "Prefix cache: restore not issued: " << e.what() << '\n';
                 failed_restores.push_back(std::move(r));
@@ -416,13 +427,16 @@ struct Engine::Impl {
                 const size_t first = s.plan.first_page, n = s.plan.slot->host.size();
                 Inflight f;
                 f.save = true;
+                f.issued = Clock::now();
                 f.ticket = model.kv_save(
                     std::span<const int>(s.gpu.data() + first, n - first),
                     std::span<const int>(s.plan.slot->host.data() + first, n - first));
+                cc_issue_max = std::max(cc_issue_max, std::chrono::duration<double, std::milli>(
+                                                          Clock::now() - f.issued)
+                                                          .count());
                 f.pages = n - first;
                 f.plan = std::move(s.plan);
                 f.gpu = std::move(s.gpu);
-                f.issued = Clock::now();
                 issued.push_back(std::move(f));
             } catch (const std::exception &e) {
                 std::cerr << "Prefix cache: save not issued: " << e.what() << '\n';
@@ -430,7 +444,7 @@ struct Engine::Impl {
             }
         cc_issue_ms += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
     }
-    double cc_issue_ms = 0; // engine thread only; copied to cc under the lock
+    double cc_issue_ms = 0, cc_issue_max = 0; // engine thread only; copied to cc under the lock
     void loop() {
         for (;;) {
             std::vector<std::pair<GenerationCallback, GenerationEvent>> events;
@@ -439,7 +453,7 @@ struct Engine::Impl {
             std::vector<SaveWork> saves;
             std::vector<RestoreWork> restores;
             size_t arena_pages = 0;
-            bool arena_failed_now = false;
+            bool decoding = false;
             bool waiting_transfers = false;
             {
                 std::unique_lock lock(mutex);
@@ -502,18 +516,13 @@ struct Engine::Impl {
                 step = scheduler.schedule();
                 if (!step.requests.empty())
                     input = make_inference_batch(scheduler, step);
+                for (const auto &s : step.requests)
+                    decoding |= s.count == 1 && s.sample && s.begin > 0;
                 saves.swap(to_save);
                 restores.swap(to_restore);
-                if (cache) {
-                    const size_t want = std::min(cache->options().host_pages,
-                                                 cache->host_high_water() + arena_headroom);
-                    if (want > arena_target) {
-                        arena_target = want;
-                        arena_cv.notify_one();
-                    }
+                issuing = saves.size() + restores.size();
+                if (cache)
                     arena_pages = model.kv_host_pages();
-                    arena_failed_now = arena_failed;
-                }
                 waiting_transfers = !inflight.empty() || !saves.empty() || !restores.empty();
             }
             for (auto &[cb, e] : events)
@@ -524,26 +533,35 @@ struct Engine::Impl {
             events.clear();
             if (cache) {
                 std::vector<Inflight> issued;
-                std::vector<SaveWork> deferred, failed_saves;
-                std::vector<RestoreWork> failed_restores;
-                issue_transfers(saves, restores, arena_pages, arena_failed_now, issued, deferred,
+                std::vector<SaveWork> failed_saves;
+                std::vector<RestoreWork> remaining, failed_restores;
+                issue_transfers(saves, restores, arena_pages, decoding, issued, remaining,
                                 failed_saves, failed_restores);
                 std::lock_guard lock(mutex);
                 for (auto &f : issued)
                     inflight.push_back(std::move(f));
-                for (auto &d : deferred)
-                    to_save.push_back(std::move(d));
-                waiting_transfers |= !deferred.empty();
+                for (auto &r : remaining)
+                    to_restore.push_back(std::move(r));
+                issuing = 0;
                 for (auto &s : failed_saves) {
                     cache->abandon(s.plan);
                     scheduler.release_pages(s.gpu);
                     ++cc.save_failures;
                 }
                 for (auto &r : failed_restores) {
+                    // earlier pieces of a paced restore may still be copying into its pages
+                    for (auto it = inflight.begin(); it != inflight.end();)
+                        if (!it->save && it->request == r.request) {
+                            model.kv_wait(it->ticket);
+                            model.kv_poll(it->ticket);
+                            it = inflight.erase(it);
+                        } else
+                            ++it;
                     restoring_inflight.erase(r.request);
                     scheduler.abort_restore(r.request);
                 }
                 cc.save_issue_ms = cc_issue_ms;
+                cc.issue_max_ms = cc_issue_max;
             }
             if (step.requests.empty()) {
                 // Nothing runnable: copies in flight (or requests waiting for pages). Sleep
@@ -757,7 +775,8 @@ nlohmann::json Engine::metrics() const {
             {"save_gbps_rank0_last", cc.save_gbps0.empty() ? 0. : cc.save_gbps0.back()},
             {"save_gbps_rank1_last", cc.save_gbps1.empty() ? 0. : cc.save_gbps1.back()},
             {"issue_ms_total", cc.save_issue_ms},
-            {"host_alloc_ms_total", cc.alloc_ms},
+            {"issue_ms_max", cc.issue_max_ms}, // engine-thread time to enqueue one transfer
+            {"host_alloc_ms_startup", cc.alloc_ms},
             {"save_failures", cc.save_failures},
             {"saves_skipped", s.skipped},
             {"inserts", s.inserts},
@@ -776,7 +795,7 @@ nlohmann::json Engine::metrics() const {
                      held += s.gpu.size();
                  return int64_t(impl_->scheduler.capacity()) - int64_t(held);
              }()},
-            {"saves_pending", impl_->to_save.size()}};
+            {"saves_pending", impl_->to_save.size() + impl_->to_restore.size() + impl_->issuing}};
     } else
         m["prefix_cache"] = {{"enabled", false}};
     return m;

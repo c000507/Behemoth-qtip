@@ -148,7 +148,8 @@ def main():
           f"TTFT {t2['ttft_s']:.2f} s")
     check(c2 >= p1, f"turn 2 reuses at least the turn-1 prompt ({c2} >= {p1})")
     # The reply is reused only where re-tokenizing the assistant text reproduces the generated
-    # ids (this template renders " " + text: a reply starting with <think> never matches).
+    # ids (the template renders " " + text; this model's replies start with <think> right after
+    # [/INST], so the first reply token differs).
     print(f"  turn-1 reply tokens reused: {c2 - p1} of {g1}")
     check(metrics()["prefix_cache"]["slots_used"] == slots_after_t1,
           "turn 2 replaced the turn-1 slot (no second slot for the same conversation)")
