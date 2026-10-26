@@ -14,7 +14,11 @@ struct FloatTensorView {
     }
     float operator[](size_t i) const;
 };
+// Weight format of the checkpoint: AQLM 1x16 (the original runtime format) or QTIP 2-bit HYB
+// (qtip_quant output, QTIP-hfized llama layout with config.quip_params; see qtip.hpp).
+enum class Quantization { Aqlm, Qtip };
 struct ModelConfig {
+    Quantization quantization = Quantization::Aqlm;
     int layers = 88, hidden = 12288, intermediate = 28672, q_heads = 96, kv_heads = 8, dim = 128,
         vocab = 32768;
     int max_context = 131072;

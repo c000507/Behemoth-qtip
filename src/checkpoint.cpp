@@ -69,18 +69,34 @@ static nlohmann::json read_json(const std::filesystem::path &p) {
 ModelConfig ModelConfig::read(const std::filesystem::path &path) {
     auto j = read_json(path);
     ModelConfig c;
+    // QTIP checkpoints (qtip_quant --mode assemble) are QTIP-hfized llama configs of the same
+    // Mistral-Large architecture: model_type llama + quip_params, no quantization_config.
+    const bool qtip = j.contains("quip_params");
     if (j.at("hidden_size") != c.hidden || j.at("intermediate_size") != c.intermediate ||
         j.at("num_hidden_layers") != c.layers || j.at("num_attention_heads") != c.q_heads ||
         j.at("num_key_value_heads") != c.kv_heads || j.at("head_dim") != c.dim ||
-        j.at("vocab_size") != c.vocab || j.at("model_type") != "mistral" ||
+        j.at("vocab_size") != c.vocab || j.at("model_type") != (qtip ? "llama" : "mistral") ||
         j.at("hidden_act") != "silu" || j.at("tie_word_embeddings") != false ||
-        !j.at("sliding_window").is_null())
+        (j.contains("sliding_window") && !j.at("sliding_window").is_null()) ||
+        (!qtip && !j.contains("sliding_window")))
         throw std::invalid_argument("Checkpoint is not the supported Behemoth architecture");
-    auto q = j.at("quantization_config");
-    if (q.at("quant_method") != "aqlm" || q.at("in_group_size") != 8 ||
-        q.at("out_group_size") != 1 || q.at("num_codebooks") != 1 ||
-        q.at("nbits_per_codebook") != 16)
-        throw std::invalid_argument("Unsupported AQLM format");
+    if (qtip) {
+        auto q = j.at("quip_params");
+        if (q.at("codebook") != "bitshift" || q.at("L") != 16 || q.at("K") != 2 || q.at("V") != 2 ||
+            q.at("tlut_bits") != 9 || q.at("decode_mode") != "quantlut_sym" || q.at("td_x") != 16 ||
+            q.at("td_y") != 16 || (q.contains("split_for_tp") && q.at("split_for_tp") != false) ||
+            (q.contains("skip_list") && !q.at("skip_list").is_null()) ||
+            j.contains("quantization_config"))
+            throw std::invalid_argument("Unsupported QTIP format (needs HYB L16 K2 V2 tlut_bits 9 "
+                                        "quantlut_sym 16x16, no TP split, no skip list)");
+        c.quantization = Quantization::Qtip;
+    } else {
+        auto q = j.at("quantization_config");
+        if (q.at("quant_method") != "aqlm" || q.at("in_group_size") != 8 ||
+            q.at("out_group_size") != 1 || q.at("num_codebooks") != 1 ||
+            q.at("nbits_per_codebook") != 16)
+            throw std::invalid_argument("Unsupported AQLM format");
+    }
     c.max_context = j.at("max_position_embeddings");
     c.epsilon = j.at("rms_norm_eps");
     c.theta = j.at("rope_theta");
@@ -149,7 +165,10 @@ std::span<const std::byte> SafeTensorFile::bytes(const std::string &name) const 
     if (offsets.size() != 2 || offsets[0] > offsets[1] || offsets[1] > bytes_ - data_start_)
         throw std::runtime_error("Tensor offsets out of bounds");
     std::string d = dtype(name);
-    size_t width = d == "F32" ? 4 : (d == "F16" || d == "BF16" || d == "I16" ? 2 : 0);
+    size_t width = d == "F32" ? 4
+                   : (d == "F16" || d == "BF16" || d == "I16") ? 2
+                   : d == "I64" ? 8 // QTIP rcp / tp_rank scalars
+                                : 0;
     if (!width)
         throw std::runtime_error("Unsupported checkpoint dtype: " + d);
     size_t count = 1;
