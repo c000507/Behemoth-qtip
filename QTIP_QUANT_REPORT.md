@@ -11,20 +11,28 @@ quantization → QTIP-format HF directory, and it is resumable.
 What has been validated:
 - **Unit level** against the unmodified reference python: Hadamard, codebook/LUT, Viterbi, packing, LDL, and LDLQ
   (bit-identical trellises).
-- **Pipeline on a tiny random Mistral checkpoint**, end to end, including resume and reference decode of the
-  written files. The QTIP reference's own `decode_compressed` + RHT inverse reproduces the binary's weights to
-  1e-7 relative.
+- **Pipeline on a tiny random Mistral checkpoint**, end to end, including resume and reference decode.
 - **Real-model forward pass / Hessians** on layers 0–1.
+- **Real layer 40, quantized from 512k-token Hessians, against the python reference on the same Hessians:**
+  - the proxy error matches within 0.5% on every linear;
+  - the reference decoder reproduces the written weights to 1.6e-7 relative;
+  - the reference `QuantizedLinear` forward agrees to 3e-4 (fp16 internals).
+- **Measured wall times**, at DPM level 1 (2.1–2.3 GHz) with behemoth_server stopped:
+  - 1 layer quantized on 1 GPU in 81–92 s;
+  - 2 layers on 2 GPUs in 82.6 s (41 s/layer throughput);
+  - Hessian collection at 18.7 k tokens/s per GPU.
 
-What is **not done**:
-- real-layer (layer 40) proxy parity against the python reference;
-- measured real per-layer wall times on 1 vs 2 GPUs.
+What is **not done**: step 6, the 2-GPU full-pipeline run with all 4.19M tokens.
+- Its first attempt (14:16) was cut by a power loss of the whole box; see the MES section.
+- After the reboot the model's NFS export (192.168.0.130:/mnt/evo) is empty, so the run cannot read the checkpoint.
+- Its 4.19M-token per-layer time below is therefore projected from the measured 512k-token throughput.
 
-Why: the only stop window was aborted after its first step. GPU0 (33:00.0) logged
-`MES(1) failed to respond to msg=INVALIDATE_TLBS` (68 lines, 13:09:15–13:09:27) while qtip_quant was collecting
-layers 0–1. Under the GPU-safety rule I stopped all GPU work at that point. Both GPUs are still present, and
-behemoth_server was restarted with its exact command line (healthy). The timings below are therefore
-measured kernels/stages plus projections. The remaining validation is one scripted command (see "Next window").
+**MES `INVALIDATE_TLBS` errors: root-caused and fixed in our code** (commit `ca70f68`, details below and in
+`refusal_bench/GPU0_MES_INVALIDATE_TLBS.md`):
+- They came from large device→host copies into pageable `std::vector`s: the Hessian download, plus the HRr and
+  trellis downloads in the quantizer.
+- They are not specific to GPU0.
+- All such copies now go through a pinned staging pair. Step 1 went from 35 MES lines to 0, and steps 2–5 had 0.
 
 ## Design
 
@@ -70,88 +78,136 @@ Deliberate differences from the reference (all quality-neutral or better; each i
 | **Tiny random Mistral checkpoint, full pipeline** (3 layers, 2 GPUs): reference `decode_compressed` + reference `matmul_hadU` on the written files vs the binary's own reconstruction | rel. Frobenius diff 8–10e-8 on all 21 linears; reference `QuantizedLinear.forward` vs x·Ŵᵀ: 3e-4 (fp16 internals); proxy from the reference decode = proxy reported by the binary |
 | resume (delete outputs/Hessians, rerun) | replays the chain, re-collects only what is missing, bit-identical outputs |
 | **Real model, layers 0–1, 2×2048 tokens** (`tools/check_forward.py`, fp32 torch reimplementation on CPU) | activations rel err 0.59% / 0.54% (bf16 level); Hessian rel Frobenius err: qkv 0.14% / 0.03%, o 0.21% / 0.54%, gate/up 0.10% / 0.22%, down 1.3% / 0.42% |
-| **Real layer 40 vs reference QTIP** (proxy within 1–2%) | **not run** (GPU stop, see top). The previous agent's reference numbers (32k-token Hessians, which are deleted) were: k 0.0022, q 0.0027, o 0.0123, down 0.0185 |
+| **Real layer 40 vs reference QTIP**, same 512k-token Hessians | proxy within 0.5% on all 7 linears; the reference decoder reproduces the written weights to 1.6e-7 (see "Validation results — real layer 40") |
 
 Real-shape run with a synthetic Hessian (`qtip_tests_gpu --shape 1024 12288`, i.e. k_proj size, H from 4096
 correlated samples): proxy 0.0062. This cannot be compared numerically with the real k_proj, since the Hessian is
 different. It shows the full path at real n.
 
-## Timings
+## MES `INVALIDATE_TLBS` errors (root cause and fix)
 
-All GPU numbers were measured while behemoth_server was running on the same GPU (it held about 90% of VRAM and
-the stability test was driving it), at the earlier −500 MHz OD setting. Since 13:00 the cards are pinned to DPM
-level 1 (~2.1–2.3 GHz), so expect roughly 0–20% slower kernels now.
+Symptom: bursts of `amdgpu 0000:33:00.0: MES(1) failed to respond to msg=INVALIDATE_TLBS`, seen during step 1
+(13:09 and 13:41).
 
-Measured:
+**Cause:** a large `hipMemcpy` device→host into pageable, CPU-resident memory, here a freshly `resize()`d
+`std::vector`.
+- HIP locks those pages on the fly through KFD SVM-range ioctls.
+- On gfx1201 with amdgpu DKMS 7.1.9 and MES fw 0x93, MES answers some of the resulting TLB invalidations with a
+  failure status, roughly every 1–10 ms during the copy (this is not a timeout).
+- `gmc_v12_0_flush_gpu_tlb_pasid` ignores the error and has no fallback.
 
-| piece | number |
+**Evidence:**
+- strace plus kmsg markers put every burst inside `deposit_partial`'s downloads of the 4 Hessian accumulators
+  (604 MB ×3 + 3.3 GB per layer).
+- A minimal HIP test (`/mnt/nvme/qtip_quant/mes/mes_test.cpp`) reproduces it:
+  - D2H of 3 GB into a zeroed vector: 13 lines on GPU0, **5 on GPU1** (so not card-specific);
+  - 0.56 GB: 1 line; 50 MB: 0;
+  - a re-used vector: only its first copy;
+  - zero lines for H2D from pageable memory, D2H into `hipHostMalloc`, `hipHostRegister`/`Unregister`,
+    `hipMalloc`/`hipFree`, and D2H into untouched mmap.
+- PCIe AER counters on 33:00.0 and its root port are zero.
+
+**Fix** (`ca70f68`): `d2h_staged()` (src/staging.cpp), a per-thread double-buffered 2×64 MB pinned staging pair.
+- Used for the Hessian download and for the quantizer's HRr, states and dump downloads.
+- Step 1: 35 lines → **0** in 4 runs (GPU0 ×3, GPU1 ×1), with md5-identical Hessians.
+- Steps 2, 3, 4 and 5 then ran with 0 new lines.
+
+**Upstream:**
+- Same message in [ROCm/TheRock#9299](https://github.com/ROCm/TheRock/issues/9299) and
+  [#9279](https://github.com/ROCm/TheRock/issues/9279) (R9700 / gfx1201, open, no fix).
+- The amd-gfx "Rework GPU TLB invalidation" series (Sep 2026) drops the gmc12 MES TLB-invalidation path in favour
+  of SDMA. It is not in DKMS 7.1.9.
+
+## Validation results — real layer 40 (validation window 13:58–14:57)
+
+Setup:
+- Hessians for layers 40/41 from 512k calibration tokens (256×2048), collected on GPU0 (step 2).
+- Layer 40 quantized on 1 GPU with dumps (step 3); layers 40+41 on 2 GPUs (step 4).
+- The python reference QTIP (`tools/ref_quantize.py`, unmodified QTIP code) on the same Hessian file (step 5).
+- Reference decode of the written file (`tools/check_decode.py --forward --hess`, CPU).
+- Both python tools read W from the binary's `W.f32` dumps (`--wdump`, new). These are exactly fp8·scale in fp32,
+  bit-identical to decoding the checkpoint, because the NFS model mount was gone after the power loss.
+
+Proxy error tr(ΔHΔᵀ)/tr(WHWᵀ), unregularised H, original domain:
+
+| linear | shape | qtip_quant | python reference | Δ | ref decode of written file: proxy / rel. diff vs binary hatW / forward rel. err |
+|---|---|---|---|---|---|
+| q_proj | 12288×12288 | 0.004004 | 0.004005 | −0.02% | 0.004004 / 1.6e-7 / 2.9e-4 |
+| k_proj | 1024×12288 | 0.003127 | 0.003129 | −0.05% | 0.003127 / 1.3e-7 / 2.9e-4 |
+| v_proj | 1024×12288 | 0.030882 | 0.030885 | −0.01% | 0.030882 / 1.3e-7 / 2.9e-4 |
+| o_proj | 12288×12288 | 0.024279 | 0.024278 | +0.00% | 0.024279 / 1.6e-7 / 2.9e-4 |
+| gate_proj | 28672×12288 | 0.013521 (same 4096 rows: 0.013692) | 0.013624 (4096 rows) | +0.50% | 0.013521 / 1.6e-7 / 2.9e-4 |
+| up_proj | 28672×12288 | 0.030481 (same rows: 0.030625) | 0.030635 (4096 rows) | −0.03% | 0.030481 / 1.6e-7 / 2.9e-4 |
+| down_proj | 12288×28672 | 0.040284 (same rows: 0.038011) | 0.038076 (4096 rows) | −0.17% | 0.040284 / 1.6e-7 / 2.9e-4 |
+
+For the MLP:
+- The reference ran on a random 4096-row subset (`--rows 4096`, seed 1234), for time.
+- The binary's proxy is restated on the same rows (`mes/subset_proxy.py`).
+- The binary quantized the full matrix, so its SU, SV and Wscale differ from the reference's. A ±0.5% difference
+  is therefore at the level of RNG noise.
+
+The other checks:
+- **The decoder** (`decode_compressed` + `matmul_hadU`, SU, SV) reproduces the binary's dumped hatW to 1.3–1.6e-7
+  relative, i.e. fp32 rounding, on all 7 linears.
+- **`proxy_ref_decode`** equals the proxy the binary reported, to ≥4 digits.
+- **Parity of the layer quantization (steps 3 vs 4).** Layer 40 got identical proxies on 1 GPU (step 3) and on
+  2 GPUs (step 4).
+- **The earlier reference run** with 32k-token Hessians (from a previous agent; not comparable) had k 0.0022,
+  q 0.0027, o 0.0123, down 0.0185. With 512k tokens the Hessian is better conditioned, and the error is higher but
+  more representative.
+
+## Timings (measured at DPM level 1, behemoth_server stopped)
+
+| piece | measured |
 |---|---|
-| Viterbi, 2 passes, 2048 trellises | 4.5 µs per trellis-pass aggregate → **28.3 M weights/s per GPU** (pass 1 + pass 2) |
-| LDLQ incl. Viterbi, 1024×12288 | 0.46 s (Viterbi 0.42 s) → 27 M weights/s |
-| RHT of W and H at n=12288 | 0.37 s |
-| fp64 Cholesky (16 threads) | n=8192 0.53 s, n=28672 12.0 s (0.66 TFLOPS); runs on the CPU, overlapped |
-| forward + Hessians, real layer 1, 4096 tokens | 0.22 s → **18.3 k tokens/s per GPU**, 81.5 TFLOPS effective (bf16 hipBLASLt) |
-| layer weights over NFS (1.38 GB fp8) | 28.4 s cold (~49 MB/s; prefetched one layer ahead) |
-| Hessian file write (5.1 GB/layer) | 4.6–4.8 s |
+| forward only (no Hessians), 524288 tokens/layer, 1 GPU | 20.7 s/layer → **25.3 k tok/s**, 72.6 TFLOPS |
+| forward + Hessians, 524288 tokens, 1 GPU (layers 40, 41) | 28.1 / 27.8 s → **18.7–18.8 k tok/s**, 83–84 TFLOPS |
+| Hessian D2H + host sum + save (5.1 GB/layer, staged) | ~10 s per layer (save 4.7 s) |
+| quantize 1 layer, 1 GPU (step 3, incl. dumps) | **91.5 s** (qkv 13.3, o 11.4, gate/up 42.4, down 41.1; Viterbi 50 s of it) |
+| quantize layers 40+41, 2 GPUs concurrently (step 4) | **82.6 s for 2 layers** (81.4 / 82.4 s each) → 41 s/layer |
+| python reference, layer 40 on 1 GPU | attention 373 s; MLP extrapolated from the 4096-row subsets ≈ 1100 s → ≈ 25 min/layer, **≈17× slower** |
+| CPU fp64 LDL, n = 28672 (down) | 17–22 s; it shows up inside the down group, while the LDLs for n = 12288 (2.3–2.7 s) are mostly hidden |
+| layer weights from NFS (1.38 GB fp8) | ~26 s cold (step 1), prefetched one layer ahead; 0 s warm |
 
-Projected per layer (Behemoth layer = 1.384 G weights):
+Not measured: step 6 (Hessian collection with all 4.19M tokens on 2 GPUs). It was interrupted by the power loss at
+14:16, and could not be repeated because the NFS export was empty after the reboot. Collection is linear in tokens
+(the GEMMs dominate; 512k already runs at 84 TFLOPS), so from the measured 18.7 k tok/s per GPU:
 
 | | 1 GPU | 2 GPUs |
 |---|---|---|
-| quantization (Viterbi ≈ 49 s + RHT/proxy/pack/IO ≈ 10 s; LDL hidden on CPU) | ~60 s | ~30 s/layer throughput (one layer per GPU) |
-| Hessian collection, 4.19M tokens | ~230 s | ~115 s (token halves in parallel) |
-| **total per layer** | **~290 s** | **~145 s** |
-| **full model, 88 layers** | **~7 h** | **~3.5–4 h** |
+| Hessian collection, 512k tokens | 28 s + ~10 s save (measured) | ~14 s + ~10 s (projected) |
+| Hessian collection, 4.19M tokens | ~224 s + ~10 s | ~112 s + ~10 s (token halves in parallel) |
+| quantization | ~82–92 s | ~41 s/layer throughput |
+| **per layer, 4.19M tokens** | **~320 s** | **~160 s** (≈ (2×112 + 82 + 10) GPU-s / 2) |
+| **full model, 88 layers, 4.19M tokens** | **~7.8 h** | **~3.9 h** |
+| full model, 1M tokens | ~3.1 h | ~1.6 h |
 
-For comparison, the python reference is ≈25 min per layer per GPU for quantization alone (≈23 h on 2 GPUs). That
-makes the quantization step ≈25× faster. Collection now dominates, and with fewer calibration tokens (`--ntok`) the
-total shrinks proportionally:
-
-- 1M tokens: ≈1.6 h on 2 GPUs (projected).
-- The paper/QTIP default is 6144 × 4096 = 25M tokens. This box cannot hold those activations in RAM; ≈4M tokens is
-  the practical setting here.
+On 2 GPUs, the earlier 3.5–4 h projection is confirmed. Collection is ~70% of the time.
 
 Memory and disk:
-- **GPU** (projected from the buffer sizes): ~10.5 GB for the forward + Hessian accumulators, plus ~12 GB peak for
-  the gate+up group. Fits in 32 GB, but only with behemoth_server stopped.
-- **Host RAM**: 98 GB activations (4.19M tokens) + 5–15 GB Hessians + ~6 GB layer cache.
-- **Disk**: Hessian backlog ≤ 2 layers × 5.1 GB; output ≈ 30.4 GB (2 bpw, about 345 MB per layer) + 1.6 GB
-  embeddings/lm_head. Total under 45 GB, within the 60 GB budget.
-- **Currently on /mnt/nvme/qtip_quant**: 17 MB (calibration tokens + logs). All temporaries have been removed.
+- **Host RAM**: 103.1 GB activations at 4.19M tokens (measured at the step-6 start).
+- **Disk**: Hessians 5.1 GB per layer; output 346.7 MB per layer (≈30.5 GB for 88 layers) + embeddings.
+- **GPU**: fits with behemoth_server stopped (steps 2–4 ran fine).
 
-## Next window (remaining validation, ~45 min, one command)
+## Remaining
 
-```
-cd /home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/qtip_quant
-setsid nohup bash tools/window_validate.sh "2 3 4 5 6" > /dev/null 2>&1 < /dev/null &   # log: /mnt/nvme/qtip_quant/window.log
-```
-
-The script:
-- **Before it starts:** stops the server by exact PID and records its command line.
-- **Before every step:** checks GPU presence, DPM `manual` / not on the top level, and new MES errors in dmesg.
-- **On exit (any exit):** restarts the server with the identical command line.
-
-Steps:
-- **2**: layer 40/41 Hessians, 512k tokens, one GPU.
-- **3**: layer 40 on 1 GPU, with dumps.
-- **4**: layers 40+41 on 2 GPUs.
-- **5**: reference QTIP on the same Hessians. q/k/v/o full; MLP on 4096-row subsets.
-- **6**: full pipeline with 4.19M tokens, layers 0–1, both GPUs.
-
-After it:
+Step 6, once 192.168.0.130:/mnt/evo is back:
 
 ```
-QTIP_DIR=/mnt/nvme/quantbench/qtip /home/charles/venvs/quantbench/bin/python tools/check_decode.py \
-  --out /mnt/nvme/qtip_quant/q1/out --layer 40 --dump /mnt/nvme/qtip_quant/q1/dump \
-  --hess /mnt/nvme/qtip_quant/par/hess/layer40.safetensors --forward
+bash /mnt/nvme/qtip_quant/window_noserver.sh "6"     # 2 GPUs, layers 0-1, 4.19M tokens; log: /mnt/nvme/qtip_quant/window.log
 ```
 
-Then compare `q1/work/quant_log.jsonl` with `ref_results.jsonl`.
+Watch the box during it. It is the first sustained dual-GPU forward pass, and the 14:16 power loss happened at its
+start.
 
-Before running it, someone should look at the GPU0 MES messages. They appeared first at 12:37 during the −50 mV
-test, then again at 13:09 during qtip_quant step 1. That step was a short single-GPU forward of 4096 tokens plus
-hipMalloc/hipFree of the Hessian buffers. The messages could be a lingering firmware state on GPU0 since the 12:37
-hang, rather than something specific to this workload.
+Full run:
+
+```
+./build/qtip_quant --tokens /mnt/nvme/qtip_quant/calib_2048x2048.i32 \
+    --out /mnt/nvme/qtip_quant/Behemoth-R1-123B-v2-QTIP-2bit --work /mnt/nvme/qtip_quant/work --gpus 0,1
+```
+
+It takes ~4 h with the server down.
 
 ## What an inference runtime needs for this format
 
