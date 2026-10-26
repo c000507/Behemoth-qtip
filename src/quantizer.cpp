@@ -147,8 +147,7 @@ void rotate_hessian(hipStream_t s, const float* H, int n, uint64_t seed, const Q
   k_transpose(Ht, n, n, n, HR, n, s);
   k_hadamard_rows(HR, n, n, n, true, s);
   hp.HRr.resize(size_t(n) * n);
-  HIP_CHECK(hipMemcpyAsync(hp.HRr.data(), HR, hp.HRr.size() * 4, hipMemcpyDeviceToHost, s));
-  HIP_CHECK(hipStreamSynchronize(s));
+  d2h_staged(hp.HRr.data(), HR, hp.HRr.size() * 4, s);
   hp.t_rot = now_s() - t0;
 }
 
@@ -225,8 +224,7 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
       }
       if (!opt.dump_dir.empty()) {
         std::vector<float> h(size_t(L.m) * n);
-        HIP_CHECK(hipMemcpyAsync(h.data(), Wt, h.size() * 4, hipMemcpyDeviceToHost, s));
-        HIP_CHECK(hipStreamSynchronize(s));
+        d2h_staged(h.data(), Wt, h.size() * 4, s);
         write_f32(opt.dump_dir + "/" + tag + "_" + L.name + ".W.f32", h.data(), h.size());
       }
       HIP_CHECK(hipStreamSynchronize(s));
@@ -304,7 +302,7 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
   {
     const long nblk = n / 16;
     std::vector<uint16_t> Qh(size_t(mt / 16) * nblk * 128);
-    HIP_CHECK(hipMemcpy(Qh.data(), Q, Qh.size() * 2, hipMemcpyDeviceToHost));
+    d2h_staged(Qh.data(), Q, Qh.size() * 2, s);
     for (size_t li = 0; li < lins.size(); ++li) {
       long m = lins[li].m;
       long ntr = (m / 16) * nblk;
@@ -328,8 +326,7 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
       k_scale(b, m, n, n, out[li].wscale, s);
       k_scale_rows_cols(b, m, n, n, d_sv + off[li], d_su, s);
       std::vector<float> h(size_t(m) * n);
-      HIP_CHECK(hipMemcpyAsync(h.data(), b, h.size() * 4, hipMemcpyDeviceToHost, s));
-      HIP_CHECK(hipStreamSynchronize(s));
+      d2h_staged(h.data(), b, h.size() * 4, s);
       write_f32(opt.dump_dir + "/" + tag + "_" + lins[li].name + ".hatW.f32", h.data(), h.size());
     }
   }

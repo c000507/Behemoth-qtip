@@ -73,6 +73,10 @@ struct HBuf {
   operator T*() const { return p; }
 };
 
+// Synchronous (w.r.t. the host) device -> pageable-host copy on stream s via reused pinned staging buffers.
+// Use for every large D2H into pageable memory; see staging.cpp for why (MES INVALIDATE_TLBS failures on gfx12).
+void d2h_staged(void* dst, const void* src, size_t bytes, hipStream_t s);
+
 // ---------------------------------------------------------------- GEMM (hipBLASLt), column-major semantics
 // D(MxN) = alpha * op(A)(MxK) * op(B)(KxN) + beta * C, A/B bf16, C/D fp32 or bf16 (D == C), fp32 accumulate.
 enum class OutT { F32, BF16 };

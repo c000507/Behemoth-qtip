@@ -250,10 +250,8 @@ void Pipeline::deposit_partial(int L, HessAcc& acc, LayerRunner& R) {
   std::vector<std::vector<float>> part(4);
   for (int i = 0; i < 4; ++i) {
     part[size_t(i)].resize(size_t(acc.dim[i]) * acc.dim[i]);
-    HIP_CHECK(hipMemcpyAsync(part[size_t(i)].data(), acc.h[i], part[size_t(i)].size() * 4, hipMemcpyDeviceToHost,
-                             R.stream()));
+    d2h_staged(part[size_t(i)].data(), acc.h[i], part[size_t(i)].size() * 4, R.stream());
   }
-  HIP_CHECK(hipStreamSynchronize(R.stream()));
   long cnt = acc.count;
   bool complete = false;
   std::vector<std::vector<float>> mine;
