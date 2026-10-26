@@ -538,6 +538,11 @@ struct Shard {
             partition = decode_attention_partition(batch.layout, attention_workspace.size(),
                                                    requested_partition, target_blocks);
         }
+        // BEHEMOTH_ATTN_QP=bf16: unquantised BF16 queries and probabilities (K/V FP8).
+        static const bool bf16_qp = [] {
+            const char *v = std::getenv("BEHEMOTH_ATTN_QP");
+            return v && std::string(v) == "bf16";
+        }();
         for (int index = only_layer < 0 ? 0 : only_layer;
              index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
             auto &l = layers[size_t(index)];
@@ -552,6 +557,8 @@ struct Shard {
                 AttentionDeviceView view{query.data(),     query_scale.data(), l.cache_k.data(),
                                          l.cache_v.data(), l.k_scale.data(),   l.v_scale.data(),
                                          attention.data()};
+                if (bf16_qp)
+                    view.q_bf16 = q.data(); // rotated BF16 queries written by rope_quantize
                 append_kv(metadata, view, k.data(), v.data(), stream);
                 paged_attention(metadata, view, attention_workspace.data(),
                                 attention_workspace.size(), partition, stream);

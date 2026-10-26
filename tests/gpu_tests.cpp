@@ -32,10 +32,16 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
     DeviceBuffer<std::byte> workspace(attention_workspace_bytes(l, partition));
     AttentionDeviceView view{q.data(),  qs.data(),        k.data(),  v.data(),  ks.data(),
                              vs.data(), out.data() + 128, mx.data(), den.data()};
+    DeviceBuffer<BFloat16> qb;
+    const bool bf16 = !a.q_bf16.empty();
+    if (bf16) {
+        qb.upload(a.q_bf16);
+        view.q_bf16 = qb.data();
+    }
     paged_attention(metadata, view, workspace.data(), workspace.size(), partition, stream);
     HIP_CHECK(hipStreamSynchronize(stream));
     auto actual = out.download();
-    auto reference = reference_attention(l, a, true, partition);
+    auto reference = reference_attention(l, a, !bf16, partition);
     std::vector<float> values(reference.output.size());
     for (size_t i = 0; i < values.size(); ++i) {
         values[i] = float(actual[i + 128]);
@@ -48,7 +54,8 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
                                  " max=" + std::to_string(error.max_abs) +
                                  " partition=" + std::to_string(partition) +
                                  " max_len=" + std::to_string(*std::max_element(
-                                                   l.lengths.begin(), l.lengths.end())));
+                                                   l.lengths.begin(), l.lengths.end())) +
+                                 (bf16 ? " bf16" : ""));
     auto maxima = mx.download(), denominators = den.download();
     for (size_t i = 0; i < rows; ++i) {
         check(std::abs(maxima[i] - reference.maximum[i]) <
@@ -62,6 +69,15 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
         check(actual[i].bits == guarded[i].bits &&
                   actual[actual.size() - 1 - i].bits == guarded.back().bits,
               "Attention wrote outside output");
+}
+// BF16 Q/P mode: unquantised queries alongside the FP8 copy (which stays valid).
+static test::Fixture with_bf16_queries(test::Fixture f, int seed) {
+    std::mt19937 rng{unsigned(seed) * 31 + 5};
+    std::normal_distribution<float> normal(0, 1);
+    f.data.q_bf16.resize(f.data.q.size());
+    for (auto &x : f.data.q_bf16)
+        x = BFloat16(normal(rng));
+    return f;
 }
 // Long single-query contexts (decode) through every partition the model can
 // pick: unsplit, the forced 32/1024-key splits and the automatic block-filling
@@ -87,6 +103,9 @@ static void long_contexts(hipStream_t stream) {
         partitions.push_back(decode_attention_partition(f.layout, 32u << 20, 32));
         for (int partition : partitions)
             run_case(f, partition, stream);
+        auto g = with_bf16_queries(f, b.seed);
+        run_case(g, 0, stream);
+        run_case(g, partitions[3], stream);
     }
     // Decode queries that are not at the end of their context (masked tail keys).
     run_case(test::fixture({4100, 700}, {{2049}, {31}}, 11), 256, stream);
@@ -399,8 +418,13 @@ int main(int argc, char **argv) {
             for (int seed : {7, 19, 103}) {
                 run_case(test::fixture({33, 17}, {{0, 15, 16, 32}, {0, 16}}, seed), 0, stream);
                 run_case(test::fixture({129, 17}, {{0, 16, 128}, {0, 16}}, seed, 96), 32, stream);
-                // Mixed decode batch with 96/8 heads and masked tails.
+                // Mixed decode batch with 96/8 heads and masked tails; BF16 Q/P on both kernels.
                 run_case(test::fixture({129, 17, 1}, {{100}, {16}, {0}}, seed, 96), 32, stream);
+                run_case(with_bf16_queries(test::fixture({33, 17}, {{0, 15, 16, 32}, {0, 16}}, seed),
+                                           seed),
+                         32, stream);
+                run_case(with_bf16_queries(test::fixture({129, 17}, {{128}, {16}}, seed), seed), 0,
+                         stream);
             }
             long_contexts(stream);
             auto known = test::fixture({33}, {{0, 16, 32}});
@@ -420,7 +444,7 @@ int main(int argc, char **argv) {
             throw;
         }
         std::cout << "PASS GPU conversion, append, projections, prefill, decode (GQA, long "
-                     "contexts), split/merge, output guards and stream checks\n";
+                     "contexts, BF16 Q/P), split/merge, output guards and stream checks\n";
     } catch (const std::exception &e) {
         std::cerr << "FAIL (GPU acceptance NOT passed): " << e.what() << '\n';
         return 1;

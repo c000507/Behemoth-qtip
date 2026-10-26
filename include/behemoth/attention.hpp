@@ -22,6 +22,7 @@ struct AttentionLayout {
 struct AttentionData {
     std::vector<uint8_t> q, k, v;
     std::vector<float> q_scale, k_scale, v_scale;
+    std::vector<BFloat16> q_bf16; // optional unquantised queries (BF16 Q/P mode)
     void validate(const AttentionLayout &) const;
 };
 struct AttentionResult {
@@ -29,6 +30,8 @@ struct AttentionResult {
     std::vector<float> maximum, denominator; // pre-normalization online-softmax statistics
 };
 // Independent scalar reference. partition_keys=0 is unsplit; otherwise a multiple of 32.
+// With a.q_bf16 populated the queries are taken from it (q/q_scale ignored); pass
+// quantize_probabilities=false for the BF16 Q/P mode (P then stays unquantised).
 AttentionResult reference_attention(const AttentionLayout &, const AttentionData &,
                                     bool quantize_probabilities = true, int partition_keys = 0);
 void reference_append(const AttentionLayout &, AttentionData &, std::span<const BFloat16> k,

@@ -54,8 +54,10 @@ template <> struct Operand<true> {
 };
 template <bool BF16, class Raw>
 __device__ inline void load_query_element(const AttentionDeviceView &a, size_t index, Raw &out) {
-    static_assert(!BF16, "BF16 queries are not wired yet");
-    out = a.q[index];
+    if constexpr (BF16)
+        out = reinterpret_cast<const uint16_t *>(a.q_bf16)[index];
+    else
+        out = a.q[index];
 }
 // scores[16 x 32] = Q[16 x 128] . K[32 x 128]^T for key columns [n, n+16).
 template <bool BF16, class Raw>
@@ -886,8 +888,9 @@ void paged_attention(const GpuMetadata &metadata, AttentionDeviceView a, void *w
             ? 0
             : checked_mul(checked_mul(size_t(l.queries()) * size_t(l.query_heads), size_t(parts)),
                           130 * sizeof(float));
-    if (!a.q || !a.q_scale || !a.k || !a.v || !a.k_scale || !a.v_scale || !a.output ||
-        (needed && (!workspace || bytes < needed)))
+    const bool bf16 = a.q_bf16 != nullptr;
+    if ((!bf16 && (!a.q || !a.q_scale)) || !a.k || !a.v || !a.k_scale || !a.v_scale ||
+        !a.output || (needed && (!workspace || bytes < needed)))
         throw std::invalid_argument("Missing/undersized attention buffers");
     if (!l.queries())
         return;
@@ -900,19 +903,30 @@ void paged_attention(const GpuMetadata &metadata, AttentionDeviceView a, void *w
     if (m.max_q == 1 && !legacy) {
         // Decode: every request carries one query -> GQA kernel over kv heads.
         dim3 grid(unsigned(m.requests), unsigned(m.kh), unsigned(parts));
-        gqa_decode_kernel<false><<<grid, gqa_threads, 0, stream>>>(m, a, partial, parts,
+        if (bf16)
+            gqa_decode_kernel<true><<<grid, gqa_threads, 0, stream>>>(m, a, partial, parts,
+                                                                       partition);
+        else
+            gqa_decode_kernel<false><<<grid, gqa_threads, 0, stream>>>(m, a, partial, parts,
                                                                         partition);
     } else if (!legacy) {
         // Prefill / multi-query: 12 waves (one per query head of the kv group) per
         // (request, kv head, 16-query tile, key partition).
         dim3 grid(unsigned(m.requests), unsigned(m.kh),
                   unsigned(ceil_div(size_t(m.max_q), 16)) * unsigned(parts));
-        gqa_prefill_kernel<false><<<grid, prefill_threads, 0, stream>>>(m, a, partial, parts,
+        if (bf16)
+            gqa_prefill_kernel<true><<<grid, prefill_threads, 0, stream>>>(m, a, partial, parts,
+                                                                           partition);
+        else
+            gqa_prefill_kernel<false><<<grid, prefill_threads, 0, stream>>>(m, a, partial, parts,
                                                                             partition);
     } else {
         dim3 grid(unsigned(m.requests), unsigned(m.qh),
                   unsigned(ceil_div(size_t(m.max_q), 16)) * unsigned(parts));
-        attention_kernel<false><<<grid, 32, 0, stream>>>(m, a, partial, parts, partition);
+        if (bf16)
+            attention_kernel<true><<<grid, 32, 0, stream>>>(m, a, partial, parts, partition);
+        else
+            attention_kernel<false><<<grid, 32, 0, stream>>>(m, a, partial, parts, partition);
     }
     HIP_CHECK(hipGetLastError());
     if (parts > 1) {

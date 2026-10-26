@@ -49,6 +49,8 @@ void AttentionData::validate(const AttentionLayout &l) const {
         k.size() != checked_mul(ks, head_dim) || v.size() != k.size() || k_scale.size() != ks ||
         v_scale.size() != ks)
         throw std::invalid_argument("Attention storage shape mismatch");
+    if (!q_bf16.empty() && q_bf16.size() != checked_mul(qs, head_dim))
+        throw std::invalid_argument("BF16 query storage shape mismatch");
     // Unused pages/padding may be poisoned; validate only the entries the kernel can read.
     for (float s : q_scale)
         if (!(s > 0 && std::isfinite(s)))
@@ -75,6 +77,7 @@ AttentionResult reference_attention(const AttentionLayout &l, const AttentionDat
     result.maximum.resize(rows);
     result.denominator.resize(rows);
     // Deliberately scalar indexing and double dot/exp/merge; no GPU address helpers are used.
+    const bool bf16_q = !a.q_bf16.empty();
     for (int request = 0; request < l.requests(); ++request)
         for (int query = l.query_offsets[size_t(request)];
              query < l.query_offsets[size_t(request + 1)]; ++query)
@@ -104,11 +107,12 @@ AttentionResult reference_attention(const AttentionLayout &l, const AttentionDat
                             locations[size_t(j)] = loc;
                             double dot = 0;
                             for (int d = 0; d < head_dim; ++d)
-                                dot += double(decode_e4m3(a.q[row * head_dim + size_t(d)])) *
+                                dot += (bf16_q ? double(float(a.q_bf16[row * head_dim + size_t(d)]))
+                                               : double(decode_e4m3(a.q[row * head_dim + size_t(d)])) *
+                                                     double(a.q_scale[row])) *
                                        double(decode_e4m3(a.k[loc * head_dim + size_t(d)]));
-                            scores[size_t(j)] = dot * double(a.q_scale[row]) *
-                                                double(a.k_scale[loc]) /
-                                                std::sqrt(double(head_dim));
+                            scores[size_t(j)] =
+                                dot * double(a.k_scale[loc]) / std::sqrt(double(head_dim));
                             tile_m = std::max(tile_m, scores[size_t(j)]);
                         }
                         const double next_m = std::max(m, tile_m),

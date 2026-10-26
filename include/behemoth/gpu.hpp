@@ -142,6 +142,10 @@ struct AttentionDeviceView {
     BFloat16 *output{};
     float *maximum{};
     float *denominator{}; // optional final statistics for correctness checks
+    // Optional BF16 queries (rotated, unquantised). When set, the kernels take
+    // Q from here (q/q_scale unused) and keep the softmax probabilities in BF16
+    // instead of per-tile FP8; K/V stay FP8 (BEHEMOTH_ATTN_QP=bf16).
+    const BFloat16 *q_bf16{};
 };
 size_t attention_workspace_bytes(const AttentionLayout &, int partition_keys = 0);
 // Key-partition size for the GQA decode kernel: `requested` > 0 forces a
