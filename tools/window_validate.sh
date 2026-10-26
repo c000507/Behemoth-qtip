@@ -14,12 +14,14 @@ LOG=$Q/window.log
 exec >> $LOG 2>&1
 say() { echo "[$(date +%T)] $*"; }
 gpus_ok() { [ "$(sudo setpci -s 33:00.0 VENDOR_ID)" = 1002 ] && [ "$(sudo setpci -s cc:00.0 VENDOR_ID)" = 1002 ]; }
-od_ok() {
+od_ok() {  # policy since 13:00: DPM manual, sclk level 1
   for c in 1 2; do
-    grep -A1 OD_SCLK_OFFSET /sys/class/drm/card$c/device/pp_od_clk_voltage | grep -q -- "-500Mhz" || return 1
-    [ "$(cat /sys/class/drm/card$c/device/hwmon/hwmon*/power1_cap)" = 210000000 ] || return 1
+    [ "$(cat /sys/class/drm/card$c/device/power_dpm_force_performance_level)" = manual ] || return 1
+    grep -q "^2: .*\*" /sys/class/drm/card$c/device/pp_dpm_sclk && return 1  # never on the top level
   done
+  return 0
 }
+mes_errors() { sudo dmesg | grep -ciE "mes.*(fail|hang|timeout)|ring .* timeout|gpu reset" ; }
 PID=$(cat /tmp/beh_server.pid)
 CMD=$(tr '\0' ' ' < /proc/$PID/cmdline)
 CWD=$(readlink /proc/$PID/cwd)
@@ -48,9 +50,12 @@ for i in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 2; done
 if kill -0 $PID 2>/dev/null; then say "server pid $PID still alive: abort without restart"; trap - EXIT; exit 1; fi
 sleep 5
 for c in 1 2; do say "card$c vram used $(( $(cat /sys/class/drm/card$c/device/mem_info_vram_used) / 1048576 )) MiB"; done
-od_ok || { say "OD not at -500 MHz / 210 W: re-applying the coordinator's point"; bash ~/gpu_od_apply.sh -500 -50 210; }
+od_ok || { say "DPM not manual/level1: running gpu_vf_cap.sh"; bash ~/gpu_vf_cap.sh; }
+MES0=$(mes_errors)
 for s in $STEPS; do
   gpus_ok || { say "GPU(s) missing before step $s: stop"; exit 1; }
+  [ "$(mes_errors)" = "$MES0" ] || { say "new MES/ring errors in dmesg before step $s: stop"; exit 1; }
+  od_ok || { say "DPM state changed before step $s: stop"; exit 1; }
   say "=== step $s"
   case $s in
   1) # forward / Hessian check on layers 0,1 with 2 sequences (GPU 0)
