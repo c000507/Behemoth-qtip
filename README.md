@@ -66,6 +66,8 @@ runtime/build-rocm/behemoth_server --model /mnt/nvme/qtip_quant/Behemoth-R1-123B
   --host 0.0.0.0 --port 1337 --threads 4 --profile false
 ```
 
+(The prefix cache is enabled at its defaults, see below; add `--prefix-cache-slots 0` to disable it.)
+
 The model directory needs `tokenizer.model` next to `tokenizer.json` (copy it from the source model if
 `qtip_quant --mode assemble` did not). Single-request decode is ~44 ms/token short context (~52 ms at 16k) on
 2x R9700, against ~69-74 ms/token for the AQLM 1x16 model.
@@ -88,6 +90,25 @@ QTIP prefill and scheduling options (`runtime/PREFILL_SCHED_REPORT.md`):
 | `BEHEMOTH_ATTN_PREFILL_BLOCKS` | 512 | key-split target for multi-query steps with few query tiles (0: off) |
 
 Step-level prefill timings without the server: `runtime/build-rocm/behemoth_prefill_bench MODEL [rows,...] [ctx,...] [reps]`.
+
+Prefix cache (on by default, `runtime/PREFIX_CACHE_REPORT.md`): when a prompt's token ids (after chat
+templating) start with a cached sequence, that KV is restored instead of prefilled and only the rest of the prompt
+is prefilled. Every request that ends - finished, stopped, or cancelled by the client, also mid-prefill - is cached
+(prompt + generated tokens), so the next turn of a conversation and prompts sharing a system prompt start from the
+cached KV. Slots live in pinned host memory (both GPUs' KV pages, ~186 KB per token, i.e. ~6 GB per 32k-token
+slot); the most recent ones also keep their GPU pages until the KV pool needs them (a GPU-tier hit needs no copy).
+Turn-2 TTFT after a 32k-token turn 1: ~0.6 s (GPU tier) / ~0.9 s (host restore, 13 / 24 GB/s per GPU) instead of
+133 s. `usage.prompt_tokens_details.cached_tokens` reports the reused prompt tokens (streaming:
+`"stream_options": {"include_usage": true}`), `/metrics` has a `prefix_cache` section.
+
+| flag | default | meaning |
+|---|---|---|
+| `--prefix-cache-slots N` | 10 | cached sequences (LRU; the next turn of a conversation replaces its slot); 0 disables the cache |
+| `--prefix-cache-gb X` | 64 | host memory cap (both GPUs' pages, 1e9 bytes); pinned in full at startup (~29 s for 64 GB), LRU slots are evicted to stay under it |
+| `--prefix-cache-min-tokens N` | 64 | shortest sequence saved and shortest prefix restored |
+| `--prefix-cache-gpu true\|false` | true | keep a finished sequence's KV pages on the GPUs until the pool needs them |
+| `--prefix-cache-staging-pages N` | 32 | pages per device staging buffer (two per GPU, 47.6 MB each at 32; taken from the KV pool) |
+| `--prefix-cache-restore-pace N` | 0 | while requests decode, issue at most N restore pages per step (smoother ITL for the others, later TTFT for the restored request; 0: all at once) |
 
 ## Build
 

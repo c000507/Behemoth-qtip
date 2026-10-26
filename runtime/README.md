@@ -154,6 +154,17 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 cpp_runtime/build-rocm/behemoth_http_tests 127.0.0.1 8080
 ```
 
+### Prefix cache
+
+Enabled by default (`--prefix-cache-slots 10`, `--prefix-cache-gb 64`, `--prefix-cache-min-tokens 64`,
+`--prefix-cache-gpu true`, `--prefix-cache-staging-pages 32`, `--prefix-cache-restore-pace 0`;
+`--prefix-cache-slots 0` disables it). A prompt
+whose token ids start with a cached sequence restores that KV (from pinned host memory, or by taking over the
+pages a recent sequence left on the GPUs) and prefills only the remainder; finished and cancelled requests are
+cached. Design, tests and measurements: [PREFIX_CACHE_REPORT.md](PREFIX_CACHE_REPORT.md). Tests:
+`behemoth_model_tests MODEL prefix` (save/restore round trip, logits vs cold prefill) and, against a running
+server, `python3 tests/prefix_cache_e2e.py --port PORT`.
+
 The HTTP test exercises protocol errors, deterministic streaming/nonstreaming
 output, concurrent requests, stop strings, client disconnects, and page reclamation.
 `/metrics` reports engine-side rolling TTFT/inter-token percentiles (last 1024
