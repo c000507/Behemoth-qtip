@@ -4,6 +4,7 @@
 #include "behemoth/tokenizer.hpp"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <algorithm>
 #include <csignal>
 #include <ctime>
 #include <deque>
@@ -28,7 +29,7 @@ class Session : public std::enable_shared_from_this<Session> {
     uint64_t id_ = 0;
     std::time_t created_ = std::time(nullptr);
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
-         closed_ = false, first_piece_ = true;
+         closed_ = false, first_piece_ = true, include_usage_ = false;
     std::string output_;
     TextStream text_;
     std::deque<std::string> queue_;
@@ -118,6 +119,12 @@ class Session : public std::enable_shared_from_this<Session> {
         if (streaming_ && !text.empty())
             enqueue("data: " + chunk({{"content", text}}).dump() + "\n\n");
     }
+    static json usage(const GenerationEvent &event) {
+        return {{"prompt_tokens", event.prompt_tokens},
+                {"completion_tokens", event.completion_tokens},
+                {"total_tokens", event.prompt_tokens + event.completion_tokens},
+                {"prompt_tokens_details", {{"cached_tokens", event.cached_tokens}}}};
+    }
     void finish(const GenerationEvent &event, const std::string &reason) {
         if (finished_ || closed_)
             return;
@@ -125,6 +132,16 @@ class Session : public std::enable_shared_from_this<Session> {
         finished_ = true;
         if (streaming_) {
             enqueue("data: " + chunk(json::object(), reason).dump() + "\n\n");
+            if (include_usage_)
+                enqueue("data: " +
+                        json{{"id", completion_id()},
+                             {"object", "chat.completion.chunk"},
+                             {"created", created_},
+                             {"model", model_id},
+                             {"choices", json::array()},
+                             {"usage", usage(event)}}
+                            .dump() +
+                        "\n\n");
             enqueue("data: [DONE]\n\n");
             enqueue("", true);
         } else
@@ -137,10 +154,7 @@ class Session : public std::enable_shared_from_this<Session> {
                       {{{"index", 0},
                         {"message", {{"role", "assistant"}, {"content", output_}}},
                         {"finish_reason", reason}}}},
-                     {"usage",
-                      {{"prompt_tokens", event.prompt_tokens},
-                       {"completion_tokens", event.completion_tokens},
-                       {"total_tokens", event.prompt_tokens + event.completion_tokens}}}});
+                     {"usage", usage(event)}});
     }
     void on_event(const GenerationEvent &event) {
         if (closed_ || finished_)
@@ -206,6 +220,7 @@ class Session : public std::enable_shared_from_this<Session> {
             auto request = parse_chat(json::parse(req.body()));
             auto prompt = tokenizer_.encode(request.rendered);
             streaming_ = request.stream;
+            include_usage_ = request.include_usage;
             text_ = TextStream(request.stops);
             std::weak_ptr<Session> weak = shared_from_this();
             id_ = engine_.submit(prompt, request.max_new, request.sampling,
@@ -292,6 +307,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
 int main(int argc, char **argv) {
     try {
         RuntimeOptions options;
+        options.prefix_cache.slots = 10; // PREFIX_CACHE_REPORT.md; --prefix-cache-slots 0 disables
         std::string host = "127.0.0.1";
         unsigned short port = 8080;
         int threads = 4;
@@ -346,6 +362,22 @@ int main(int argc, char **argv) {
                 options.projection_search = value;
             } else if (key == "--code-layout") {
                 options.code_layout = value;
+            } else if (key == "--prefix-cache-slots") {
+                options.prefix_cache.slots = std::stoul(value);
+            } else if (key == "--prefix-cache-gb") {
+                options.prefix_cache_gb = std::stod(value);
+                if (!(options.prefix_cache_gb > 0))
+                    throw std::invalid_argument("--prefix-cache-gb must be positive");
+            } else if (key == "--prefix-cache-min-tokens") {
+                options.prefix_cache.min_tokens = std::max<size_t>(1, std::stoul(value));
+            } else if (key == "--prefix-cache-gpu") {
+                if (value != "true" && value != "false" && value != "1" && value != "0")
+                    throw std::invalid_argument("--prefix-cache-gpu expects true or false");
+                options.prefix_cache.gpu_tier = value == "true" || value == "1";
+            } else if (key == "--prefix-cache-staging-pages") {
+                options.kv_transfer_pages = std::stoi(value);
+                if (options.kv_transfer_pages < 1 || options.kv_transfer_pages > 64)
+                    throw std::invalid_argument("--prefix-cache-staging-pages must be 1..64");
             } else if (key == "--profile") {
                 if (value != "true" && value != "false" && value != "1" && value != "0")
                     throw std::invalid_argument("--profile expects true or false");

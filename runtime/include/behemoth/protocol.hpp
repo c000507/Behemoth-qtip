@@ -9,6 +9,7 @@ struct ChatRequest {
     SamplingOptions sampling;
     size_t max_new = 256;
     bool stream = false;
+    bool include_usage = false; // stream_options.include_usage: final chunk carries usage
     std::vector<std::string> stops;
 };
 ChatRequest parse_chat(const nlohmann::json &);

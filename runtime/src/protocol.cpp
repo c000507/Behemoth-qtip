@@ -44,6 +44,8 @@ ChatRequest parse_chat(const nlohmann::json &j) {
         throw std::invalid_argument("Output-token limit must be 1..131072");
     r.max_new = maximum.get<size_t>();
     r.stream = j.value("stream", false);
+    if (j.contains("stream_options") && j.at("stream_options").is_object())
+        r.include_usage = j.at("stream_options").value("include_usage", false);
     r.sampling.temperature = j.value("temperature", 0.f);
     r.sampling.top_k = j.value("top_k", 0);
     r.sampling.top_p = j.value("top_p", 1.f);

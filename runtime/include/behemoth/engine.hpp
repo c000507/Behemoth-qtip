@@ -10,6 +10,7 @@ struct GenerationEvent {
     bool done = false;
     std::string reason, error;
     size_t prompt_tokens = 0, completion_tokens = 0;
+    size_t cached_tokens = 0; // prompt tokens whose KV came from the prefix cache
 };
 using GenerationCallback = std::function<void(const GenerationEvent &)>;
 class Engine {
