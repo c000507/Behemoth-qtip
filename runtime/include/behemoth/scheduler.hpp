@@ -1,6 +1,7 @@
 #pragma once
 #include "cache.hpp"
 #include <deque>
+#include <functional>
 #include <map>
 #include <span>
 #include <string>
@@ -18,6 +19,11 @@ struct Request {
     size_t cached = 0, prompt_size = 0, generated = 0, max_new = 0;
     SamplingOptions sampling;
     bool done = false, inflight = false;
+    // Prefix cache (PREFIX_CACHE_REPORT.md): while `restoring`, KV pages are being copied in
+    // (or the request waits for them); it is neither scheduled nor preempted. `restored`: prompt
+    // tokens whose KV came from the cache (reset to 0 when the request is preempted).
+    bool restoring = false;
+    size_t restored = 0;
     std::string reason;
 };
 struct ScheduledRequest {
@@ -51,6 +57,9 @@ class Scheduler {
     size_t preemptions_ = 0;
     SchedulerPolicy policy_;
     size_t steps_since_prefill_ = 0;
+    bool retain_finished_ = false;
+    std::function<std::vector<int>(size_t)> reclaim_;
+    bool grow(std::vector<int> &table, size_t tokens);
 
   public:
     Scheduler(int pages, size_t token_budget = 1024, size_t prefill_chunk = 256,
@@ -76,5 +85,31 @@ class Scheduler {
         return pool_.capacity();
     }
     size_t pending() const;
+    size_t held_pages() const; // pages owned by requests (active, restoring or retained)
+
+    // Prefix cache hooks (PREFIX_CACHE_REPORT.md).
+    // Finished/cancelled requests keep their KV pages until erase() or take_pages() (default:
+    // released as soon as the request is done).
+    void set_retain_finished(bool retain) {
+        retain_finished_ = retain;
+    }
+    // Called when the pool runs out of pages, before any request is preempted: returns pages
+    // (prefix-cache GPU tier) that are released into the pool.
+    void set_reclaim(std::function<std::vector<int>(size_t pages_needed)> reclaim) {
+        reclaim_ = std::move(reclaim);
+    }
+    // Pages of a done request (moved out; the caller releases them later).
+    std::vector<int> take_pages(uint64_t id);
+    void release_pages(std::vector<int> &pages);
+    // Grows `table` to cover `tokens` from the pool (reclaiming cache pages if needed).
+    bool allocate_pages(std::vector<int> &table, size_t tokens);
+    // A queued request waits for a prefix restore (not scheduled until finish/abort_restore).
+    void wait_restore(uint64_t id);
+    // Restore copies into `pages` (the request's first pages) are in flight.
+    void begin_restore(uint64_t id, std::vector<int> pages);
+    // KV of the first `tokens` prompt tokens is in the request's pages.
+    void finish_restore(uint64_t id, size_t tokens);
+    // Restore not done: the request prefills from scratch (pages released).
+    void abort_restore(uint64_t id);
 };
 } // namespace behemoth

@@ -1,5 +1,6 @@
 #include "behemoth/cache.hpp"
 #include "behemoth/checkpoint.hpp"
+#include "behemoth/prefix_cache.hpp"
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
 #include "behemoth/sorted_layout.hpp"
@@ -309,6 +310,226 @@ static void scheduler_policy_tests() {
         rejects([] { SchedulerPolicy bad; bad.prefill_interval = 0; Scheduler x(4, 4, 4, bad); });
     }
 }
+
+// Prefix cache index (PREFIX_CACHE_REPORT.md): longest-prefix matching, superseding/extension,
+// page sharing, LRU slot eviction, the host page cap, leases, GPU tier, abandon.
+static void prefix_cache_tests() {
+    auto seq = [](size_t n, int base) {
+        std::vector<int> v(n);
+        for (size_t i = 0; i < n; ++i)
+            v[i] = base + int(i % 1000);
+        return v;
+    };
+    auto cat = [](std::vector<int> a, const std::vector<int> &b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    };
+    {
+        PrefixCache c({4, 1000, 16, true});
+        std::vector<int> release;
+        auto a = seq(100, 1);
+        CHECK(!c.lookup(a));
+        CHECK(c.stats().misses == 1);
+        auto plan = c.insert(a, 0, nullptr, release);
+        CHECK(plan.slot && plan.first_page == 0 && plan.slot->host.size() == 7);
+        CHECK(!plan.slot->ready && c.slots() == 1 && c.host_pages_used() == 7);
+        // a request may match the slot while its save is still in flight
+        auto early = c.lookup(cat(a, seq(5, 5000)));
+        CHECK(early && early->tokens == 100 && !early->slot->ready);
+        c.release(*early);
+        std::vector<int> gpu{10, 11, 12, 13, 14, 15, 16, 17};
+        c.saved(plan, gpu, release);
+        CHECK(plan.slot->ready && plan.slot->gpu.size() == 7);
+        CHECK(release == std::vector<int>{17}); // pages beyond ceil(100/16)
+        CHECK(c.gpu_pages() == 7);
+        release.clear();
+        // longest common prefix, capped at prompt.size() - 1
+        auto hit = c.lookup(cat(a, seq(20, 7000)));
+        CHECK(hit && hit->tokens == 100 && hit->host.size() == 7);
+        auto partial = c.lookup(cat(seq(50, 1), seq(30, 9000)));
+        CHECK(partial && partial->tokens == 50 && partial->host.size() == 4);
+        c.release(*partial);
+        auto same = c.lookup(a);
+        CHECK(same && same->tokens == 99);
+        c.release(*same);
+        CHECK(!c.lookup(cat(seq(10, 1), seq(90, 4000)))); // 10 < min_tokens
+        // GPU-tier hit takes the resident pages over; the rest goes back to the pool
+        auto taken = c.take_gpu(hit->slot, 7, release);
+        CHECK(taken == (std::vector<int>{10, 11, 12, 13, 14, 15, 16}) && release.empty());
+        CHECK(c.gpu_pages() == 0 && c.take_gpu(hit->slot, 7, release).empty());
+        // next turn: a + reply extends the slot; pages fully inside the restored 100 tokens
+        // (6 of them) are shared, the partial 7th and the new ones are copied
+        auto b = cat(a, seq(30, 3000));
+        auto plan_b = c.insert(b, 0, &*hit, release);
+        CHECK(plan_b.slot && plan_b.first_page == 6 && plan_b.slot->host.size() == 9);
+        CHECK(c.slots() == 1 && !plan.slot->indexed); // a superseded
+        for (int k = 0; k < 6; ++k)
+            CHECK(plan_b.slot->host[size_t(k)] == plan.slot->host[size_t(k)]);
+        CHECK(c.host_pages_used() == 10); // 9 + a's partial page held by the lease
+        c.release(*hit);
+        CHECK(c.host_pages_used() == 9);
+        c.saved(plan_b, {20, 21, 22, 23, 24, 25, 26, 27, 28}, release);
+        // a shorter or equal sequence is already covered
+        CHECK(!c.insert(seq(80, 1), 0, nullptr, release).slot && c.stats().covered == 1);
+        // shared system prompt: two conversations, a third one matches the common part
+        auto sys = seq(64, 20000);
+        auto p1 = c.insert(cat(sys, seq(40, 1)), 0, nullptr, release);
+        auto p2 = c.insert(cat(sys, seq(40, 500)), 0, nullptr, release);
+        CHECK(p1.slot && p2.slot && c.slots() == 3);
+        c.saved(p1, {}, release);
+        c.saved(p2, {}, release);
+        auto third = c.lookup(cat(sys, seq(40, 900)));
+        CHECK(third && third->tokens == 64 && third->slot == p2.slot); // tie: most recent
+        c.release(*third);
+        // slot limit 4: inserting two more evicts the least recently used slot (b: touched by
+        // the covered insert before p1/p2 were inserted)
+        auto q1 = c.insert(seq(32, 30000), 0, nullptr, release);
+        c.saved(q1, {}, release);
+        CHECK(c.slots() == 4 && c.stats().evictions == 0);
+        auto q2 = c.insert(seq(32, 31000), 0, nullptr, release);
+        c.saved(q2, {}, release);
+        CHECK(c.slots() == 4 && c.stats().evictions == 1 && !plan_b.slot->indexed);
+        CHECK(c.cached_tokens() == 104 + 104 + 32 + 32);
+        // abandon drops a slot
+        auto q3 = c.insert(seq(48, 32000), 0, nullptr, release);
+        c.abandon(q3);
+        CHECK(q3.slot->failed && !q3.slot->indexed);
+        CHECK(!c.lookup(seq(48, 32000)));
+    }
+    {
+        // host page cap: 20 pages, 7-page sequences -> the third evicts the oldest; a lease
+        // keeps evicted pages alive (still counted) until released
+        PrefixCache c({10, 20, 16, false});
+        std::vector<int> release;
+        auto s1 = c.insert(seq(112, 1), 0, nullptr, release);
+        c.saved(s1, {1, 2, 3, 4, 5, 6, 7}, release);
+        CHECK(release.size() == 7); // no GPU tier
+        auto lease = c.lookup(cat(seq(112, 1), seq(3, 7777)));
+        CHECK(lease && lease->tokens == 112);
+        auto s2 = c.insert(seq(112, 2000), 0, nullptr, release);
+        c.saved(s2, {}, release);
+        CHECK(c.host_pages_used() == 14 && c.host_high_water() == 14);
+        auto s3 = c.insert(seq(112, 4000), 0, nullptr, release);
+        // 6 pages left under the cap; evicting s1 frees nothing (its pages are leased), so s2
+        // is evicted as well
+        CHECK(s3.slot && c.stats().evictions == 2 && !s1.slot->indexed && !s2.slot->indexed);
+        CHECK(c.host_pages_used() == 14 && c.host_high_water() == 20);
+        c.saved(s3, {}, release);
+        c.release(*lease);
+        CHECK(c.host_pages_used() == 7 * (c.slots()));
+        // a sequence larger than the cap is skipped without evicting anything
+        CHECK(!c.insert(seq(400, 9000), 0, nullptr, release).slot && c.stats().skipped == 1);
+        CHECK(c.slots() == 1 && c.stats().evictions == 2);
+    }
+    {
+        // reclaim: GPU tiers released least recently used first
+        PrefixCache c({10, 100, 16, true});
+        std::vector<int> release;
+        auto a = c.insert(seq(32, 1), 0, nullptr, release);
+        c.saved(a, {1, 2}, release);
+        auto b = c.insert(seq(32, 500), 0, nullptr, release);
+        c.saved(b, {3, 4}, release);
+        auto touch = c.lookup(cat(seq(32, 1), seq(1, 7000)));
+        c.release(*touch);
+        CHECK(c.reclaim_gpu(1, release) == 2 && release == (std::vector<int>{3, 4}));
+        CHECK(c.gpu_pages() == 2 && a.slot->gpu.size() == 2);
+    }
+    {
+        // next turn of a conversation: the previous reply is re-tokenized differently, so only
+        // the slot's prompt part matches; the new sequence replaces the slot (no second slot),
+        // while a match ending inside the prompt (shared system prompt) keeps it
+        PrefixCache c({10, 100, 16, true});
+        std::vector<int> release;
+        auto prompt = seq(100, 1);
+        auto t1 = c.insert(cat(prompt, seq(20, 5000)), 100, nullptr, release);
+        c.saved(t1, {}, release);
+        auto sys_hit = c.lookup(cat(seq(70, 1), seq(50, 8000)));
+        CHECK(sys_hit && sys_hit->tokens == 70);
+        auto other = c.insert(cat(seq(70, 1), seq(60, 8000)), 120, &*sys_hit, release);
+        c.release(*sys_hit);
+        c.saved(other, {}, release);
+        CHECK(c.slots() == 2 && t1.slot->indexed && other.first_page == 4);
+        auto next = cat(cat(prompt, seq(25, 6000)), seq(10, 7000));
+        auto hit = c.lookup(next);
+        CHECK(hit && hit->slot == t1.slot && hit->tokens == 100);
+        auto t2 = c.insert(cat(next, seq(15, 9000)), next.size(), &*hit, release);
+        c.release(*hit);
+        CHECK(t2.slot && !t1.slot->indexed && other.slot->indexed && c.slots() == 2);
+        CHECK(t2.first_page == 6 && t2.slot->prompt == next.size());
+    }
+    {
+        PrefixCache off({0, 100, 16, true});
+        std::vector<int> release;
+        CHECK(!off.insert(seq(100, 1), 0, nullptr, release).slot && !off.lookup(seq(100, 1)));
+    }
+}
+// Scheduler hooks used by the prefix cache.
+static void scheduler_restore_tests() {
+    Scheduler s(16, 64, 64);
+    s.set_retain_finished(true);
+    auto id = s.submit(std::vector<int>(40, 3), 2);
+    s.wait_restore(id);
+    CHECK(s.schedule().requests.empty()); // waiting requests are not scheduled
+    std::vector<int> pages;
+    CHECK(s.allocate_pages(pages, 32) && pages.size() == 2 && s.free_pages() == 14);
+    s.begin_restore(id, pages);
+    rejects([&] { s.cancel(id); }); // copy in flight
+    s.finish_restore(id, 30);
+    CHECK(s.request(id).cached == 30 && s.request(id).restored == 30);
+    auto b = s.schedule();
+    CHECK(b.requests.size() == 1 && b.requests[0].begin == 30 && b.requests[0].count == 10);
+    s.complete(b.requests[0], 5);
+    auto d = s.schedule();
+    CHECK(d.requests.size() == 1 && d.requests[0].count == 1);
+    s.complete(d.requests[0], 5);
+    CHECK(s.request(id).done && s.free_pages() == 13); // retained until taken
+    auto kept = s.take_pages(id);
+    CHECK(kept.size() == 3);
+    s.erase(id);
+    CHECK(s.free_pages() == 13);
+    s.release_pages(kept);
+    CHECK(s.free_pages() == 16);
+    // full prefix restored: the remaining prompt token is a decode-shaped step
+    auto full = s.submit(std::vector<int>(33, 3), 1);
+    s.wait_restore(full);
+    std::vector<int> fp;
+    CHECK(s.allocate_pages(fp, 32));
+    s.begin_restore(full, fp);
+    s.finish_restore(full, 32);
+    auto one = s.schedule();
+    CHECK(one.requests.size() == 1 && one.requests[0].count == 1 && one.requests[0].sample);
+    s.complete(one.requests[0], 9);
+    auto fk = s.take_pages(full);
+    s.erase(full);
+    s.release_pages(fk);
+    // abort: pages go back, request prefills from scratch
+    auto ab = s.submit(std::vector<int>(20, 3), 1);
+    s.wait_restore(ab);
+    std::vector<int> ap;
+    CHECK(s.allocate_pages(ap, 16));
+    s.begin_restore(ab, ap);
+    s.abort_restore(ab);
+    CHECK(s.free_pages() == 16 && s.request(ab).cached == 0);
+    auto abs = s.schedule();
+    CHECK(abs.requests.size() == 1 && abs.requests[0].begin == 0 && abs.requests[0].count == 20);
+    s.complete(abs.requests[0], 9);
+    auto apk = s.take_pages(ab);
+    s.erase(ab);
+    s.release_pages(apk);
+    // reclaim hook: cache-held pages are returned before anything is preempted
+    std::vector<int> held;
+    CHECK(s.allocate_pages(held, 16 * 16) && s.free_pages() == 0);
+    size_t asked = 0;
+    s.set_reclaim([&](size_t need) {
+        asked = need;
+        std::vector<int> give(held.end() - 4, held.end());
+        held.resize(held.size() - 4);
+        return give;
+    });
+    auto r = s.submit(std::vector<int>(40, 3), 1);
+    auto rb = s.schedule();
+    CHECK(rb.requests.size() == 1 && rb.requests[0].id == r && asked == 3 && s.preemptions() == 0);
+}
 static void sampling_tests() {
     std::thread::id worker_id;
     {
@@ -597,6 +818,8 @@ int main() {
                  {"attention", attention_tests},
                  {"scheduler", scheduler_tests},
                  {"scheduler_policy", scheduler_policy_tests},
+                 {"prefix_cache", prefix_cache_tests},
+                 {"scheduler_restore", scheduler_restore_tests},
                   {"sampling", sampling_tests},
                   {"sampler_equivalence", sampler_equivalence_tests},
                   {"tuning", tuning_tests},

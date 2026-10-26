@@ -12,7 +12,7 @@ FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(json)
 find_package(Threads REQUIRED)
-add_library(behemoth_core src/attention.cpp src/cache.cpp src/checkpoint.cpp src/sorted_layout.cpp src/scheduler.cpp src/sampling.cpp src/protocol.cpp src/reference_block.cpp src/qtip.cpp)
+add_library(behemoth_core src/attention.cpp src/cache.cpp src/checkpoint.cpp src/sorted_layout.cpp src/scheduler.cpp src/sampling.cpp src/protocol.cpp src/reference_block.cpp src/qtip.cpp src/prefix_cache.cpp)
 target_include_directories(behemoth_core PUBLIC include)
 target_link_libraries(behemoth_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
 target_compile_options(behemoth_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)

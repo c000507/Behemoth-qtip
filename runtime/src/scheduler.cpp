@@ -30,20 +30,80 @@ uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, Sampling
     requests_.emplace(id, std::move(r));
     return id;
 }
+bool Scheduler::grow(std::vector<int> &table, size_t tokens) {
+    if (pool_.grow(table, tokens))
+        return true;
+    if (!reclaim_)
+        return false;
+    const size_t need = ceil_div(tokens, size_t(16)) - table.size();
+    auto pages = reclaim_(need > pool_.free_pages() ? need - pool_.free_pages() : 1);
+    if (pages.empty())
+        return false;
+    pool_.release(pages);
+    return pool_.grow(table, tokens);
+}
+std::vector<int> Scheduler::take_pages(uint64_t id) {
+    auto &r = requests_.at(id);
+    if (!r.done || r.inflight || r.restoring)
+        throw std::logic_error("Pages of an active request cannot be taken");
+    return std::move(r.pages);
+}
+void Scheduler::release_pages(std::vector<int> &pages) {
+    pool_.release(pages);
+}
+bool Scheduler::allocate_pages(std::vector<int> &table, size_t tokens) {
+    return grow(table, tokens);
+}
+void Scheduler::wait_restore(uint64_t id) {
+    auto &r = requests_.at(id);
+    if (r.done || r.inflight || r.cached || !r.pages.empty())
+        throw std::logic_error("Only a queued request can wait for a prefix restore");
+    r.restoring = true;
+}
+void Scheduler::begin_restore(uint64_t id, std::vector<int> pages) {
+    auto &r = requests_.at(id);
+    if (!r.restoring || !r.pages.empty())
+        throw std::logic_error("Restore without wait_restore");
+    r.pages = std::move(pages);
+}
+void Scheduler::finish_restore(uint64_t id, size_t tokens) {
+    auto &r = requests_.at(id);
+    if (!r.restoring || tokens >= r.history.size() || ceil_div(tokens, size_t(16)) > r.pages.size())
+        throw std::logic_error("Invalid prefix restore completion");
+    r.restoring = false;
+    r.cached = r.restored = tokens;
+}
+void Scheduler::abort_restore(uint64_t id) {
+    auto &r = requests_.at(id);
+    if (!r.restoring)
+        throw std::logic_error("No restore to abort");
+    pool_.release(r.pages);
+    r.restoring = false;
+    r.cached = r.restored = 0;
+}
 void Scheduler::cancel(uint64_t id) {
     auto &r = requests_.at(id);
-    if (r.inflight)
+    if (r.inflight || r.restoring)
         throw std::logic_error("Cancel must be processed between GPU steps");
-    pool_.release(r.pages);
+    if (!retain_finished_)
+        pool_.release(r.pages);
     r.done = true;
     r.reason = "cancelled";
 }
 void Scheduler::erase(uint64_t id) {
     auto &r = requests_.at(id);
-    if (!r.done || r.inflight)
+    if (!r.done || r.inflight || r.restoring)
         throw std::logic_error("Cannot erase active request");
     pool_.release(r.pages);
     requests_.erase(id);
+}
+size_t Scheduler::held_pages() const {
+    size_t n = 0;
+    for (const auto &[id, r] : requests_) {
+        (void)id;
+        n += r.pages.size();
+    }
+    return n;
 }
 size_t Scheduler::pending() const {
     size_t n = 0;
@@ -57,7 +117,7 @@ ScheduledBatch Scheduler::schedule() {
     ScheduledBatch batch;
     std::vector<uint64_t> decode, prefill;
     for (auto &[id, r] : requests_)
-        if (!r.done) {
+        if (!r.done && !r.restoring) {
             if (r.inflight)
                 throw std::logic_error("Previous GPU step not completed");
             if (r.history.size() > 131072 ||
@@ -96,19 +156,20 @@ ScheduledBatch Scheduler::schedule() {
             return;
         // Queued prefills cannot evict older work. Decode growth may reclaim newest unpinned
         // requests.
-        while (!pool_.grow(r.pages, r.cached + count)) {
+        while (!grow(r.pages, r.cached + count)) {
             if (!is_decode)
                 return;
             auto victim = requests_.rend();
             for (auto it = requests_.rbegin(); it != requests_.rend(); ++it)
-                if (!it->second.done && !it->second.inflight && !it->second.pages.empty()) {
+                if (!it->second.done && !it->second.inflight && !it->second.restoring &&
+                    !it->second.pages.empty()) {
                     victim = it;
                     break;
                 }
             if (victim == requests_.rend())
                 return;
             pool_.release(victim->second.pages);
-            victim->second.cached = 0;
+            victim->second.cached = victim->second.restored = 0;
             ++preemptions_;
             if (victim->first == id)
                 return;
@@ -129,12 +190,16 @@ ScheduledBatch Scheduler::schedule() {
     // If incomplete prefills fill the pool, retain the oldest and recompute newer ones to guarantee
     // progress.
     if (batch.requests.empty() && pending()) {
-        auto first = std::find_if(requests_.begin(), requests_.end(),
-                                  [](const auto &p) { return !p.second.done; });
+        auto first = std::find_if(requests_.begin(), requests_.end(), [](const auto &p) {
+            return !p.second.done && !p.second.restoring;
+        });
+        if (first == requests_.end())
+            return batch; // only prefix restores pending
         for (auto it = requests_.rbegin(); it != requests_.rend(); ++it)
-            if (it->first != first->first && !it->second.done && !it->second.pages.empty()) {
+            if (it->first != first->first && !it->second.done && !it->second.restoring &&
+                !it->second.pages.empty()) {
                 pool_.release(it->second.pages);
-                it->second.cached = 0;
+                it->second.cached = it->second.restored = 0;
                 ++preemptions_;
             }
         prefill_cap = token_budget_;
@@ -158,7 +223,8 @@ void Scheduler::complete(const ScheduledRequest &step, int token, bool eos) {
         if (eos || r.generated >= r.max_new || r.history.size() >= 131072) {
             r.done = true;
             r.reason = eos ? "stop" : "length";
-            pool_.release(r.pages);
+            if (!retain_finished_)
+                pool_.release(r.pages);
         }
     }
 }
