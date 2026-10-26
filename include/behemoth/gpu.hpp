@@ -144,6 +144,12 @@ struct AttentionDeviceView {
     float *denominator{}; // optional final statistics for correctness checks
 };
 size_t attention_workspace_bytes(const AttentionLayout &, int partition_keys = 0);
+// Key-partition size for the GQA decode kernel: `requested` > 0 forces a
+// multiple of 32 (grown until the split-K partials fit the workspace);
+// otherwise the partition is chosen so ~target_blocks (request, kv head,
+// partition) blocks cover the longest context. Returns 0 for a single partition.
+int decode_attention_partition(const AttentionLayout &, size_t workspace_bytes, int requested = 0,
+                               int target_blocks = 512);
 void paged_attention(const GpuMetadata &, AttentionDeviceView, void *workspace,
                      size_t workspace_bytes, int partition_keys, hipStream_t);
 void append_kv(const GpuMetadata &, AttentionDeviceView, const BFloat16 *k, const BFloat16 *v,

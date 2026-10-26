@@ -523,19 +523,20 @@ struct Shard {
         for (size_t r = 0; r < batch.layout.lengths.size(); ++r)
             decode &= batch.layout.query_offsets[r + 1] - batch.layout.query_offsets[r] == 1;
         if (decode) {
-            // Decode attention runs one wave per (request, head, key partition):
-            // short partitions give the 48 heads of a single request enough
-            // blocks to fill the GPU (PERF_ROUND2_REPORT.md).
-            // 32 keys: c=1 step 79.9 -> 76.4 ms, c=4 124.6 -> 121.6 ms (128: no gain).
-            static const int decode_partition = [] {
+            // Decode attention: the GQA kernel runs one block per (request, kv
+            // head, key partition); the partition is sized so ~512 blocks cover
+            // the longest context (ATTENTION_ROUND4_REPORT.md). Overrides:
+            // BEHEMOTH_ATTN_PARTITION (keys, multiple of 32), BEHEMOTH_ATTN_BLOCKS.
+            static const int requested_partition = [] {
                 const char *v = std::getenv("BEHEMOTH_ATTN_PARTITION");
-                return v ? std::atoi(v) : 32;
+                return v ? std::atoi(v) : 0;
             }();
-            for (int candidate : {decode_partition, 1024})
-                if (attention_workspace_bytes(batch.layout, candidate) <= attention_workspace.size()) {
-                    partition = candidate;
-                    break;
-                }
+            static const int target_blocks = [] {
+                const char *v = std::getenv("BEHEMOTH_ATTN_BLOCKS");
+                return v ? std::atoi(v) : 512;
+            }();
+            partition = decode_attention_partition(batch.layout, attention_workspace.size(),
+                                                   requested_partition, target_blocks);
         }
         for (int index = only_layer < 0 ? 0 : only_layer;
              index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {

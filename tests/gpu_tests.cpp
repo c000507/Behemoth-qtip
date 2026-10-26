@@ -45,7 +45,10 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
     auto error = compare_attention(values, reference.output);
     if (!error.pass)
         throw std::runtime_error("GPU attention mismatch: rms=" + std::to_string(error.rms_error) +
-                                 " max=" + std::to_string(error.max_abs));
+                                 " max=" + std::to_string(error.max_abs) +
+                                 " partition=" + std::to_string(partition) +
+                                 " max_len=" + std::to_string(*std::max_element(
+                                                   l.lengths.begin(), l.lengths.end())));
     auto maxima = mx.download(), denominators = den.download();
     for (size_t i = 0; i < rows; ++i) {
         check(std::abs(maxima[i] - reference.maximum[i]) <
@@ -59,6 +62,50 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
         check(actual[i].bits == guarded[i].bits &&
                   actual[actual.size() - 1 - i].bits == guarded.back().bits,
               "Attention wrote outside output");
+}
+// Long single-query contexts (decode) through every partition the model can
+// pick: unsplit, the forced 32/1024-key splits and the automatic block-filling
+// choice at the production 32 MB workspace.
+static void long_contexts(hipStream_t stream) {
+    struct Batch {
+        std::vector<int> lengths;
+        int seed;
+    };
+    const std::vector<Batch> batches = {{{4096}, 7},
+                                        {{13000}, 19},
+                                        {{33000}, 103},
+                                        {{13000, 517, 8191, 2049}, 7},
+                                        {{33, 4097, 1, 2048}, 19}};
+    for (const auto &b : batches) {
+        std::vector<std::vector<int>> positions;
+        for (int len : b.lengths)
+            positions.push_back({len - 1});
+        auto f = test::fixture(b.lengths, positions, b.seed);
+        std::vector<int> partitions = {0, 32, 1024};
+        for (int target : {512, 2048})
+            partitions.push_back(decode_attention_partition(f.layout, 32u << 20, 0, target));
+        partitions.push_back(decode_attention_partition(f.layout, 32u << 20, 32));
+        for (int partition : partitions)
+            run_case(f, partition, stream);
+    }
+    // Decode queries that are not at the end of their context (masked tail keys).
+    run_case(test::fixture({4100, 700}, {{2049}, {31}}, 11), 256, stream);
+    // Partition sizing: short contexts stay unsplit; long ones split along 32-key tiles.
+    {
+        AttentionLayout l = test::fixture({90}, {{89}}).layout;
+        check(decode_attention_partition(l, 32u << 20) == 32, "Short context: one tile per block");
+        check(decode_attention_partition(test::fixture({32}, {{31}}).layout, 32u << 20) == 0,
+              "Single-tile context should be unsplit");
+        l = test::fixture({13000}, {{12999}}).layout;
+        int p = decode_attention_partition(l, 32u << 20);
+        check(p > 0 && p % 32 == 0 && ceil_div(size_t(13000), size_t(p)) * 4 >= 256 &&
+                  ceil_div(size_t(13000), size_t(p)) * 4 <= 512,
+              "Automatic partition should give about the target block count");
+        check(decode_attention_partition(l, 32u << 20, 32) == 32, "Requested partition kept");
+        check(decode_attention_partition(l, 1024, 32) % 32 == 0 &&
+                  attention_workspace_bytes(l, decode_attention_partition(l, 1024, 32)) <= 1024,
+              "Partition must grow until the partials fit the workspace");
+    }
 }
 static void conversion(hipStream_t stream) {
     std::vector<float> values;
@@ -352,7 +399,10 @@ int main(int argc, char **argv) {
             for (int seed : {7, 19, 103}) {
                 run_case(test::fixture({33, 17}, {{0, 15, 16, 32}, {0, 16}}, seed), 0, stream);
                 run_case(test::fixture({129, 17}, {{0, 16, 128}, {0, 16}}, seed, 96), 32, stream);
+                // Mixed decode batch with 96/8 heads and masked tails.
+                run_case(test::fixture({129, 17, 1}, {{100}, {16}, {0}}, seed, 96), 32, stream);
             }
+            long_contexts(stream);
             auto known = test::fixture({33}, {{0, 16, 32}});
             std::fill(known.data.q.begin(), known.data.q.end(), 0);
             std::fill(known.data.v.begin(), known.data.v.end(), encode_e4m3(1));
@@ -369,8 +419,8 @@ int main(int argc, char **argv) {
             (void)hipStreamDestroy(stream);
             throw;
         }
-        std::cout << "PASS GPU conversion, append, projections, prefill, decode, split/merge, "
-                     "output guards and stream checks\n";
+        std::cout << "PASS GPU conversion, append, projections, prefill, decode (GQA, long "
+                     "contexts), split/merge, output guards and stream checks\n";
     } catch (const std::exception &e) {
         std::cerr << "FAIL (GPU acceptance NOT passed): " << e.what() << '\n';
         return 1;
