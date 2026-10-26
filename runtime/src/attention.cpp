@@ -14,8 +14,9 @@ void AttentionLayout::validate() const {
         size_t(query_offsets.back()) != positions.size() ||
         page_table.size() != checked_mul(lengths.size(), size_t(table_stride)))
         throw std::invalid_argument("Invalid query offsets or page-table shape");
-    if (queries() > 1024 || lengths.size() > 1024)
-        throw std::invalid_argument("Attention batch exceeds the 1024-token runtime budget");
+    // 4096 queries: the QTIP runtime's largest token budget (dense prefill chunks).
+    if (queries() > 4096 || lengths.size() > 1024)
+        throw std::invalid_argument("Attention batch exceeds the 4096-token runtime budget");
     for (size_t r = 0; r < lengths.size(); ++r)
         if (query_offsets[r] < 0 || query_offsets[r] > query_offsets[r + 1] ||
             query_offsets[r + 1] > queries())

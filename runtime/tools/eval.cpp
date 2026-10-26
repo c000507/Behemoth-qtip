@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
             opts.zero_copy_transport = true;
             opts.memory_fraction = .85;
             opts.token_budget = opts.prefill_chunk = size_t(chunk);
+            opts.sampled_rows = opts.token_budget;
             TensorParallelModel model(opts);
             Session session{model};
             std::vector<std::vector<float>> output(selected.size());
@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
             const size_t max_tokens = argc > 4 ? std::stoul(argv[4]) : 4096;
             const size_t chunk = argc > 5 ? std::stoul(argv[5]) : 256;
             options.token_budget = options.prefill_chunk = chunk;
+            options.sampled_rows = chunk;
             auto ids = tokenizer.encode(text);
             ids.insert(ids.begin(), 1);
             if (ids.size() > max_tokens + 1)

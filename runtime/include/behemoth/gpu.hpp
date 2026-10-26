@@ -154,6 +154,12 @@ size_t attention_workspace_bytes(const AttentionLayout &, int partition_keys = 0
 // partition) blocks cover the longest context. Returns 0 for a single partition.
 int decode_attention_partition(const AttentionLayout &, size_t workspace_bytes, int requested = 0,
                                int target_blocks = 512);
+// Multi-query (prefill / mixed) steps: a key partition (multiple of 32, 0 = unsplit) so that
+// (kv head, 16-query tile, partition) blocks of the largest request reach about target_blocks
+// when there are few query tiles (e.g. a small prefill piece over a long context), partitions of at least
+// min_partition keys, and the split-K partials fit workspace_bytes.
+int prefill_attention_partition(const AttentionLayout &, size_t workspace_bytes,
+                                int target_blocks = 512, int min_partition = 256);
 void paged_attention(const GpuMetadata &, AttentionDeviceView, void *workspace,
                      size_t workspace_bytes, int partition_keys, hipStream_t);
 void append_kv(const GpuMetadata &, AttentionDeviceView, const BFloat16 *k, const BFloat16 *v,

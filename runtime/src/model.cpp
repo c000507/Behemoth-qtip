@@ -2,6 +2,7 @@
 #include "behemoth/gpu.hpp"
 #include "behemoth/qtip_gpu.hpp"
 #include "behemoth/worker.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,16 @@
 
 namespace behemoth {
 namespace {
+size_t sampled_capacity(const RuntimeOptions &o) {
+    return std::min(o.token_budget, o.sampled_rows ? o.sampled_rows : max_sampled_rows);
+}
+std::atomic<int> &qtip_overlap_setting() {
+    static std::atomic<int> v{[] {
+        const char *e = std::getenv("BEHEMOTH_QTIP_OVERLAP_ROWS");
+        return e ? std::atoi(e) : -1;
+    }()};
+    return v;
+}
 void collective_check(ncclResult_t s, const char *op) {
     if (s != ncclSuccess)
         throw std::runtime_error(std::string(op) + ": " + ncclGetErrorString(s));
@@ -56,6 +67,121 @@ void topology(int device) {
               << " BAR_covers_VRAM=" << (largest >= p.totalGlobalMem) << " iommu_pt=" << iommu_pt
               << " P2P=disabled; BAR/IOMMU are diagnostic only\n";
 }
+// Stream-ordered copy-engine all-gather between the two ranks through pinned host memory
+// (PREFILL_SCHED_REPORT.md). gather(): the rank's stream copies its half to its host buffer in
+// pieces and records one event per piece; a second (copy) stream of the rank waits for the
+// peer's piece events (cross-device hipStreamWaitEvent: a command-processor barrier, not a
+// kernel) and copies the peer's pieces in, so outgoing and incoming PCIe traffic overlap (full
+// duplex); the rank's stream then waits for the copy stream. The copy engines reach ~13 (GPU 0)
+// / ~27 GB/s (GPU 1) here; kernel-issued PCIe stores (the publish kernels) only ~7 GB/s, and
+// hipStreamWaitValue32 runs as a spinning kernel that slows concurrent GEMMs.
+// Host handshake: a rank issues its waits for message e only after both ranks recorded message
+// e's events (one host arrival per message per rank), so a wait never sees a stale record.
+// Buffer/event reuse: message e uses parity e & 1. The peer's H2D of message e completes before
+// its stream issues the copy-out of message e + 1 (its stream waits for its copy stream), and
+// this rank's copy-in of message e + 1 waits for those events before its stream writes
+// buffer e + 2; events of message e + 2 are recorded after this rank passed the handshake of
+// e + 1, which the peer reaches only after issuing its waits for message e. Each channel is
+// used by one stream per rank, with the same message order on both ranks.
+class DmaChannel {
+    static constexpr int max_pieces = 16;
+    std::array<std::array<float *, 2>, 2> host_{};          // [owner][parity]
+    std::array<std::array<std::array<hipEvent_t, max_pieces>, 2>, 2> events_{}; // [rank][parity]
+    std::array<int, 2> event_device_{-1, -1};
+    std::array<unsigned, 2> messages_{};
+    std::atomic<uint64_t> arrivals_{0};
+    const std::atomic<bool> *aborted_ = nullptr;
+    size_t capacity_ = 0;
+    void release() noexcept {
+        for (auto &r : host_)
+            for (auto p : r)
+                if (p)
+                    (void)hipHostFree(p);
+        for (size_t r = 0; r < 2; ++r) {
+            if (event_device_[r] < 0)
+                continue;
+            int current = 0;
+            (void)hipGetDevice(&current);
+            (void)hipSetDevice(event_device_[r]);
+            for (auto &parity : events_[r])
+                for (auto e : parity)
+                    if (e)
+                        (void)hipEventDestroy(e);
+            (void)hipSetDevice(current);
+        }
+    }
+
+  public:
+    DmaChannel(size_t capacity, const std::atomic<bool> *aborted) : aborted_(aborted), capacity_(capacity) {
+        try {
+            for (size_t owner = 0; owner < 2; ++owner)
+                for (auto &p : host_[owner])
+                    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&p), capacity * sizeof(float),
+                                            hipHostMallocPortable));
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    ~DmaChannel() {
+        release();
+    }
+    DmaChannel(const DmaChannel &) = delete;
+    DmaChannel &operator=(const DmaChannel &) = delete;
+    size_t capacity() const {
+        return capacity_;
+    }
+    // local: this rank's n floats; all[(1 - rank) * n ..] receives the peer's n floats (the
+    // caller's half at all[rank * n ..] is untouched). Runs on the rank's thread and device.
+    void gather(int rank, const float *local, float *all, size_t n, hipStream_t stream,
+                hipStream_t copy_stream, hipEvent_t start, hipEvent_t done) {
+        if (n > capacity_)
+            throw std::invalid_argument("DMA gather exceeds the channel buffers");
+        const size_t r = size_t(rank), peer = size_t(1 - rank);
+        if (event_device_[r] < 0) {
+            HIP_CHECK(hipGetDevice(&event_device_[r]));
+            for (auto &parity : events_[r])
+                for (auto &e : parity)
+                    HIP_CHECK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+        }
+        static const size_t piece_limit = [] {
+            const char *v = std::getenv("BEHEMOTH_DMA_PIECES");
+            const int x = v ? std::atoi(v) : 4;
+            return size_t(std::clamp(x, 1, max_pieces));
+        }();
+        // pieces of at least 1 MiB; both ranks derive the same count from n
+        const size_t pieces = std::clamp<size_t>(n * sizeof(float) >> 20, 1, piece_limit);
+        const size_t per = (n + pieces - 1) / pieces;
+        const unsigned message = messages_[r]++, parity = message & 1U;
+        HIP_CHECK(hipEventRecord(start, stream));
+        HIP_CHECK(hipStreamWaitEvent(copy_stream, start, 0));
+        for (size_t p = 0; p < pieces; ++p) {
+            const size_t a = std::min(n, p * per), b = std::min(n, a + per);
+            if (b > a)
+                HIP_CHECK(hipMemcpyAsync(host_[r][parity] + a, local + a, (b - a) * sizeof(float),
+                                         hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipEventRecord(events_[r][parity][p], stream));
+        }
+        // handshake: both ranks recorded this message's events
+        const uint64_t target = 2 * (uint64_t(message) + 1);
+        arrivals_.fetch_add(1, std::memory_order_acq_rel);
+        while (arrivals_.load(std::memory_order_acquire) < target) {
+            if (aborted_ && aborted_->load(std::memory_order_relaxed))
+                throw std::runtime_error("Host transport aborted");
+            std::this_thread::yield();
+        }
+        for (size_t p = 0; p < pieces; ++p) {
+            const size_t a = std::min(n, p * per), b = std::min(n, a + per);
+            HIP_CHECK(hipStreamWaitEvent(copy_stream, events_[peer][parity][p], 0));
+            if (b > a)
+                HIP_CHECK(hipMemcpyAsync(all + peer * n + a, host_[peer][parity] + a,
+                                         (b - a) * sizeof(float), hipMemcpyHostToDevice,
+                                         copy_stream));
+        }
+        HIP_CHECK(hipEventRecord(done, copy_stream));
+        HIP_CHECK(hipStreamWaitEvent(stream, done, 0));
+    }
+};
 class HostTransport {
     std::array<float *, 2> host_{};
     size_t capacity_;
@@ -63,6 +189,7 @@ class HostTransport {
     std::condition_variable cv_;
     unsigned arrived_ = 0, generation_ = 0;
     bool aborted_ = false;
+    std::atomic<bool> abort_flag_{false}; // for the DMA channels' host handshake
     // Zero-copy path: per-rank double-buffered fine-grained host buffers plus a
     // sequence flag, exchanged by stream-ordered kernels (see transport.hip).
     // Decode-sized messages avoid the three host rendezvous and two stream
@@ -73,6 +200,17 @@ class HostTransport {
     std::array<unsigned *, 2> zc_flag_{};
     std::array<unsigned *, 2> zc_counter_{}; // device memory, owned by each rank
     std::array<unsigned, 2> zc_seq_{};
+    // Buffer parity alternates per exchange (both paths); flag values advance per published
+    // piece (the DMA path publishes a message in pieces).
+    std::array<unsigned, 2> zc_exchange_{};
+    struct Slot {
+        unsigned parity, seq; // seq: flag value of the (last) piece
+    };
+    Slot next_slot(int rank, unsigned pieces = 1) {
+        const unsigned parity = zc_exchange_[size_t(rank)]++ & 1U;
+        zc_seq_[size_t(rank)] += pieces;
+        return {parity, zc_seq_[size_t(rank)]};
+    }
     struct DevicePointers {
         bool valid = false;
         std::array<std::array<float *, 2>, 2> host{}; // [owner][parity]
@@ -184,10 +322,10 @@ class HostTransport {
         if (!zero_copy_eligible(n))
             return {};
         const auto &d = device_pointers(rank);
-        const unsigned seq = ++zc_seq_[size_t(rank)];
+        const auto [parity, seq] = next_slot(rank);
         Exchange e;
-        e.mine = d.host[size_t(rank)][seq & 1];
-        e.peer = d.host[size_t(1 - rank)][seq & 1];
+        e.mine = d.host[size_t(rank)][parity];
+        e.peer = d.host[size_t(1 - rank)][parity];
         e.flag = d.flag[size_t(rank)];
         e.peer_flag = d.flag[size_t(1 - rank)];
         e.counter = zc_counter_[size_t(rank)];
@@ -217,6 +355,7 @@ class HostTransport {
     void abort() {
         std::lock_guard lock(mutex_);
         aborted_ = true;
+        abort_flag_ = true;
         cv_.notify_all();
     }
     void reduce(int rank, float *values, size_t n, hipStream_t stream) {
@@ -224,10 +363,10 @@ class HostTransport {
             throw std::invalid_argument("Host transport capacity exceeded");
         if (zero_copy_ && n <= zero_copy_limit_ && n % 4 == 0) {
             const auto &d = device_pointers(rank);
-            const unsigned seq = ++zc_seq_[size_t(rank)];
-            zero_copy_publish(values, d.host[size_t(rank)][seq & 1], n, d.flag[size_t(rank)],
+            const auto [parity, seq] = next_slot(rank);
+            zero_copy_publish(values, d.host[size_t(rank)][parity], n, d.flag[size_t(rank)],
                               zc_counter_[size_t(rank)], seq, stream);
-            zero_copy_reduce(values, d.host[size_t(1 - rank)][seq & 1], n,
+            zero_copy_reduce(values, d.host[size_t(1 - rank)][parity], n,
                              d.flag[size_t(1 - rank)], seq, stream);
             return;
         }
@@ -244,15 +383,32 @@ class HostTransport {
         HIP_CHECK(hipStreamSynchronize(stream));
         barrier();
     }
+    // Copy-engine channels for prefill-sized all-gathers: channel i for micro-batch i (0: the
+    // rank stream; see DmaChannel).
+    std::array<std::unique_ptr<DmaChannel>, 4> dma_;
+    // rows: token budget; channel 0 carries whole steps, channels 1.. the later micro-batches
+    // (at most half of a step each). Largest message: the bf16 gate/up words, rows x 14336.
+    void enable_dma(size_t rows, int channels) {
+        for (int c = 0; c < channels && c < int(dma_.size()); ++c)
+            dma_[size_t(c)] =
+                std::make_unique<DmaChannel>((c ? (rows + 1) / 2 : rows) * 14336, &abort_flag_);
+    }
+    bool dma_eligible(size_t n) const {
+        return dma_[0] && n <= dma_[0]->capacity();
+    }
+    void dma_gather(int channel, int rank, const float *local, float *all, size_t n,
+                    hipStream_t stream, hipStream_t copy_stream, hipEvent_t start, hipEvent_t done) {
+        dma_.at(size_t(channel))->gather(rank, local, all, n, stream, copy_stream, start, done);
+    }
     void gather(int rank, const float *local, float *all, size_t n, hipStream_t stream) {
         if (n > capacity_)
             throw std::invalid_argument("Host transport capacity exceeded");
         if (zero_copy_ && n <= zero_copy_limit_ && n % 4 == 0) {
             const auto &d = device_pointers(rank);
-            const unsigned seq = ++zc_seq_[size_t(rank)];
-            zero_copy_publish(local, d.host[size_t(rank)][seq & 1], n, d.flag[size_t(rank)],
+            const auto [parity, seq] = next_slot(rank);
+            zero_copy_publish(local, d.host[size_t(rank)][parity], n, d.flag[size_t(rank)],
                               zc_counter_[size_t(rank)], seq, stream);
-            zero_copy_gather(local, d.host[size_t(1 - rank)][seq & 1], all, n, rank,
+            zero_copy_gather(local, d.host[size_t(1 - rank)][parity], all, n, rank,
                              d.flag[size_t(1 - rank)], seq, stream);
             return;
         }
@@ -357,11 +513,42 @@ struct Shard {
     bool qtip = false;
     DeviceBuffer<BFloat16> qtip_u, qtip_h;
     DeviceBuffer<float> qtip_partial, qtip_all;
+    // Dense prefill path (PREFILL_SCHED_REPORT.md): one decoded-weight scratch shared by every
+    // linear (pieces of <= qtip::dense_scratch_elements), hipBLASLt plans per shape.
+    std::unique_ptr<qtip::DenseMatmul> qtip_dense;
+    DeviceBuffer<BFloat16> qtip_dense_scratch;
+    hipStream_t copy_stream{};
+    hipEvent_t copy_start{}, copy_done{};
+    // Second micro-batch stream of large prefill steps (qtip_forward) and its events.
+    // Micro-batch streams 1..max_micro_batches-1 of large prefill steps (qtip_forward; micro-
+    // batch 0 runs on the rank stream) and their cross-stream events.
+    static constexpr int max_micro_batches = 4;
+    std::array<hipStream_t, max_micro_batches> mb_stream{}, mb_copy_stream{};
+    std::array<hipEvent_t, max_micro_batches> mb_copy_start{}, mb_copy_done{}, ev_gemm_done{}, ev_kv{},
+        ev_mb_end{};
+    hipEvent_t ev_decoded{}, ev_mb_start{};
+    GpuMetadata mb_metadata[max_micro_batches];
+    bool scratch_busy = false;
+    int active_micro_batches = 1;
+    size_t sample_capacity = 0;
     explicit Shard(int id, int r, Checkpoint &checkpoint, const RuntimeOptions &options)
         : device(id), rank(r) {
         HIP_CHECK(hipSetDevice(device));
         verify_device();
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+        HIP_CHECK(hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking));
+        HIP_CHECK(hipEventCreateWithFlags(&copy_start, hipEventDisableTiming));
+        HIP_CHECK(hipEventCreateWithFlags(&copy_done, hipEventDisableTiming));
+        for (int i = 1; i < max_micro_batches; ++i) {
+            HIP_CHECK(hipStreamCreateWithFlags(&mb_stream[size_t(i)], hipStreamNonBlocking));
+            HIP_CHECK(hipStreamCreateWithFlags(&mb_copy_stream[size_t(i)], hipStreamNonBlocking));
+        }
+        for (int i = 0; i < max_micro_batches; ++i)
+            for (auto *e : {&mb_copy_start[size_t(i)], &mb_copy_done[size_t(i)], &ev_gemm_done[size_t(i)],
+                            &ev_kv[size_t(i)], &ev_mb_end[size_t(i)]})
+                HIP_CHECK(hipEventCreateWithFlags(e, hipEventDisableTiming));
+        for (auto *e : {&ev_decoded, &ev_mb_start})
+            HIP_CHECK(hipEventCreateWithFlags(e, hipEventDisableTiming));
         runner = std::make_unique<ProjectionRunner>();
         runner->set_mode(parse_projection_mode(options.projection_mode));
         runner->set_search(parse_projection_search(options.projection_search));
@@ -414,6 +601,7 @@ struct Shard {
         }
         head.dense.upload(weights);
         head.row_scale.upload(scales);
+        sample_capacity = sampled_capacity(options);
         reserve(options.token_budget);
         // Split-K scratch: decode (rows <= 64) needs <= 64*14336*16*4 B ~ 59 MB
         // and a 256-row prefill chunk needs ~205 MB; the launch path grows the
@@ -421,6 +609,12 @@ struct Shard {
         // instead of a permanent reservation for the whole token budget.
         size_t split_rows = std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);
+        if (qtip) {
+            qtip_dense = std::make_unique<qtip::DenseMatmul>();
+            const int dense = qtip::dense_rows_threshold();
+            if (dense > 0 && options.token_budget >= size_t(dense))
+                qtip_dense_scratch.resize(qtip::dense_scratch_elements);
+        }
     }
     void load_qtip_layer(const Checkpoint &checkpoint, int i) {
         auto &l = layers[size_t(i)];
@@ -471,8 +665,50 @@ struct Shard {
         (void)hipSetDevice(device);
         if (stream)
             (void)hipStreamDestroy(stream);
+        if (copy_stream)
+            (void)hipStreamDestroy(copy_stream);
+        if (copy_start)
+            (void)hipEventDestroy(copy_start);
+        if (copy_done)
+            (void)hipEventDestroy(copy_done);
+        for (int i = 0; i < max_micro_batches; ++i) {
+            for (auto st : {mb_stream[size_t(i)], mb_copy_stream[size_t(i)]})
+                if (st)
+                    (void)hipStreamDestroy(st);
+            for (auto e : {mb_copy_start[size_t(i)], mb_copy_done[size_t(i)], ev_gemm_done[size_t(i)],
+                           ev_kv[size_t(i)], ev_mb_end[size_t(i)]})
+                if (e)
+                    (void)hipEventDestroy(e);
+        }
+        for (auto e : {ev_decoded, ev_mb_start})
+            if (e)
+                (void)hipEventDestroy(e);
     }
     void reserve(size_t rows) {
+        if (qtip) {
+            // QTIP never touches the AQLM projection buffers; the lm_head path only sees the
+            // sampled rows (at most sample_capacity per step, Scheduler::max_requests).
+            const size_t n = std::max<size_t>(sample_capacity, 1);
+            state.resize(rows * 12288);
+            q.resize(rows * 6144);
+            k.resize(rows * 512);
+            v.resize(rows * 512);
+            query.resize(rows * 6144);
+            query_scale.resize(rows * 48);
+            selected.resize(n * 12288);
+            raw.resize(n * 16384);
+            gathered.resize(n * 32768);
+            sample_rows.resize(n);
+            projection.input.resize(n * 14336);
+            projection.input_scale.resize(n);
+            projection.blas.resize(64 * 1024 * 1024);
+            attention_workspace.resize(32 * 1024 * 1024);
+            qtip_u.resize(rows * 28672);
+            qtip_h.resize(rows * 28672);
+            qtip_all.resize(rows * 2 * 14336);
+            qtip_partial.resize(std::max<size_t>(rows, 64) * 28672);
+            return;
+        }
         state.resize(rows * 12288);
         norm.resize(rows * 12288);
         tmp.resize(rows * 16384);
@@ -524,6 +760,8 @@ struct Shard {
     void forward(const InferenceBatch &batch, ncclComm_t comm, HostTransport *transport,
                  int only_layer = -1, const std::vector<BFloat16> *injected = nullptr) {
         HIP_CHECK(hipSetDevice(device));
+        if (qtip && batch.sample_rows.size() > sample_capacity)
+            throw std::invalid_argument("More sampled rows than the lm_head buffers hold");
         timings.reset();
         metadata.upload(batch.layout, batch.tokens, stream);
         int rows = int(batch.tokens.size());
@@ -610,15 +848,25 @@ struct Shard {
             }();
             partition = decode_attention_partition(batch.layout, attention_workspace.size(),
                                                    requested_partition, target_blocks);
+        } else if (qtip) {
+            // QTIP multi-query steps: split the keys when there are few query tiles (mixed
+            // decode + small prefill pieces over long contexts, PREFILL_SCHED_REPORT.md).
+            // BEHEMOTH_ATTN_PREFILL_BLOCKS=0 disables.
+            static const int prefill_blocks = [] {
+                const char *v = std::getenv("BEHEMOTH_ATTN_PREFILL_BLOCKS");
+                return v ? std::atoi(v) : 512;
+            }();
+            if (prefill_blocks > 0)
+                partition = prefill_attention_partition(batch.layout, attention_workspace.size(),
+                                                        prefill_blocks);
         }
         // BEHEMOTH_ATTN_QP=bf16: unquantised BF16 queries and probabilities (K/V FP8).
         static const bool bf16_qp = [] {
             const char *v = std::getenv("BEHEMOTH_ATTN_QP");
             return v && std::string(v) == "bf16";
         }();
-        for (int index = only_layer < 0 ? 0 : only_layer;
-             qtip && index < (only_layer < 0 ? 88 : only_layer + 1); ++index)
-            qtip_layer(layers[size_t(index)], rows, partition, bf16_qp, comm, transport);
+        if (qtip)
+            qtip_forward(batch, rows, decode, partition, bf16_qp, comm, transport, only_layer);
         for (int index = only_layer < 0 ? 0 : only_layer;
              !qtip && index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
             auto &l = layers[size_t(index)];
@@ -683,13 +931,86 @@ struct Shard {
         }
         HIP_CHECK(hipStreamSynchronize(stream));
     }
-    // Rank-blocked all-gather of `words` 32-bit words per rank through qtip_all: this rank's
-    // half must already be at qtip_all + rank * words (or is produced there by reduce_publish when
-    // partial is non-null: the sum of the matmul slices, fp32 or bf16 payload).
-    void qtip_exchange(const float *partial, int slices, size_t elements, bool bf16, size_t words,
-                       ncclComm_t comm, HostTransport *transport) {
-        float *all = qtip_all.data();
+    // Startup autotuning of the dense-prefill GEMMs (hipBLASLt's first heuristic choice is
+    // 20-35 % slower than its best candidate for these shapes): every linear shape at the
+    // batch sizes the dense path sees (dense threshold .. token budget, and the overlapped
+    // halves). Synchronous; runs before the KV cache is sized.
+    void tune_dense(size_t budget, int candidates) {
+        HIP_CHECK(hipSetDevice(device));
+        const int dense = qtip::dense_rows_threshold();
+        if (!qtip || !qtip_dense || dense <= 0 || budget < size_t(dense) ||
+            qtip_dense_scratch.size() < qtip::dense_scratch_elements)
+            return;
+        auto &w0 = layers[0].qtip;
+        qtip::decode_dense(w0.gate_up.view(), w0.lut.lut.data(), qtip_dense_scratch.data(), stream);
+        HIP_CHECK(hipMemsetAsync(qtip_u.data(), 0x3c, qtip_u.bytes(), stream)); // bf16 ~0.0115
+        std::vector<int> sizes;
+        for (size_t n = size_t(dense); n <= budget; n *= 2)
+            sizes.push_back(int(n));
+        sizes.push_back(int(budget));
+        sizes.push_back(int(budget / 2));
+        std::sort(sizes.begin(), sizes.end());
+        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+        std::erase_if(sizes, [&](int n) { return n < dense; });
+        const std::pair<const char *, const qtip::GpuLinear *> shapes[] = {
+            {"qkv", &w0.qkv}, {"o", &w0.o}, {"gate_up", &w0.gate_up}, {"down", &w0.down}};
+        std::ostringstream log;
+        log << "rank " << rank << " dense GEMM autotune (TFLOP/s):";
+        for (int n : sizes)
+            for (const auto &[name, w] : shapes) {
+                const double tflops = qtip_dense->tune(w->rows, w->in, qtip_u.data(), w->in, n,
+                                                       qtip_partial.data(), w->rows,
+                                                       qtip_dense_scratch.data(), stream, candidates);
+                log << ' ' << name << '@' << n << '=' << int(tflops);
+            }
+        std::cerr << log.str() << '\n';
+    }
+    // ---------------------------------------------------------------- QTIP execution
+    // A micro-batch: rows [r0, r0 + rows) of the step, its stream, copy stream, attention
+    // metadata and copy-engine channel (PREFILL_SCHED_REPORT.md). The whole step is one
+    // micro-batch on the rank stream unless forward() splits a large prefill step into two
+    // that run on two streams, so one micro-batch's all-gathers overlap the other's compute.
+    struct Mb {
+        int index = 0, r0 = 0, rows = 0;
+        hipStream_t s{}, copy{};
+        hipEvent_t copy_start{}, copy_done{};
+        const GpuMetadata *meta = nullptr;
+        bool overlap = false; // two micro-batches in flight
+        bool input_ready = false; // the previous down epilogue wrote this layer's q/k/v input
+    };
+    template <class F> void measure(const Mb &mb, const char *name, F f) {
+        if (mb.index == 0)
+            timings.measure(name, mb.s, f);
+        else
+            f();
+    }
+    // Rank-blocked all-gather of `words` 32-bit words per rank through the micro-batch's block
+    // of qtip_all ([2][rows][W] at word offset 2 * r0 * 14336): this rank's half must already
+    // be at block + rank * words, or is produced there from the matmul slices when partial is
+    // non-null (fp32 or bf16 payload).
+    float *qtip_block(const Mb &mb) {
+        return qtip_all.data() + size_t(2) * size_t(mb.r0) * 14336;
+    }
+    void qtip_exchange(const Mb &mb, const float *partial, int slices, size_t elements, bool bf16,
+                       size_t words, ncclComm_t comm, HostTransport *transport) {
+        float *all = qtip_block(mb);
         float *local = all + size_t(rank) * words;
+        if (qtip_use_dma(mb.rows, transport)) {
+            // slice sum on the device, then the copy-engine all-gather
+            if (partial)
+                measure(mb, "elementwise_ms", [&] {
+                    qtip::reduce_publish(partial, slices, elements, bf16, local, nullptr, nullptr,
+                                         nullptr, 0, mb.s);
+                });
+            measure(mb, "collectives_ms", [&] {
+                transport->dma_gather(mb.index, rank, local, all, words, mb.s, mb.copy,
+                                      mb.copy_start, mb.copy_done);
+            });
+            return;
+        }
+        if (mb.overlap)
+            throw std::logic_error("QTIP micro-batch overlap needs the copy-engine transport");
+        hipStream_t stream = mb.s;
         HostTransport::Exchange e{};
         if (transport && transport->zero_copy_eligible(words))
             e = transport->begin_exchange(rank, words);
@@ -697,7 +1018,8 @@ struct Shard {
             const char *v = std::getenv("BEHEMOTH_QTIP_FUSED_EXCHANGE");
             return !v || std::atoi(v) != 0;
         }();
-        if (e.valid && fused) {
+        // The fused kernel spins with <= 64 resident blocks: decode-sized messages only.
+        if (e.valid && fused && words <= size_t(8) * 16384) {
             // one kernel: publish (slice sum) + flag, then the peer half
             timings.measure("collectives_ms", stream, [&] {
                 qtip::exchange(partial, slices, partial ? elements : words,
@@ -727,76 +1049,275 @@ struct Shard {
                 RCCL_CHECK(ncclAllGather(local, all, words, ncclFloat, comm, stream));
         });
     }
-    // x . hatWr^T for this rank's rows of `w`, slices summed and all-gathered into qtip_all.
-    void qtip_project(const qtip::GpuLinear &w, const qtip::GpuCodebook &lut, int rows, int ldu,
-                      bool bf16, ncclComm_t comm, HostTransport *transport) {
-        const int slices = qtip::matmul_slices(w, rows);
-        qtip_partial.resize(size_t(slices) * size_t(rows) * size_t(w.rows));
-        timings.measure("projections_ms", stream, [&] {
-            qtip::matmul(w, lut.lut.data(), qtip_u.data(), ldu, rows, qtip_partial.data(), slices,
-                         stream);
-        });
-        const size_t elements = size_t(rows) * size_t(w.rows);
-        qtip_exchange(qtip_partial.data(), slices, elements, bf16, bf16 ? elements / 2 : elements,
-                      comm, transport);
+    // Copy-engine all-gathers for every QTIP step of more than BEHEMOTH_QTIP_DMA_ROWS - 1 rows
+    // (default 9; smaller steps keep the fused zero-copy kernels).
+    static bool qtip_use_dma(int rows, HostTransport *transport) {
+        static const int min_rows = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_DMA_ROWS");
+            return v ? std::atoi(v) : 9;
+        }();
+        return transport && min_rows > 0 && rows >= min_rows && transport->dma_eligible(1);
     }
-    void qtip_layer(Layer &l, int rows, int partition, bool bf16_qp, ncclComm_t comm,
-                    HostTransport *transport) {
+    // x . hatWr^T for this rank's rows of `w`, slices summed and all-gathered into the
+    // micro-batch's qtip_all block. Dense path: the shard is decoded once per step into the
+    // shared scratch; with two micro-batches, micro-batch 0 decodes (after micro-batch 1's
+    // previous GEMM released the scratch) and micro-batch 1 waits for the decode.
+    void qtip_project(Mb &mb, const qtip::GpuLinear &w, const qtip::GpuCodebook &lut, int ldu,
+                      bool bf16, ncclComm_t comm, HostTransport *transport) {
+        const int rows = mb.rows;
+        const int dense = qtip::dense_rows_threshold();
+        const bool use_dense = dense > 0 && rows >= dense;
+        const int slices = use_dense ? 1 : qtip::matmul_slices(w, rows);
+        // micro-batch regions use the widest row strides (28672) so that no stage of one
+        // micro-batch overlaps any stage of the other
+        const BFloat16 *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        float *partial = qtip_partial.data() + size_t(mb.r0) * 28672;
+        if (mb.overlap && !use_dense)
+            throw std::logic_error("QTIP micro-batch overlap needs the dense path");
+        if (size_t(mb.r0) * 28672 + size_t(slices) * size_t(rows) * size_t(w.rows) >
+            qtip_partial.size()) {
+            if (mb.overlap || mb.r0)
+                throw std::logic_error("QTIP partial buffer too small for the micro-batch");
+            qtip_partial.resize(size_t(slices) * size_t(rows) * size_t(w.rows));
+            partial = qtip_partial.data();
+        }
+        const size_t elements = size_t(rows) * size_t(w.rows);
+        // fp32 payloads on the copy-engine path: the dense GEMM writes this rank's half of the
+        // exchange block directly (one slice: the reduce kernel would be a plain copy)
+        const bool direct = use_dense && !bf16 && qtip_use_dma(rows, transport);
+        if (direct)
+            partial = qtip_block(mb) + size_t(rank) * elements;
+        if (use_dense) {
+            qtip_dense_scratch.resize(qtip::dense_scratch_elements); // no-op when reserved
+            const bool whole = size_t(w.rows) * size_t(w.in) <= qtip_dense_scratch.size();
+            measure(mb, "dense_projections_ms", [&] {
+                if (!mb.overlap) {
+                    qtip_dense->run(w.view(), lut.lut.data(), u, ldu, rows, partial,
+                                    qtip_dense_scratch.data(), qtip_dense_scratch.size(), mb.s);
+                    return;
+                }
+                if (!whole)
+                    throw std::logic_error("QTIP overlap needs a whole-shard dense scratch");
+                if (mb.index == 0) {
+                    // every other micro-batch's previous GEMM released the scratch
+                    for (int i = 1; scratch_busy && i < active_micro_batches; ++i)
+                        HIP_CHECK(hipStreamWaitEvent(mb.s, ev_gemm_done[size_t(i)], 0));
+                    qtip::decode_dense(w.view(), lut.lut.data(), qtip_dense_scratch.data(), mb.s);
+                    HIP_CHECK(hipEventRecord(ev_decoded, mb.s));
+                } else
+                    HIP_CHECK(hipStreamWaitEvent(mb.s, ev_decoded, 0));
+                qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
+                                 qtip_dense_scratch.data(), mb.s);
+                if (mb.index > 0) {
+                    HIP_CHECK(hipEventRecord(ev_gemm_done[size_t(mb.index)], mb.s));
+                    scratch_busy = true;
+                }
+            });
+        } else
+            measure(mb, "projections_ms", [&] {
+                qtip::matmul(w, lut.lut.data(), u, ldu, rows, partial, slices, mb.s);
+            });
+        if (direct)
+            qtip_exchange(mb, nullptr, 0, 0, false, elements, comm, transport);
+        else
+            qtip_exchange(mb, partial, slices, elements, bf16, bf16 ? elements / 2 : elements, comm,
+                          transport);
+    }
+    // One layer in four steps; with two micro-batches the steps are issued alternately
+    // (step A of micro-batch 0, step A of 1, step B of 0, ...) so every cross-stream event is
+    // recorded before the matching wait is issued.
+    BFloat16 *mb_state(const Mb &mb) {
+        return state.data() + size_t(mb.r0) * 12288;
+    }
+    // A: q/k/v input transform (norm + SU + hadUt), stacked matmul, all-gather of the rotated
+    // outputs, hadU + SV for this rank's heads, rope, KV append, attention, all-gather of the
+    // head-sharded attention output.
+    void qtip_step_attention(Layer &l, Mb &mb, int partition, bool bf16_qp, ncclComm_t comm,
+                             HostTransport *transport) {
         auto &w = l.qtip;
-        const qtip::Source state_source{state.data(), 12288, 0, 12288, 0};
-        // q/k/v: norm + SU + hadUt, stacked matmul, all-gather of the rotated outputs, hadU + SV
-        // for this rank's heads.
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::input_transform(state_source, l.input_norm.data(), 1e-5f, w.su_qkv.data(), 12288,
-                                  rows, qtip_u.data(), 12288, stream);
+        const int rows = mb.rows;
+        BFloat16 *st = mb_state(mb), *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        if (!mb.input_ready)
+            measure(mb, "elementwise_ms", [&] {
+                qtip::input_transform(qtip::Source{st, 12288, 0, 12288, 0}, l.input_norm.data(),
+                                      1e-5f, w.su_qkv.data(), 12288, rows, u, 12288, mb.s);
+            });
+        mb.input_ready = false;
+        qtip_project(mb, w.qkv, w.lut, 12288, false, comm, transport);
+        BFloat16 *qm = q.data() + size_t(mb.r0) * 6144, *km = k.data() + size_t(mb.r0) * 512,
+                 *vm = v.data() + size_t(mb.r0) * 512;
+        float *all = qtip_block(mb);
+        measure(mb, "elementwise_ms", [&] {
+            qtip::output_qkv(all, rows, rank, w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km,
+                             vm, mb.s);
         });
-        qtip_project(w.qkv, w.lut, rows, 12288, false, comm, transport);
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::output_qkv(qtip_all.data(), rows, rank, w.sv_q.data(), w.sv_k.data(),
-                             w.sv_v.data(), q.data(), k.data(), v.data(), stream);
-        });
-        // Attention writes this rank's heads straight into its half of the exchange buffer.
-        auto *attention_out = reinterpret_cast<BFloat16 *>(qtip_all.data()) +
-                              size_t(rank) * size_t(rows) * 6144;
-        timings.measure("attention_and_cache_ms", stream, [&] {
-            rope_quantize(q.data(), k.data(), metadata.positions, rows, 48, 4, 1000000,
-                          query.data(), query_scale.data(), stream);
-            AttentionDeviceView view{query.data(),     query_scale.data(), l.cache_k.data(),
-                                     l.cache_v.data(), l.k_scale.data(),   l.v_scale.data(),
+        // Attention writes this rank's heads straight into its half of the exchange block.
+        auto *attention_out = reinterpret_cast<BFloat16 *>(all) + size_t(rank) * size_t(rows) * 6144;
+        measure(mb, "attention_and_cache_ms", [&] {
+            uint8_t *qq = query.data() + size_t(mb.r0) * 6144;
+            float *qs = query_scale.data() + size_t(mb.r0) * 48;
+            rope_quantize(qm, km, mb.meta->positions, rows, 48, 4, 1000000, qq, qs, mb.s);
+            AttentionDeviceView view{qq,               qs,
+                                     l.cache_k.data(), l.cache_v.data(),
+                                     l.k_scale.data(), l.v_scale.data(),
                                      attention_out};
             if (bf16_qp)
-                view.q_bf16 = q.data();
-            append_kv(metadata, view, k.data(), v.data(), stream);
-            paged_attention(metadata, view, attention_workspace.data(), attention_workspace.size(),
-                            partition, stream);
+                view.q_bf16 = qm;
+            append_kv(*mb.meta, view, km, vm, mb.s);
+            // a micro-batch's queries attend to the earlier micro-batches' keys of the same
+            // layer: chained append events
+            if (mb.overlap && mb.index > 0)
+                HIP_CHECK(hipStreamWaitEvent(mb.s, ev_kv[size_t(mb.index - 1)], 0));
+            if (mb.overlap)
+                HIP_CHECK(hipEventRecord(ev_kv[size_t(mb.index)], mb.s));
+            paged_attention(*mb.meta, view, attention_workspace.data(), attention_workspace.size(),
+                            partition, mb.s);
         });
-        // o: all-gather the head-sharded attention output, hadUt over the full 12288.
-        qtip_exchange(nullptr, 0, 0, false, size_t(rows) * 3072, comm, transport);
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::input_transform(qtip::Source{qtip_all.data(), 6144, size_t(rows) * 3072 * 2, 6144, 0},
-                                  nullptr, 0.f, w.su_o.data(), 12288, rows, qtip_u.data(), 12288,
-                                  stream);
+        qtip_exchange(mb, nullptr, 0, 0, false, size_t(rows) * 3072, comm, transport);
+    }
+    // B: o input transform (hadUt over the gathered 12288), matmul, all-gather, residual epilogue
+    // fused with the MLP input transform.
+    void qtip_step_o(Layer &l, Mb &mb, ncclComm_t comm, HostTransport *transport) {
+        auto &w = l.qtip;
+        const int rows = mb.rows;
+        BFloat16 *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        float *all = qtip_block(mb);
+        measure(mb, "elementwise_ms", [&] {
+            qtip::input_transform(qtip::Source{all, 6144, size_t(rows) * 3072 * 2, 6144, 0}, nullptr,
+                                  0.f, w.su_o.data(), 12288, rows, u, 12288, mb.s);
         });
-        qtip_project(w.o, w.lut, rows, 12288, false, comm, transport);
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::output_residual(qtip_all.data(), rows, w.sv_o.data(), state.data(), stream);
+        qtip_project(mb, w.o, w.lut, 12288, false, comm, transport);
+        measure(mb, "elementwise_ms", [&] {
+            qtip::output_residual_input(all, rows, w.sv_o.data(), mb_state(mb), l.post_norm.data(),
+                                        1e-5f, w.su_gate_up.data(), u, 12288, mb.s);
         });
-        // MLP: gate/up stacked, bf16 exchange, silu product, down.
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::input_transform(state_source, l.post_norm.data(), 1e-5f, w.su_gate_up.data(), 12288,
-                                  rows, qtip_u.data(), 12288, stream);
+    }
+    // C: gate/up stacked matmul, bf16 all-gather, silu product, down input transform.
+    void qtip_step_gate_up(Layer &l, Mb &mb, ncclComm_t comm, HostTransport *transport) {
+        auto &w = l.qtip;
+        const int rows = mb.rows;
+        qtip_project(mb, w.gate_up, w.lut, 12288, true, comm, transport);
+        BFloat16 *h = qtip_h.data() + size_t(mb.r0) * 28672,
+                 *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        measure(mb, "elementwise_ms", [&] {
+            qtip::output_gateup(reinterpret_cast<const BFloat16 *>(qtip_block(mb)), rows,
+                                w.sv_gate.data(), w.sv_up.data(), h, mb.s);
+            qtip::input_transform(qtip::Source{h, 28672, 0, 28672, 0}, nullptr, 0.f, w.su_down.data(),
+                                  28672, rows, u, 28672, mb.s);
         });
-        qtip_project(w.gate_up, w.lut, rows, 12288, true, comm, transport);
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::output_gateup(reinterpret_cast<const BFloat16 *>(qtip_all.data()), rows,
-                                w.sv_gate.data(), w.sv_up.data(), qtip_h.data(), stream);
-            qtip::input_transform(qtip::Source{qtip_h.data(), 28672, 0, 28672, 0}, nullptr, 0.f,
-                                  w.su_down.data(), 28672, rows, qtip_u.data(), 28672, stream);
+    }
+    // D: down matmul, all-gather, residual epilogue (fused with the next layer's q/k/v input
+    // transform for row-batched sizes).
+    void qtip_step_down(Layer &l, Mb &mb, Layer *next, ncclComm_t comm, HostTransport *transport) {
+        auto &w = l.qtip;
+        const int rows = mb.rows;
+        qtip_project(mb, w.down, w.lut, 28672, false, comm, transport);
+        measure(mb, "elementwise_ms", [&] {
+            const int t = qtip::row_transform_threshold();
+            if (next && t > 0 && rows >= t) {
+                qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
+                                            next->input_norm.data(), 1e-5f, next->qtip.su_qkv.data(),
+                                            qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
+                mb.input_ready = true;
+            } else
+                qtip::output_residual(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb), mb.s);
         });
-        qtip_project(w.down, w.lut, rows, 28672, false, comm, transport);
-        timings.measure("elementwise_ms", stream, [&] {
-            qtip::output_residual(qtip_all.data(), rows, w.sv_down.data(), state.data(), stream);
-        });
+    }
+    // Sub-layout of rows [begin, end) of a step: whole or partial requests, lengths cut at the
+    // last included position (causal: earlier rows never see later ones).
+    static AttentionLayout sub_layout(const AttentionLayout &l, int begin, int end) {
+        AttentionLayout s;
+        s.query_heads = l.query_heads;
+        s.kv_heads = l.kv_heads;
+        s.physical_pages = l.physical_pages;
+        s.table_stride = l.table_stride;
+        s.query_offsets = {0};
+        for (int r = 0; r < l.requests(); ++r) {
+            const int a = std::max(begin, l.query_offsets[size_t(r)]),
+                      b = std::min(end, l.query_offsets[size_t(r + 1)]);
+            if (a >= b)
+                continue;
+            for (int q = a; q < b; ++q)
+                s.positions.push_back(l.positions[size_t(q)]);
+            s.query_offsets.push_back(int(s.positions.size()));
+            s.lengths.push_back(b == l.query_offsets[size_t(r + 1)] ? l.lengths[size_t(r)]
+                                                                   : l.positions[size_t(b - 1)] + 1);
+            s.page_table.insert(s.page_table.end(),
+                                l.page_table.begin() + std::ptrdiff_t(size_t(r) * size_t(l.table_stride)),
+                                l.page_table.begin() + std::ptrdiff_t(size_t(r + 1) * size_t(l.table_stride)));
+        }
+        s.validate();
+        return s;
+    }
+    // Micro-batch count for a step: dense prefill steps of at least BEHEMOTH_QTIP_OVERLAP_ROWS rows
+    // (default 2x the dense threshold; 0 disables) run as up to BEHEMOTH_QTIP_MICRO_BATCHES
+    // (default 2, max 4) overlapped micro-batches of at least the dense threshold each.
+    int qtip_micro_batches(int rows, bool decode, HostTransport *transport) const {
+        const int setting = qtip_overlap_setting().load(std::memory_order_relaxed);
+        const int dense = qtip::dense_rows_threshold();
+        const int min_rows = setting >= 0 ? setting : 2 * dense;
+        if (decode || dense <= 0 || min_rows <= 0 || rows < min_rows || !qtip_dense ||
+            qtip_dense_scratch.size() < qtip::dense_scratch_elements || !qtip_use_dma(dense, transport))
+            return 1;
+        static const int requested = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_MICRO_BATCHES");
+            return std::clamp(v ? std::atoi(v) : 2, 1, max_micro_batches);
+        }();
+        int n = requested;
+        while (n > 1 && rows / n < dense)
+            --n;
+        return n;
+    }
+    void qtip_forward(const InferenceBatch &batch, int rows, bool decode, int partition, bool bf16_qp,
+                      ncclComm_t comm, HostTransport *transport, int only_layer) {
+        const int first = only_layer < 0 ? 0 : only_layer, last = only_layer < 0 ? 88 : only_layer + 1;
+        auto next_layer = [&](int i) {
+            return only_layer < 0 && i + 1 < 88 ? &layers[size_t(i + 1)] : nullptr;
+        };
+        const int count = only_layer >= 0 ? 1 : qtip_micro_batches(rows, decode, transport);
+        active_micro_batches = count;
+        std::array<Mb, max_micro_batches> mbs{};
+        for (int i = 0; i < count; ++i) {
+            auto &m = mbs[size_t(i)];
+            m.index = i;
+            m.r0 = int(size_t(rows) * size_t(i) / size_t(count));
+            m.rows = int(size_t(rows) * size_t(i + 1) / size_t(count)) - m.r0;
+            m.s = i ? mb_stream[size_t(i)] : stream;
+            m.copy = i ? mb_copy_stream[size_t(i)] : copy_stream;
+            m.copy_start = i ? mb_copy_start[size_t(i)] : copy_start;
+            m.copy_done = i ? mb_copy_done[size_t(i)] : copy_done;
+            m.overlap = count > 1;
+            m.meta = &metadata;
+        }
+        if (count > 1) {
+            partition = 0; // the micro-batches share the attention workspace: unsplit keys
+            // micro-batches start after the embedding (and everything before) on the rank stream
+            HIP_CHECK(hipEventRecord(ev_mb_start, stream));
+            for (int i = 0; i < count; ++i) {
+                auto &m = mbs[size_t(i)];
+                if (i)
+                    HIP_CHECK(hipStreamWaitEvent(m.s, ev_mb_start, 0));
+                mb_metadata[i].upload(sub_layout(batch.layout, m.r0, m.r0 + m.rows), {}, m.s);
+                m.meta = &mb_metadata[i];
+            }
+        }
+        scratch_busy = false;
+        for (int l = first; l < last; ++l) {
+            auto &layer = layers[size_t(l)];
+            for (int i = 0; i < count; ++i)
+                qtip_step_attention(layer, mbs[size_t(i)], partition, bf16_qp, comm, transport);
+            for (int i = 0; i < count; ++i)
+                qtip_step_o(layer, mbs[size_t(i)], comm, transport);
+            for (int i = 0; i < count; ++i)
+                qtip_step_gate_up(layer, mbs[size_t(i)], comm, transport);
+            for (int i = 0; i < count; ++i)
+                qtip_step_down(layer, mbs[size_t(i)], next_layer(l), comm, transport);
+        }
+        for (int i = 1; i < count; ++i) {
+            HIP_CHECK(hipEventRecord(ev_mb_end[size_t(i)], mbs[size_t(i)].s));
+            HIP_CHECK(hipStreamWaitEvent(stream, ev_mb_end[size_t(i)], 0));
+        }
+        active_micro_batches = 1;
     }
     nlohmann::json profile() const {
         return {{"rank", rank},
@@ -938,20 +1459,36 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
     (void)parse_projection_search(options.projection_search);
     (void)parse_code_layout(options.code_layout);
     impl_->profiling = options.profile;
-    if (options.token_budget < 1 || options.token_budget > 1024 || options.prefill_chunk < 1 ||
+    if (options.token_budget < 1 || options.token_budget > 4096 || options.prefill_chunk < 1 ||
         options.prefill_chunk > options.token_budget)
-        throw std::invalid_argument("Token budget must be 1..1024 and cover the prefill chunk");
+        throw std::invalid_argument("Token budget must be 1..4096 and cover the prefill chunk");
+    if (std::min(options.scheduler.max_requests, options.token_budget) > sampled_capacity(options))
+        throw std::invalid_argument("Scheduler max_requests exceeds the sampled-row capacity");
+    if (options.qtip_dense_rows >= 0)
+        qtip::set_dense_rows_threshold(options.qtip_dense_rows);
+    if (options.qtip_row_transforms >= 0)
+        qtip::set_row_transform_threshold(options.qtip_row_transforms);
     tensor_parallel_smoke(options.devices, options.rccl_shared_memory);
     Checkpoint checkpoint(options.model);
+    if (checkpoint.config.quantization != Quantization::Qtip && options.token_budget > 1024)
+        throw std::invalid_argument("AQLM token budget must be 1..1024");
     for (int rank = 0; rank < 2; ++rank)
         impl_->shards[size_t(rank)] =
             std::make_unique<Shard>(options.devices[size_t(rank)], rank, checkpoint, options);
     if (options.rccl_shared_memory)
         RCCL_CHECK(ncclCommInitAll(impl_->comm.data(), 2, options.devices.data()));
-    else
+    else {
+        const bool is_qtip = checkpoint.config.quantization == Quantization::Qtip;
+        const size_t zc_rows = options.zero_copy_rows ? options.zero_copy_rows : 8;
         impl_->transport = std::make_unique<HostTransport>(
             options.token_budget * 16384,
-            options.zero_copy_transport ? options.zero_copy_rows * 16384 : 0, options.devices);
+            options.zero_copy_transport ? std::min(zc_rows, options.token_budget) * 16384 : 0,
+            options.devices);
+        // QTIP all-gathers of more than 8 rows: copy-engine channels (largest message: the
+        // bf16 gate/up words, rows x 14336).
+        if (is_qtip && options.zero_copy_transport)
+            impl_->transport->enable_dma(options.token_budget, 4);
+    }
     for (auto &worker : impl_->workers)
         worker = std::make_unique<RankWorker>();
     {
@@ -1036,17 +1573,48 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
                       << seconds << " s\n";
         }
     }
+    {
+        // Dense-prefill GEMM autotune on both ranks (BEHEMOTH_QTIP_DENSE_TUNE = candidates,
+        // default 64; 0 disables).
+        static const int candidates = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_DENSE_TUNE");
+            return v ? std::atoi(v) : 64;
+        }();
+        if (candidates > 0 && impl_->shards[0]->qtip) {
+            const auto started = std::chrono::steady_clock::now();
+            std::array<std::future<void>, 2> jobs;
+            for (int rank = 0; rank < 2; ++rank)
+                jobs[size_t(rank)] = impl_->workers[size_t(rank)]->submit([&, rank] {
+                    impl_->shards[size_t(rank)]->tune_dense(options.token_budget, candidates);
+                });
+            std::exception_ptr error;
+            for (auto &job : jobs)
+                try {
+                    job.get();
+                } catch (...) {
+                    error = std::current_exception();
+                }
+            if (error)
+                std::rethrow_exception(error);
+            std::cerr << "Dense GEMM autotune: "
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+                      << " s\n";
+        }
+    }
     impl_->pages = std::min(impl_->shards[0]->page_capacity(options.memory_fraction),
                             impl_->shards[1]->page_capacity(options.memory_fraction));
     for (auto &shard : impl_->shards)
         shard->allocate_cache(impl_->pages);
-    impl_->logits_capacity = options.token_budget * 32768;
+    impl_->logits_capacity = sampled_capacity(options) * 32768;
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->logits_host),
                             impl_->logits_capacity * sizeof(float), hipHostMallocPortable));
     std::cerr << "KV pages=" << impl_->pages << ", aggregate token capacity=" << impl_->pages * 16
               << ", bytes/token/GPU=" << PagePool::bytes_per_page() / 16 << '\n';
 }
 TensorParallelModel::~TensorParallelModel() = default;
+void set_qtip_overlap_rows(int rows) {
+    qtip_overlap_setting().store(rows, std::memory_order_relaxed);
+}
 int TensorParallelModel::cache_pages() const {
     return impl_->pages;
 }
@@ -1153,7 +1721,8 @@ std::span<const float> TensorParallelModel::forward(const InferenceBatch &batch)
     const auto started = std::chrono::steady_clock::now();
     batch.layout.validate();
     if (batch.tokens.size() != size_t(batch.layout.queries()) ||
-        batch.layout.physical_pages != impl_->pages)
+        batch.layout.physical_pages != impl_->pages ||
+        batch.sample_rows.size() * 32768 > impl_->logits_capacity)
         throw std::invalid_argument("Inference batch shape mismatch");
     std::array<std::future<void>, 2> jobs;
     for (int rank = 0; rank < 2; ++rank)

@@ -877,6 +877,25 @@ int decode_attention_partition(const AttentionLayout &l, size_t workspace_bytes,
         partition *= 2;
     return partition >= max_len ? 0 : partition;
 }
+int prefill_attention_partition(const AttentionLayout &l, size_t workspace_bytes, int target_blocks,
+                                int min_partition) {
+    l.validate();
+    const int max_len = *std::max_element(l.lengths.begin(), l.lengths.end());
+    int max_q = 0;
+    for (int r = 0; r < l.requests(); ++r)
+        max_q = std::max(max_q, l.query_offsets[size_t(r + 1)] - l.query_offsets[size_t(r)]);
+    // blocks of the request with the most queries (decode rows of a mixed step add blocks that
+    // exit after one tile)
+    const size_t blocks = size_t(l.kv_heads) * ceil_div(size_t(std::max(max_q, 1)), size_t(16));
+    if (blocks >= size_t(std::max(target_blocks, 1)))
+        return 0;
+    const size_t parts = ceil_div(size_t(target_blocks), blocks);
+    int partition = int(ceil_div(ceil_div(size_t(max_len), parts), size_t(32)) * 32);
+    partition = std::max(partition, std::max(32, int(ceil_div(size_t(min_partition), size_t(32)) * 32)));
+    while (partition < max_len && attention_workspace_bytes(l, partition) > workspace_bytes)
+        partition *= 2;
+    return partition >= max_len ? 0 : partition;
+}
 void paged_attention(const GpuMetadata &metadata, AttentionDeviceView a, void *workspace,
                      size_t bytes, int partition, hipStream_t stream) {
     const auto &l = metadata.layout();
