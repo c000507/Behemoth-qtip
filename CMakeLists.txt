@@ -12,7 +12,7 @@ FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(json)
 find_package(Threads REQUIRED)
-add_library(behemoth_core src/attention.cpp src/cache.cpp src/checkpoint.cpp src/sorted_layout.cpp src/scheduler.cpp src/sampling.cpp src/protocol.cpp src/reference_block.cpp)
+add_library(behemoth_core src/attention.cpp src/cache.cpp src/checkpoint.cpp src/sorted_layout.cpp src/scheduler.cpp src/sampling.cpp src/protocol.cpp src/reference_block.cpp src/qtip.cpp)
 target_include_directories(behemoth_core PUBLIC include)
 target_link_libraries(behemoth_core PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
 target_compile_options(behemoth_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -42,7 +42,7 @@ if(BEHEMOTH_ROCM)
   find_package(rocwmma REQUIRED CONFIG)
   find_package(hipblaslt REQUIRED CONFIG)
   find_package(rccl REQUIRED CONFIG)
-  add_library(behemoth_gpu src/attention.hip src/projection.hip src/ops.hip src/transport.hip src/model.cpp src/engine.cpp)
+  add_library(behemoth_gpu src/attention.hip src/projection.hip src/ops.hip src/transport.hip src/qtip.hip src/model.cpp src/engine.cpp)
   # rocWMMA is header-only. Its packaged target exports unconditional '-x hip'
   # flags, which must not leak into host C++ sources or downstream executables.
   get_target_property(ROCWMMA_HEADERS roc::rocwmma INTERFACE_INCLUDE_DIRECTORIES)
