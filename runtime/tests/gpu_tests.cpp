@@ -125,6 +125,24 @@ static void long_contexts(hipStream_t stream) {
                   attention_workspace_bytes(l, decode_attention_partition(l, 1024, 32)) <= 1024,
               "Partition must grow until the partials fit the workspace");
     }
+    // Mixed decode + small prefill piece over a long context (PREFILL_SCHED_REPORT.md): the
+    // automatic multi-query key split against the reference.
+    {
+        std::vector<int> piece;
+        for (int q = 12968; q < 13000; ++q)
+            piece.push_back(q);
+        auto f = test::fixture({13000, 517, 2049}, {piece, {516}, {2048}}, 29);
+        const int p = prefill_attention_partition(f.layout, 32u << 20);
+        check(p > 0 && p % 32 == 0 && p >= 256 && attention_workspace_bytes(f.layout, p) <= (32u << 20),
+              "Mixed-step prefill partition splits the long context within the workspace");
+        run_case(f, p, stream);
+        run_case(with_bf16_queries(f, 29), p, stream);
+        std::vector<int> chunk;
+        for (int q = 0; q < 2048; ++q)
+            chunk.push_back(q);
+        check(prefill_attention_partition(test::fixture({2048}, {chunk}).layout, 32u << 20) == 0,
+              "Large prefill chunks stay unsplit");
+    }
 }
 static void conversion(hipStream_t stream) {
     std::vector<float> values;

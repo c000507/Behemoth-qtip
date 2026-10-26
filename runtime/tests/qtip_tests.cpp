@@ -496,6 +496,168 @@ void test_epilogues_gpu() {
                   " | down input transform (SU, hadUt 28672) " + describe(eu));
     }
 }
+// Dense prefill path (decode to bf16 + hipBLASLt bf16 GEMM, fp32 accumulation) vs the double
+// reference of the decoded weights and vs the WMMA trellis kernel. scratch_rows < shard rows
+// exercises the piecewise decode (several GEMMs into column ranges of the output).
+void test_dense_matmul_gpu(const qtip::HostLinear &l, int block_row, int count, const std::string &name,
+                           const std::vector<int> &rows_list, int scratch_rows) {
+    auto cb = qtip::make_codebook(l.tlut);
+    qtip::GpuCodebook lut;
+    lut.upload(cb);
+    auto g = upload_shard(l, block_row, count);
+    std::vector<float> w(size_t(g.rows) * size_t(l.in));
+    qtip::decode_rows_bf16(l, cb, block_row * 32, g.rows, w.data());
+    qtip::DenseMatmul dense;
+    DeviceBuffer<BFloat16> scratch(size_t(scratch_rows) * size_t(l.in));
+    for (int rows : rows_list) {
+        auto x = bf16_round(random_vector(size_t(rows) * size_t(l.in), unsigned(rows * 17 + l.in)));
+        auto ref = dense_matmul(w, g.rows, l.in, x);
+        DeviceBuffer<BFloat16> dx;
+        dx.upload(to_bf16(x));
+        DeviceBuffer<float> out(size_t(rows) * size_t(g.rows));
+        dense.run(g.view(), lut.lut.data(), dx.data(), l.in, rows, out.data(), scratch.data(), scratch.size(),
+                  nullptr);
+        const qtip::MatmulOptions wmma{qtip::MatmulKernel::Wmma, 0, 0};
+        const int slices = qtip::matmul_slices(g, rows, wmma);
+        DeviceBuffer<float> partial(size_t(slices) * size_t(rows) * size_t(g.rows)), z(size_t(rows) * size_t(g.rows));
+        qtip::matmul(g, lut.lut.data(), dx.data(), l.in, rows, partial.data(), slices, nullptr, wmma);
+        qtip::reduce_publish(partial.data(), slices, size_t(rows) * size_t(g.rows), false, z.data(), nullptr,
+                             nullptr, nullptr, 0, nullptr);
+        HIP_CHECK(hipDeviceSynchronize());
+        auto got = out.download(), wm = z.download();
+        auto e = compare(got, ref), ew = compare(got, wm);
+        // same tolerance as the WMMA/GEMV kernels against the double reference
+        check(e.rel_rms < 1e-5 && ew.rel_rms < 1e-5,
+              "gpu dense prefill matmul " + name + " rows=" + std::to_string(rows) + " scratch_rows=" +
+                  std::to_string(scratch_rows) + " vs double " + describe(e) + " | vs wmma " + describe(ew));
+    }
+}
+// Row-batched transforms (one block per row) vs the per-chunk kernels: bit-identical, and the fused
+// residual + next input transform vs the two separate kernels.
+void test_row_transforms_gpu() {
+    const int saved = qtip::row_transform_threshold();
+    for (int rows : {1, 70}) {
+        auto run_both = [&](auto f) {
+            qtip::set_row_transform_threshold(0);
+            auto a = f();
+            qtip::set_row_transform_threshold(1);
+            auto b = f();
+            qtip::set_row_transform_threshold(saved);
+            return std::make_pair(a, b);
+        };
+        auto same = [](const auto &a, const auto &b) {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i].bits != b[i].bits)
+                    return false;
+            return true;
+        };
+        const std::string rs = " rows=" + std::to_string(rows);
+        std::mt19937 rng(5 + unsigned(rows));
+        auto signs = [&](size_t n) {
+            std::vector<float> v(n);
+            for (auto &x : v)
+                x = (rng() & 1) ? 1.f : -1.f;
+            return v;
+        };
+        DeviceBuffer<float> su12, su28, sv12, sv28a, sv28b, svk, svv;
+        su12.upload(signs(12288));
+        su28.upload(signs(28672));
+        sv12.upload(random_vector(12288, 61, 0.002f));
+        sv28a.upload(random_vector(28672, 62, 0.003f));
+        sv28b.upload(random_vector(28672, 63, 0.003f));
+        svk.upload(random_vector(1024, 64, 0.002f));
+        svv.upload(random_vector(1024, 65, 0.002f));
+        DeviceBuffer<BFloat16> x12, nw, x28;
+        x12.upload(to_bf16(random_vector(size_t(rows) * 12288, 66, 2.f)));
+        nw.upload(to_bf16(random_vector(12288, 67, 1.f)));
+        x28.upload(to_bf16(random_vector(size_t(rows) * 28672, 68, 1.f)));
+        DeviceBuffer<BFloat16> u(size_t(rows) * 28672);
+        for (int norm = 0; norm < 2; ++norm) {
+            auto [a, b] = run_both([&] {
+                HIP_CHECK(hipMemset(u.data(), 0, u.bytes()));
+                qtip::input_transform(qtip::Source{x12.data(), 12288, 0, 12288, 0}, norm ? nw.data() : nullptr,
+                                      1e-5f, su12.data(), 12288, rows, u.data(), 12288, nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                return u.download();
+            });
+            check(same(a, b), std::string("gpu row-batched input transform 12288") + (norm ? " +norm" : "") +
+                                  " bit-identical" + rs);
+        }
+        {
+            auto [a, b] = run_both([&] {
+                qtip::input_transform(qtip::Source{x28.data(), 28672, 0, 28672, 0}, nullptr, 0.f, su28.data(),
+                                      28672, rows, u.data(), 28672, nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                return u.download();
+            });
+            check(same(a, b), "gpu row-batched input transform 28672 bit-identical" + rs);
+        }
+        for (int rank = 0; rank < 2; ++rank) {
+            DeviceBuffer<float> all;
+            all.upload(random_vector(size_t(2) * size_t(rows) * 7168, 70 + unsigned(rank), 20.f));
+            DeviceBuffer<BFloat16> q(size_t(rows) * 6144), k(size_t(rows) * 512), v(size_t(rows) * 512);
+            auto [a, b] = run_both([&] {
+                qtip::output_qkv(all.data(), rows, rank, sv12.data(), svk.data(), svv.data(), q.data(), k.data(),
+                                 v.data(), nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                auto r = q.download();
+                auto kk = k.download(), vv = v.download();
+                r.insert(r.end(), kk.begin(), kk.end());
+                r.insert(r.end(), vv.begin(), vv.end());
+                return r;
+            });
+            check(same(a, b), "gpu row-batched qkv epilogue bit-identical rank " + std::to_string(rank) + rs);
+        }
+        {
+            DeviceBuffer<float> all;
+            all.upload(random_vector(size_t(2) * size_t(rows) * 6144, 80, 20.f));
+            const auto st0 = to_bf16(random_vector(size_t(rows) * 12288, 81, 0.5f));
+            DeviceBuffer<BFloat16> st;
+            auto [a, b] = run_both([&] {
+                st.upload(st0);
+                qtip::output_residual(all.data(), rows, sv12.data(), st.data(), nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                return st.download();
+            });
+            check(same(a, b), "gpu row-batched residual epilogue bit-identical" + rs);
+            auto [c, d] = run_both([&] {
+                st.upload(st0);
+                qtip::output_residual_input(all.data(), rows, sv12.data(), st.data(), nw.data(), 1e-5f,
+                                            su12.data(), u.data(), 12288, nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                auto r = st.download();
+                auto uu = u.download();
+                r.insert(r.end(), uu.begin(), uu.begin() + std::ptrdiff_t(size_t(rows) * 12288));
+                return r;
+            });
+            // c: separate kernels (reference), d: fused kernel
+            st.upload(st0);
+            qtip::set_row_transform_threshold(0);
+            qtip::output_residual(all.data(), rows, sv12.data(), st.data(), nullptr);
+            qtip::input_transform(qtip::Source{st.data(), 12288, 0, 12288, 0}, nw.data(), 1e-5f, su12.data(),
+                                  12288, rows, u.data(), 12288, nullptr);
+            qtip::set_row_transform_threshold(saved);
+            HIP_CHECK(hipDeviceSynchronize());
+            auto e = st.download();
+            auto ue = u.download();
+            e.insert(e.end(), ue.begin(), ue.begin() + std::ptrdiff_t(size_t(rows) * 12288));
+            check(same(c, e) && same(d, e),
+                  "gpu fused residual + input transform bit-identical to the separate kernels" + rs);
+        }
+        {
+            DeviceBuffer<BFloat16> all, h(size_t(rows) * 28672);
+            all.upload(to_bf16(random_vector(size_t(2) * size_t(rows) * 28672, 90, 20.f)));
+            auto [a, b] = run_both([&] {
+                qtip::output_gateup(all.data(), rows, sv28a.data(), sv28b.data(), h.data(), nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                return h.download();
+            });
+            check(same(a, b), "gpu row-batched gate/up epilogue bit-identical" + rs);
+        }
+    }
+}
 void test_real(const fs::path &layer_file, const fs::path &refvec) {
     SafeTensorFile file(layer_file);
     const std::string stem = layer_file.stem().string(); // model-layer-00040
@@ -539,6 +701,7 @@ void test_real(const fs::path &layer_file, const fs::path &refvec) {
         test_decode_gpu(l, 0, half, name + " rank0");
         test_decode_gpu(l, half, half, name + " rank1");
         test_matmul_gpu(l, half, half, name + " rank1", {1, 2, 4, 5, 33}, false);
+        test_dense_matmul_gpu(l, half, half, name + " rank1", {64, 300}, std::max(32, half * 32 / 2));
     }
 }
 } // namespace
@@ -556,8 +719,14 @@ int main(int argc, char **argv) {
             test_matmul_gpu(l, 0, 2, "synthetic 64x12288", {1, 2, 3, 4, 5, 16, 33, 64, 130}, true);
             auto t = synthetic(96, 224, 10); // 7 blocks along K: odd slices / tails
             test_matmul_gpu(t, 1, 2, "synthetic 64x224 (block-rows 1..2)", {1, 4, 7, 70}, true);
+            auto d = synthetic(256, 12288, 12);
+            test_decode_gpu(d, 1, 6, "synthetic 192x12288 (block-rows 1..6)");
+            test_dense_matmul_gpu(d, 1, 6, "synthetic 192x12288", {1, 64, 130, 513}, 192);
+            test_dense_matmul_gpu(d, 1, 6, "synthetic 192x12288", {130}, 64);
+            test_dense_matmul_gpu(t, 1, 2, "synthetic 64x224", {7, 70}, 32);
         }
         test_epilogues_gpu();
+        test_row_transforms_gpu();
         if (argc == 3)
             test_real(argv[1], argv[2]);
         else if (argc != 1)

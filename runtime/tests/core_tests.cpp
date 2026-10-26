@@ -226,6 +226,89 @@ static void scheduler_tests() {
     }
     CHECK(r.request(r1).done && r.request(r2).done);
 }
+// Decode-first step composition (SchedulerPolicy): mixed-step prefill cap, decode-only
+// interleaving, FIFO prefill order, request cap, full chunks without decodes.
+static void scheduler_policy_tests() {
+    auto finish_step = [](Scheduler &s, const ScheduledBatch &b) {
+        for (const auto &x : b.requests)
+            s.complete(x, x.sample ? 5 : -1);
+    };
+    auto prefill_tokens = [](const Scheduler &s, const ScheduledBatch &b) {
+        size_t n = 0;
+        for (const auto &x : b.requests)
+            if (!(s.request(x.id).cached > 0 && x.count == 1 && x.begin + 1 == s.request(x.id).history.size()))
+                n += x.count;
+        return n;
+    };
+    {
+        // Cap: 2 decodes + a 1000-token prompt with budget 512 / chunk 512 / mixed cap 64.
+        SchedulerPolicy p;
+        p.mixed_prefill_tokens = 64;
+        Scheduler s(1024, 512, 512, p);
+        auto d1 = s.submit(std::vector<int>(3, 1), 100), d2 = s.submit(std::vector<int>(5, 1), 100);
+        auto first = s.schedule(); // both prompts prefill (no decodes yet): full chunks
+        CHECK(first.requests.size() == 2 && first.tokens == 8);
+        finish_step(s, first);
+        auto big = s.submit(std::vector<int>(1000, 1), 4);
+        for (int i = 0; i < 4; ++i) {
+            auto b = s.schedule();
+            CHECK(b.requests.size() == 3);
+            CHECK(b.requests[0].count == 1 && b.requests[1].count == 1); // decodes first
+            CHECK(b.requests[2].id == big && b.requests[2].count == 64);
+            CHECK(prefill_tokens(s, b) == 64 && b.tokens == 66);
+            finish_step(s, b);
+        }
+        CHECK(s.request(big).cached == 256);
+        s.cancel(d1);
+        s.cancel(d2);
+        auto alone = s.schedule(); // no decodes: full prefill chunk
+        CHECK(alone.requests.size() == 1 && alone.requests[0].count == 512);
+        finish_step(s, alone);
+        CHECK(s.request(big).cached == 768);
+    }
+    {
+        // Interval: prefill only every 3rd step while decoding; FIFO among queued prompts.
+        SchedulerPolicy p;
+        p.prefill_interval = 3;
+        p.mixed_prefill_tokens = 100;
+        Scheduler s(1024, 512, 64, p);
+        auto d = s.submit(std::vector<int>(2, 1), 1000);
+        finish_step(s, s.schedule());
+        auto a = s.submit(std::vector<int>(300, 1), 2), b = s.submit(std::vector<int>(300, 1), 2);
+        std::vector<size_t> pattern;
+        for (int i = 0; i < 9; ++i) {
+            auto bt = s.schedule();
+            CHECK(bt.requests.size() >= 1 && bt.requests[0].id == d && bt.requests[0].count == 1);
+            pattern.push_back(prefill_tokens(s, bt));
+            if (bt.requests.size() > 1) {
+                CHECK(bt.requests[1].id == a); // older prompt first
+                CHECK(bt.requests[1].count == 64);
+            }
+            if (bt.requests.size() > 2)
+                CHECK(bt.requests[2].id == b && bt.requests[2].count == 36); // cap 100
+            finish_step(s, bt);
+        }
+        // first mixed step prefills at once, then two decode-only steps per prefill step
+        CHECK((pattern == std::vector<size_t>{100, 0, 0, 100, 0, 0, 100, 0, 0}));
+    }
+    {
+        // Request cap bounds sampled rows; default policy keeps the old behavior.
+        SchedulerPolicy p;
+        p.max_requests = 3;
+        Scheduler s(1024, 64, 16, p);
+        for (int i = 0; i < 5; ++i)
+            s.submit(std::vector<int>(4, 1), 2);
+        auto b = s.schedule();
+        CHECK(b.requests.size() == 3 && b.tokens == 12);
+        Scheduler legacy(1024, 1024, 256);
+        auto l1 = legacy.submit(std::vector<int>(2, 1), 10);
+        finish_step(legacy, legacy.schedule());
+        legacy.submit(std::vector<int>(2000, 1), 1);
+        auto lb = legacy.schedule();
+        CHECK(lb.requests.size() == 2 && lb.requests[0].id == l1 && lb.tokens == 257);
+        rejects([] { SchedulerPolicy bad; bad.prefill_interval = 0; Scheduler x(4, 4, 4, bad); });
+    }
+}
 static void sampling_tests() {
     std::thread::id worker_id;
     {
@@ -513,6 +596,7 @@ int main() {
                  {"numeric", numeric_tests},
                  {"attention", attention_tests},
                  {"scheduler", scheduler_tests},
+                 {"scheduler_policy", scheduler_policy_tests},
                   {"sampling", sampling_tests},
                   {"sampler_equivalence", sampler_equivalence_tests},
                   {"tuning", tuning_tests},
