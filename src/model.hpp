@@ -65,6 +65,7 @@ struct HessAcc {
   DBuf<float> h[4];  // qkv, o, gateup, down
   long count = 0;    // tokens
   int dim[4] = {};
+  int blocks[4] = {1, 1, 1, 1};  // block partition used for the triangular accumulation
 };
 extern const char* kHessName[4];  // "qkv", "o", "gateup", "down"
 
@@ -77,6 +78,7 @@ class LayerRunner {
   void forward(uint16_t* host_x, long nseq, HessAcc* acc);
   void alloc_hess(HessAcc& a);
   void zero_hess(HessAcc& a);
+  void symmetrize_hess(HessAcc& a);  // fill the blocks skipped by the triangular accumulation
   hipStream_t stream() const { return s_; }
   Gemm& gemm() { return *gemm_; }
   int device() const { return dev_; }

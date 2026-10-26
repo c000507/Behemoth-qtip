@@ -162,6 +162,11 @@ void LayerRunner::alloc_hess(HessAcc& a) {
   for (int i = 0; i < 4; ++i) a.h[i].alloc(size_t(a.dim[i]) * a.dim[i]);
   zero_hess(a);
 }
+void LayerRunner::symmetrize_hess(HessAcc& a) {
+  for (int i = 0; i < 4; ++i)
+    if (a.blocks[i] > 1) k_symmetrize_blocks(a.h[i], a.dim[i], a.dim[i] / a.blocks[i], s_);
+  HIP_CHECK(hipStreamSynchronize(s_));
+}
 void LayerRunner::zero_hess(HessAcc& a) {
   for (int i = 0; i < 4; ++i) HIP_CHECK(hipMemsetAsync(a.h[i], 0, a.h[i].bytes(), s_));
   a.count = 0;
@@ -217,9 +222,15 @@ void LayerRunner::forward_batch(long R, HessAcc* acc) {
   Gemm& g = *gemm_;
   auto hess = [&](int which, const uint16_t* X, int n) {
     if (!acc) return;
-    // H(n x n) += X^T X ; X row-major (R x n) == col-major (n x R)
-    g.run(false, true, n, n, int(R), X, n, X, n, acc->h[which], n, OutT::F32, 1.f, 1.f);
-    gemm_flops += 2.0 * n * n * R;
+    // H(n x n) += X^T X ; X row-major (R x n) == col-major (n x R). Only the 10 blocks (bi <= bj) of a 4 x 4 block
+    // partition are accumulated (symmetry); symmetrize_hess() fills the rest before the Hessians are read.
+    const int nb = (n % 4 == 0 && (n / 4) % 16 == 0) ? 4 : 1, bs = n / nb;
+    for (int bi = 0; bi < nb; ++bi)
+      for (int bj = bi; bj < nb; ++bj)
+        g.run(false, true, bs, bs, int(R), X + long(bi) * bs, n, X + long(bj) * bs, n,
+              acc->h[which] + long(bj) * bs * n + long(bi) * bs, n, OutT::F32, 1.f, 1.f);
+    acc->blocks[which] = nb;
+    gemm_flops += 2.0 * n * n * R * (nb * (nb + 1) / 2) / double(nb * nb);
   };
   auto proj = [&](const uint16_t* X, int in, const uint16_t* W, int out, float* Y) {
     // Y (R x out) = X (R x in) W^T ; col-major: Y_cm(out x R) = W_cm^T (out x in) X_cm (in x R)

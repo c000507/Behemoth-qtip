@@ -423,6 +423,18 @@ void k_heads_to_tokens(const float* O, uint16_t* out, int nh, int T, int hd, int
   HIP_CHECK(hipGetLastError());
 }
 
+// memory index a*n + b holds col-major element (row b, col a); it was computed iff blk(b) <= blk(a)
+__global__ void symmetrize_blocks_kernel(float* H, long n, long bs) {
+  long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n * n) return;
+  long a = idx / n, b = idx % n;
+  if (b / bs > a / bs) H[idx] = H[b * n + a];
+}
+void k_symmetrize_blocks(float* H, long n, long bs, hipStream_t s) {
+  symmetrize_blocks_kernel<<<nblocks(n * n, 256), 256, 0, s>>>(H, n, bs);
+  HIP_CHECK(hipGetLastError());
+}
+
 __global__ void residual_add_kernel(uint16_t* x, const float* y, const float* cs, long rows, int n) {
   long i = long(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= rows * n) return;

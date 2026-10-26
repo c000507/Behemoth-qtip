@@ -245,6 +245,7 @@ static std::vector<std::vector<float>> read_hess(const std::string& path) {
 }
 
 void Pipeline::deposit_partial(int L, HessAcc& acc, LayerRunner& R) {
+  R.symmetrize_hess(acc);
   // download partial sums
   std::vector<std::vector<float>> part(4);
   for (int i = 0; i < 4; ++i) {

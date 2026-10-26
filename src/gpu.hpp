@@ -138,6 +138,9 @@ void k_qkv_rope(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t
 void k_causal_softmax(const float* S, uint16_t* P, int nh, int T, float scale, hipStream_t s);
 // O [nh][T][hd] fp32 -> out [T][(h0+h)*hd] bf16 with row stride ld
 void k_heads_to_tokens(const float* O, uint16_t* out, int nh, int T, int hd, int h0, long ld, hipStream_t s);
+// n x n buffer where only blocks (row block <= col block) of a bs-partition of the column-major matrix were
+// accumulated: copy them to the mirrored positions
+void k_symmetrize_blocks(float* H, long n, long bs, hipStream_t s);
 // x_bf16 += y_fp32 * col_scale[col] (residual add, bf16 result)
 void k_residual_add(uint16_t* x, const float* y, const float* col_scale, long rows, int n, hipStream_t s);
 // act[T][F] = silu(gu[:, :F] * sg) * (gu[:, F:] * su), gu fp32 [T][2F]
