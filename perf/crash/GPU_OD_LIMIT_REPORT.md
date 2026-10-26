@@ -132,3 +132,16 @@ How to read it:
 - The real fix is still the per-card native PCIe power cables. After re-cabling, test
   `~/gpu_od_apply.sh 0 0 300` (stock) for 45 min with `load_bench` c=4.
 - Optional: a 45+ min soak of the chosen point would confirm the margin; only 20.9 + 6 min were run.
+
+## Update 2026-10-26
+- 11:36: -500 MHz / 0 mV / 210 W dropped both cards off the bus during a 20.8k-token prefill (attention
+  round 4 benchmark). Poller peaks that day under this setting: 263-330 W and 3.08-3.09 GHz despite the
+  210 W cap and -500 MHz offset - the cap/offset limit the average, not the transients.
+- 12:10: -500 MHz / -50 mV / 210 W soak (`perf/crash/stress/stab_od50.sh`: 33.8k-token prefill + c=4
+  decode, alternating). Rounds 1-5 clean (prefill ~200 s, c=4 38 tok/s, 96 ms/step; median 171-177 W,
+  max 306-330 W, vddgfx max ~0.99 V, edge 63-67 C, junction 75-80 C). At ~12:32 (22 min) the server
+  returned "Nonfinite model logits" (silent compute corruption), then at ~12:37
+  `amdgpu 0000:33:00.0: MES(1) failed to respond to msg=INVALIDATE_TLBS`. Cards stayed on the bus; a
+  server restart recovered without a reboot. -50 mV is NOT stable (as -100 mV before).
+- New default (`~/kernel.sh`): OD reset to stock (`gpu_od_apply.sh 0 0 300`) then DPM level 1
+  (`gpu_vf_cap.sh`, ~2.1-2.3 GHz under load).
