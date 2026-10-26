@@ -35,6 +35,38 @@ Pipeline:
    layout), `SU`, `SV` (×Wscale, as `hfize_llama`/`unpack_quip` store it), `tlut`, `rcp`, `tp_rank`, plus the
    layer norms. The result is an HF directory in the QTIP-hfized llama layout.
 
+
+## Inference runtime (`runtime/`)
+
+`runtime/` is the Behemoth C++/HIP inference runtime and OpenAI-compatible server (`behemoth_server`), imported
+with its history from the AQLM codebase. It serves both the AQLM 1x16 model and QTIP 2-bit models written by
+`qtip_quant` (detected from `quip_params` in `config.json`): trellis-decode GEMV/WMMA kernels, Hadamard
+transforms and rotated-row tensor parallelism over the two GPUs. Details and measurements:
+`runtime/README.md`, `runtime/VALIDATION.md` and the reports in `runtime/`.
+
+Build (from this repository root):
+
+```sh
+cmake -S runtime -B runtime/build-rocm -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBEHEMOTH_ROCM=ON -DBEHEMOTH_SERVER=ON -DBEHEMOTH_TOKENIZER=ON \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DCMAKE_PREFIX_PATH=/opt/rocm
+cmake --build runtime/build-rocm -j 16
+```
+
+Serve a QTIP model on both GPUs:
+
+```sh
+runtime/build-rocm/behemoth_server --model /mnt/nvme/qtip_quant/Behemoth-R1-123B-v2-QTIP-2bit \
+  --devices 0,1 --transport zerocopy --memory-fraction 0.9 --token-budget 1024 --prefill-chunk 256 \
+  --host 0.0.0.0 --port 1337 --threads 4
+```
+
+The model directory needs `tokenizer.model` next to `tokenizer.json` (copy it from the source model if
+`qtip_quant --mode assemble` did not). Single-request decode is ~49 ms/token (~20 tok/s) on 2x R9700, against
+~69-74 ms/token for the AQLM 1x16 model.
+
 ## Build
 
 ```
