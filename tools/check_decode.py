@@ -30,6 +30,7 @@ ap.add_argument("--model", default="/mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic")
 ap.add_argument("--linears", default=",".join(LIN))
 ap.add_argument("--forward", action="store_true")
 ap.add_argument("--results", default="")
+ap.add_argument("--wdump", default="", help="for --hess: read W from <dump>/L<L>_<linear>.W.f32 instead of --model")
 args = ap.parse_args()
 
 qtip_shim.install()
@@ -73,11 +74,15 @@ for lin in args.linears.split(","):
         yr = x.double() @ hatW.T
         rec["forward_rel_err"] = ((y - yr).norm() / yr.norm()).item()
     if args.hess:
-        with open(os.path.join(args.model, "model.safetensors.index.json")) as fi:
-            wm = json.load(fi)["weight_map"]
-        k = pre + lin + ".weight"
-        with safe_open(os.path.join(args.model, wm[k]), "pt") as fw:
-            W = fw.get_tensor(k).double() * fw.get_tensor(k + "_scale").double().reshape(-1, 1)
+        if args.wdump:
+            W = torch.from_file(os.path.join(args.wdump, f"L{args.layer}_{lin}.W.f32"), size=m * n,
+                                dtype=torch.float32).view(m, n).double()
+        else:
+            with open(os.path.join(args.model, "model.safetensors.index.json")) as fi:
+                wm = json.load(fi)["weight_map"]
+            k = pre + lin + ".weight"
+            with safe_open(os.path.join(args.model, wm[k]), "pt") as fw:
+                W = fw.get_tensor(k).double() * fw.get_tensor(k + "_scale").double().reshape(-1, 1)
         with safe_open(args.hess, "pt") as fh:
             H = fh.get_tensor(HN[lin]).double()
         d = W - hatW

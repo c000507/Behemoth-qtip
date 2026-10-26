@@ -18,6 +18,10 @@ LIN = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_
 HN = {"self_attn.q_proj": "qkv", "self_attn.k_proj": "qkv", "self_attn.v_proj": "qkv", "self_attn.o_proj": "o",
       "mlp.gate_proj": "gateup", "mlp.up_proj": "gateup", "mlp.down_proj": "down"}
 
+SHAPE = {"self_attn.q_proj": (12288, 12288), "self_attn.k_proj": (1024, 12288), "self_attn.v_proj": (1024, 12288),
+         "self_attn.o_proj": (12288, 12288), "mlp.gate_proj": (28672, 12288), "mlp.up_proj": (28672, 12288),
+         "mlp.down_proj": (12288, 28672)}  # Behemoth / Mistral-Large
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="/mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic")
 ap.add_argument("--hess", required=True, help="qtip_quant Hessian file layer<L>.safetensors")
@@ -27,6 +31,8 @@ ap.add_argument("--rows", type=int, default=0, help="random subset of output row
 ap.add_argument("--device", default="cuda:0")
 ap.add_argument("--results", default="ref_results.jsonl")
 ap.add_argument("--tag", default="")
+ap.add_argument("--wdump", default="", help="read W from qtip_quant --dump-dir files L<L>_<linear>.W.f32 (exact fp8*scale "
+                "in fp32, identical to the checkpoint decode) instead of --model")
 args = ap.parse_args()
 
 qtip_shim.install()
@@ -38,6 +44,10 @@ dev = torch.device(args.device)
 
 
 def load_w(lin):
+    if args.wdump:
+        m, n = SHAPE[lin]
+        return torch.from_file(os.path.join(args.wdump, f"L{args.layer}_{lin}.W.f32"), size=m * n,
+                               dtype=torch.float32).view(m, n).clone()
     with open(os.path.join(args.model, "model.safetensors.index.json")) as f:
         wm = json.load(f)["weight_map"]
     k = f"model.layers.{args.layer}.{lin}.weight"
