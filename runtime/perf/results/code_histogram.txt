@@ -1,0 +1,16 @@
+L0 self_attn.q_proj codes shape=[12288, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=59306 entropy=14.22 bits  coverage top1K=0.190 top2K=0.306 top4K=0.474 top8K=0.683 top16K=0.879 top32K=0.984 max_freq=0.0008
+   codebook: min=-0.3008 max=0.2754 absmean=0.0057 std=0.0100
+L0 self_attn.o_proj codes shape=[12288, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.32 bits  coverage top1K=0.099 top2K=0.155 top4K=0.250 top8K=0.405 top16K=0.623 top32K=0.856 max_freq=0.0007
+   codebook: min=-0.1025 max=0.1030 absmean=0.0075 std=0.0098
+L0 mlp.gate_proj codes shape=[28672, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.97 bits  coverage top1K=0.021 top2K=0.042 top4K=0.082 top8K=0.160 top16K=0.310 top32K=0.584 max_freq=0.0000
+   codebook: min=-0.0684 max=0.0635 absmean=0.0079 std=0.0099
+L0 mlp.down_proj codes shape=[12288, 3584, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.62 bits  coverage top1K=0.075 top2K=0.120 top4K=0.196 top8K=0.324 top16K=0.517 top32K=0.765 max_freq=0.0009
+   codebook: min=-0.0825 max=0.0850 absmean=0.0048 std=0.0061
+L44 self_attn.q_proj codes shape=[12288, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.93 bits  coverage top1K=0.026 top2K=0.050 top4K=0.097 top8K=0.185 top16K=0.347 top32K=0.627 max_freq=0.0000
+   codebook: min=-0.0884 max=0.0859 absmean=0.0077 std=0.0097
+L44 self_attn.o_proj codes shape=[12288, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.96 bits  coverage top1K=0.022 top2K=0.044 top4K=0.085 top8K=0.164 top16K=0.315 top32K=0.590 max_freq=0.0000
+   codebook: min=-0.0713 max=0.0669 absmean=0.0073 std=0.0091
+L44 mlp.gate_proj codes shape=[28672, 1536, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.94 bits  coverage top1K=0.026 top2K=0.050 top4K=0.096 top8K=0.185 top16K=0.346 top32K=0.624 max_freq=0.0000
+   codebook: min=-0.1104 max=0.0923 absmean=0.0076 std=0.0094
+L44 mlp.down_proj codes shape=[12288, 3584, 1] dtype=I16 book shape=[1, 65536, 1, 8] F16 used=65536 entropy=15.94 bits  coverage top1K=0.025 top2K=0.048 top4K=0.094 top8K=0.180 top16K=0.341 top32K=0.620 max_freq=0.0000
+   codebook: min=-0.1758 max=0.0903 absmean=0.0048 std=0.0060

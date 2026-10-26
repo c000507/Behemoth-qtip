@@ -1,0 +1,339 @@
+[Sun Oct 25 12:02:43 2026] amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+[Sun Oct 25 12:02:43 2026] amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+[Sun Oct 25 12:02:46 2026] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:02:46 2026] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:02:48 2026] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:02:48 2026] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:02:50 2026] amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:02:50 2026] amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:02:52 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:02:54 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:02:57 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:02:59 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:01 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=39802, emitted seq=39806
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[Sun Oct 25 12:03:03 2026] amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=39802, emitted seq=39806
+[Sun Oct 25 12:03:05 2026] amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+[Sun Oct 25 12:03:06 2026] amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+[Sun Oct 25 12:03:08 2026] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:03:08 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:03:10 2026] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:03:10 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:03:12 2026] amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+[Sun Oct 25 12:03:12 2026] amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+[Sun Oct 25 12:03:15 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:17 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:19 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:21 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:23 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:26 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:28 2026] amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:30 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:03:32 2026] amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:5:26774 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:5  state:D stack:0     pid:26774 tgid:26774 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:7:26776 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:7  state:D stack:0     pid:26776 tgid:26776 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u261:0:27577 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u261:0  state:D stack:0     pid:27577 tgid:27577 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u261:2:29549 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u261:2  state:D stack:0     pid:29549 tgid:29549 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:0:30491 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:0  state:D stack:0     pid:30491 tgid:30491 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:1:30496 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:1  state:D stack:0     pid:30496 tgid:30496 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:2:30497 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:2  state:D stack:0     pid:30497 tgid:30497 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:3:30504 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:3  state:D stack:0     pid:30504 tgid:30504 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:4:30505 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:4  state:D stack:0     pid:30505 tgid:30505 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] INFO: task kworker/u260:6:30514 blocked for more than 122 seconds.
+[Sun Oct 25 12:05:14 2026]       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+[Sun Oct 25 12:05:14 2026] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Sun Oct 25 12:05:14 2026] task:kworker/u260:6  state:D stack:0     pid:30514 tgid:30514 ppid:2      task_flags:0x4208060 flags:0x00004000
+[Sun Oct 25 12:05:14 2026] Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+[Sun Oct 25 12:05:14 2026] Call Trace:
+[Sun Oct 25 12:05:14 2026]  <TASK>
+[Sun Oct 25 12:05:14 2026]  __schedule+0x30d/0x7a0
+[Sun Oct 25 12:05:14 2026]  schedule+0x27/0x90
+[Sun Oct 25 12:05:14 2026]  schedule_timeout+0x104/0x110
+[Sun Oct 25 12:05:14 2026]  dma_fence_default_wait+0x1f0/0x250
+[Sun Oct 25 12:05:14 2026]  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  dma_fence_wait_timeout+0x13a/0x170
+[Sun Oct 25 12:05:14 2026]  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+[Sun Oct 25 12:05:14 2026]  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+[Sun Oct 25 12:05:14 2026]  process_one_work+0x191/0x3e0
+[Sun Oct 25 12:05:14 2026]  worker_thread+0x2e3/0x420
+[Sun Oct 25 12:05:14 2026]  ? __pfx_worker_thread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  kthread+0x10d/0x230
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork+0x121/0x140
+[Sun Oct 25 12:05:14 2026]  ? __pfx_kthread+0x10/0x10
+[Sun Oct 25 12:05:14 2026]  ret_from_fork_asm+0x1a/0x30
+[Sun Oct 25 12:05:14 2026]  </TASK>
+[Sun Oct 25 12:05:14 2026] Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings
+[Sun Oct 25 12:09:59 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:09:59 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[Sun Oct 25 12:09:59 2026] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[Sun Oct 25 12:18:00 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:00 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[Sun Oct 25 12:18:00 2026] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:33:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:18 param:0x00000005 message:TransferTableSmu2Dram?
+[Sun Oct 25 12:18:54 2026] amdgpu 0000:cc:00.0: amdgpu: Failed to export SMU metrics table!
+[Sun Oct 25 12:19:16 2026] snd_hda_intel 0000:cc:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[Sun Oct 25 12:19:16 2026] snd_hda_intel 0000:cc:00.1: CORB reset timeout#2, CORBRP = 65535
+[Sun Oct 25 12:19:16 2026] snd_hda_intel 0000:33:00.1: Unable to change power state from D3cold to D0, device inaccessible
+[Sun Oct 25 12:19:16 2026] workqueue: pm_runtime_work hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+[Sun Oct 25 12:19:16 2026] snd_hda_intel 0000:33:00.1: CORB reset timeout#2, CORBRP = 65535
+[Sun Oct 25 12:19:16 2026] amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+[Sun Oct 25 12:19:16 2026] amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+[Sun Oct 25 12:19:16 2026] amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!

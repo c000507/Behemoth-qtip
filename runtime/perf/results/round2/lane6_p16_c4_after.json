@@ -1,0 +1,1 @@
+{"active_requests":0,"completed_requests":20,"completion_tokens":1200,"gpu_step_seconds":112.785481657,"healthy":true,"inter_token_p50_ms":116.025357,"inter_token_p95_ms":127.303447,"kv_pages_free":4569,"kv_pages_total":4569,"last_step_profile":null,"precision":"fp8_e4m3/bf16/fp32","preemptions":0,"ttft_p50_ms":952.235181,"ttft_p95_ms":1352.33393}

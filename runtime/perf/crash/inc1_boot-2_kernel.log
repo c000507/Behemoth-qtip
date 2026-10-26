@@ -1,0 +1,529 @@
+Oct 25 11:46:33 charles-PowerEdge-T440 kernel: snd_hda_intel 0000:cc:00.1: Unable to change power state from D3hot to D0, device inaccessible
+Oct 25 11:46:33 charles-PowerEdge-T440 kernel: snd_hda_intel 0000:33:00.1: Unable to change power state from D3hot to D0, device inaccessible
+Oct 25 11:46:33 charles-PowerEdge-T440 kernel: snd_hda_intel 0000:cc:00.1: CORB reset timeout#2, CORBRP = 65535
+Oct 25 11:46:33 charles-PowerEdge-T440 kernel: snd_hda_intel 0000:33:00.1: CORB reset timeout#2, CORBRP = 65535
+Oct 25 11:46:33 charles-PowerEdge-T440 kernel: workqueue: pm_runtime_work hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+Oct 25 12:00:41 charles-PowerEdge-T440 kernel: audit: type=1400 audit(1792893641.068:178): apparmor="DENIED" operation="open" class="file" profile="snap.firmware-updater.firmware-notifier" name="/proc/sys/vm/max_map_count" pid=30115 comm="firmware-notifi" requested_mask="r" denied_mask="r" fsuid=1000 ouid=0
+Oct 25 12:01:25 charles-PowerEdge-T440 kernel: ptrace attach of "/home/charles/Development/behemoth-perf/cpp_runtime/build-rocm/behemoth_server --model /mnt/nvme/models/Behemoth-R1-123B-v2-aqlm-output --devices 0,1 --transport host --memory-fraction 0.9 --token-budget 1024 --prefill-chunk 256 --host 127.0.0.1 --port 8080 --threads 4 --profile false"[29448] was attempted by "gdb -batch -ex thread apply all bt 8 -p 29448"[30293]
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1216
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to evict queue 9
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to evict process queues
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1216
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to evict queue 8
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to evict process queues
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu: Failed to quiesce KFD
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:35 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1004
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 6
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:37 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1202
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 5
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:39 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 1
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:41 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1000
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to remove queue 0
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu: Resetting wave fronts (cpsch) on dev 00000000d2692954
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: no vmid pasid mapping supported
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:8 param:0x00000400 message:EnableSmuFeaturesLow?
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable GFXCLK DS!
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:36 param:0x00000000 message:SetWorkloadMask?
+Oct 25 12:01:43 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to set workload mask 0x00000000
+Oct 25 12:01:46 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(0) failed to respond to msg=MISC (SET_SHADER_DEBUGGER)
+Oct 25 12:01:46 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to set_shader_debugger
+Oct 25 12:01:46 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:46 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:01:46 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1004
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 7
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:48 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1202
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 4
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:50 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 3
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:52 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=REMOVE_QUEUE
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1000
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to remove queue 2
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  3
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu: Resetting wave fronts (cpsch) on dev 000000001785483f
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: no vmid pasid mapping supported
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:8 param:0x00000400 message:EnableSmuFeaturesLow?
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to enable GFXCLK DS!
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:36 param:0x00000000 message:SetWorkloadMask?
+Oct 25 12:01:54 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to set workload mask 0x00000000
+Oct 25 12:01:56 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(0) failed to respond to msg=MISC (SET_SHADER_DEBUGGER)
+Oct 25 12:01:56 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to set_shader_debugger
+Oct 25 12:01:56 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:56 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:01:56 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:01:59 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:01:59 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:01:59 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:01:59 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:01:59 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: ring sdma1 timeout, signaled seq=654, emitted seq=656
+Oct 25 12:02:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Starting sdma1 ring reset
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: reset sdma queue (1:0:0)
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Ring sdma1 reset failed
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:02:01 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: ring sdma1 timeout, signaled seq=654, emitted seq=656
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Starting sdma1 ring reset
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: reset sdma queue (1:0:0)
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Ring sdma1 reset failed
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:02:03 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:02:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:09 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:09 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:12 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:12 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:14 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:14 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:16 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:16 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:18 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:18 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:20 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:20 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:22 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:22 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:25 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:25 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:27 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:27 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:29 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:29 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:31 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:31 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:33 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:35 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:35 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:38 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:38 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:40 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:40 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: ring sdma0 timeout, signaled seq=42213, emitted seq=42217
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Starting sdma0 ring reset
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: reset sdma queue (0:0:0)
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Ring sdma0 reset failed
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:02:42 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: ring sdma0 timeout, signaled seq=42213, emitted seq=42217
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Starting sdma0 ring reset
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:02:44 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: reset sdma queue (0:0:0)
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Ring sdma0 reset failed
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:02:45 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:02:47 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:47 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:49 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:49 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:51 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:02:51 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:02:53 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:02:56 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:02:58 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:02 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=39802, emitted seq=39806
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:03:04 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:03:05 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Dumping IP State
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Dumping IP State Completed
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: [drm] AMDGPU device coredump file has been created
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: [drm] Check your /sys/class/drm/card2/device/devcoredump/data
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: ring sdma0 timeout, signaled seq=39802, emitted seq=39806
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Starting sdma0 ring reset
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Failed to enable gfxoff!
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: reset sdma queue (0:0:0)
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to wait on sdma queue reset done
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reset legacy queue
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: Ring sdma0 reset failed
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset begin!. Source:  1
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: device lost from bus!
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU reset end with ret = -19
+Oct 25 12:03:07 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: GPU Recovery Failed: -19
+Oct 25 12:03:09 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:03:09 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:03:12 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:03:12 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:03:14 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES(1) failed to respond to msg=MISC (WAIT_REG_MEM)
+Oct 25 12:03:14 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: failed to reg_write_reg_wait
+Oct 25 12:03:16 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:18 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:20 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:23 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:25 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:27 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:29 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:31 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:03:33 charles-PowerEdge-T440 kernel: amdgpu 0000:cc:00.0: amdgpu: MES ring buffer is full.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:5:26774 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:5  state:D stack:0     pid:26774 tgid:26774 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:7:26776 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:7  state:D stack:0     pid:26776 tgid:26776 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u261:0:27577 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u261:0  state:D stack:0     pid:27577 tgid:27577 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u261:2:29549 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u261:2  state:D stack:0     pid:29549 tgid:29549 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:0:30491 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:0  state:D stack:0     pid:30491 tgid:30491 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:1:30496 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:1  state:D stack:0     pid:30496 tgid:30496 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:2:30497 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:2  state:D stack:0     pid:30497 tgid:30497 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:3:30504 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:3  state:D stack:0     pid:30504 tgid:30504 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:4:30505 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:4  state:D stack:0     pid:30505 tgid:30505 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: INFO: task kworker/u260:6:30514 blocked for more than 122 seconds.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:       Tainted: G     U  W  OE       6.17.0-35-generic #35~24.04.1-Ubuntu
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: task:kworker/u260:6  state:D stack:0     pid:30514 tgid:30514 ppid:2      task_flags:0x4208060 flags:0x00004000
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Workqueue: ttm ttm_bo_delayed_delete [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Call Trace:
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  <TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  __schedule+0x30d/0x7a0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule+0x27/0x90
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  schedule_timeout+0x104/0x110
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_default_wait+0x1f0/0x250
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  dma_fence_wait_timeout+0x13a/0x170
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  amddma_resv_wait_timeout+0x85/0x110 [amdkcl]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ttm_bo_delayed_delete+0x33/0xc0 [amdttm]
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  process_one_work+0x191/0x3e0
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  worker_thread+0x2e3/0x420
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_worker_thread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  kthread+0x10d/0x230
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork+0x121/0x140
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ? __pfx_kthread+0x10/0x10
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  ret_from_fork_asm+0x1a/0x30
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel:  </TASK>
+Oct 25 12:05:15 charles-PowerEdge-T440 kernel: Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings
+Oct 25 12:10:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: device lost from bus!
+Oct 25 12:10:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: SMU: response:0xFFFFFFFF for index:40 param:0x00000000 message:AllowGfxOff?
+Oct 25 12:10:00 charles-PowerEdge-T440 kernel: amdgpu 0000:33:00.0: amdgpu: Failed to enable gfxoff!

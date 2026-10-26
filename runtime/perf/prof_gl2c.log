@@ -1,0 +1,49 @@
+W20261025 11:12:14.443128 125645978120960 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.167156 sec
+W20261025 11:12:14.443555 125645978120960 simple_timer.cpp:55] [rocprofv3] './micro gemv2x8 0' ::     0.000000 sec
+W20261025 11:12:14.478976 125645978120960 tool.cpp:2422] HSA version 8.20.4 initialized (instance=0)
+W20261025 11:12:14.933590 125645978120960 simple_timer.cpp:55] [rocprofv3] './micro gemv2x8 0' ::     0.490035 sec
+E20261025 11:12:14.948561 125645978120960 output_stream.cpp:111] Opened result file: prof/gl2c_counter_collection.csv
+E20261025 11:12:14.959549 125645978120960 output_stream.cpp:111] Opened result file: prof/gl2c_agent_info.csv
+W20261025 11:12:14.961069 125645978120960 simple_timer.cpp:55] [rocprofv3] output generation ::     0.026232 sec
+W20261025 11:12:14.961121 125645978120960 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.026291 sec
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+# q 12288->6144 codes=18.9 MB
+  2x8-lds  U= 8 CPT=2 thr=256 partK=  512 blocks=  288 waves= 2304 :  0.0933 ms   202.3 GB/s
+  2x8-lds  U= 8 CPT=4 thr=256 partK=  512 blocks=  144 waves= 1152 :  0.0924 ms   204.4 GB/s
+  2x8-lds  U= 8 CPT=2 thr=128 partK=  512 blocks=  576 waves= 2304 :  0.0897 ms   210.4 GB/s
+  2x8-lds  U= 8 CPT=4 thr=128 partK=  512 blocks=  288 waves= 1152 :  0.0880 ms   214.5 GB/s
+  2x8-l0   U= 8 CPT=2 thr=256 partK=  512 blocks=  288 waves= 2304 :  0.0760 ms   248.5 GB/s
+  2x8-l0   U= 8 CPT=4 thr=256 partK=  512 blocks=  144 waves= 1152 :  0.0720 ms   262.0 GB/s
+  2x8-l0   U= 8 CPT=4 thr=128 partK=  512 blocks=  288 waves= 1152 :  0.0688 ms   274.2 GB/s
+# k/v 12288->512 codes=1.6 MB
+  2x8-lds  U= 8 CPT=2 thr=256 partK=  512 blocks=   24 waves=  192 :  0.0595 ms    26.4 GB/s
+  2x8-lds  U= 8 CPT=4 thr=256 partK=  512 blocks=   24 waves=  192 :  0.0627 ms    25.1 GB/s
+  2x8-lds  U= 8 CPT=2 thr=128 partK=  512 blocks=   48 waves=  192 :  0.0593 ms    26.5 GB/s
+  2x8-lds  U= 8 CPT=4 thr=128 partK=  512 blocks=   24 waves=   96 :  0.0596 ms    26.4 GB/s
+  2x8-l0   U= 8 CPT=2 thr=256 partK=  512 blocks=   24 waves=  192 :  0.0575 ms    27.3 GB/s
+  2x8-l0   U= 8 CPT=4 thr=256 partK=  512 blocks=   24 waves=  192 :  0.0596 ms    26.4 GB/s
+  2x8-l0   U= 8 CPT=4 thr=128 partK=  512 blocks=   24 waves=   96 :  0.0577 ms    27.2 GB/s
+# o 6144->12288 codes=18.9 MB
+  2x8-lds  U= 8 CPT=2 thr=256 partK=  512 blocks=  288 waves= 2304 :  0.0911 ms   207.1 GB/s
+  2x8-lds  U= 8 CPT=4 thr=256 partK=  512 blocks=  144 waves= 1152 :  0.0924 ms   204.4 GB/s
+  2x8-lds  U= 8 CPT=2 thr=128 partK=  512 blocks=  576 waves= 2304 :  0.0899 ms   210.0 GB/s
+  2x8-lds  U= 8 CPT=4 thr=128 partK=  512 blocks=  288 waves= 1152 :  0.0884 ms   213.5 GB/s
+  2x8-l0   U= 8 CPT=2 thr=256 partK=  512 blocks=  288 waves= 2304 :  0.0792 ms   238.3 GB/s
+  2x8-l0   U= 8 CPT=4 thr=256 partK=  512 blocks=  144 waves= 1152 :  0.0781 ms   241.7 GB/s
+  2x8-l0   U= 8 CPT=4 thr=128 partK=  512 blocks=  288 waves= 1152 :  0.0758 ms   249.0 GB/s
+# gate/up 12288->14336 codes=44.0 MB
+  2x8-lds  U= 8 CPT=2 thr=256 partK=  512 blocks=  672 waves= 5376 :  0.1368 ms   321.9 GB/s
+  2x8-lds  U= 8 CPT=4 thr=256 partK=  512 blocks=  336 waves= 2688 :  0.1384 ms   318.3 GB/s
+  2x8-lds  U= 8 CPT=2 thr=128 partK=  512 blocks= 1344 waves= 5376 :  0.1345 ms   327.4 GB/s
+  2x8-lds  U= 8 CPT=4 thr=128 partK=  512 blocks=  672 waves= 2688 :  0.1331 ms   330.9 GB/s
+  2x8-l0   U= 8 CPT=2 thr=256 partK=  512 blocks=  672 waves= 5376 :  0.1059 ms   415.9 GB/s
+  2x8-l0   U= 8 CPT=4 thr=256 partK=  512 blocks=  336 waves= 2688 :  0.1096 ms   401.8 GB/s
+  2x8-l0   U= 8 CPT=4 thr=128 partK=  512 blocks=  672 waves= 2688 :  0.1086 ms   405.4 GB/s
+# down 14336->12288 codes=44.0 MB
+  2x8-lds  U= 8 CPT=2 thr=256 partK=  512 blocks=  672 waves= 5376 :  0.1367 ms   322.2 GB/s
+  2x8-lds  U= 8 CPT=4 thr=256 partK=  512 blocks=  336 waves= 2688 :  0.1374 ms   320.6 GB/s
+  2x8-lds  U= 8 CPT=2 thr=128 partK=  512 blocks= 1344 waves= 5376 :  0.1346 ms   327.3 GB/s
+  2x8-lds  U= 8 CPT=4 thr=128 partK=  512 blocks=  672 waves= 2688 :  0.1336 ms   329.7 GB/s
+  2x8-l0   U= 8 CPT=2 thr=256 partK=  512 blocks=  672 waves= 5376 :  0.1046 ms   420.9 GB/s
+  2x8-l0   U= 8 CPT=4 thr=256 partK=  512 blocks=  336 waves= 2688 :  0.1087 ms   405.2 GB/s
+  2x8-l0   U= 8 CPT=4 thr=128 partK=  512 blocks=  672 waves= 2688 :  0.1086 ms   405.7 GB/s

@@ -1,0 +1,27 @@
+GPU 0 AMD Radeon AI PRO R9700 arch=gfx1201 wave=32 pci=0000:33:00.0 link=32.0 GT/s PCIe width=16 largest_memory_BAR=34359738368 BAR_covers_VRAM=1 iommu_pt=1 P2P=disabled; BAR/IOMMU are diagnostic only
+GPU 1 AMD Radeon AI PRO R9700 arch=gfx1201 wave=32 pci=0000:cc:00.0 link=32.0 GT/s PCIe width=16 largest_memory_BAR=34359738368 BAR_covers_VRAM=1 iommu_pt=1 P2P=disabled; BAR/IOMMU are diagnostic only
+Collective smoke: explicit pinned-host; reduction/gather validated; 0.570065 GB/s end-to-end smoke transfer rate (includes allocation, host sum and validation)
+rank 0: loaded block 0/88
+rank 0: loaded block 8/88
+rank 0: loaded block 16/88
+rank 0: loaded block 24/88
+rank 0: loaded block 32/88
+rank 0: loaded block 40/88
+rank 0: loaded block 48/88
+rank 0: loaded block 56/88
+rank 0: loaded block 64/88
+rank 0: loaded block 72/88
+rank 0: loaded block 80/88
+rank 1: loaded block 0/88
+rank 1: loaded block 8/88
+rank 1: loaded block 16/88
+rank 1: loaded block 24/88
+rank 1: loaded block 32/88
+rank 1: loaded block 40/88
+rank 1: loaded block 48/88
+rank 1: loaded block 56/88
+rank 1: loaded block 64/88
+rank 1: loaded block 72/88
+rank 1: loaded block 80/88
+KV pages=5957, aggregate token capacity=95312, bytes/token/GPU=92928
+Listening on http://127.0.0.1:8080; transport=zerocopy; P2P disabled

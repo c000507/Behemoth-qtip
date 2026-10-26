@@ -1,0 +1,5 @@
+=== baseline (/home/charles/Development/behemoth-perf/cpp_runtime/build-rocm/behemoth_server --transport host)
+server baseline failed to start
+=== proto_host (/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm/behemoth_server --transport host)
+server proto_host failed to start
+=== proto_zerocopy (/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm/behemoth_server --transport zerocopy)

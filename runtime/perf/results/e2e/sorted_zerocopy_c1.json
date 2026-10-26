@@ -1,0 +1,27 @@
+{
+  "completion_tokens": 192,
+  "completion_tokens_per_second": 11.03482352538649,
+  "concurrency": 1,
+  "elapsed_seconds": 17.39946267,
+  "mean_prompt_tokens": 39.0,
+  "request_latency_p50_seconds": 8.683767073,
+  "request_latency_p95_seconds": 8.683767073,
+  "request_latency_p99_seconds": 8.683767073,
+  "requests": 2,
+  "server_rolling_metrics": {
+    "active_requests": 0,
+    "completed_requests": 4,
+    "completion_tokens": 240,
+    "gpu_step_seconds": 39.045429371000004,
+    "healthy": true,
+    "inter_token_p50_ms": 73.620884,
+    "inter_token_p95_ms": 77.690346,
+    "kv_pages_free": 5957,
+    "kv_pages_total": 5957,
+    "last_step_profile": null,
+    "precision": "fp8_e4m3/bf16/fp32",
+    "preemptions": 0,
+    "ttft_p50_ms": 1641.54433,
+    "ttft_p95_ms": 1642.118539
+  }
+}

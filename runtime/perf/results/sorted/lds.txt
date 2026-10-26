@@ -1,0 +1,13 @@
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+# LDS random throughput, 2048 blocks x 256 threads, 4096 ops/thread
+ds_add_f32 random slots=   32 :  54.748 ms    39.2 Gop/s  ops/clk/CU=0.26
+ds_add_f32 random slots=  256 :  54.498 ms    39.4 Gop/s  ops/clk/CU=0.26
+ds_add_f32 random slots= 1024 :  53.984 ms    39.8 Gop/s  ops/clk/CU=0.26
+ds_add_f32 random slots= 4096 :  53.374 ms    40.2 Gop/s  ops/clk/CU=0.27
+ds_read_b64 random 2048 entries :   3.495 ms   614.5 Gop/s  ops/clk/CU=4.09
+read_b64 + add_f32 (256 slots)  :  55.359 ms    38.8 Gpair/s  pairs/clk/CU=0.26
+ds_add_u32 random 256 slots     :   2.570 ms   835.5 Gop/s  ops/clk/CU=5.55
+ds_add_u64 random 32 slots      :   4.739 ms   453.1 Gop/s  ops/clk/CU=3.01
+lane-private RMW [row][lane]    :   2.892 ms   742.6 Gop/s  ops/clk/CU=4.94
+read_b64 + lane-private RMW     :   4.793 ms   448.0 Gpair/s  pairs/clk/CU=2.98
+LDS per multiprocessor (WGP): 65536 bytes, per block 65536

@@ -1,0 +1,3 @@
+=== batched_zerocopy (/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime/build-rocm/behemoth_server --transport zerocopy)
+{"healthy":true}batched_zerocopy c1 HANG/timeout in warmup
+DONE

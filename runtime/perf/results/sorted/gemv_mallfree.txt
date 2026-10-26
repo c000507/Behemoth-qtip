@@ -1,0 +1,37 @@
+# AMD Radeon AI PRO R9700 WGPs=32 clock=2350 MHz
+# q 12288->6144 entries=9437184 (2B codes = 18.9 MB)
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  192 dummies=0.40%:  0.0658 ms  logical(2B)  286.8 GB/s  actual  342.2 GB/s  2.386 B/entry  0.066 ms/row maxerr=0/63.7
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits=16 blocks=  384 dummies=0.40%:  0.0711 ms  logical(2B)  265.4 GB/s  actual  316.6 GB/s  2.386 B/entry  0.071 ms/row maxerr=0/63.7
+  int64-atm C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=   96 dummies=0.40%:  0.0660 ms  logical(2B)  286.0 GB/s  actual  341.2 GB/s  2.386 B/entry  0.066 ms/row maxerr=0/63.7
+  int64-xL0 C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  192 dummies=0.40%:  0.0695 ms  logical(2B)  271.7 GB/s  actual  324.1 GB/s  2.386 B/entry  0.069 ms/row maxerr=0/63.7
+  int64-xL0 C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=   96 dummies=0.40%:  0.0707 ms  logical(2B)  266.9 GB/s  actual  318.4 GB/s  2.386 B/entry  0.071 ms/row maxerr=0/63.7
+  PIPE C=2 W= 8 U=4 splits= 8 blocks=  192 S=16:  0.0671 ms  logical(2B)  281.2 GB/s  actual  335.9 GB/s  maxerr=0/63.7
+  PIPE C=2 W= 8 U=4 splits=16 blocks=  384 S=16:  0.0766 ms  logical(2B)  246.3 GB/s  actual  294.2 GB/s  maxerr=0/63.7
+  PIPE C=2 W= 8 U=2 splits=16 blocks=  384 S=16:  0.0768 ms  logical(2B)  245.9 GB/s  actual  293.7 GB/s  maxerr=0/63.7
+  PIPE C=2 W=16 U=4 splits= 8 blocks=   96 S=16:  0.0672 ms  logical(2B)  280.9 GB/s  actual  335.5 GB/s  maxerr=0/63.7
+  PIPE C=2 W=16 U=4 splits=16 blocks=  192 S=16:  0.0698 ms  logical(2B)  270.3 GB/s  actual  322.8 GB/s  maxerr=0/63.7
+  PIPE C=2 W=16 U=2 splits=16 blocks=  192 S=16:  0.0700 ms  logical(2B)  269.6 GB/s  actual  322.1 GB/s  maxerr=0/63.7
+# gate/up 12288->14336 entries=22020096 (2B codes = 44.0 MB)
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  448 dummies=0.40%:  0.1300 ms  logical(2B)  338.9 GB/s  actual  404.3 GB/s  2.386 B/entry  0.130 ms/row maxerr=0/66.3
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits=16 blocks=  896 dummies=0.40%:  0.1478 ms  logical(2B)  298.0 GB/s  actual  355.5 GB/s  2.386 B/entry  0.148 ms/row maxerr=0/66.3
+  int64-atm C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=  224 dummies=0.40%:  0.1288 ms  logical(2B)  341.9 GB/s  actual  407.9 GB/s  2.386 B/entry  0.129 ms/row maxerr=0/66.3
+  int64-xL0 C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  448 dummies=0.40%:  0.1517 ms  logical(2B)  290.3 GB/s  actual  346.3 GB/s  2.386 B/entry  0.152 ms/row maxerr=0/66.3
+  int64-xL0 C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=  224 dummies=0.40%:  0.1282 ms  logical(2B)  343.5 GB/s  actual  409.8 GB/s  2.386 B/entry  0.128 ms/row maxerr=0/66.3
+  PIPE C=2 W= 8 U=4 splits= 8 blocks=  448 S=16:  0.1275 ms  logical(2B)  345.5 GB/s  actual  412.6 GB/s  maxerr=0/66.3
+  PIPE C=2 W= 8 U=4 splits=16 blocks=  896 S=16:  0.1255 ms  logical(2B)  351.0 GB/s  actual  419.2 GB/s  maxerr=0/66.3
+  PIPE C=2 W= 8 U=2 splits=16 blocks=  896 S=16:  0.1498 ms  logical(2B)  293.9 GB/s  actual  351.1 GB/s  maxerr=0/66.3
+  PIPE C=2 W=16 U=4 splits= 8 blocks=  224 S=16:  0.1427 ms  logical(2B)  308.7 GB/s  actual  368.7 GB/s  maxerr=0/66.3
+  PIPE C=2 W=16 U=4 splits=16 blocks=  448 S=16:  0.1240 ms  logical(2B)  355.3 GB/s  actual  424.3 GB/s  maxerr=0/66.3
+  PIPE C=2 W=16 U=2 splits=16 blocks=  448 S=16:  0.1438 ms  logical(2B)  306.2 GB/s  actual  365.7 GB/s  maxerr=0/66.3
+# down 14336->12288 entries=22020096 (2B codes = 44.0 MB)
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  384 dummies=0.17%:  0.1569 ms  logical(2B)  280.7 GB/s  actual  334.1 GB/s  2.380 B/entry  0.157 ms/row maxerr=0/73.7
+  int64-atm C=2 G=2048 DB=3 M=1 W= 8 U=4 splits=16 blocks=  768 dummies=0.17%:  0.1238 ms  logical(2B)  355.7 GB/s  actual  423.4 GB/s  2.380 B/entry  0.124 ms/row maxerr=7.63e-06/73.7
+  int64-atm C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=  192 dummies=0.17%:  0.1566 ms  logical(2B)  281.2 GB/s  actual  334.7 GB/s  2.380 B/entry  0.157 ms/row maxerr=0/73.7
+  int64-xL0 C=2 G=2048 DB=3 M=1 W= 8 U=4 splits= 8 blocks=  384 dummies=0.17%:  0.1673 ms  logical(2B)  263.2 GB/s  actual  313.3 GB/s  2.380 B/entry  0.167 ms/row maxerr=0/73.7
+  int64-xL0 C=2 G=2048 DB=3 M=1 W=16 U=4 splits= 8 blocks=  192 dummies=0.17%:  0.1540 ms  logical(2B)  286.0 GB/s  actual  340.4 GB/s  2.380 B/entry  0.154 ms/row maxerr=0/73.7
+  PIPE C=2 W= 8 U=4 splits= 8 blocks=  384 S=16:  0.1562 ms  logical(2B)  282.0 GB/s  actual  336.1 GB/s  maxerr=7.63e-06/73.7
+  PIPE C=2 W= 8 U=4 splits=16 blocks=  768 S=16:  0.1257 ms  logical(2B)  350.3 GB/s  actual  417.4 GB/s  maxerr=7.63e-06/73.7
+  PIPE C=2 W= 8 U=2 splits=16 blocks=  768 S=16:  0.1290 ms  logical(2B)  341.5 GB/s  actual  406.9 GB/s  maxerr=7.63e-06/73.7
+  PIPE C=2 W=16 U=4 splits= 8 blocks=  192 S=16:  0.1184 ms  logical(2B)  372.0 GB/s  actual  443.2 GB/s  maxerr=7.63e-06/73.7
+  PIPE C=2 W=16 U=4 splits=16 blocks=  384 S=16:  0.1432 ms  logical(2B)  307.6 GB/s  actual  366.6 GB/s  maxerr=7.63e-06/73.7
+  PIPE C=2 W=16 U=2 splits=16 blocks=  384 S=16:  0.1208 ms  logical(2B)  364.6 GB/s  actual  434.4 GB/s  maxerr=7.63e-06/73.7

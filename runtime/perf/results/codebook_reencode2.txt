@@ -1,0 +1,9 @@
+model.layers.44.mlp.down_proj: used=65536 fp8(1x16 runtime) rel err=0.0264
+  M=2 K=1024 table=16 KiB (20 bits/8 weights = 2.50 bpw): weighted rel err=0.2156 unweighted=0.2241  fit 32s
+  M=2 K=2048 table=32 KiB (22 bits/8 weights = 2.75 bpw): weighted rel err=0.1747 unweighted=0.1832  fit 64s
+  M=3 K=256 table=6 KiB (24 bits/8 weights = 3.00 bpw): weighted rel err=0.1755 unweighted=0.1867  fit 15s
+  M=3 K=512 table=12 KiB (27 bits/8 weights = 3.38 bpw): weighted rel err=0.1351 unweighted=0.1482  fit 26s
+model.layers.20.self_attn.o_proj: used=65536 fp8(1x16 runtime) rel err=0.0266
+  M=2 K=256 table=4 KiB (16 bits/8 weights = 2.00 bpw): weighted rel err=0.3134 unweighted=0.3135  fit 10s
+  M=2 K=1024 table=16 KiB (20 bits/8 weights = 2.50 bpw): weighted rel err=0.2157 unweighted=0.2159  fit 33s
+  M=3 K=256 table=6 KiB (24 bits/8 weights = 3.00 bpw): weighted rel err=0.1765 unweighted=0.1770  fit 15s

@@ -1,0 +1,5 @@
+pgrep: pattern that searches for process name longer than 15 characters will result in zero matches
+Try `pgrep -f' option to match against the complete command line.
+=== baseline (/home/charles/Development/behemoth-perf/cpp_runtime/build-rocm/behemoth_server --transport host)
+{"healthy":true}baseline concurrency 1 {'completion_tokens': 192, 'completion_tokens_per_second': 5.85696492721128, 'elapsed_seconds': 32.78148365, 'mean_prompt_tokens': 39.0, 'request_latency_p50_seconds': 16.359172592, 'request_latency_p95_seconds': 16.359172592, 'request_latency_p99_seconds': 16.359172592}
+baseline concurrency 8 {'completion_tokens': 1536, 'completion_tokens_per_second': 20.47681661921051, 'elapsed_seconds': 75.011659701, 'mean_prompt_tokens': 39.0, 'request_latency_p50_seconds': 21.868740725, 'request_latency_p95_seconds': 54.158188453, 'request_latency_p99_seconds': 54.158188453}

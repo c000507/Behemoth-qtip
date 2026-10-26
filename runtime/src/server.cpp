@@ -1,0 +1,376 @@
+#include "behemoth/engine.hpp"
+#include "behemoth/protocol.hpp"
+#include "behemoth/sampling.hpp"
+#include "behemoth/tokenizer.hpp"
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <csignal>
+#include <ctime>
+#include <deque>
+#include <iostream>
+#include <sstream>
+#include <thread>
+#include <utility>
+
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
+using json = nlohmann::json;
+using namespace behemoth;
+
+class Session : public std::enable_shared_from_this<Session> {
+    beast::tcp_stream stream_;
+    beast::flat_buffer buffer_;
+    http::request_parser<http::string_body> parser_;
+    Engine &engine_;
+    const Tokenizer &tokenizer_;
+    uint64_t id_ = 0;
+    std::time_t created_ = std::time(nullptr);
+    bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
+         closed_ = false, first_piece_ = true;
+    std::string output_;
+    TextStream text_;
+    std::deque<std::string> queue_;
+    size_t queued_ = 0;
+    std::array<char, 1> disconnect_{};
+    http::response<http::empty_body> header_{http::status::ok, 11};
+    std::unique_ptr<http::response_serializer<http::empty_body>> serializer_;
+    std::string completion_id() const {
+        return "chatcmpl-" + std::to_string(id_);
+    }
+    json chunk(json delta, json reason = nullptr) const {
+        return {
+            {"id", completion_id()},
+            {"object", "chat.completion.chunk"},
+            {"created", created_},
+            {"model", model_id},
+            {"choices",
+             {{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(reason)}}}}};
+    }
+    void close() {
+        if (closed_)
+            return;
+        closed_ = true;
+        if (id_ && !finished_)
+            engine_.cancel(id_);
+        beast::error_code ec;
+        stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
+        stream_.socket().close(ec);
+    }
+    void watch_disconnect() {
+        stream_.socket().async_read_some(
+            asio::buffer(disconnect_),
+            [self = shared_from_this()](beast::error_code, size_t) { self->close(); });
+    }
+    void respond(http::status status, json body) {
+        auto response = std::make_shared<http::response<http::string_body>>(status, 11);
+        response->set(http::field::content_type, "application/json");
+        response->keep_alive(false);
+        response->body() = body.dump();
+        response->prepare_payload();
+        http::async_write(
+            stream_, *response,
+            [self = shared_from_this(), response](beast::error_code, size_t) { self->close(); });
+    }
+    void write_next() {
+        if (closed_ || writing_ || !header_done_)
+            return;
+        if (queue_.empty()) {
+            if (finished_)
+                close();
+            return;
+        }
+        writing_ = true;
+        asio::async_write(stream_, asio::buffer(queue_.front()),
+                          [self = shared_from_this()](beast::error_code ec, size_t) {
+                              self->writing_ = false;
+                              if (ec) {
+                                  self->close();
+                                  return;
+                              }
+                              self->queued_ -= self->queue_.front().size();
+                              self->queue_.pop_front();
+                              self->write_next();
+                          });
+    }
+    void enqueue(std::string data, bool last = false) {
+        if (closed_)
+            return;
+        std::string wire;
+        if (last)
+            wire = "0\r\n\r\n";
+        else {
+            std::ostringstream prefix;
+            prefix << std::hex << data.size();
+            wire = prefix.str() + "\r\n" + data + "\r\n";
+        }
+        queued_ += wire.size();
+        if (queued_ > 1024 * 1024) {
+            close();
+            return;
+        }
+        queue_.push_back(std::move(wire));
+        write_next();
+    }
+    void emit(const std::string &text) {
+        output_ += text;
+        if (streaming_ && !text.empty())
+            enqueue("data: " + chunk({{"content", text}}).dump() + "\n\n");
+    }
+    void finish(const GenerationEvent &event, const std::string &reason) {
+        if (finished_ || closed_)
+            return;
+        emit(text_.append("", true));
+        finished_ = true;
+        if (streaming_) {
+            enqueue("data: " + chunk(json::object(), reason).dump() + "\n\n");
+            enqueue("data: [DONE]\n\n");
+            enqueue("", true);
+        } else
+            respond(http::status::ok,
+                    {{"id", completion_id()},
+                     {"object", "chat.completion"},
+                     {"created", created_},
+                     {"model", model_id},
+                     {"choices",
+                      {{{"index", 0},
+                        {"message", {{"role", "assistant"}, {"content", output_}}},
+                        {"finish_reason", reason}}}},
+                     {"usage",
+                      {{"prompt_tokens", event.prompt_tokens},
+                       {"completion_tokens", event.completion_tokens},
+                       {"total_tokens", event.prompt_tokens + event.completion_tokens}}}});
+    }
+    void on_event(const GenerationEvent &event) {
+        if (closed_ || finished_)
+            return;
+        if (!event.error.empty()) {
+            finished_ = true;
+            json error = {{"error", {{"message", event.error}, {"type", "server_error"}}}};
+            if (streaming_) {
+                enqueue("data: " + error.dump() + "\n\n");
+                enqueue("data: [DONE]\n\n");
+                enqueue("", true);
+            } else
+                respond(http::status::internal_server_error, error);
+            return;
+        }
+        if (event.token >= 0) {
+            emit(text_.append(tokenizer_.piece(event.token, first_piece_)));
+            if (text_.stopped()) {
+                engine_.cancel(id_);
+                finish(event, "stop");
+                return;
+            }
+        }
+        if (event.done)
+            finish(event, event.reason == "length" ? "length" : "stop");
+    }
+    void route() {
+        try {
+            const auto &req = parser_.get();
+            auto target = req.target();
+            if (req.method() == http::verb::get) {
+                if (target == "/health") {
+                    bool ok = engine_.healthy();
+                    respond(ok ? http::status::ok : http::status::service_unavailable,
+                            {{"healthy", ok}});
+                    return;
+                }
+                if (target == "/metrics") {
+                    respond(http::status::ok, engine_.metrics());
+                    return;
+                }
+                if (target == "/metrics/tuning" || target == "/metrics/tuning/all") {
+                    respond(http::status::ok,
+                            engine_.projection_tuning(target == "/metrics/tuning/all" ? -1 : 0));
+                    return;
+                }
+                if (target == "/v1/models") {
+                    respond(http::status::ok,
+                            {{"object", "list"},
+                             {"data",
+                              {{{"id", model_id}, {"object", "model"}, {"owned_by", "cgg507"}}}}});
+                    return;
+                }
+            }
+            if (target != "/v1/chat/completions") {
+                respond(http::status::not_found, {{"error", {{"message", "Unknown endpoint"}}}});
+                return;
+            }
+            if (req.method() != http::verb::post) {
+                respond(http::status::method_not_allowed, {{"error", {{"message", "Use POST"}}}});
+                return;
+            }
+            auto request = parse_chat(json::parse(req.body()));
+            auto prompt = tokenizer_.encode(request.rendered);
+            streaming_ = request.stream;
+            text_ = TextStream(request.stops);
+            std::weak_ptr<Session> weak = shared_from_this();
+            id_ = engine_.submit(prompt, request.max_new, request.sampling,
+                                 [weak](const GenerationEvent &event) {
+                                     if (auto self = weak.lock())
+                                         asio::post(self->stream_.get_executor(),
+                                                    [self, event] { self->on_event(event); });
+                                 });
+            stream_.expires_never();
+            watch_disconnect();
+            if (streaming_) {
+                header_.set(http::field::content_type, "text/event-stream");
+                header_.set(http::field::cache_control, "no-cache");
+                header_.keep_alive(false);
+                header_.chunked(true);
+                serializer_ =
+                    std::make_unique<http::response_serializer<http::empty_body>>(header_);
+                http::async_write_header(stream_, *serializer_,
+                                         [self = shared_from_this()](beast::error_code ec, size_t) {
+                                             if (ec) {
+                                                 self->close();
+                                                 return;
+                                             }
+                                             self->header_done_ = true;
+                                             self->write_next();
+                                         });
+                enqueue("data: " + chunk({{"role", "assistant"}}).dump() + "\n\n");
+            }
+        } catch (const std::exception &e) {
+            respond(http::status::bad_request,
+                    {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}}}});
+        }
+    }
+
+  public:
+    Session(tcp::socket socket, Engine &engine, const Tokenizer &tokenizer)
+        : stream_(std::move(socket)), engine_(engine), tokenizer_(tokenizer) {
+        parser_.body_limit(4 * 1024 * 1024);
+    }
+    void run() {
+        stream_.expires_after(std::chrono::seconds(30));
+        http::async_read(stream_, buffer_, parser_,
+                         [self = shared_from_this()](beast::error_code ec, size_t) {
+                             if (ec) {
+                                 self->close();
+                                 return;
+                             }
+                             self->route();
+                         });
+    }
+};
+
+class Listener : public std::enable_shared_from_this<Listener> {
+    asio::io_context &io_;
+    tcp::acceptor acceptor_;
+    Engine &engine_;
+    const Tokenizer &tokenizer_;
+
+  public:
+    Listener(asio::io_context &io, tcp::endpoint endpoint, Engine &engine,
+             const Tokenizer &tokenizer)
+        : io_(io), acceptor_(io), engine_(engine), tokenizer_(tokenizer) {
+        acceptor_.open(endpoint.protocol());
+        acceptor_.set_option(asio::socket_base::reuse_address(true));
+        acceptor_.bind(endpoint);
+        acceptor_.listen(asio::socket_base::max_listen_connections);
+    }
+    void accept() {
+        acceptor_.async_accept(
+            asio::make_strand(io_),
+            [self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
+                if (!ec)
+                    std::make_shared<Session>(std::move(socket), self->engine_, self->tokenizer_)
+                        ->run();
+                if (self->acceptor_.is_open())
+                    self->accept();
+            });
+    }
+    void close() {
+        beast::error_code ec;
+        acceptor_.close(ec);
+    }
+};
+int main(int argc, char **argv) {
+    try {
+        RuntimeOptions options;
+        std::string host = "127.0.0.1";
+        unsigned short port = 8080;
+        int threads = 4;
+        for (int i = 1; i < argc; ++i) {
+            std::string key = argv[i];
+            if (i + 1 >= argc)
+                throw std::invalid_argument("Every option requires a value");
+            std::string value = argv[++i];
+            if (key == "--model")
+                options.model = value;
+            else if (key == "--host")
+                host = value;
+            else if (key == "--port") {
+                int p = std::stoi(value);
+                if (p < 1 || p > 65535)
+                    throw std::invalid_argument("Invalid port");
+                port = static_cast<unsigned short>(p);
+            } else if (key == "--threads")
+                threads = std::stoi(value);
+            else if (key == "--memory-fraction")
+                options.memory_fraction = std::stod(value);
+            else if (key == "--token-budget")
+                options.token_budget = std::stoul(value);
+            else if (key == "--prefill-chunk")
+                options.prefill_chunk = std::stoul(value);
+            else if (key == "--devices") {
+                auto comma = value.find(',');
+                if (comma == std::string::npos)
+                    throw std::invalid_argument("Specify two devices: 0,1");
+                options.devices = {std::stoi(value.substr(0, comma)),
+                                   std::stoi(value.substr(comma + 1))};
+            } else if (key == "--transport") {
+                if (value != "host" && value != "rccl-shm" && value != "zerocopy")
+                    throw std::invalid_argument("Transport must be host, zerocopy or rccl-shm");
+                options.rccl_shared_memory = value == "rccl-shm";
+                options.zero_copy_transport = value == "zerocopy";
+            } else if (key == "--projection-mode") {
+                options.projection_mode = value;
+            } else if (key == "--projection-search") {
+                options.projection_search = value;
+            } else if (key == "--code-layout") {
+                options.code_layout = value;
+            } else if (key == "--profile") {
+                if (value != "true" && value != "false" && value != "1" && value != "0")
+                    throw std::invalid_argument("--profile expects true or false");
+                options.profile = value == "true" || value == "1";
+            } else
+                throw std::invalid_argument("Unknown option: " + key);
+        }
+        if (options.model.empty() || threads < 1 || threads > 32)
+            throw std::invalid_argument("Usage: behemoth_server --model DIRECTORY [--transport "
+                                        "host|rccl-shm] [--port 8080] [--threads 4]");
+        Tokenizer tokenizer(options.model);
+        Engine engine(options);
+        asio::io_context io(threads);
+        auto listener = std::make_shared<Listener>(
+            io, tcp::endpoint(asio::ip::make_address(host), port), engine, tokenizer);
+        listener->accept();
+        asio::signal_set signals(io, SIGINT, SIGTERM);
+        signals.async_wait([&](beast::error_code, int) {
+            listener->close();
+            engine.shutdown();
+            io.stop();
+        });
+        std::cerr << "Listening on http://" << host << ':' << port
+                  << "; transport="
+                  << (options.rccl_shared_memory  ? "rccl-shm"
+                      : options.zero_copy_transport ? "zerocopy"
+                                                    : "pinned-host")
+                  << "; P2P disabled\n";
+        std::vector<std::thread> pool;
+        for (int i = 1; i < threads; ++i)
+            pool.emplace_back([&] { io.run(); });
+        io.run();
+        for (auto &t : pool)
+            t.join();
+        engine.shutdown();
+    } catch (const std::exception &e) {
+        std::cerr << "Server failed: " << e.what() << '\n';
+        return 1;
+    }
+}
