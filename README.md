@@ -57,17 +57,37 @@ cmake -S runtime -B runtime/build-rocm -G Ninja \
 cmake --build runtime/build-rocm -j 16
 ```
 
-Serve a QTIP model on both GPUs:
+Serve a QTIP model on both GPUs (recommended flags, see `runtime/PREFILL_SCHED_REPORT.md`):
 
 ```sh
 runtime/build-rocm/behemoth_server --model /mnt/nvme/qtip_quant/Behemoth-R1-123B-v2-QTIP-2bit \
-  --devices 0,1 --transport zerocopy --memory-fraction 0.9 --token-budget 1024 --prefill-chunk 256 \
-  --host 0.0.0.0 --port 1337 --threads 4
+  --devices 0,1 --transport zerocopy --code-layout lane --memory-fraction 0.9 \
+  --token-budget 2048 --prefill-chunk 2048 --mixed-prefill-tokens 512 --prefill-interval 24 \
+  --host 0.0.0.0 --port 1337 --threads 4 --profile false
 ```
 
 The model directory needs `tokenizer.model` next to `tokenizer.json` (copy it from the source model if
-`qtip_quant --mode assemble` did not). Single-request decode is ~49 ms/token (~20 tok/s) on 2x R9700, against
-~69-74 ms/token for the AQLM 1x16 model.
+`qtip_quant --mode assemble` did not). Single-request decode is ~44 ms/token short context (~52 ms at 16k) on
+2x R9700, against ~69-74 ms/token for the AQLM 1x16 model.
+
+QTIP prefill and scheduling options (`runtime/PREFILL_SCHED_REPORT.md`):
+
+| flag / env | default | meaning |
+|---|---|---|
+| `--token-budget N` | 1024 | tokens per step; QTIP allows up to 4096 (AQLM 1024) |
+| `--prefill-chunk N` | 256 | prefill tokens per request per step (when nothing is decoding) |
+| `--mixed-prefill-tokens N` | 0 | at most N prefill tokens in a step that also decodes (0: no cap) |
+| `--prefill-interval K` | 1 | while requests decode, only every K-th step carries prefill tokens |
+| `--max-batch-requests N` | 256 | requests (sampled rows) per step |
+| `--qtip-dense-rows N` / `BEHEMOTH_QTIP_DENSE_ROWS` | 512 | steps of >= N rows decode each linear to bf16 and use hipBLASLt (0: always the WMMA trellis kernel) |
+| `--qtip-row-transforms N` / `BEHEMOTH_QTIP_ROW_TRANSFORMS` | 64 | steps of >= N rows use the row-batched Hadamard kernels (bit-identical) |
+| `BEHEMOTH_QTIP_OVERLAP_ROWS` | 2x dense rows | steps of >= N rows run as two overlapped micro-batches (0: off) |
+| `BEHEMOTH_QTIP_MICRO_BATCHES` | 2 | micro-batches per overlapped step (max 4) |
+| `BEHEMOTH_QTIP_DENSE_TUNE` | 64 | hipBLASLt candidates timed per dense GEMM shape at startup (0: heuristic only) |
+| `BEHEMOTH_QTIP_DMA_ROWS` | 9 | steps of >= N rows exchange through the copy-engine channels |
+| `BEHEMOTH_ATTN_PREFILL_BLOCKS` | 512 | key-split target for multi-query steps with few query tiles (0: off) |
+
+Step-level prefill timings without the server: `runtime/build-rocm/behemoth_prefill_bench MODEL [rows,...] [ctx,...] [reps]`.
 
 ## Build
 
