@@ -288,12 +288,14 @@ static inline void micro_6x16(int kc, const double* a, const double* b, double* 
 }
 }  // namespace
 
+double g_chol_t[4] = {0, 0, 0, 0};
 bool cholesky_inplace(double* A, int n, int nthreads) {
   if (nthreads > 0) omp_set_num_threads(nthreads);
   std::vector<double> packA, packB;
   bool ok = true;
   for (int k = 0; k < n && ok; k += NB) {
     int kb = std::min(NB, n - k);
+    double tq0 = now_s();
     // 1) unblocked Cholesky of the diagonal block
     for (int j = k; j < k + kb; ++j) {
       double* aj = A + long(j) * n;
@@ -312,46 +314,76 @@ bool cholesky_inplace(double* A, int n, int nthreads) {
     if (!ok) break;
     int r0 = k + kb, nr = n - r0;
     if (nr <= 0) break;
-    // 2) panel solve: rows i >= r0: x L11^T = a
-#pragma omp parallel for schedule(static)
-    for (int i = r0; i < n; ++i) {
-      double* ai = A + long(i) * n + k;
-      for (int j = 0; j < kb; ++j) {
-        const double* lj = A + long(k + j) * n + k;
-        double s = ai[j];
-        for (int p = 0; p < j; ++p) s -= ai[p] * lj[p];
-        ai[j] = s / lj[j];
-      }
-    }
-    // 3) pack panel rows r0..n-1 (cols k..k+kb) in MR- and NR-interleaved layouts
+    double tq1 = now_s();
+    g_chol_t[0] += tq1 - tq0;
+    // 2+3) panel solve (rows i >= r0: x L11^T = a), 8 rows per AVX-512 vector, fused with packing the panel in
+    //      MR- and NR-interleaved layouts for the trailing update
     int nA = (nr + MR - 1) / MR, nBk = (nr + NR - 1) / NR;
     packA.assign(size_t(nA) * MR * kb, 0.0);
     packB.assign(size_t(nBk) * NR * kb, 0.0);
-#pragma omp parallel for schedule(static)
-    for (int i = 0; i < nr; ++i) {
-      const double* src = A + long(r0 + i) * n + k;
-      double* pa = packA.data() + size_t(i / MR) * MR * kb + (i % MR);
-      double* pb = packB.data() + size_t(i / NR) * NR * kb + (i % NR);
-      for (int p = 0; p < kb; ++p) {
-        pa[size_t(p) * MR] = src[p];
-        pb[size_t(p) * NR] = src[p];
+    std::vector<double> Lkk(size_t(kb) * kb), rdiag(static_cast<size_t>(kb));
+    for (int j = 0; j < kb; ++j) {
+      for (int p = 0; p < kb; ++p) Lkk[size_t(j) * kb + p] = p <= j ? A[long(k + j) * n + k + p] : 0.0;
+      rdiag[size_t(j)] = 1.0 / Lkk[size_t(j) * kb + j];
+    }
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int g = 0; g < (nr + 7) / 8; ++g) {
+      int rbeg = g * 8, nrow = std::min(8, nr - rbeg);
+      alignas(64) double X[NB][8];
+      for (int p = 0; p < kb; ++p)
+        for (int r = 0; r < 8; ++r) X[p][r] = r < nrow ? A[long(r0 + rbeg + r) * n + k + p] : 0.0;
+      for (int j = 0; j < kb; ++j) {
+        const double* lj = Lkk.data() + size_t(j) * kb;
+        __m512d s0 = _mm512_load_pd(X[j]), s1 = _mm512_setzero_pd(), s2 = _mm512_setzero_pd(),
+                s3 = _mm512_setzero_pd();
+        int p = 0;
+        for (; p + 4 <= j; p += 4) {
+          s0 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p]), _mm512_load_pd(X[p]), s0);
+          s1 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p + 1]), _mm512_load_pd(X[p + 1]), s1);
+          s2 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p + 2]), _mm512_load_pd(X[p + 2]), s2);
+          s3 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p + 3]), _mm512_load_pd(X[p + 3]), s3);
+        }
+        for (; p < j; ++p) s0 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p]), _mm512_load_pd(X[p]), s0);
+        s0 = _mm512_add_pd(_mm512_add_pd(s0, s1), _mm512_add_pd(s2, s3));
+        _mm512_store_pd(X[j], _mm512_mul_pd(s0, _mm512_set1_pd(rdiag[size_t(j)])));
+      }
+      for (int r = 0; r < nrow; ++r) {
+        int i = rbeg + r;
+        double* dst = A + long(r0 + i) * n + k;
+        double* pa = packA.data() + size_t(i / MR) * MR * kb + (i % MR);
+        double* pb = packB.data() + size_t(i / NR) * NR * kb + (i % NR);
+        for (int p = 0; p < kb; ++p) {
+          double v = X[p][r];
+          dst[p] = v;
+          pa[size_t(p) * MR] = v;
+          pb[size_t(p) * NR] = v;
+        }
       }
     }
-    // 4) trailing update of the lower triangle: tiles of (MC rows) x (NR cols)
-    constexpr int MC = 96;  // rows per task (multiple of MR)
+    double tq2 = now_s();
+    g_chol_t[1] += tq2 - tq1;
+    double tq3 = now_s();
+    g_chol_t[2] += tq3 - tq2;
+    // 4) trailing update of the lower triangle. One task = MC rows of C (A micro-panels stay in L2); it sweeps the
+    //    16-column B micro-panels left to right up to the diagonal (each B panel sits in L1 across the rows).
+    constexpr int MC = 192;  // rows per task (multiple of MR)
     int nTi = (nr + MC - 1) / MC;
 #pragma omp parallel for schedule(dynamic, 1)
-    for (long task = 0; task < long(nTi) * nBk; ++task) {
-      int ti = int(task / nBk), tj = int(task % nBk);
-      int i0 = ti * MC, j0 = tj * NR;
-      if (j0 > i0 + MC - 1) continue;  // tile fully above the diagonal
-      for (int ii = i0; ii < std::min(nr, i0 + MC); ii += MR) {
-        if (j0 > ii + MR - 1) continue;
-        int mr = std::min(MR, nr - ii), nrr = std::min(NR, nr - j0);
-        micro_6x16(kb, packA.data() + size_t(ii / MR) * MR * kb, packB.data() + size_t(tj) * NR * kb,
-                   A + long(r0 + ii) * n + r0 + j0, n, mr, nrr);
+    for (int tt = 0; tt < nTi; ++tt) {
+      int ti = nTi - 1 - tt;  // biggest (bottom) row blocks first
+      int i0 = ti * MC, i1 = std::min(nr, i0 + MC);
+      int tj_end = std::min(nBk, (i1 - 1) / NR + 1);
+      for (int tj = 0; tj < tj_end; ++tj) {
+        int j0 = tj * NR;
+        const double* pb = packB.data() + size_t(tj) * NR * kb;
+        for (int ii = i0; ii < i1; ii += MR) {
+          if (j0 > ii + MR - 1) continue;  // micro tile fully above the diagonal
+          int mr = std::min(MR, nr - ii), nrr = std::min(NR, nr - j0);
+          micro_6x16(kb, packA.data() + size_t(ii / MR) * MR * kb, pb, A + long(r0 + ii) * n + r0 + j0, n, mr, nrr);
+        }
       }
     }
+    g_chol_t[3] += now_s() - tq3;
   }
   return ok;
 }

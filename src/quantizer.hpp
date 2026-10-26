@@ -41,7 +41,22 @@ struct GroupTiming {
   double load = 0, rht = 0, ldl_cpu = 0, ldlq = 0, viterbi = 0, proxy = 0, pack = 0, total = 0;
 };
 
-class GpuWorker;
+// Rotated / factorised Hessian of one group (shared SU).  rotate_hessian runs on the GPU, ldl_hessian on the CPU
+// (fp64), so the LDL of the next group can overlap the LDLQ of the current one.
+struct HessPrep {
+  int n = 0;
+  uint64_t seed = 0;
+  std::vector<float> su;   // [n] +-1
+  double creg = 0;         // sigma_reg * mean(diag(H))
+  std::vector<float> HRr;  // rotated regularized Hessian [n][n]
+  std::vector<float> L;    // block-LDL factor (strictly block-lower, fp32)
+  double t_rot = 0, t_ldl = 0;
+};
+void rotate_hessian(hipStream_t s, const float* H, int n, uint64_t seed, const QuantOpts& opt, HessPrep& hp);
+void ldl_hessian(HessPrep& hp, int threads, const std::string& tag);
+std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vector<LinearIn>& lins, HessPrep& hp,
+                                      const QuantOpts& opt, GroupTiming* tm, const std::string& tag);
+
 // Quantize one Hessian group on the current device. H: n x n fp32 host (any positive scale).
 // seed: deterministic sign vectors. Returns outputs in the order of `lins`.
 std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vector<LinearIn>& lins, int n,

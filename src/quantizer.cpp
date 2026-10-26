@@ -121,20 +121,74 @@ void write_f32(const std::string& path, const float* p, size_t n) {
 }
 }  // namespace
 
+void rotate_hessian(hipStream_t s, const float* H, int n, uint64_t seed, const QuantOpts& opt, HessPrep& hp) {
+  double t0 = now_s();
+  hp.n = n;
+  hp.seed = seed;
+  Rng rng(seed);
+  hp.su.resize(static_cast<size_t>(n));
+  for (auto& v : hp.su) v = rng.sign();
+  DBuf<float> d_su(static_cast<size_t>(n));
+  HIP_CHECK(hipMemcpyAsync(d_su, hp.su.data(), hp.su.size() * 4, hipMemcpyHostToDevice, s));
+  DBuf<double> acc(1);
+  DBuf<float> Ht(size_t(n) * n), HR(size_t(n) * n);
+  HIP_CHECK(hipMemcpyAsync(Ht, H, size_t(n) * n * 4, hipMemcpyHostToDevice, s));
+  HIP_CHECK(hipMemsetAsync(acc, 0, 8, s));
+  k_diag_sum(Ht, n, acc, s);
+  double dsum = 0;
+  HIP_CHECK(hipMemcpyAsync(&dsum, acc, 8, hipMemcpyDeviceToHost, s));
+  HIP_CHECK(hipStreamSynchronize(s));
+  // regularize_H: H += sigma_reg * mean(diag(H)) * I
+  hp.creg = opt.sigma_reg * dsum / n;
+  k_add_diag(Ht, n, float(hp.creg), s);
+  // HRr = hadUt(hadUt(HR * SU)^T * SU)
+  k_scale_rows_cols(Ht, n, n, n, d_su, d_su, s);
+  k_hadamard_rows(Ht, n, n, n, true, s);
+  k_transpose(Ht, n, n, n, HR, n, s);
+  k_hadamard_rows(HR, n, n, n, true, s);
+  hp.HRr.resize(size_t(n) * n);
+  HIP_CHECK(hipMemcpyAsync(hp.HRr.data(), HR, hp.HRr.size() * 4, hipMemcpyDeviceToHost, s));
+  HIP_CHECK(hipStreamSynchronize(s));
+  hp.t_rot = now_s() - t0;
+}
+
+void ldl_hessian(HessPrep& hp, int threads, const std::string& tag) {
+  double t0 = now_s();
+  const long n = hp.n;
+  std::vector<double> A(size_t(n) * n);
+  const float* hr = hp.HRr.data();
+#pragma omp parallel for schedule(static) num_threads(threads)
+  for (long i = 0; i < n; ++i)
+    for (long j = 0; j <= i; ++j) A[size_t(i) * n + j] = 0.5 * (double(hr[size_t(i) * n + j]) + hr[size_t(j) * n + i]);
+  hp.L.resize(size_t(n) * n);
+  QCHECK(block_ldl_to_L(A.data(), int(n), hp.L.data(), threads), "block LDL failed (H not PD) for " + tag);
+  hp.t_ldl = now_s() - t0;
+}
+
 std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vector<LinearIn>& lins, int n,
                                       const float* H, uint64_t seed, const QuantOpts& opt, GroupTiming* tm,
                                       const std::string& tag) {
+  HessPrep hp;
+  rotate_hessian(s, H, n, seed, opt, hp);
+  ldl_hessian(hp, opt.ldl_threads, tag);
+  return quantize_group(s, gemm, lins, hp, opt, tm, tag);
+}
+
+std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vector<LinearIn>& lins, HessPrep& hp,
+                                      const QuantOpts& opt, GroupTiming* tm, const std::string& tag) {
   const Codebook& cb = codebook();
   const uint32_t* lut = device_lut();
+  const int n = hp.n;
+  const uint64_t seed = hp.seed;
   GroupTiming T{};
+  T.rht = hp.t_rot;
+  T.ldl_cpu = hp.t_ldl;
   double t_start = now_s(), t0 = t_start;
   long mt = 0;
   std::vector<long> off;
   for (auto& l : lins) off.push_back(mt), mt += l.m;
   std::vector<LinearOut> out(lins.size());
-  Rng rng(seed);
-  std::vector<float> su(static_cast<size_t>(n));
-  for (auto& v : su) v = rng.sign();
+  const std::vector<float>& su = hp.su;
   DBuf<float> d_su(static_cast<size_t>(n)), d_sv(static_cast<size_t>(mt));
   HIP_CHECK(hipMemcpyAsync(d_su, su.data(), su.size() * 4, hipMemcpyHostToDevice, s));
   DBuf<double> acc(1);
@@ -193,41 +247,13 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
     }
   }
 
-  // ---- Hessian: regularize, rotate, LDL on CPU (fp64)
-  DBuf<float> HR(size_t(n) * n);
-  double creg = 0;
-  {
-    DBuf<float> Ht(size_t(n) * n);
-    HIP_CHECK(hipMemcpyAsync(Ht, H, size_t(n) * n * 4, hipMemcpyHostToDevice, s));
-    HIP_CHECK(hipMemsetAsync(acc, 0, 8, s));
-    k_diag_sum(Ht, n, acc, s);
-    double dsum = 0;
-    HIP_CHECK(hipMemcpyAsync(&dsum, acc, 8, hipMemcpyDeviceToHost, s));
-    HIP_CHECK(hipStreamSynchronize(s));
-    creg = opt.sigma_reg * dsum / n;
-    k_add_diag(Ht, n, float(creg), s);
-    k_scale_rows_cols(Ht, n, n, n, d_su, d_su, s);
-    k_hadamard_rows(Ht, n, n, n, true, s);
-    k_transpose(Ht, n, n, n, HR, n, s);
-    k_hadamard_rows(HR, n, n, n, true, s);
-    HIP_CHECK(hipStreamSynchronize(s));
-    T.rht += now_s() - t0;
-    t0 = now_s();
-  }
   DBuf<float> Ld(size_t(n) * n);
-  {
-    std::vector<float> hr(size_t(n) * n);
-    HIP_CHECK(hipMemcpy(hr.data(), HR, hr.size() * 4, hipMemcpyDeviceToHost));
-    std::vector<double> A(hr.size());
-#pragma omp parallel for schedule(static) num_threads(opt.ldl_threads)
-    for (long i = 0; i < long(n); ++i)
-      for (long j = 0; j <= i; ++j) A[size_t(i) * n + j] = 0.5 * (double(hr[size_t(i) * n + j]) + hr[size_t(j) * n + i]);
-    std::vector<float> Lh(hr.size());
-    QCHECK(block_ldl_to_L(A.data(), n, Lh.data(), opt.ldl_threads), "block LDL failed (H not PD) for " + tag);
-    HIP_CHECK(hipMemcpy(Ld, Lh.data(), Lh.size() * 4, hipMemcpyHostToDevice));
-    T.ldl_cpu += now_s() - t0;
-    t0 = now_s();
-  }
+  HIP_CHECK(hipMemcpyAsync(Ld, hp.L.data(), hp.L.size() * 4, hipMemcpyHostToDevice, s));
+  HIP_CHECK(hipStreamSynchronize(s));
+  hp.L.clear();
+  hp.L.shrink_to_fit();
+  const double creg = hp.creg;
+  t0 = now_s();
 
   // ---- LDLQ + Viterbi
   DBuf<float> hatWT(size_t(n) * mt);
@@ -244,9 +270,13 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
   // The unregularized original-domain proxy follows from HRr = rot(H) + creg * I (rotation is orthogonal).
   {
     DBuf<uint16_t> Hcat(size_t(3) * n * n);
-    k_split_bf16(HR, n, n, n, Hcat, Hcat + long(n) * n, n, s);  // [Hh | Hl | Hh]
-    HIP_CHECK(hipMemcpyAsync(Hcat + 2L * n * n, Hcat, size_t(n) * n * 2, hipMemcpyDeviceToDevice, s));
-    HR.free();
+    {
+      DBuf<float> HR(size_t(n) * n);
+      HIP_CHECK(hipMemcpyAsync(HR, hp.HRr.data(), HR.bytes(), hipMemcpyHostToDevice, s));
+      k_split_bf16(HR, n, n, n, Hcat, Hcat + long(n) * n, n, s);  // [Hh | Hl | Hh]
+      HIP_CHECK(hipMemcpyAsync(Hcat + 2L * n * n, Hcat, size_t(n) * n * 2, hipMemcpyDeviceToDevice, s));
+      HIP_CHECK(hipStreamSynchronize(s));
+    }
     DBuf<float> DT(size_t(n) * mt);
     k_sub(WT, hatWT, DT, n, mt, mt, s);
     DBuf<uint16_t> Acat;
@@ -304,7 +334,7 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
     }
   }
   T.pack += now_s() - t0;
-  T.total = now_s() - t_start;
+  T.total = now_s() - t_start + T.rht + T.ldl_cpu;
   double wsum = 0;
   for (auto& l : lins) wsum += double(l.m) * n;
   for (size_t li = 0; li < lins.size(); ++li) out[li].seconds = T.total * double(lins[li].m) * n / wsum;

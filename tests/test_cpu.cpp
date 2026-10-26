@@ -165,7 +165,31 @@ static void test_ldl() {
   EXPECT(md < 1e-10, "blocked cholesky");
 }
 
+namespace qtip { extern double g_chol_t[4]; }
+static void chol_bench(int n, int threads) {
+  // SPD: A = G G^T / k + I with G random (built blockwise to keep it fast)
+  std::vector<double> A(size_t(n) * n);
+  Rng r(1);
+  std::vector<double> d(static_cast<size_t>(n));
+  for (auto& v : d) v = r.normal();
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j <= i; ++j) {
+      double v = 0.3 * std::cos(0.001 * (i - j)) * d[size_t(i)] * d[size_t(j)] / (1 + std::abs(i - j));
+      A[size_t(i) * n + j] = A[size_t(j) * n + i] = v + (i == j ? 2.0 + std::fabs(d[size_t(i)]) : 0.0);
+    }
+  double t0 = now_s();
+  bool ok = cholesky_inplace(A.data(), n, threads);
+  double t = now_s() - t0;
+  std::printf("cholesky n=%d threads=%d ok=%d %.2fs %.1f GFLOPS (diag %.2f trsm %.2f pack %.2f update %.2f)\n", n,
+              threads, ok, t, double(n) * n * n / 3 / t / 1e9, g_chol_t[0], g_chol_t[1], g_chol_t[2], g_chol_t[3]);
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 4 && std::string(argv[1]) == "--chol") {
+    chol_bench(std::atoi(argv[2]), std::atoi(argv[3]));
+    return 0;
+  }
   QCHECK(argc >= 2, "usage: qtip_tests_cpu <refvec_dir>");
   D = argv[1];
   test_hadamard();

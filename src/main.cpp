@@ -362,9 +362,32 @@ void Pipeline::quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, in
   std::vector<Grp> groups = {{0, {LQ, LK, LV}}, {1, {LO}}, {2, {LGate, LUp}}, {3, {LDown}}};
   std::vector<LinearOut> outs(kNumLin);
   json jl = json::object();
-  for (auto& G : groups) {
-    std::vector<LinearIn> ins;
+  // rotate all four Hessians on the GPU first, then factorise them on the CPU in a side thread (fp64 LDL of
+  // group g+1 overlaps the GPU LDLQ of group g)
+  std::vector<HessPrep> preps(groups.size());
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const Grp& G = groups[gi];
     int n = LH->in_dim[G.lins[0]];
+    QCHECK(long(H[size_t(G.hess)].size()) == long(n) * n, "Hessian size mismatch");
+    uint64_t seed = (o_.seed * 1000003ull + uint64_t(L)) * 16 + uint64_t(G.hess);
+    rotate_hessian(s, H[size_t(G.hess)].data(), n, seed, o_.q, preps[gi]);
+    H[size_t(G.hess)].clear();
+    H[size_t(G.hess)].shrink_to_fit();
+  }
+  std::mutex lmu;
+  std::condition_variable lcv;
+  int ldl_done = 0;
+  std::thread ldl_th([&] {
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+      ldl_hessian(preps[gi], o_.q.ldl_threads, "L" + std::to_string(L) + "_" + kHessName[groups[gi].hess]);
+      std::lock_guard<std::mutex> lk(lmu);
+      ldl_done = int(gi) + 1;
+      lcv.notify_all();
+    }
+  });
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const Grp& G = groups[gi];
+    std::vector<LinearIn> ins;
     for (int li : G.lins) {
       LinearIn in;
       in.name = kLinName[li];
@@ -373,13 +396,17 @@ void Pipeline::quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, in
       in.scale_bf16 = LH->sc[li].data();
       ins.push_back(in);
     }
-    QCHECK(long(H[size_t(G.hess)].size()) == long(n) * n, "Hessian size mismatch");
+    double tw = now_s();
+    {
+      std::unique_lock<std::mutex> lk(lmu);
+      lcv.wait(lk, [&] { return ldl_done > int(gi); });
+    }
+    double ldl_wait = now_s() - tw;
     GroupTiming tm;
-    uint64_t seed = (o_.seed * 1000003ull + uint64_t(L)) * 16 + uint64_t(G.hess);
-    auto res = quantize_group(s, g, ins, n, H[size_t(G.hess)].data(), seed, o_.q, &tm,
-                              "L" + std::to_string(L));
-    H[size_t(G.hess)].clear();
-    H[size_t(G.hess)].shrink_to_fit();
+    auto res = quantize_group(s, g, ins, preps[gi], o_.q, &tm, "L" + std::to_string(L));
+    preps[gi].HRr.clear();
+    preps[gi].HRr.shrink_to_fit();
+    if (ldl_wait > 0.5) logf("gpu%d layer %d group %s waited %.1fs for the CPU LDL", dev, L, kHessName[G.hess], ldl_wait);
     logf("gpu%d layer %d group %s: total %.1fs (load %.1f rht %.1f ldl_cpu %.1f ldlq %.1f [viterbi %.1f] proxy %.1f "
          "pack %.1f)",
          dev, L, kHessName[G.hess], tm.total, tm.load, tm.rht, tm.ldl_cpu, tm.ldlq, tm.viterbi, tm.proxy, tm.pack);
@@ -395,6 +422,7 @@ void Pipeline::quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, in
                                                      {"ldl_cpu", tm.ldl_cpu}, {"ldlq", tm.ldlq}, {"viterbi", tm.viterbi},
                                                      {"proxy", tm.proxy}, {"pack", tm.pack}};
   }
+  ldl_th.join();
   // ---- write layer file (QTIP hfized layout)
   SafeTensorsWriter w;
   std::string pre = "model.layers." + std::to_string(L) + ".";
@@ -558,8 +586,8 @@ void Pipeline::run() {
     logf("calibration: %ld sequences x %d tokens (%ld tokens); embeddings read in %.1fs", nseq, o_.seq_len,
          nseq * o_.seq_len, now_s() - t0);
     const long H = cfg_.hidden;
-    act_.resize(size_t(ng));
-    act_nseq_.resize(size_t(ng));
+    act_.resize(static_cast<size_t>(ng));
+    act_nseq_.resize(static_cast<size_t>(ng));
     long per = (nseq + ng - 1) / ng;
     for (int g = 0; g < ng; ++g) {
       long s0 = g * per, s1 = std::min(nseq, s0 + per);

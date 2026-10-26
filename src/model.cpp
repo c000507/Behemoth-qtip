@@ -128,12 +128,12 @@ LayerRunner::LayerRunner(int device, const ModelConfig& cfg, int max_rows, int s
   wo_.alloc(size_t(H) * cfg.nq * cfg.hd);
   wgu_.alloc(size_t(2 * F) * H);
   wd_.alloc(size_t(H) * F);
-  ln_in_.alloc(size_t(H));
-  ln_post_.alloc(size_t(H));
-  sqkv_.alloc(size_t(nqkv));
-  so_.alloc(size_t(H));
+  ln_in_.alloc(static_cast<size_t>(H));
+  ln_post_.alloc(static_cast<size_t>(H));
+  sqkv_.alloc(static_cast<size_t>(nqkv));
+  so_.alloc(static_cast<size_t>(H));
   sgu_.alloc(size_t(2 * F));
-  sd_.alloc(size_t(H));
+  sd_.alloc(static_cast<size_t>(H));
   stage8_.alloc(size_t(F) * H);
   x_.alloc(size_t(R) * H);
   h_.alloc(size_t(R) * H);

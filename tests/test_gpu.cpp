@@ -371,14 +371,54 @@ static void test_group() {
   }
 }
 
+// timing at a real shape with a synthetic Hessian H = X^T X / N (X: N x n correlated bf16) and a random weight
+static void shape_bench(int m, int n, int nsamp) {
+  std::printf("[shape bench] m=%d n=%d (synthetic H from %d samples)\n", m, n, nsamp);
+  Gemm g(S);
+  Rng r(77);
+  std::vector<uint16_t> X(size_t(nsamp) * n);
+  std::vector<double> scale(static_cast<size_t>(n));
+  for (auto& v : scale) v = std::exp(r.normal());
+  for (long i = 0; i < nsamp; ++i) {
+    double common = r.normal();
+    for (int j = 0; j < n; ++j) X[size_t(i) * n + j] = f32_to_bf16(float((r.normal() + 0.5 * common) * scale[size_t(j)]));
+  }
+  DBuf<uint16_t> dX(X.size());
+  DBuf<float> dH(size_t(n) * n);
+  HIP_CHECK(hipMemcpy(dX, X.data(), X.size() * 2, hipMemcpyHostToDevice));
+  g.run(false, true, n, n, nsamp, dX, n, dX, n, dH, n, OutT::F32, 1.f / nsamp, 0.f);
+  std::vector<float> H(size_t(n) * n);
+  HIP_CHECK(hipMemcpy(H.data(), dH, H.size() * 4, hipMemcpyDeviceToHost));
+  dX.free();
+  dH.free();
+  std::vector<float> W(size_t(m) * n);
+  for (auto& v : W) v = float(r.normal() * 0.01 * (1 + 0.5 * std::fabs(r.normal())));
+  std::vector<LinearIn> lins(1);
+  lins[0].name = "w", lins[0].m = m, lins[0].w_f32 = W.data();
+  QuantOpts o;
+  GroupTiming tm;
+  double t0 = now_s();
+  auto out = quantize_group(S, g, lins, n, H.data(), 3, o, &tm, "bench");
+  double t = now_s() - t0;
+  std::printf("  wall %.2fs: rht %.2f ldl_cpu %.2f ldlq %.2f (viterbi %.2f) proxy %.2f pack %.2f load %.2f\n", t, tm.rht,
+              tm.ldl_cpu, tm.ldlq, tm.viterbi, tm.proxy, tm.pack, tm.load);
+  std::printf("  proxy %.6f proxy_rot_reg %.6f; %.3f s/Mweight (ldlq+viterbi %.3f s/Mweight)\n", out[0].proxy,
+              out[0].proxy_rot_reg, t / (double(m) * n / 1e6), tm.ldlq / (double(m) * n / 1e6));
+}
+
 int main(int argc, char** argv) {
-  int dev = 0, bench = 0;
+  int dev = 0, bench = 0, sm = 0, sn = 0;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--device") && i + 1 < argc) dev = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--bench") && i + 1 < argc) bench = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--shape") && i + 2 < argc) sm = std::atoi(argv[++i]), sn = std::atoi(argv[++i]);
   }
   HIP_CHECK(hipSetDevice(dev));
   HIP_CHECK(hipStreamCreate(&S));
+  if (sm > 0) {
+    shape_bench(sm, sn, 4096);
+    return 0;
+  }
   test_hadamard();
   test_gemm();
   test_viterbi(bench);
