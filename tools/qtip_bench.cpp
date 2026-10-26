@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipSetDevice(device));
         hipStream_t stream;
         HIP_CHECK(hipStreamCreate(&stream));
+        std::cout << "kernels: " << qtip::kernel_info().dump() << '\n';
         SafeTensorFile file(argv[1]);
         const std::string stem = std::filesystem::path(argv[1]).stem().string();
         const int layer = std::stoi(stem.substr(stem.size() - 5));
