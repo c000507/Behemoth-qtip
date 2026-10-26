@@ -618,7 +618,8 @@ __global__ __launch_bounds__(256) void input_transform_kernel(Source src, const 
                    uint32_t(device::bf16(v[2] * scale)) | uint32_t(device::bf16(v[3] * scale)) << 16);
 }
 // grid (8, rows): blocks 0..5 = this rank's q chunks, 6 = k, 7 = v.
-__global__ __launch_bounds__(256) void output_qkv_kernel(const float *all, int rows, int rank,
+template <class T>
+__global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows, int rank,
                                                          const float *sv_q, const float *sv_k,
                                                          const float *sv_v, uint16_t *q, uint16_t *k,
                                                          uint16_t *v) {
@@ -629,7 +630,7 @@ __global__ __launch_bounds__(256) void output_qkv_kernel(const float *all, int r
     if (b < 6) {
         const int k2 = 6 * rank + b;
         Source s{all, 6144, part, 7168, 0};
-        mix<12, false, float>(s, row, k2, x);
+        mix<12, false, T>(s, row, k2, x);
         fwht1024(x, scratch);
         const float scale = rsqrtf(12288.f);
         const int e = k2 * 1024 + j;
@@ -641,7 +642,7 @@ __global__ __launch_bounds__(256) void output_qkv_kernel(const float *all, int r
     }
     const bool is_k = b == 6;
     Source s{all, 512, part, 7168, is_k ? 6144 : 6656};
-    mix<1, false, float>(s, row, 0, x);
+    mix<1, false, T>(s, row, 0, x);
     fwht1024(x, scratch);
     const float scale = 1.f / 32.f; // 1/sqrt(1024)
     const float *sv = is_k ? sv_k : sv_v;
@@ -653,13 +654,14 @@ __global__ __launch_bounds__(256) void output_qkv_kernel(const float *all, int r
     }
 }
 // grid (12, rows)
-__global__ __launch_bounds__(256) void output_residual_kernel(const float *all, int rows,
+template <class T>
+__global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int rows,
                                                               const float *sv, uint16_t *state) {
     __shared__ float scratch[1024];
     const int k2 = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
     Source s{all, 6144, size_t(rows) * 6144, 6144, 0};
     float x[4];
-    mix<12, false, float>(s, row, k2, x);
+    mix<12, false, T>(s, row, k2, x);
     fwht1024(x, scratch);
     const float scale = rsqrtf(12288.f);
     const int e = k2 * 1024 + j;
@@ -796,7 +798,8 @@ __global__ __launch_bounds__(256) void input_transform_rows_kernel(Source src, c
     input_transform_regs<K, NORM>(t, norm, epsilon, su, u + size_t(row) * size_t(ldu), scratch, red);
 }
 // grid (rows): this rank's 6 q chunks from one load of the row, then k and v.
-__global__ __launch_bounds__(256) void output_qkv_rows_kernel(const float *all, int rows, int rank,
+template <class T>
+__global__ __launch_bounds__(256) void output_qkv_rows_kernel(const T *all, int rows, int rank,
                                                               const float *sv_q, const float *sv_k,
                                                               const float *sv_v, uint16_t *q,
                                                               uint16_t *k, uint16_t *v) {
@@ -805,7 +808,7 @@ __global__ __launch_bounds__(256) void output_qkv_rows_kernel(const float *all, 
     const size_t part = size_t(rows) * 7168;
     {
         float t[12][4];
-        load_row<float, 12>(Source{all, 6144, part, 7168, 0}, row, t);
+        load_row<T, 12>(Source{all, 6144, part, 7168, 0}, row, t);
         const float scale = rsqrtf(12288.f);
         for (int b = 0; b < 6; ++b) {
             const int k2 = 6 * rank + b;
@@ -822,7 +825,7 @@ __global__ __launch_bounds__(256) void output_qkv_rows_kernel(const float *all, 
     for (int b = 6; b < 8; ++b) {
         const bool is_k = b == 6;
         float x[4];
-        mix<1, false, float>(Source{all, 512, part, 7168, is_k ? 6144 : 6656}, row, 0, x);
+        mix<1, false, T>(Source{all, 512, part, 7168, is_k ? 6144 : 6656}, row, 0, x);
         fwht1024(x, scratch);
         const float scale = 1.f / 32.f;
         const float *sv = is_k ? sv_k : sv_v;
@@ -837,8 +840,8 @@ __global__ __launch_bounds__(256) void output_qkv_rows_kernel(const float *all, 
 }
 // grid (rows): residual epilogue; FUSE: then the next input transform (rms norm, SU, hadUt
 // 12288) of the updated state, from registers.
-template <bool FUSE>
-__global__ __launch_bounds__(256) void output_residual_rows_kernel(const float *all, int rows,
+template <bool FUSE, class T>
+__global__ __launch_bounds__(256) void output_residual_rows_kernel(const T *all, int rows,
                                                                    const float *sv, uint16_t *state,
                                                                    const uint16_t *norm, float epsilon,
                                                                    const float *su, uint16_t *u,
@@ -847,7 +850,7 @@ __global__ __launch_bounds__(256) void output_residual_rows_kernel(const float *
     __shared__ float red[8];
     const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
     float t[12][4], s[12][4];
-    load_row<float, 12>(Source{all, 6144, size_t(rows) * 6144, 6144, 0}, row, t);
+    load_row<T, 12>(Source{all, 6144, size_t(rows) * 6144, 6144, 0}, row, t);
     const float scale = rsqrtf(12288.f);
     // fully unrolled: s[k2] must stay in registers
 #pragma unroll
@@ -1195,7 +1198,8 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
         throw std::invalid_argument("QTIP input transform supports 12288 (+norm) and 28672");
     HIP_CHECK(hipGetLastError());
 }
-void output_qkv(const float *all, int rows, int rank, const float *sv_q, const float *sv_k,
+template <class T>
+void output_qkv_impl(const T *all, int rows, int rank, const float *sv_q, const float *sv_k,
                 const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t stream) {
     upload_tables();
     if (row_transforms(rows)) {
@@ -1210,7 +1214,8 @@ void output_qkv(const float *all, int rows, int rank, const float *sv_q, const f
         reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v));
     HIP_CHECK(hipGetLastError());
 }
-void output_residual(const float *all, int rows, const float *sv, BFloat16 *state,
+template <class T>
+void output_residual_impl(const T *all, int rows, const float *sv, BFloat16 *state,
                      hipStream_t stream) {
     upload_tables();
     if (row_transforms(rows)) {
@@ -1223,12 +1228,13 @@ void output_residual(const float *all, int rows, const float *sv, BFloat16 *stat
         all, rows, sv, reinterpret_cast<uint16_t *>(state));
     HIP_CHECK(hipGetLastError());
 }
-void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+template <class T>
+void output_residual_input_impl(const T *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
                            int ldu, hipStream_t stream) {
     upload_tables();
     if (!row_transforms(rows)) {
-        output_residual(all, rows, sv, state, stream);
+        output_residual_impl(all, rows, sv, state, stream);
         input_transform(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, 12288, rows, u, ldu,
                         stream);
         return;
@@ -1237,6 +1243,31 @@ void output_residual_input(const float *all, int rows, const float *sv, BFloat16
         all, rows, sv, reinterpret_cast<uint16_t *>(state),
         reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u), ldu);
     HIP_CHECK(hipGetLastError());
+}
+void output_qkv(const float *all, int rows, int rank, const float *sq, const float *sk,
+                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s) {
+    output_qkv_impl(all, rows, rank, sq, sk, sv, q, k, v, s);
+}
+void output_qkv(const BFloat16 *all, int rows, int rank, const float *sq, const float *sk,
+                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s) {
+    output_qkv_impl(reinterpret_cast<const uint16_t *>(all), rows, rank, sq, sk, sv, q, k, v, s);
+}
+void output_residual(const float *all, int rows, const float *sv, BFloat16 *state, hipStream_t s) {
+    output_residual_impl(all, rows, sv, state, s);
+}
+void output_residual(const BFloat16 *all, int rows, const float *sv, BFloat16 *state, hipStream_t s) {
+    output_residual_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, s);
+}
+void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+                           const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
+                           hipStream_t s) {
+    output_residual_input_impl(all, rows, sv, state, norm, eps, su, u, ldu, s);
+}
+void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
+                           const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
+                           hipStream_t s) {
+    output_residual_input_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, norm, eps,
+                               su, u, ldu, s);
 }
 void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const float *sv_up,
                    BFloat16 *h, hipStream_t stream) {

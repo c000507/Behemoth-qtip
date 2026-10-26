@@ -15,12 +15,13 @@ namespace {
 // prefill + row-batched/fused transforms. The transforms are bit-identical by construction;
 // the GEMM summation order differs, so logits must agree within tolerance and the argmax must
 // match. Then the same prompt in mixed 1-decode + 64-token steps through the scheduler.
-int prefill_paths(const std::string &model_dir) {
+int prefill_paths(const std::string &model_dir, int bf16_rows = 0) {
     RuntimeOptions o;
     o.model = model_dir;
     o.token_budget = 512;
     o.prefill_chunk = 512;
     o.zero_copy_transport = true;
+    o.qtip_bf16_prefill_rows = bf16_rows;
     TensorParallelModel model(o);
     std::mt19937 rng(3);
     std::vector<int> prompt(300);
@@ -123,9 +124,10 @@ int prefill_paths(const std::string &model_dir) {
 //  - save -> restore -> save reproduces the host bytes exactly (both ranks);
 //  - a restore ending inside a page (1690 tokens, tail recomputes the rest of that page) and
 //    the restored prefix vs one 1760-token cold prefill are compared by rel_rms / argmax.
-int prefix_cache_paths(const std::string &model_dir) {
+int prefix_cache_paths(const std::string &model_dir, int bf16_rows = 0) {
     RuntimeOptions o;
     o.model = model_dir;
+    o.qtip_bf16_prefill_rows = bf16_rows;
     o.token_budget = 2048;
     o.prefill_chunk = 2048;
     o.zero_copy_transport = true;
@@ -316,10 +318,14 @@ int main(int argc, char **argv) {
     try {
         if (argc == 3 && std::string(argv[2]) == "prefill")
             return prefill_paths(argv[1]);
+        if (argc == 3 && std::string(argv[2]) == "prefill-bf16")
+            return prefill_paths(argv[1], 64);
         if (argc == 3 && std::string(argv[2]) == "prefix")
             return prefix_cache_paths(argv[1]);
+        if (argc == 3 && std::string(argv[2]) == "prefix-bf16")
+            return prefix_cache_paths(argv[1], 64);
         if (argc != 2) {
-            std::cerr << "Usage: behemoth_model_tests MODEL_DIRECTORY [prefill|prefix]\n";
+            std::cerr << "Usage: behemoth_model_tests MODEL_DIRECTORY [prefill|prefix|prefill-bf16|prefix-bf16]\n";
             return 2;
         }
         RuntimeOptions o;

@@ -345,6 +345,8 @@ int main(int argc, char **argv) {
                 options.qtip_dense_rows = std::stoi(value);
             else if (key == "--qtip-row-transforms")
                 options.qtip_row_transforms = std::stoi(value);
+            else if (key == "--qtip-bf16-prefill-rows")
+                options.qtip_bf16_prefill_rows = std::stoi(value);
             else if (key == "--devices") {
                 auto comma = value.find(',');
                 if (comma == std::string::npos)

@@ -92,6 +92,8 @@ int main(int argc, char **argv) {
             opts.zero_copy_transport = true;
             opts.memory_fraction = .85;
             opts.token_budget = opts.prefill_chunk = size_t(chunk);
+            if (const char *value = std::getenv("BEHEMOTH_QTIP_BF16_PREFILL_ROWS"))
+                opts.qtip_bf16_prefill_rows = std::stoi(value);
             opts.sampled_rows = opts.token_budget;
             TensorParallelModel model(opts);
             Session session{model};
@@ -125,6 +127,8 @@ int main(int argc, char **argv) {
         options.token_budget = 256;
         options.prefill_chunk = 256;
         options.memory_fraction = 0.85;
+        if (const char *value = std::getenv("BEHEMOTH_QTIP_BF16_PREFILL_ROWS"))
+            options.qtip_bf16_prefill_rows = std::stoi(value);
         if (mode == "ppl") {
             const size_t max_tokens = argc > 4 ? std::stoul(argv[4]) : 4096;
             const size_t chunk = argc > 5 ? std::stoul(argv[5]) : 256;

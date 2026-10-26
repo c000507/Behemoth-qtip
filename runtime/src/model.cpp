@@ -1,6 +1,7 @@
 #include "behemoth/model.hpp"
 #include "behemoth/gpu.hpp"
 #include "behemoth/qtip_gpu.hpp"
+#include "behemoth/prefill.hpp"
 #include "behemoth/worker.hpp"
 #include <algorithm>
 #include <atomic>
@@ -514,6 +515,7 @@ struct Shard {
     GpuTimes timings;
     // QTIP path: rotated bf16 inputs, matmul slices, rank-blocked exchange buffer, MLP product.
     bool qtip = false;
+    int bf16_prefill_rows = 0;
     DeviceBuffer<BFloat16> qtip_u, qtip_h;
     DeviceBuffer<float> qtip_partial, qtip_all;
     // Dense prefill path (PREFILL_SCHED_REPORT.md): one decoded-weight scratch shared by every
@@ -543,7 +545,7 @@ struct Shard {
     hipStream_t kv_stream{}, kv_copy_stream{};
     DeviceBuffer<KvLayerPointers> kv_layers;
     explicit Shard(int id, int r, Checkpoint &checkpoint, const RuntimeOptions &options)
-        : device(id), rank(r) {
+        : device(id), rank(r), bf16_prefill_rows(options.qtip_bf16_prefill_rows) {
         HIP_CHECK(hipSetDevice(device));
         verify_device();
         HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
@@ -1080,6 +1082,7 @@ struct Shard {
         const GpuMetadata *meta = nullptr;
         bool overlap = false; // two micro-batches in flight
         bool input_ready = false; // the previous down epilogue wrote this layer's q/k/v input
+        bool bf16_projection = false; // q/k/v, o and down payloads for pure prefill only
     };
     template <class F> void measure(const Mb &mb, const char *name, F f) {
         if (mb.index == 0)
@@ -1246,13 +1249,17 @@ struct Shard {
                                       1e-5f, w.su_qkv.data(), 12288, rows, u, 12288, mb.s);
             });
         mb.input_ready = false;
-        qtip_project(mb, w.qkv, w.lut, 12288, false, comm, transport);
+        qtip_project(mb, w.qkv, w.lut, 12288, mb.bf16_projection, comm, transport);
         BFloat16 *qm = q.data() + size_t(mb.r0) * 6144, *km = k.data() + size_t(mb.r0) * 512,
                  *vm = v.data() + size_t(mb.r0) * 512;
         float *all = qtip_block(mb);
         measure(mb, "elementwise_ms", [&] {
-            qtip::output_qkv(all, rows, rank, w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km,
-                             vm, mb.s);
+            if (mb.bf16_projection)
+                qtip::output_qkv(reinterpret_cast<const BFloat16 *>(all), rows, rank,
+                                 w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km, vm, mb.s);
+            else
+                qtip::output_qkv(all, rows, rank, w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km,
+                                 vm, mb.s);
         });
         // Attention writes this rank's heads straight into its half of the exchange block.
         auto *attention_out = reinterpret_cast<BFloat16 *>(all) + size_t(rank) * size_t(rows) * 6144;
@@ -1289,10 +1296,15 @@ struct Shard {
             qtip::input_transform(qtip::Source{all, 6144, size_t(rows) * 3072 * 2, 6144, 0}, nullptr,
                                   0.f, w.su_o.data(), 12288, rows, u, 12288, mb.s);
         });
-        qtip_project(mb, w.o, w.lut, 12288, false, comm, transport);
+        qtip_project(mb, w.o, w.lut, 12288, mb.bf16_projection, comm, transport);
         measure(mb, "elementwise_ms", [&] {
-            qtip::output_residual_input(all, rows, w.sv_o.data(), mb_state(mb), l.post_norm.data(),
-                                        1e-5f, w.su_gate_up.data(), u, 12288, mb.s);
+            if (mb.bf16_projection)
+                qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(all), rows,
+                    w.sv_o.data(), mb_state(mb), l.post_norm.data(), 1e-5f, w.su_gate_up.data(), u,
+                    12288, mb.s);
+            else
+                qtip::output_residual_input(all, rows, w.sv_o.data(), mb_state(mb), l.post_norm.data(),
+                                            1e-5f, w.su_gate_up.data(), u, 12288, mb.s);
         });
     }
     // C: gate/up stacked matmul, bf16 all-gather, silu product, down input transform.
@@ -1314,15 +1326,23 @@ struct Shard {
     void qtip_step_down(Layer &l, Mb &mb, Layer *next, ncclComm_t comm, HostTransport *transport) {
         auto &w = l.qtip;
         const int rows = mb.rows;
-        qtip_project(mb, w.down, w.lut, 28672, false, comm, transport);
+        qtip_project(mb, w.down, w.lut, 28672, mb.bf16_projection, comm, transport);
         measure(mb, "elementwise_ms", [&] {
             const int t = qtip::row_transform_threshold();
             if (next && t > 0 && rows >= t) {
-                qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
-                                            next->input_norm.data(), 1e-5f, next->qtip.su_qkv.data(),
-                                            qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
+                if (mb.bf16_projection)
+                    qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(qtip_block(mb)),
+                        rows, w.sv_down.data(), mb_state(mb), next->input_norm.data(), 1e-5f,
+                        next->qtip.su_qkv.data(), qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
+                else
+                    qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
+                                                next->input_norm.data(), 1e-5f, next->qtip.su_qkv.data(),
+                                                qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
                 mb.input_ready = true;
-            } else
+            } else if (mb.bf16_projection)
+                qtip::output_residual(reinterpret_cast<const BFloat16 *>(qtip_block(mb)), rows,
+                                     w.sv_down.data(), mb_state(mb), mb.s);
+            else
                 qtip::output_residual(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb), mb.s);
         });
     }
@@ -1380,6 +1400,9 @@ struct Shard {
         const int count = only_layer >= 0 ? 1 : qtip_micro_batches(rows, decode, transport);
         active_micro_batches = count;
         std::array<Mb, max_micro_batches> mbs{};
+        bool has_decode = false;
+        for (int r = 0; r < batch.layout.requests(); ++r)
+            has_decode |= batch.layout.query_offsets[size_t(r + 1)] - batch.layout.query_offsets[size_t(r)] == 1;
         for (int i = 0; i < count; ++i) {
             auto &m = mbs[size_t(i)];
             m.index = i;
@@ -1390,6 +1413,7 @@ struct Shard {
             m.copy_start = i ? mb_copy_start[size_t(i)] : copy_start;
             m.copy_done = i ? mb_copy_done[size_t(i)] : copy_done;
             m.overlap = count > 1;
+            m.bf16_projection = qtip_bf16_prefill_enabled(m.rows, bf16_prefill_rows, has_decode);
             m.meta = &metadata;
         }
         if (count > 1) {
@@ -1599,6 +1623,9 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
     if (options.token_budget < 1 || options.token_budget > 4096 || options.prefill_chunk < 1 ||
         options.prefill_chunk > options.token_budget)
         throw std::invalid_argument("Token budget must be 1..4096 and cover the prefill chunk");
+    if (options.qtip_bf16_prefill_rows != 0 &&
+        (options.qtip_bf16_prefill_rows < 64 || options.qtip_bf16_prefill_rows > 4096))
+        throw std::invalid_argument("qtip-bf16-prefill-rows must be 0 (off) or 64..4096");
     if (std::min(options.scheduler.max_requests, options.token_budget) > sampled_capacity(options))
         throw std::invalid_argument("Scheduler max_requests exceeds the sampled-row capacity");
     if (options.qtip_dense_rows >= 0)

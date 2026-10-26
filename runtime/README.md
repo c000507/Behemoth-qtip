@@ -1,5 +1,11 @@
 # Behemoth C++ ROCm runtime
 
+For the new opt-in BF16 prefill-transport experiment, benchmark correction,
+validation status and remaining bottlenecks, see
+[PREFILL_INVESTIGATION.md](PREFILL_INVESTIGATION.md). It is disabled by default;
+`--qtip-bf16-prefill-rows 512` enables it for qualifying pure-prefill micro-batches
+and adds rounding that needs hardware/quality evaluation.
+
 Model-specific C++20 implementation for **two Radeon AI PRO R9700 (`gfx1201`) GPUs**.
 It retains AQLM 1x16/8-weight compression, uses native OCP E4M3 matrix operands and
 KV storage, BF16 residuals/activations/embedding and norm weights, and FP32

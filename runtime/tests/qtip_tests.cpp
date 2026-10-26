@@ -658,6 +658,58 @@ void test_row_transforms_gpu() {
         }
     }
 }
+// Payload conversion is the only new rounding: the BF16 consumers must exactly
+// match existing FP32 consumers given explicitly BF16-rounded FP32 input. Test
+// both rank layouts, per-chunk and row-batched kernels, and fused residual+norm.
+void test_bf16_epilogues_gpu() {
+    const int saved = qtip::row_transform_threshold();
+    auto same = [](const auto &a, const auto &b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(BFloat16)) == 0;
+    };
+    DeviceBuffer<float> sv, sk, su;
+    sv.upload(random_vector(12288, 110, .02f));
+    sk.upload(random_vector(1024, 111, .02f));
+    su.upload(random_vector(12288, 112, 1.f));
+    DeviceBuffer<BFloat16> norm;
+    norm.upload(to_bf16(random_vector(12288, 113, .5f)));
+    for (int rows : {1, 70}) {
+        for (int threshold : {0, 1}) {
+            qtip::set_row_transform_threshold(threshold);
+            auto values = to_bf16(random_vector(size_t(2) * size_t(rows) * 7168, 114, 20.f));
+            DeviceBuffer<BFloat16> packed;
+            DeviceBuffer<float> expanded;
+            packed.upload(values);
+            expanded.upload(to_float(values));
+            for (int rank : {0, 1}) {
+                DeviceBuffer<BFloat16> qa(size_t(rows) * 6144), ka(size_t(rows) * 512), va(size_t(rows) * 512);
+                DeviceBuffer<BFloat16> qb(size_t(rows) * 6144), kb(size_t(rows) * 512), vb(size_t(rows) * 512);
+                qtip::output_qkv(expanded.data(), rows, rank, sv.data(), sk.data(), sk.data(), qa.data(), ka.data(), va.data(), nullptr);
+                qtip::output_qkv(packed.data(), rows, rank, sv.data(), sk.data(), sk.data(), qb.data(), kb.data(), vb.data(), nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                check(same(qa.download(), qb.download()) && same(ka.download(), kb.download()) && same(va.download(), vb.download()),
+                      "bf16 qkv payload equals explicitly rounded fp32 rows=" + std::to_string(rows) +
+                      " rank=" + std::to_string(rank) + " row-kernel=" + std::to_string(threshold));
+            }
+            values.resize(size_t(2) * size_t(rows) * 6144);
+            packed.upload(values);
+            expanded.upload(to_float(values));
+            const auto state = to_bf16(random_vector(size_t(rows) * 12288, 115, .5f));
+            DeviceBuffer<BFloat16> a, b, ua(size_t(rows) * 12288), ub(size_t(rows) * 12288);
+            a.upload(state); b.upload(state);
+            qtip::output_residual(expanded.data(), rows, sv.data(), a.data(), nullptr);
+            qtip::output_residual(packed.data(), rows, sv.data(), b.data(), nullptr);
+            HIP_CHECK(hipDeviceSynchronize());
+            check(same(a.download(), b.download()), "bf16 residual payload equals rounded fp32");
+            a.upload(state); b.upload(state);
+            qtip::output_residual_input(expanded.data(), rows, sv.data(), a.data(), norm.data(), 1e-5f, su.data(), ua.data(), 12288, nullptr);
+            qtip::output_residual_input(packed.data(), rows, sv.data(), b.data(), norm.data(), 1e-5f, su.data(), ub.data(), 12288, nullptr);
+            HIP_CHECK(hipDeviceSynchronize());
+            check(same(a.download(), b.download()) && same(ua.download(), ub.download()),
+                  "bf16 fused residual/input equals explicitly rounded fp32");
+        }
+    }
+    qtip::set_row_transform_threshold(saved);
+}
 void test_real(const fs::path &layer_file, const fs::path &refvec) {
     SafeTensorFile file(layer_file);
     const std::string stem = layer_file.stem().string(); // model-layer-00040
@@ -727,6 +779,7 @@ int main(int argc, char **argv) {
         }
         test_epilogues_gpu();
         test_row_transforms_gpu();
+        test_bf16_epilogues_gpu();
         if (argc == 3)
             test_real(argv[1], argv[2]);
         else if (argc != 1)

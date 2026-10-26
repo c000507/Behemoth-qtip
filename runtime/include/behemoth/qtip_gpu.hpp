@@ -88,9 +88,14 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
 // SV (.) hadU(z).
 void output_qkv(const float *all, int rows, int rank, const float *sv_q, const float *sv_k,
                 const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t);
+// Prefill-only BF16 rotated-output payload (same rank-blocked element layout).
+// Equivalent to the FP32 epilogue with every input explicitly rounded to BF16.
+void output_qkv(const BFloat16 *all, int rows, int rank, const float *sv_q, const float *sv_k,
+                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t);
 // o/down epilogue: all = gathered [2][rows][6144] fp32 rotated outputs; state[rows][12288] =
 // bf16(state + bf16(SV (.) hadU(z))).
 void output_residual(const float *all, int rows, const float *sv, BFloat16 *state, hipStream_t);
+void output_residual(const BFloat16 *all, int rows, const float *sv, BFloat16 *state, hipStream_t);
 // gate/up epilogue: all = gathered [2][rows][28672] bf16 (gate 14336 | up 14336 per rank);
 // h[rows][28672] = bf16(silu(g) * u), g = bf16(SVg (.) hadU(zg)), u = bf16(SVu (.) hadU(zu)).
 void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const float *sv_up,
@@ -149,6 +154,9 @@ void set_row_transform_threshold(int rows);
 // One kernel when rows >= row_transform_threshold(), else the two separate kernels; identical
 // results either way.
 void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+                           const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
+                           int ldu, hipStream_t);
+void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
                            int ldu, hipStream_t);
 // WMMA layout probe (tests): D = A * B for one 16x16x16 bf16 tile with A/B given row-major as

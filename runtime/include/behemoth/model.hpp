@@ -28,6 +28,10 @@ struct RuntimeOptions {
     size_t sampled_rows = 0;
     int qtip_dense_rows = -1;     // >= 0 overrides qtip::dense_rows_threshold (0 disables)
     int qtip_row_transforms = -1; // >= 0 overrides qtip::row_transform_threshold (0 disables)
+    // Experimental: BF16 rotated-output exchange for QTIP pure-prefill micro-batches
+    // of at least this size (0: off; otherwise 64..4096). Adds BF16 rounding to
+    // q/k/v, o and down; decode-only and mixed steps keep existing numerics.
+    int qtip_bf16_prefill_rows = 0;
     bool rccl_shared_memory = false; // default: explicit pinned-host staging, no P2P assumptions
     bool zero_copy_transport = false; // --transport zerocopy: kernel-driven host-memory exchange
     // Largest batch (rows) exchanged by the zero-copy kernels (0: 8). QTIP batches of more

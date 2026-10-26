@@ -1,6 +1,7 @@
 #include "behemoth/cache.hpp"
 #include "behemoth/checkpoint.hpp"
 #include "behemoth/prefix_cache.hpp"
+#include "behemoth/prefill.hpp"
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
 #include "behemoth/sorted_layout.hpp"
@@ -813,6 +814,15 @@ static void checkpoint_tests() {
 }
 int main() {
     try {
+        CHECK(qtip_fp32_exchange_bytes == 147456);
+        CHECK(qtip_bf16_exchange_bytes == 108544);
+        CHECK(qtip_bf16_exchange_bytes * 100 / qtip_fp32_exchange_bytes == 73);
+        for (int rows : {1, 4, 8, 16, 63, 64, 256, 512, 1024, 2048, 4096}) {
+            CHECK(!qtip_bf16_prefill_enabled(rows, 0, false));
+            CHECK(!qtip_bf16_prefill_enabled(rows, 512, true)); // mixed and decode-only
+            CHECK(qtip_bf16_prefill_enabled(rows, 512, false) == (rows >= 512));
+        }
+        std::cout << "PASS prefill_transport_policy\n";
         for (auto [name, fn] : std::vector<std::pair<const char *, std::function<void()>>>{
                  {"numeric", numeric_tests},
                  {"attention", attention_tests},
