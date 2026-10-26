@@ -82,12 +82,48 @@ int main(int argc, char **argv) {
                 h[i] = BFloat16(float(int(i * 2654435761U % 2001) - 1000) / 1000.f);
             x.upload(h);
         }
-        DeviceBuffer<float> partial(size_t(64) * size_t(max_rows) * 28672), z(size_t(max_rows) * 28672);
+        DeviceBuffer<float> partial(size_t(std::max(1, 16384 / std::max(max_rows, 256))) * size_t(max_rows) * 28672),
+            z(size_t(max_rows) * 28672);
         nlohmann::json report = nlohmann::json::array();
+        // BEHEMOTH_QTIP_BENCH_WMMA=0 skips the trellis-kernel variant sweep (dense + transforms only)
+        const bool sweep = !std::getenv("BEHEMOTH_QTIP_BENCH_WMMA") ||
+                           std::atoi(std::getenv("BEHEMOTH_QTIP_BENCH_WMMA")) != 0;
+        qtip::DenseMatmul dense;
+        DeviceBuffer<BFloat16> scratch(qtip::dense_scratch_elements);
         for (int rows : rows_list) {
-            double best_total = 0, bytes_total = 0;
+            double best_total = 0, bytes_total = 0, dense_total = 0, decode_total = 0;
             for (auto &s : shapes) {
                 const auto &w0 = s.w[0];
+                {
+                    const float ms = time_ms(
+                        [&](int i) {
+                            dense.run(s.w[size_t(i % copies_n)].view(), lut.lut.data(), x.data(), w0.in, rows,
+                                      partial.data(), scratch.data(), scratch.size(), stream);
+                        },
+                        10, stream);
+                    const float dec = time_ms(
+                        [&](int i) {
+                            const auto &w = s.w[size_t(i % copies_n)];
+                            const int piece = int(std::min<size_t>(size_t(w.rows),
+                                                                   scratch.size() / size_t(w.in) / 32 * 32));
+                            for (int r0 = 0; r0 < w.rows; r0 += piece)
+                                qtip::decode_dense(
+                                    qtip::LinearView{w.trellis.data() + size_t(r0 / 32) * size_t(w.in / 32) * 128,
+                                                     w.in, std::min(piece, w.rows - r0)},
+                                    lut.lut.data(), scratch.data(), stream);
+                        },
+                        10, stream);
+                    std::cout << "rows=" << rows << " " << s.name << " dense prefill " << ms << " ms (decode "
+                              << dec << " ms = " << double(w0.rows) * w0.in * 2 / dec / 1e6 << " GB/s written, gemm "
+                              << ms - dec << " ms = " << 2.0 * rows * w0.rows * w0.in / (ms - dec) / 1e9
+                              << " TFLOP/s)\n";
+                    report.push_back({{"rows", rows}, {"shape", s.name}, {"variant", "dense"}, {"ms", ms},
+                                      {"decode_ms", dec}});
+                    dense_total += ms;
+                    decode_total += dec;
+                }
+                if (!sweep)
+                    continue;
                 std::vector<qtip::MatmulOptions> variants;
                 for (auto kernel : {qtip::MatmulKernel::Gemv, qtip::MatmulKernel::Wmma}) {
                     if (kernel == qtip::MatmulKernel::Gemv && rows > 4)
@@ -130,6 +166,8 @@ int main(int argc, char **argv) {
                 best_total += best;
                 bytes_total += double(w0.bytes());
             }
+            std::cout << "rows=" << rows << " layer dense prefill " << dense_total << " ms (decode "
+                      << decode_total << ") x88 = " << dense_total * 88 << " ms\n";
             // epilogues for one layer at this row count
             DeviceBuffer<float> all(size_t(2) * size_t(rows) * 14336), svf(28672);
             DeviceBuffer<BFloat16> st(size_t(rows) * 12288), qb(size_t(rows) * 6144), kb(size_t(rows) * 512),
@@ -139,6 +177,8 @@ int main(int argc, char **argv) {
             HIP_CHECK(hipMemset(st.data(), 0, st.bytes()));
             HIP_CHECK(hipMemset(h.data(), 0, h.bytes()));
             HIP_CHECK(hipMemset(nw.data(), 0, nw.bytes()));
+            for (int mode = 0; mode < 2; ++mode) {
+            qtip::set_row_transform_threshold(mode ? 1 : 0);
             const float t_in = time_ms(
                 [&](int) {
                     qtip::input_transform(qtip::Source{st.data(), 12288, 0, 12288, 0}, nw.data(), 1e-5f,
@@ -166,12 +206,24 @@ int main(int argc, char **argv) {
                                           svf.data(), 28672, rows, ub.data(), 28672, stream);
                 },
                 50, stream);
+            const float t_fused = time_ms(
+                [&](int) {
+                    qtip::output_residual_input(all.data(), rows, svf.data(), st.data(), nw.data(), 1e-5f,
+                                                svf.data(), ub.data(), 12288, stream);
+                },
+                50, stream);
             const double transforms = 3 * t_in + t_qkv + 2 * t_res + t_gu + t_din;
-            std::cout << "rows=" << rows << " layer matmuls " << best_total << " ms ("
+            // model schedule with fusion: in(qkv, first layer only) + qkv + in(o) + 2 fused + gu + down-in
+            const double fused = t_in + t_qkv + 2 * t_fused + t_gu + t_din;
+            std::cout << "rows=" << rows << (mode ? " ROW-BATCHED" : " PER-CHUNK") << " layer matmuls "
+                      << best_total << " ms ("
                       << bytes_total / best_total / 1e6 << " GB/s) x88 = " << best_total * 88
                       << " ms; transforms/layer " << transforms << " ms (in " << t_in << ", qkv " << t_qkv
-                      << ", res " << t_res << ", gu " << t_gu << ", down-in " << t_din << ") x88 = "
-                      << transforms * 88 << " ms\n";
+                      << ", res " << t_res << ", gu " << t_gu << ", down-in " << t_din << ", res+in fused "
+                      << t_fused << ") x88 = " << transforms * 88 << " ms; with fusion " << fused * 88
+                      << " ms\n";
+            }
+            qtip::set_row_transform_threshold(64);
         }
         std::cerr << report.dump() << '\n';
     } catch (const std::exception &e) {

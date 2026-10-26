@@ -5,6 +5,7 @@
 // exchange. See QTIP_RUNTIME_REPORT.md for the design.
 #include "gpu.hpp"
 #include "qtip.hpp"
+#include <memory>
 
 namespace behemoth::qtip {
 // Non-owning view for externally managed/double-buffered device storage.
@@ -96,9 +97,60 @@ void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const fl
                    BFloat16 *h, hipStream_t);
 // Standalone transforms for tests: y = bf16(hadU(x)) or hadUt (transpose), x fp32 [rows][n].
 void hadamard_rows(const float *x, int n, int rows, bool transpose, float *y, hipStream_t);
-// Dense decode for tests: w[rows][in] = bf16 LUT values of the shard (row-major, as bf16).
+// Dense decode: w[rows][in] = bf16 LUT values of the shard (row-major, as bf16). Used by the
+// tests and by DenseMatmul (prefill).
 void decode_dense(const GpuLinear &, const uint32_t *lut, BFloat16 *w, hipStream_t);
 void decode_dense(LinearView, const uint32_t *lut, BFloat16 *w, hipStream_t);
+
+// ---------------------------------------------------------------- prefill path
+// (PREFILL_SCHED_REPORT.md) Dense prefill matmul: decodes the shard into a bf16 scratch, in
+// pieces of whole block-rows of at most scratch_elements weights, and runs a hipBLASLt
+// bf16 x bf16 -> fp32 GEMM (fp32 accumulation) per piece:
+//   out[rows][l.rows] = x[rows][ldx] . hatWr^T
+// i.e. the same result as matmul with one slice (summation order differs: within tolerance,
+// not bit-identical). One instance per device (owns a hipBLASLt handle, plans, workspace).
+class DenseMatmul {
+    struct State;
+    std::unique_ptr<State> s_;
+
+  public:
+    DenseMatmul();
+    ~DenseMatmul();
+    DenseMatmul(DenseMatmul &&) noexcept;
+    DenseMatmul &operator=(DenseMatmul &&) noexcept;
+    void run(LinearView, const uint32_t *lut, const BFloat16 *x, int ldx, int rows, float *out,
+             BFloat16 *scratch, size_t scratch_elements, hipStream_t);
+    // The GEMM alone on an already decoded weight w[m][in] (decode_dense):
+    // out[r * ldo + j] = sum_i x[r * ldx + i] * w[j * in + i], j < m, r < rows.
+    void gemm(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
+              const BFloat16 *w, hipStream_t);
+    // Times up to max_candidates hipBLASLt algorithms for this GEMM shape on the given buffers
+    // (synchronous; overwrites out) and keeps the fastest for (m, in, ldx, ldo) at batch `rows`:
+    // later GEMMs of that shape use the algorithm tuned at the nearest batch >= their rows when
+    // the heuristic offers it for their size. Returns the best TFLOP/s.
+    double tune(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
+                const BFloat16 *w, hipStream_t, int max_candidates = 64);
+};
+// Scratch elements of one whole decoded shard of every linear of the model (the largest is a
+// gate/up shard, 28672 x 12288): each linear decodes once per step, and two micro-batches can
+// share it.
+inline constexpr size_t dense_scratch_elements = size_t(28672) * 12288;
+// Batch rows at and above which the model runs DenseMatmul instead of the WMMA trellis kernel
+// (env BEHEMOTH_QTIP_DENSE_ROWS; <= 0 disables). set_* overrides it (tests, benchmarks).
+int dense_rows_threshold();
+void set_dense_rows_threshold(int rows);
+// Batch rows at and above which the Hadamard transforms/epilogues run one block per row over
+// the whole vector (each input read once) instead of one block per (1024-chunk, row) (env
+// BEHEMOTH_QTIP_ROW_TRANSFORMS; <= 0 disables). Both variants are bit-identical.
+int row_transform_threshold();
+void set_row_transform_threshold(int rows);
+// Fused o/down epilogue + the next input transform: state = bf16(state + bf16(SV (.) hadU(z)))
+// as output_residual, then u = input_transform(state, norm, epsilon, su) (12288, with norm).
+// One kernel when rows >= row_transform_threshold(), else the two separate kernels; identical
+// results either way.
+void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+                           const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
+                           int ldu, hipStream_t);
 // WMMA layout probe (tests): D = A * B for one 16x16x16 bf16 tile with A/B given row-major as
 // bf16 [16][16] (A: M x K, B: K x N); returns D row-major fp32.
 void wmma_probe(const BFloat16 *a, const BFloat16 *b, float *d, hipStream_t);

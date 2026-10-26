@@ -17,7 +17,10 @@
 #include "device_numeric.hpp"
 #include "qtip_tables.hpp"
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 namespace behemoth::qtip {
 namespace {
@@ -278,28 +281,53 @@ __global__ __launch_bounds__(WAVES * 32) void wmma_kernel(
     }
 }
 
-// ---------------------------------------------------------------- decode (tests)
-__global__ void decode_dense_kernel(const uint2 *__restrict__ trellis, int n2, const uint32_t *lut,
-                                    uint16_t *w, int in) {
-    // grid (n2, block_rows), 32 threads: lane w decodes word w of the 4 tiles of one block
-    const int lane = int(threadIdx.x), j0 = int(blockIdx.x), br = int(blockIdx.y);
-    const uint2 *tp = trellis + (size_t(br) * size_t(n2) + size_t(j0)) * 32;
-    const uint2 d0 = tp[lane], d1 = tp[(lane + 1) & 31];
-    const int A = lane >> 2, B = lane & 3;
-    for (int j1 = 0; j1 < 2; ++j1) {
-        const uint32_t a = j1 ? d0.y : d0.x, b = j1 ? d1.y : d1.x;
-        for (int i1 = 0; i1 < 2; ++i1) {
-            const uint32_t u = __builtin_amdgcn_perm(a, b, i1 ? 0x07060302U : 0x05040100U);
-            for (int k = 0; k < 4; ++k) {
-                const uint32_t p = lut_state(u >> (16 - 4 * k));
-                const uint32_t e = (p >> 6) & 1023U, v = lut[e];
-                const int cc = k >> 1, D = k & 1;
-                const size_t row = size_t(br * 32 + i1 * 16 + D * 8 + A);
-                const size_t col = size_t(32 * j0 + 16 * j1 + 8 * cc + 2 * B);
-                w[row * size_t(in) + col] = uint16_t(v & 0xffffU);
-                w[row * size_t(in) + col + 1] = uint16_t(v >> 16);
+// ---------------------------------------------------------------- dense decode
+// grid (ceil(n2 / 8), block_rows), 256 threads. Wave w decodes 2x2-tile block j0 = 8 * x + w of
+// block-row br (lane l: word l of the 4 tiles) into an LDS tile of 32 rows x 256 columns; the
+// block then writes the tile with coalesced 16-byte stores (prefill streams the whole model
+// through this kernel, so it runs at write bandwidth).
+constexpr int decode_tile_words = 128 + 4; // 256 bf16 columns as words, padded
+__global__ __launch_bounds__(256) void decode_dense_kernel(const uint2 *__restrict__ trellis, int n2,
+                                                           const uint32_t *__restrict__ lut,
+                                                           uint16_t *__restrict__ w, int in) {
+    __shared__ uint32_t table[1024];
+    __shared__ uint32_t tile[32 * decode_tile_words];
+    const int tid = int(threadIdx.x), lane = tid & 31, wave = tid >> 5;
+    for (int i = tid; i < 1024; i += 256)
+        table[i] = lut[i];
+    __syncthreads();
+    const int br = int(blockIdx.y), j0 = int(blockIdx.x) * 8 + wave;
+    if (j0 < n2) {
+        const uint2 *tp = trellis + (size_t(br) * size_t(n2) + size_t(j0)) * 32;
+        const uint2 d0 = tp[lane], d1 = tp[(lane + 1) & 31];
+        const int A = lane >> 2, B = lane & 3;
+#pragma unroll
+        for (int j1 = 0; j1 < 2; ++j1) {
+            const uint32_t a = j1 ? d0.y : d0.x, b = j1 ? d1.y : d1.x;
+#pragma unroll
+            for (int i1 = 0; i1 < 2; ++i1) {
+                const uint32_t u = __builtin_amdgcn_perm(a, b, i1 ? 0x07060302U : 0x05040100U);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t p = lut_state(u >> (16 - 4 * k));
+                    const int cc = k >> 1, D = k & 1;
+                    const int row = i1 * 16 + D * 8 + A;
+                    // columns 16 j1 + 8 cc + 2 B (+1) of block j0: word 8 j1 + 4 cc + B
+                    tile[row * decode_tile_words + wave * 16 + 8 * j1 + 4 * cc + B] =
+                        table[(p >> 6) & 1023U];
+                }
             }
         }
+    }
+    __syncthreads();
+    const int words = min(8, n2 - int(blockIdx.x) * 8) * 16; // valid words per tile row
+    for (int idx = tid; idx < 32 * 32; idx += 256) {
+        const int r = idx >> 5, c4 = idx & 31;
+        if (c4 * 4 >= words)
+            continue;
+        const uint32_t *t = tile + r * decode_tile_words + c4 * 4;
+        *reinterpret_cast<uint4 *>(w + size_t(br * 32 + r) * size_t(in) + size_t(blockIdx.x) * 256 +
+                                   size_t(c4) * 8) = make_uint4(t[0], t[1], t[2], t[3]);
     }
 }
 __global__ void wmma_probe_kernel(const uint16_t *a, const uint16_t *b, float *d) {
@@ -680,6 +708,220 @@ __global__ __launch_bounds__(256) void hadamard_kernel(const float *x, int rows,
         y[size_t(row) * n + size_t(k2 * 1024 + j + i)] = v[i] * scale;
 }
 
+// ---------------------------------------------------------------- row-batched transforms
+// One 256-thread block per row over the whole vector (PREFILL_SCHED_REPORT.md, item 3): thread
+// t holds positions 4t..4t+3 of every 1024-chunk in registers, so each input element is read
+// once (the per-chunk kernels above read the whole row once per output chunk, K = 12 / 28 times)
+// and the hadK mix of output chunk k2 is computed from registers. The arithmetic per output
+// element (mix order, fwht1024, scaling and rounding) is exactly that of the per-chunk kernels:
+// the results are bit-identical.
+template <int K, bool TRANSPOSE>
+__device__ __forceinline__ void mix_regs(const float (&t)[K][4], int k2, float v[4]) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        v[i] = 0.f;
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const float sign =
+            K == 1 ? 1.f : float(TRANSPOSE ? had_sign<K>(k, k2) : had_sign<K>(k2, k));
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            v[i] += sign * t[k][i];
+    }
+}
+template <class T, int K>
+__device__ __forceinline__ void load_row(const Source &s, int row, float (&t)[K][4]) {
+    const int j = 4 * int(threadIdx.x);
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+        load4<T>(s, row, k * 1024 + j, t[k]);
+}
+// u = bf16(hadUt(SU (.) x')) from registers t (the row's values, see input_transform_kernel):
+// rms norm (NORM), SU, then the K output chunks.
+template <int K, bool NORM>
+__device__ __forceinline__ void input_transform_regs(float (&t)[K][4], const uint16_t *norm,
+                                                     float epsilon, const float *su, uint16_t *u,
+                                                     float *scratch, float *red) {
+    constexpr int n = K * 1024;
+    const int j = 4 * int(threadIdx.x);
+    float factor = 1.f;
+    if constexpr (NORM) {
+        float ss = 0;
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                ss += t[k][i] * t[k][i];
+        factor = rsqrtf(block_sum(ss, red) / float(n) + epsilon);
+    }
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int e = k * 1024 + j;
+        const float4 sg = *reinterpret_cast<const float4 *>(su + e);
+        const float sgn[4] = {sg.x, sg.y, sg.z, sg.w};
+        float w[4] = {1.f, 1.f, 1.f, 1.f};
+        if constexpr (NORM) {
+            const uint2 wv = *reinterpret_cast<const uint2 *>(norm + e);
+            w[0] = device::bf16(uint16_t(wv.x & 0xffffU));
+            w[1] = device::bf16(uint16_t(wv.x >> 16));
+            w[2] = device::bf16(uint16_t(wv.y & 0xffffU));
+            w[3] = device::bf16(uint16_t(wv.y >> 16));
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float x = NORM ? device::bf16(device::bf16(t[k][i] * factor * w[i])) : t[k][i];
+            t[k][i] = sgn[i] * x;
+        }
+    }
+    const float scale = rsqrtf(float(n));
+    for (int k2 = 0; k2 < K; ++k2) {
+        float v[4];
+        mix_regs<K, true>(t, k2, v);
+        fwht1024(v, scratch);
+        *reinterpret_cast<uint2 *>(u + size_t(k2 * 1024 + j)) = make_uint2(
+            uint32_t(device::bf16(v[0] * scale)) | uint32_t(device::bf16(v[1] * scale)) << 16,
+            uint32_t(device::bf16(v[2] * scale)) | uint32_t(device::bf16(v[3] * scale)) << 16);
+    }
+}
+// grid (rows)
+template <int K, bool NORM>
+__global__ __launch_bounds__(256) void input_transform_rows_kernel(Source src, const uint16_t *norm,
+                                                                   float epsilon, const float *su,
+                                                                   uint16_t *u, int ldu) {
+    __shared__ float scratch[1024];
+    __shared__ float red[8];
+    const int row = int(blockIdx.x);
+    float t[K][4];
+    load_row<uint16_t, K>(src, row, t);
+    input_transform_regs<K, NORM>(t, norm, epsilon, su, u + size_t(row) * size_t(ldu), scratch, red);
+}
+// grid (rows): this rank's 6 q chunks from one load of the row, then k and v.
+__global__ __launch_bounds__(256) void output_qkv_rows_kernel(const float *all, int rows, int rank,
+                                                              const float *sv_q, const float *sv_k,
+                                                              const float *sv_v, uint16_t *q,
+                                                              uint16_t *k, uint16_t *v) {
+    __shared__ float scratch[1024];
+    const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
+    const size_t part = size_t(rows) * 7168;
+    {
+        float t[12][4];
+        load_row<float, 12>(Source{all, 6144, part, 7168, 0}, row, t);
+        const float scale = rsqrtf(12288.f);
+        for (int b = 0; b < 6; ++b) {
+            const int k2 = 6 * rank + b;
+            float x[4];
+            mix_regs<12, false>(t, k2, x);
+            fwht1024(x, scratch);
+            const int e = k2 * 1024 + j;
+            uint16_t *dst = q + size_t(row) * 6144 + size_t(b * 1024 + j);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                dst[i] = device::bf16(x[i] * scale * sv_q[e + i]);
+        }
+    }
+    for (int b = 6; b < 8; ++b) {
+        const bool is_k = b == 6;
+        float x[4];
+        mix<1, false, float>(Source{all, 512, part, 7168, is_k ? 6144 : 6656}, row, 0, x);
+        fwht1024(x, scratch);
+        const float scale = 1.f / 32.f;
+        const float *sv = is_k ? sv_k : sv_v;
+        uint16_t *out = is_k ? k : v;
+        if (j >= 512 * rank && j < 512 * rank + 512) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                out[size_t(row) * 512 + size_t(j - 512 * rank + i)] =
+                    device::bf16(x[i] * scale * sv[j + i]);
+        }
+    }
+}
+// grid (rows): residual epilogue; FUSE: then the next input transform (rms norm, SU, hadUt
+// 12288) of the updated state, from registers.
+template <bool FUSE>
+__global__ __launch_bounds__(256) void output_residual_rows_kernel(const float *all, int rows,
+                                                                   const float *sv, uint16_t *state,
+                                                                   const uint16_t *norm, float epsilon,
+                                                                   const float *su, uint16_t *u,
+                                                                   int ldu) {
+    __shared__ float scratch[1024];
+    __shared__ float red[8];
+    const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
+    float t[12][4], s[12][4];
+    load_row<float, 12>(Source{all, 6144, size_t(rows) * 6144, 6144, 0}, row, t);
+    const float scale = rsqrtf(12288.f);
+    // fully unrolled: s[k2] must stay in registers
+#pragma unroll
+    for (int k2 = 0; k2 < 12; ++k2) {
+        float x[4];
+        mix_regs<12, false>(t, k2, x);
+        fwht1024(x, scratch);
+        const int e = k2 * 1024 + j;
+        uint16_t *st = state + size_t(row) * 12288 + size_t(e);
+        const uint2 old = *reinterpret_cast<const uint2 *>(st);
+        const uint16_t o[4] = {uint16_t(old.x & 0xffffU), uint16_t(old.x >> 16),
+                               uint16_t(old.y & 0xffffU), uint16_t(old.y >> 16)};
+        uint16_t r[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float y = device::bf16(device::bf16(x[i] * scale * sv[e + i]));
+            r[i] = device::bf16(device::bf16(o[i]) + y);
+        }
+        *reinterpret_cast<uint2 *>(st) =
+            make_uint2(uint32_t(r[0]) | uint32_t(r[1]) << 16, uint32_t(r[2]) | uint32_t(r[3]) << 16);
+        if constexpr (FUSE) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                s[k2][i] = device::bf16(r[i]);
+        }
+    }
+    if constexpr (FUSE)
+        input_transform_regs<12, true>(s, norm, epsilon, su, u + size_t(row) * size_t(ldu), scratch,
+                                       red);
+}
+// grid (rows): gate pass (g -> h as bf16), then up pass reading g back from h.
+__global__ __launch_bounds__(256) void output_gateup_rows_kernel(const uint16_t *all, int rows,
+                                                                 const float *sv_g, const float *sv_u,
+                                                                 uint16_t *h) {
+    __shared__ float scratch[1024];
+    const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
+    const size_t part = size_t(rows) * 28672;
+    const float scale = rsqrtf(28672.f);
+    uint16_t *hr = h + size_t(row) * 28672;
+    float t[28][4];
+    load_row<uint16_t, 28>(Source{all, 14336, part, 28672, 0}, row, t);
+    for (int k2 = 0; k2 < 28; ++k2) {
+        float g[4];
+        mix_regs<28, false>(t, k2, g);
+        fwht1024(g, scratch);
+        const int e = k2 * 1024 + j;
+        uint16_t gb[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            gb[i] = device::bf16(g[i] * scale * sv_g[e + i]); // = bits of output_gateup's gv
+        *reinterpret_cast<uint2 *>(hr + e) =
+            make_uint2(uint32_t(gb[0]) | uint32_t(gb[1]) << 16, uint32_t(gb[2]) | uint32_t(gb[3]) << 16);
+    }
+    load_row<uint16_t, 28>(Source{all, 14336, part, 28672, 14336}, row, t);
+    for (int k2 = 0; k2 < 28; ++k2) {
+        float u[4];
+        mix_regs<28, false>(t, k2, u);
+        fwht1024(u, scratch);
+        const int e = k2 * 1024 + j;
+        const uint2 gv2 = *reinterpret_cast<const uint2 *>(hr + e); // this thread's own store
+        const uint16_t gb[4] = {uint16_t(gv2.x & 0xffffU), uint16_t(gv2.x >> 16),
+                                uint16_t(gv2.y & 0xffffU), uint16_t(gv2.y >> 16)};
+        uint16_t out[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float gv = device::bf16(gb[i]);
+            const float uv = device::bf16(device::bf16(u[i] * scale * sv_u[e + i]));
+            out[i] = device::bf16(gv / (1 + expf(-gv)) * uv);
+        }
+        *reinterpret_cast<uint2 *>(hr + e) =
+            make_uint2(uint32_t(out[0]) | uint32_t(out[1]) << 16, uint32_t(out[2]) | uint32_t(out[3]) << 16);
+    }
+}
+
 std::once_flag tables_once;
 void upload_tables() {
     std::call_once(tables_once, [] {
@@ -729,6 +971,23 @@ bool use_wmma(int rows, const MatmulOptions &o) {
         return v ? std::atoi(v) : 4;
     }();
     return rows > std::min(threshold, 4);
+}
+int env_rows(const char *name, int fallback) {
+    const char *v = std::getenv(name);
+    return v ? std::atoi(v) : fallback;
+}
+// Defaults measured on 2x R9700 (PREFILL_SCHED_REPORT.md).
+std::atomic<int> &dense_rows_setting() {
+    static std::atomic<int> v{env_rows("BEHEMOTH_QTIP_DENSE_ROWS", 512)};
+    return v;
+}
+std::atomic<int> &row_transform_setting() {
+    static std::atomic<int> v{env_rows("BEHEMOTH_QTIP_ROW_TRANSFORMS", 64)};
+    return v;
+}
+bool row_transforms(int rows) {
+    const int t = row_transform_setting().load(std::memory_order_relaxed);
+    return t > 0 && rows >= t;
 }
 constexpr int gemv_waves = 16, wmma_waves = 8;
 // 16-row batch tiles per WMMA pass: 1 (rows <= 16), 2 (<= 32), else 4 (64 rows per pass).
@@ -911,6 +1170,19 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
     upload_tables();
     auto *out = reinterpret_cast<uint16_t *>(u);
     const auto *w = reinterpret_cast<const uint16_t *>(norm);
+    if (row_transforms(rows)) {
+        if (n == 12288) {
+            if (norm)
+                input_transform_rows_kernel<12, true><<<rows, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+            else
+                input_transform_rows_kernel<12, false><<<rows, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+        } else if (n == 28672 && !norm) {
+            input_transform_rows_kernel<28, false><<<rows, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+        } else
+            throw std::invalid_argument("QTIP input transform supports 12288 (+norm) and 28672");
+        HIP_CHECK(hipGetLastError());
+        return;
+    }
     const dim3 grid(unsigned(n / 1024), unsigned(rows));
     if (n == 12288) {
         if (norm)
@@ -926,6 +1198,13 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
 void output_qkv(const float *all, int rows, int rank, const float *sv_q, const float *sv_k,
                 const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t stream) {
     upload_tables();
+    if (row_transforms(rows)) {
+        output_qkv_rows_kernel<<<rows, 256, 0, stream>>>(
+            all, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
+            reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v));
+        HIP_CHECK(hipGetLastError());
+        return;
+    }
     output_qkv_kernel<<<dim3(8, unsigned(rows)), 256, 0, stream>>>(
         all, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
         reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v));
@@ -934,13 +1213,41 @@ void output_qkv(const float *all, int rows, int rank, const float *sv_q, const f
 void output_residual(const float *all, int rows, const float *sv, BFloat16 *state,
                      hipStream_t stream) {
     upload_tables();
+    if (row_transforms(rows)) {
+        output_residual_rows_kernel<false><<<rows, 256, 0, stream>>>(
+            all, rows, sv, reinterpret_cast<uint16_t *>(state), nullptr, 0.f, nullptr, nullptr, 0);
+        HIP_CHECK(hipGetLastError());
+        return;
+    }
     output_residual_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
         all, rows, sv, reinterpret_cast<uint16_t *>(state));
+    HIP_CHECK(hipGetLastError());
+}
+void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+                           const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
+                           int ldu, hipStream_t stream) {
+    upload_tables();
+    if (!row_transforms(rows)) {
+        output_residual(all, rows, sv, state, stream);
+        input_transform(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, 12288, rows, u, ldu,
+                        stream);
+        return;
+    }
+    output_residual_rows_kernel<true><<<rows, 256, 0, stream>>>(
+        all, rows, sv, reinterpret_cast<uint16_t *>(state),
+        reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u), ldu);
     HIP_CHECK(hipGetLastError());
 }
 void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const float *sv_up,
                    BFloat16 *h, hipStream_t stream) {
     upload_tables();
+    if (row_transforms(rows)) {
+        output_gateup_rows_kernel<<<rows, 256, 0, stream>>>(
+            reinterpret_cast<const uint16_t *>(all), rows, sv_gate, sv_up,
+            reinterpret_cast<uint16_t *>(h));
+        HIP_CHECK(hipGetLastError());
+        return;
+    }
     output_gateup_kernel<<<dim3(28, unsigned(rows)), 256, 0, stream>>>(
         reinterpret_cast<const uint16_t *>(all), rows, sv_gate, sv_up,
         reinterpret_cast<uint16_t *>(h));
@@ -969,11 +1276,26 @@ void decode_dense(const GpuLinear &l, const uint32_t *lut, BFloat16 *w, hipStrea
     decode_dense(l.view(), lut, w, stream);
 }
 void decode_dense(LinearView l, const uint32_t *lut, BFloat16 *w, hipStream_t stream) {
-    decode_dense_kernel<<<dim3(unsigned(l.in / 32), unsigned(l.rows / 32)), 32, 0, stream>>>(
-        reinterpret_cast<const uint2 *>(l.trellis), l.in / 32, lut,
-        reinterpret_cast<uint16_t *>(w), l.in);
+    if (l.rows % 32 || l.in % 32 || l.rows < 32)
+        throw std::invalid_argument("QTIP decode shape");
+    const int n2 = l.in / 32;
+    decode_dense_kernel<<<dim3(unsigned((n2 + 7) / 8), unsigned(l.rows / 32)), 256, 0, stream>>>(
+        reinterpret_cast<const uint2 *>(l.trellis), n2, lut, reinterpret_cast<uint16_t *>(w), l.in);
     HIP_CHECK(hipGetLastError());
 }
+int dense_rows_threshold() {
+    return dense_rows_setting().load(std::memory_order_relaxed);
+}
+void set_dense_rows_threshold(int rows) {
+    dense_rows_setting().store(rows, std::memory_order_relaxed);
+}
+int row_transform_threshold() {
+    return row_transform_setting().load(std::memory_order_relaxed);
+}
+void set_row_transform_threshold(int rows) {
+    row_transform_setting().store(rows, std::memory_order_relaxed);
+}
+
 void wmma_probe(const BFloat16 *a, const BFloat16 *b, float *d, hipStream_t stream) {
     wmma_probe_kernel<<<1, 32, 0, stream>>>(reinterpret_cast<const uint16_t *>(a),
                                             reinterpret_cast<const uint16_t *>(b), d);
