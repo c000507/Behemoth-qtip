@@ -37,6 +37,8 @@ struct MatmulOptions {
 // them (reduce_publish). partial must hold slices * rows * lin.rows floats: query with
 // matmul_slices() first.
 int matmul_slices(const GpuLinear &, int rows, const MatmulOptions & = {});
+// Occupancy / resources of the matmul kernels on the current device (bench report).
+nlohmann::json kernel_info();
 void matmul(const GpuLinear &, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
             float *partial, int slices, hipStream_t, const MatmulOptions & = {});
 // Sum `slices` partial slices of n elements (slice stride n): result fp32 or bf16 into `local`
@@ -48,6 +50,15 @@ void reduce_publish(const float *partial, int slices, size_t n, bool bf16, void 
 // its host buffer to all + (1 - rank) * words (the local half is already at all + rank * words).
 void gather_peer(const void *peer_host, void *all, size_t words, int rank,
                  const unsigned *peer_flag, unsigned seq, hipStream_t);
+
+// Fused zero-copy all-gather step (one launch instead of reduce_publish + gather_peer): sums
+// the slices (Fp32 / Bf16 payload; n = elements) or copies n local 32-bit words (Words) into
+// `local` and the host exchange buffer, releases flag = seq, waits for the peer's flag and
+// copies the peer's payload from peer_host to peer_dst.
+enum class ExchangeMode { Fp32, Bf16, Words };
+void exchange(const float *partial, int slices, size_t n, ExchangeMode, void *local, void *host,
+              unsigned *flag, unsigned *counter, unsigned seq, const void *peer_host, void *peer_dst,
+              const unsigned *peer_flag, hipStream_t);
 
 // Element source of a transform: element e of row r is
 // p[(e / half) * part + r * ld + offset + e % half]  (half = n, part = 0 for one plain matrix;

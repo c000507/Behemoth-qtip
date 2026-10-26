@@ -1,5 +1,6 @@
 #include "behemoth/model.hpp"
 #include "behemoth/gpu.hpp"
+#include "behemoth/qtip_gpu.hpp"
 #include "behemoth/worker.hpp"
 #include <atomic>
 #include <cstdlib>
@@ -317,8 +318,22 @@ class GpuTimes {
         return result;
     }
 };
+// QTIP weights of one layer on one rank (QTIP_RUNTIME_REPORT.md, "Tensor parallelism"): the
+// rotated weights are split by output rows (q/k/v, gate/up stacked per rank), every collective is
+// an all-gather of rotated outputs (or of the head-sharded attention output), and the Hadamard
+// transforms run on full vectors on both ranks.
+struct QtipLayer {
+    qtip::GpuLinear qkv, o, gate_up, down;
+    qtip::GpuCodebook lut;
+    DeviceBuffer<float> su_qkv, su_o, su_gate_up, su_down;
+    DeviceBuffer<float> sv_q, sv_k, sv_v, sv_o, sv_gate, sv_up, sv_down;
+    size_t bytes() const {
+        return qkv.bytes() + o.bytes() + gate_up.bytes() + down.bytes();
+    }
+};
 struct Layer {
     GpuProjection q, k, v, o, gate, up, down;
+    QtipLayer qtip;
     DeviceBuffer<BFloat16> input_norm, post_norm;
     DeviceBuffer<uint8_t> cache_k, cache_v;
     DeviceBuffer<float> k_scale, v_scale;
@@ -338,6 +353,10 @@ struct Shard {
     DeviceBuffer<std::byte> attention_workspace;
     GpuMetadata metadata;
     GpuTimes timings;
+    // QTIP path: rotated bf16 inputs, matmul slices, rank-blocked exchange buffer, MLP product.
+    bool qtip = false;
+    DeviceBuffer<BFloat16> qtip_u, qtip_h;
+    DeviceBuffer<float> qtip_partial, qtip_all;
     explicit Shard(int id, int r, Checkpoint &checkpoint, const RuntimeOptions &options)
         : device(id), rank(r) {
         HIP_CHECK(hipSetDevice(device));
@@ -355,8 +374,11 @@ struct Shard {
         if (final_norm.size() != 12288)
             throw std::runtime_error("Invalid final norm shape");
         layers.resize(88);
+        qtip = checkpoint.config.quantization == Quantization::Qtip;
         auto layout = parse_code_layout(options.code_layout);
-        for (int i = 0; i < 88; ++i) {
+        for (int i = 0; qtip && i < 88; ++i)
+            load_qtip_layer(checkpoint, i);
+        for (int i = 0; !qtip && i < 88; ++i) {
             auto &l = layers[size_t(i)];
             l.q.upload(checkpoint.projection(i, "self_attn.q_proj", rank, true), layout);
             l.k.upload(checkpoint.projection(i, "self_attn.k_proj", rank, true), layout);
@@ -400,6 +422,51 @@ struct Shard {
         size_t split_rows = std::min(options.token_budget, size_t(64));
         projection.partial.resize(split_rows * 16384 * 28);
     }
+    void load_qtip_layer(const Checkpoint &checkpoint, int i) {
+        auto &l = layers[size_t(i)];
+        auto &w = l.qtip;
+        auto lin = [&](const char *name) { return qtip::load_linear(checkpoint, i, name); };
+        const auto q = lin("self_attn.q_proj"), k = lin("self_attn.k_proj"),
+                   v = lin("self_attn.v_proj"), o = lin("self_attn.o_proj"),
+                   gate = lin("mlp.gate_proj"), up = lin("mlp.up_proj"), down = lin("mlp.down_proj");
+        // The stacked q/k/v and gate/up matmuls share one rotated input: the checkpoint must use
+        // one SU per Hessian group (qtip_quant does) and one tlut per layer.
+        if (q.su != k.su || q.su != v.su || gate.su != up.su)
+            throw std::invalid_argument("QTIP layer " + std::to_string(i) +
+                                        ": q/k/v or gate/up do not share SU");
+        for (const auto *x : {&k, &v, &o, &gate, &up, &down})
+            if (x->tlut != q.tlut)
+                throw std::invalid_argument("QTIP layer " + std::to_string(i) +
+                                            ": linears use different tluts");
+        w.lut.upload(qtip::make_codebook(q.tlut));
+        // Rank r owns rotated output rows [r*m/2, (r+1)*m/2) of every linear (whole 32-row
+        // block-rows: q/o/down 192, k/v 16, gate/up 448 per rank).
+        w.qkv.upload({q.block_rows(rank * 192, 192), k.block_rows(rank * 16, 16),
+                      v.block_rows(rank * 16, 16)},
+                     12288);
+        w.o.upload({o.block_rows(rank * 192, 192)}, 12288);
+        w.gate_up.upload({gate.block_rows(rank * 448, 448), up.block_rows(rank * 448, 448)}, 12288);
+        w.down.upload({down.block_rows(rank * 192, 192)}, 28672);
+        w.su_qkv.upload(q.su);
+        w.su_o.upload(o.su);
+        w.su_gate_up.upload(gate.su);
+        w.su_down.upload(down.su);
+        w.sv_q.upload(q.sv);
+        w.sv_k.upload(k.sv);
+        w.sv_v.upload(v.sv);
+        w.sv_o.upload(o.sv);
+        w.sv_gate.upload(gate.sv);
+        w.sv_up.upload(up.sv);
+        w.sv_down.upload(down.sv);
+        std::string base = "model.layers." + std::to_string(i) + ".";
+        l.input_norm.upload(checkpoint.bf16(base + "input_layernorm.weight"));
+        l.post_norm.upload(checkpoint.bf16(base + "post_attention_layernorm.weight"));
+        if (l.input_norm.size() != 12288 || l.post_norm.size() != 12288)
+            throw std::invalid_argument("Invalid block norm shape");
+        if (i % 8 == 0)
+            std::cerr << "rank " << rank << ": loaded QTIP block " << i << "/88 ("
+                      << double(w.bytes()) / 1e6 << " MB trellis)\n";
+    }
     ~Shard() {
         (void)hipSetDevice(device);
         if (stream)
@@ -431,6 +498,12 @@ struct Shard {
         // check in forward() falls back to the 1024-key partition or to a
         // single partition. The old flat 256 MB bought nothing (item 1).
         attention_workspace.resize(32 * 1024 * 1024);
+        if (qtip) {
+            qtip_u.resize(rows * 28672);
+            qtip_h.resize(rows * 28672);
+            qtip_all.resize(rows * 2 * 14336);
+            qtip_partial.resize(std::max<size_t>(rows, 64) * 28672);
+        }
     }
     int page_capacity(double fraction) {
         HIP_CHECK(hipSetDevice(device));
@@ -544,7 +617,10 @@ struct Shard {
             return v && std::string(v) == "bf16";
         }();
         for (int index = only_layer < 0 ? 0 : only_layer;
-             index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
+             qtip && index < (only_layer < 0 ? 88 : only_layer + 1); ++index)
+            qtip_layer(layers[size_t(index)], rows, partition, bf16_qp, comm, transport);
+        for (int index = only_layer < 0 ? 0 : only_layer;
+             !qtip && index < (only_layer < 0 ? 88 : only_layer + 1); ++index) {
             auto &l = layers[size_t(index)];
             timings.measure("elementwise_ms", stream,
                             [&] { normed_input(state.data(), l.input_norm.data()); });
@@ -606,6 +682,121 @@ struct Shard {
             });
         }
         HIP_CHECK(hipStreamSynchronize(stream));
+    }
+    // Rank-blocked all-gather of `words` 32-bit words per rank through qtip_all: this rank's
+    // half must already be at qtip_all + rank * words (or is produced there by reduce_publish when
+    // partial is non-null: the sum of the matmul slices, fp32 or bf16 payload).
+    void qtip_exchange(const float *partial, int slices, size_t elements, bool bf16, size_t words,
+                       ncclComm_t comm, HostTransport *transport) {
+        float *all = qtip_all.data();
+        float *local = all + size_t(rank) * words;
+        HostTransport::Exchange e{};
+        if (transport && transport->zero_copy_eligible(words))
+            e = transport->begin_exchange(rank, words);
+        static const bool fused = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_FUSED_EXCHANGE");
+            return !v || std::atoi(v) != 0;
+        }();
+        if (e.valid && fused) {
+            // one kernel: publish (slice sum) + flag, then the peer half
+            timings.measure("collectives_ms", stream, [&] {
+                qtip::exchange(partial, slices, partial ? elements : words,
+                               !partial ? qtip::ExchangeMode::Words
+                               : bf16   ? qtip::ExchangeMode::Bf16
+                                        : qtip::ExchangeMode::Fp32,
+                               local, e.mine, e.flag, e.counter, e.seq, e.peer,
+                               all + size_t(1 - rank) * words, e.peer_flag, stream);
+            });
+            return;
+        }
+        if (partial)
+            timings.measure("elementwise_ms", stream, [&] {
+                qtip::reduce_publish(partial, slices, elements, bf16, local, e.valid ? e.mine : nullptr,
+                                     e.flag, e.counter, e.seq, stream);
+            });
+        else if (e.valid)
+            timings.measure("collectives_ms", stream, [&] {
+                zero_copy_publish(local, e.mine, words, e.flag, e.counter, e.seq, stream);
+            });
+        timings.measure("collectives_ms", stream, [&] {
+            if (e.valid)
+                qtip::gather_peer(e.peer, all, words, rank, e.peer_flag, e.seq, stream);
+            else if (transport)
+                transport->gather(rank, local, all, words, stream);
+            else
+                RCCL_CHECK(ncclAllGather(local, all, words, ncclFloat, comm, stream));
+        });
+    }
+    // x . hatWr^T for this rank's rows of `w`, slices summed and all-gathered into qtip_all.
+    void qtip_project(const qtip::GpuLinear &w, const qtip::GpuCodebook &lut, int rows, int ldu,
+                      bool bf16, ncclComm_t comm, HostTransport *transport) {
+        const int slices = qtip::matmul_slices(w, rows);
+        qtip_partial.resize(size_t(slices) * size_t(rows) * size_t(w.rows));
+        timings.measure("projections_ms", stream, [&] {
+            qtip::matmul(w, lut.lut.data(), qtip_u.data(), ldu, rows, qtip_partial.data(), slices,
+                         stream);
+        });
+        const size_t elements = size_t(rows) * size_t(w.rows);
+        qtip_exchange(qtip_partial.data(), slices, elements, bf16, bf16 ? elements / 2 : elements,
+                      comm, transport);
+    }
+    void qtip_layer(Layer &l, int rows, int partition, bool bf16_qp, ncclComm_t comm,
+                    HostTransport *transport) {
+        auto &w = l.qtip;
+        const qtip::Source state_source{state.data(), 12288, 0, 12288, 0};
+        // q/k/v: norm + SU + hadUt, stacked matmul, all-gather of the rotated outputs, hadU + SV
+        // for this rank's heads.
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::input_transform(state_source, l.input_norm.data(), 1e-5f, w.su_qkv.data(), 12288,
+                                  rows, qtip_u.data(), 12288, stream);
+        });
+        qtip_project(w.qkv, w.lut, rows, 12288, false, comm, transport);
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::output_qkv(qtip_all.data(), rows, rank, w.sv_q.data(), w.sv_k.data(),
+                             w.sv_v.data(), q.data(), k.data(), v.data(), stream);
+        });
+        // Attention writes this rank's heads straight into its half of the exchange buffer.
+        auto *attention_out = reinterpret_cast<BFloat16 *>(qtip_all.data()) +
+                              size_t(rank) * size_t(rows) * 6144;
+        timings.measure("attention_and_cache_ms", stream, [&] {
+            rope_quantize(q.data(), k.data(), metadata.positions, rows, 48, 4, 1000000,
+                          query.data(), query_scale.data(), stream);
+            AttentionDeviceView view{query.data(),     query_scale.data(), l.cache_k.data(),
+                                     l.cache_v.data(), l.k_scale.data(),   l.v_scale.data(),
+                                     attention_out};
+            if (bf16_qp)
+                view.q_bf16 = q.data();
+            append_kv(metadata, view, k.data(), v.data(), stream);
+            paged_attention(metadata, view, attention_workspace.data(), attention_workspace.size(),
+                            partition, stream);
+        });
+        // o: all-gather the head-sharded attention output, hadUt over the full 12288.
+        qtip_exchange(nullptr, 0, 0, false, size_t(rows) * 3072, comm, transport);
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::input_transform(qtip::Source{qtip_all.data(), 6144, size_t(rows) * 3072 * 2, 6144, 0},
+                                  nullptr, 0.f, w.su_o.data(), 12288, rows, qtip_u.data(), 12288,
+                                  stream);
+        });
+        qtip_project(w.o, w.lut, rows, 12288, false, comm, transport);
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::output_residual(qtip_all.data(), rows, w.sv_o.data(), state.data(), stream);
+        });
+        // MLP: gate/up stacked, bf16 exchange, silu product, down.
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::input_transform(state_source, l.post_norm.data(), 1e-5f, w.su_gate_up.data(), 12288,
+                                  rows, qtip_u.data(), 12288, stream);
+        });
+        qtip_project(w.gate_up, w.lut, rows, 12288, true, comm, transport);
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::output_gateup(reinterpret_cast<const BFloat16 *>(qtip_all.data()), rows,
+                                w.sv_gate.data(), w.sv_up.data(), qtip_h.data(), stream);
+            qtip::input_transform(qtip::Source{qtip_h.data(), 28672, 0, 28672, 0}, nullptr, 0.f,
+                                  w.su_down.data(), 28672, rows, qtip_u.data(), 28672, stream);
+        });
+        qtip_project(w.down, w.lut, rows, 28672, false, comm, transport);
+        timings.measure("elementwise_ms", stream, [&] {
+            qtip::output_residual(qtip_all.data(), rows, w.sv_down.data(), state.data(), stream);
+        });
     }
     nlohmann::json profile() const {
         return {{"rank", rank},
@@ -881,7 +1072,8 @@ nlohmann::json TensorParallelModel::projection_tuning(int layer) const {
             selections.push_back(std::move(report));
         };
         const int first = layer < 0 ? 0 : layer, last = layer < 0 ? 88 : layer + 1;
-        for (int i = first; i < last; ++i) {
+        // QTIP layers have no autotuned projections (fixed GEMV/WMMA dispatch); only lm_head.
+        for (int i = first; !shard->qtip && i < last; ++i) {
             const auto &l = shard->layers[size_t(i)];
             const auto prefix = "model.layers." + std::to_string(i) + ".";
             const int rows = impl_->last_query_rows;

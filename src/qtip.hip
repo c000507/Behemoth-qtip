@@ -173,7 +173,8 @@ __global__ __launch_bounds__(WAVES * 32) void wmma_kernel(
     float *__restrict__ partial, int out_rows) {
     __shared__ uint32_t table[1024 * C];
     fill_table<C>(table, lut);
-    const int lane = int(threadIdx.x) & 31, wave = int(threadIdx.x) >> 5;
+    const int lane = int(threadIdx.x) & 31,
+              wave = __builtin_amdgcn_readfirstlane(int(threadIdx.x) >> 5);
     const int rr = lane & 15, half = lane >> 4;
     const int q = rr & 7;
     const uint32_t shift = uint32_t(16 - (8 * half + 4 * (rr >> 3)));
@@ -202,37 +203,61 @@ __global__ __launch_bounds__(WAVES * 32) void wmma_kernel(
             valid[m] = n < rows;
             xrow[m] = x + size_t(valid[m] ? n : 0) * size_t(ldx) + size_t(8 * half);
         }
-        for (int j0 = j_begin; j0 < j_end; ++j0) {
-            const uint4 *t4 = reinterpret_cast<const uint4 *>(tp + size_t(j0) * 32 + size_t(4 * q));
-            const uint4 l0 = t4[0], l1 = t4[1];
-            const uint2 l2 = tp[size_t(j0) * 32 + size_t((4 * q + 4) & 31)];
-            // d[c][j1]: words c = 4q .. 4q+4 of the j1 tiles (lo half: i1 = 0, hi: i1 = 1)
-            const uint32_t d[5][2] = {{l0.x, l0.y}, {l0.z, l0.w}, {l1.x, l1.y}, {l1.z, l1.w}, {l2.x, l2.y}};
+        struct Buf {
+            uint32_t d[5][2]; // words c = 4q .. 4q+4 of the j1 tiles (lo: i1 = 0, hi: i1 = 1)
             uint4 bx[MT][2];
+        };
+        auto load = [&](int j0, Buf &b) {
+            j0 = min(j0, j_end - 1);
+            const uint2 *blk = tp + size_t(j0) * 32;
+            const uint4 *t4 = reinterpret_cast<const uint4 *>(blk + 4 * q);
+            const uint4 l0 = t4[0], l1 = t4[1];
+            const uint2 l2 = blk[(4 * q + 4) & 31];
+            b.d[0][0] = l0.x;
+            b.d[0][1] = l0.y;
+            b.d[1][0] = l0.z;
+            b.d[1][1] = l0.w;
+            b.d[2][0] = l1.x;
+            b.d[2][1] = l1.y;
+            b.d[3][0] = l1.z;
+            b.d[3][1] = l1.w;
+            b.d[4][0] = l2.x;
+            b.d[4][1] = l2.y;
 #pragma unroll
             for (int m = 0; m < MT; ++m)
 #pragma unroll
                 for (int j1 = 0; j1 < 2; ++j1) {
                     const uint4 v = *reinterpret_cast<const uint4 *>(xrow[m] + size_t(32 * j0 + 16 * j1));
-                    bx[m][j1] = valid[m] ? v : make_uint4(0, 0, 0, 0);
+                    b.bx[m][j1] = valid[m] ? v : make_uint4(0, 0, 0, 0);
                 }
+        };
+        auto compute = [&](const Buf &b) {
 #pragma unroll
             for (int j1 = 0; j1 < 2; ++j1)
 #pragma unroll
                 for (int i1 = 0; i1 < 2; ++i1) {
                     uint32_t f[4];
 #pragma unroll
-                    for (int b = 0; b < 4; ++b) {
-                        const uint32_t u = __builtin_amdgcn_perm(d[b][j1], d[b + 1][j1],
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t u = __builtin_amdgcn_perm(b.d[k][j1], b.d[k + 1][j1],
                                                                  i1 ? 0x07060302U : 0x05040100U);
-                        f[b] = lds_word(table, lut_address<C>(lut_state(u >> shift), offset));
+                        f[k] = lds_word(table, lut_address<C>(lut_state(u >> shift), offset));
                     }
                     const bf16x8_t af = __builtin_bit_cast(bf16x8_t, make_uint4(f[0], f[1], f[2], f[3]));
 #pragma unroll
                     for (int m = 0; m < MT; ++m)
                         acc[m][i1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
-                            af, __builtin_bit_cast(bf16x8_t, bx[m][j1]), acc[m][i1]);
+                            af, __builtin_bit_cast(bf16x8_t, b.bx[m][j1]), acc[m][i1]);
                 }
+        };
+        if (j_begin < j_end) {
+            Buf nb;
+            load(j_begin, nb);
+            for (int j0 = j_begin; j0 < j_end; ++j0) {
+                const Buf cb = nb;
+                load(j0 + 1, nb);
+                compute(cb);
+            }
         }
         // D: lane l holds batch row l % 16, output rows 8 * (l / 16) + i of the tile-row.
 #pragma unroll
@@ -342,6 +367,64 @@ __global__ void gather_peer_kernel(const uint4 *__restrict__ peer, uint4 *__rest
         all[size_t(1 - rank) * size_t(n4) + size_t(i)] = peer[i];
 }
 
+// Fused zero-copy exchange: publish (sum of slices or a copy of local words) + flag release,
+// then wait for the peer's flag and copy its half. Grid-stride with at most 64 blocks so every
+// block is resident while it spins (no deadlock against blocks that still have to publish).
+// MODE 0: partial fp32 -> fp32, 1: partial -> bf16, 2: local words (n4 = uint4 count).
+template <int MODE>
+__global__ __launch_bounds__(256) void exchange_kernel(const float4 *__restrict__ partial, int slices,
+                                                       int n4, void *__restrict__ local,
+                                                       void *__restrict__ host, unsigned *flag,
+                                                       unsigned *counter, unsigned seq,
+                                                       const void *__restrict__ peer_host,
+                                                       void *__restrict__ peer_dst,
+                                                       const unsigned *peer_flag) {
+    const int stride = int(gridDim.x) * int(blockDim.x);
+    for (int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x); i < n4; i += stride) {
+        if constexpr (MODE == 2) {
+            static_cast<uint4 *>(host)[i] = static_cast<const uint4 *>(local)[i];
+        } else {
+            float4 s = partial[i];
+            for (int k = 1; k < slices; ++k) {
+                const float4 v = partial[size_t(k) * size_t(n4) + size_t(i)];
+                s.x += v.x;
+                s.y += v.y;
+                s.z += v.z;
+                s.w += v.w;
+            }
+            if constexpr (MODE == 1) {
+                const uint2 o = make_uint2(uint32_t(device::bf16(s.x)) | uint32_t(device::bf16(s.y)) << 16,
+                                           uint32_t(device::bf16(s.z)) | uint32_t(device::bf16(s.w)) << 16);
+                static_cast<uint2 *>(local)[i] = o;
+                static_cast<uint2 *>(host)[i] = o;
+            } else {
+                static_cast<float4 *>(local)[i] = s;
+                static_cast<float4 *>(host)[i] = s;
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned done = atomicAdd(counter, 1u) + 1;
+        if (done == gridDim.x) {
+            __threadfence_system();
+            __hip_atomic_store(flag, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            *counter = 0;
+        }
+        while (__hip_atomic_load(peer_flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq)
+            __builtin_amdgcn_s_sleep(1);
+    }
+    __syncthreads();
+    if constexpr (MODE == 1) {
+        for (int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x); i < n4; i += stride)
+            static_cast<uint2 *>(peer_dst)[i] = static_cast<const uint2 *>(peer_host)[i];
+    } else {
+        for (int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x); i < n4; i += stride)
+            static_cast<uint4 *>(peer_dst)[i] = static_cast<const uint4 *>(peer_host)[i];
+    }
+}
+
 // ---------------------------------------------------------------- Hadamard transforms
 // 256 threads hold the 1024 values of one chunk, 4 consecutive positions each; natural-order
 // (Sylvester) WHT: in-thread bits 0-1, lane shuffles for bits 2-6, LDS for bits 7-9.
@@ -426,14 +509,17 @@ __device__ __forceinline__ void mix(const Source &s, int row, int k2, float v[4]
     if constexpr (K == 1) {
         load4<T>(s, row, j, v);
     } else {
-#pragma unroll 4
+        // all K loads in flight at once (the transforms are L2-latency bound at decode sizes)
+        float t[K][4];
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+            load4<T>(s, row, k * 1024 + j, t[k]);
+#pragma unroll
         for (int k = 0; k < K; ++k) {
-            float t[4];
-            load4<T>(s, row, k * 1024 + j, t);
             const float sign = float(TRANSPOSE ? had_sign<K>(k, k2) : had_sign<K>(k2, k));
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                v[i] += sign * t[i];
+                v[i] += sign * t[k][i];
         }
     }
 }
@@ -458,24 +544,27 @@ __global__ __launch_bounds__(256) void input_transform_kernel(Source src, const 
     __shared__ float red[8];
     const int k2 = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
     constexpr int n = K * 1024;
+    // The block's mix inputs (4 positions of every chunk) are the whole row, so the rms of the
+    // row comes from the same registers (no second pass over x).
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    float tk[K][4];
+#pragma unroll
+    for (int k = 0; k < K; ++k)
+        load4<uint16_t>(src, row, k * 1024 + j, tk[k]);
     float factor = 1.f;
     if constexpr (NORM) {
         float ss = 0;
-        for (int e = j; e < n; e += 1024) {
-            float t[4];
-            load4<uint16_t>(src, row, e, t);
+#pragma unroll
+        for (int k = 0; k < K; ++k)
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                ss += t[i] * t[i];
-        }
+                ss += tk[k][i] * tk[k][i];
         factor = rsqrtf(block_sum(ss, red) / float(n) + epsilon);
     }
-    float v[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll 2
+#pragma unroll
     for (int k = 0; k < K; ++k) {
         const int e = k * 1024 + j;
-        float t[4];
-        load4<uint16_t>(src, row, e, t);
+        const float *t = tk[k];
         const float4 sg = *reinterpret_cast<const float4 *>(su + e);
         const float sgn[4] = {sg.x, sg.y, sg.z, sg.w};
         float w[4] = {1.f, 1.f, 1.f, 1.f};
@@ -642,6 +731,10 @@ bool use_wmma(int rows, const MatmulOptions &o) {
     return rows > std::min(threshold, 4);
 }
 constexpr int gemv_waves = 16, wmma_waves = 8;
+// 16-row batch tiles per WMMA pass: 1 (rows <= 16), 2 (<= 32), else 4 (64 rows per pass).
+int wmma_tiles(int rows) {
+    return rows <= 16 ? 1 : rows <= 32 ? 2 : 4;
+}
 } // namespace
 
 void GpuLinear::upload(const std::vector<std::span<const uint16_t>> &parts, int in_) {
@@ -669,7 +762,7 @@ int matmul_slices(const GpuLinear &l, int rows, const MatmulOptions &o) {
     // blocks (4 KB of trellis) per wave.
     int items = block_rows;
     if (use_wmma(rows, o))
-        items *= (rows + 63) / 64;
+        items *= (rows + 16 * wmma_tiles(rows) - 1) / (16 * wmma_tiles(rows));
     int slices = 1;
     while (items * slices < 2048 && n2 / (slices * 2) >= 16)
         slices *= 2;
@@ -727,12 +820,42 @@ void matmul(const GpuLinear &l, const uint32_t *lut, const BFloat16 *x, int ldx,
         return;
     }
     const auto *xb = reinterpret_cast<const uint16_t *>(x);
-    const int passes = (rows + 63) / 64;
+    const int mt = wmma_tiles(rows);
+    const int passes = (rows + 16 * mt - 1) / (16 * mt);
     const int items = block_rows * slices * passes;
-#define WMMA_C(CC) launch(wmma_kernel<4, CC, wmma_waves>, wmma_waves, items, xb, ldx, rows, partial, l.rows)
+#define WMMA_MT(MT, CC) launch(wmma_kernel<MT, CC, wmma_waves>, wmma_waves, items, xb, ldx, rows, partial, l.rows)
+#define WMMA_C(CC)                                                                                 \
+    do {                                                                                          \
+        if (mt == 1)                                                                              \
+            WMMA_MT(1, CC);                                                                       \
+        else if (mt == 2)                                                                         \
+            WMMA_MT(2, CC);                                                                       \
+        else                                                                                      \
+            WMMA_MT(4, CC);                                                                       \
+    } while (0)
     BEHEMOTH_QTIP_COPIES(WMMA_C)
 #undef WMMA_C
+#undef WMMA_MT
 #undef BEHEMOTH_QTIP_COPIES
+}
+nlohmann::json kernel_info() {
+    nlohmann::json j;
+    j["multiprocessors"] = multiprocessors();
+    auto add = [&](const char *name, auto kernel, int threads) {
+        hipFuncAttributes a{};
+        HIP_CHECK(hipFuncGetAttributes(&a, reinterpret_cast<const void *>(kernel)));
+        j[name] = {{"blocks_per_mp", occupancy(kernel, threads, 0)},
+                   {"threads", threads},
+                   {"lds_bytes", a.sharedSizeBytes},
+                   {"vgprs", a.numRegs}};
+    };
+    add("gemv_r1_c16", gemv_kernel<1, 16, gemv_waves>, gemv_waves * 32);
+    add("gemv_r4_c16", gemv_kernel<4, 16, gemv_waves>, gemv_waves * 32);
+    add("gemv_r1_c8", gemv_kernel<1, 8, gemv_waves>, gemv_waves * 32);
+    add("wmma_mt4_c8", wmma_kernel<4, 8, wmma_waves>, wmma_waves * 32);
+    add("wmma_mt4_c16", wmma_kernel<4, 16, wmma_waves>, wmma_waves * 32);
+    add("wmma_mt1_c8", wmma_kernel<1, 8, wmma_waves>, wmma_waves * 32);
+    return j;
 }
 void reduce_publish(const float *partial, int slices, size_t n, bool bf16, void *local, void *host,
                     unsigned *flag, unsigned *counter, unsigned seq, hipStream_t stream) {
@@ -754,6 +877,30 @@ void gather_peer(const void *peer_host, void *all, size_t words, int rank, const
     const int n4 = int(words / 4);
     gather_peer_kernel<<<(n4 + 255) / 256, 256, 0, stream>>>(
         static_cast<const uint4 *>(peer_host), static_cast<uint4 *>(all), n4, rank, peer_flag, seq);
+    HIP_CHECK(hipGetLastError());
+}
+void exchange(const float *partial, int slices, size_t n, ExchangeMode mode, void *local, void *host,
+              unsigned *flag, unsigned *counter, unsigned seq, const void *peer_host, void *peer_dst,
+              const unsigned *peer_flag, hipStream_t stream) {
+    if (n % 4)
+        throw std::invalid_argument("QTIP exchange needs a multiple of four");
+    const int n4 = int(n / 4);
+    const int blocks = std::max(1, std::min(64, (n4 + 255) / 256));
+    auto *pf = reinterpret_cast<const float4 *>(partial);
+    switch (mode) {
+    case ExchangeMode::Fp32:
+        exchange_kernel<0><<<blocks, 256, 0, stream>>>(pf, slices, n4, local, host, flag, counter, seq,
+                                                       peer_host, peer_dst, peer_flag);
+        break;
+    case ExchangeMode::Bf16:
+        exchange_kernel<1><<<blocks, 256, 0, stream>>>(pf, slices, n4, local, host, flag, counter, seq,
+                                                       peer_host, peer_dst, peer_flag);
+        break;
+    case ExchangeMode::Words:
+        exchange_kernel<2><<<blocks, 256, 0, stream>>>(pf, slices, n4, local, host, flag, counter, seq,
+                                                       peer_host, peer_dst, peer_flag);
+        break;
+    }
     HIP_CHECK(hipGetLastError());
 }
 void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,
