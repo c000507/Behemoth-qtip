@@ -1,7 +1,11 @@
 #include "behemoth/model.hpp"
 #include "behemoth/qtip_gpu.hpp"
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iostream>
+#include <numeric>
 #include <random>
 
 using namespace behemoth;
@@ -112,13 +116,182 @@ int prefill_paths(const std::string &model_dir) {
     std::cout << (failures ? "PREFILL PATH TESTS FAILED" : "PREFILL PATH TESTS PASSED") << '\n';
     return failures ? 1 : 0;
 }
+
+// Prefix cache (PREFIX_CACHE_REPORT.md): KV pages of a 1700-token prompt are saved to pinned host
+// pages and restored into different (permuted) GPU pages, then a 60-token tail is prefilled.
+//  - logits must equal those of a cold prefill with the same step split (1700 + 60) bit for bit;
+//  - save -> restore -> save reproduces the host bytes exactly (both ranks);
+//  - a restore ending inside a page (1690 tokens, tail recomputes the rest of that page) and
+//    the restored prefix vs one 1760-token cold prefill are compared by rel_rms / argmax.
+int prefix_cache_paths(const std::string &model_dir) {
+    RuntimeOptions o;
+    o.model = model_dir;
+    o.token_budget = 2048;
+    o.prefill_chunk = 2048;
+    o.zero_copy_transport = true;
+    o.kv_transfer_pages = 32;
+    TensorParallelModel model(o);
+    std::mt19937 rng(11);
+    const size_t prefix = 1700, tail = 60;
+    std::vector<int> full(prefix + tail);
+    for (auto &t : full)
+        t = int(rng() % 32000) + 100;
+    const std::vector<int> head(full.begin(), full.begin() + std::ptrdiff_t(prefix));
+    auto argmax = [](const std::vector<float> &x) {
+        return size_t(std::max_element(x.begin(), x.end()) - x.begin());
+    };
+    auto rel = [](const std::vector<float> &a, const std::vector<float> &b) -> double {
+        double se = 0, sr = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!std::isfinite(a[i]))
+                return INFINITY;
+            se += double(a[i] - b[i]) * double(a[i] - b[i]);
+            sr += double(b[i]) * double(b[i]);
+        }
+        return std::sqrt(se / sr);
+    };
+    // Runs a request to completion (max_new 1); returns the sampled logits ([rank0 | rank1]).
+    auto run = [&](Scheduler &s, uint64_t id) {
+        std::vector<float> last;
+        while (!s.request(id).done) {
+            auto st = s.schedule();
+            if (st.requests.empty())
+                throw std::runtime_error("Nothing scheduled");
+            auto lg = model.forward(make_inference_batch(s, st));
+            for (const auto &r : st.requests)
+                if (r.sample) {
+                    last.assign(lg.begin(), lg.end());
+                    s.complete(r, int(argmax(last)));
+                } else
+                    s.complete(r, -1);
+        }
+        return last;
+    };
+    int failures = 0;
+    auto check = [&](bool ok, const std::string &what) {
+        std::cout << (ok ? "PASS " : "FAIL ") << what << '\n';
+        failures += !ok;
+    };
+    const int pages = model.cache_pages();
+    // A: cold prefill, steps of 1700 + 60 tokens.
+    std::vector<float> cold_split;
+    {
+        Scheduler s(pages, 2048, prefix);
+        auto id = s.submit(full, 1);
+        cold_split = run(s, id);
+        s.erase(id);
+    }
+    // D: cold prefill in one 1760-token step.
+    std::vector<float> cold_one;
+    {
+        Scheduler s(pages, 2048, 2048);
+        auto id = s.submit(full, 1);
+        cold_one = run(s, id);
+        s.erase(id);
+    }
+    Scheduler s(pages, 2048, 2048);
+    s.set_retain_finished(true);
+    auto first = s.submit(head, 1);
+    run(s, first);
+    auto saved_pages = s.take_pages(first);
+    s.erase(first);
+    const size_t n = saved_pages.size();
+    check(n == (prefix + 15) / 16, "prompt pages " + std::to_string(n));
+    model.kv_host_reserve(2 * n);
+    std::vector<int> host(n), host2(n);
+    std::iota(host.begin(), host.end(), 0);
+    std::iota(host2.begin(), host2.end(), int(n));
+    auto timed = [&](uint64_t t, const char *what) {
+        model.kv_wait(t);
+        std::array<float, 2> ms{};
+        if (!model.kv_poll(t, &ms))
+            throw std::runtime_error("KV transfer not complete after wait");
+        const double gb = double(n) * double(model.kv_page_bytes()) / 1e9;
+        std::cout << what << ": " << n << " pages, " << gb << " GB per GPU, rank0 " << ms[0]
+                  << " ms (" << gb / (ms[0] / 1e3) << " GB/s), rank1 " << ms[1] << " ms ("
+                  << gb / (ms[1] / 1e3) << " GB/s)\n";
+    };
+    timed(model.kv_save(saved_pages, host), "save");
+    s.release_pages(saved_pages);
+    std::vector<int> spacer;
+    s.allocate_pages(spacer, 50 * 16); // shift the free list so the restore lands elsewhere
+    auto restore_into = [&](uint64_t id, size_t tokens) {
+        s.wait_restore(id);
+        std::vector<int> table;
+        if (!s.allocate_pages(table, tokens))
+            throw std::runtime_error("No pages for restore");
+        std::reverse(table.begin(), table.end()); // any page permutation must work
+        std::vector<int> src(host.begin(), host.begin() + std::ptrdiff_t(table.size()));
+        auto t = model.kv_restore(src, table);
+        timed(t, "restore");
+        return table;
+    };
+    // B: restored 1700-token prefix + 60-token tail.
+    auto b = s.submit(full, 1);
+    auto table = restore_into(b, prefix);
+    bool moved = false;
+    for (size_t k = 0; k < table.size(); ++k)
+        moved |= table[k] != saved_pages[k];
+    check(moved, "restore targets different physical pages");
+    {
+        model.kv_wait(model.kv_save(table, host2));
+        size_t mismatched = 0;
+        for (int rank = 0; rank < 2; ++rank)
+            for (size_t k = 0; k < n; ++k) {
+                auto x = model.kv_host_page(rank, host[k]), y = model.kv_host_page(rank, host2[k]);
+                mismatched += std::memcmp(x.data(), y.data(), x.size()) != 0;
+            }
+        check(mismatched == 0, "save -> restore -> save reproduces every host page byte for byte "
+                               "(both ranks), mismatched pages=" + std::to_string(mismatched));
+    }
+    s.begin_restore(b, table);
+    s.finish_restore(b, prefix);
+    auto restored = run(s, b);
+    {
+        auto p = s.take_pages(b);
+        s.erase(b);
+        s.release_pages(p);
+    }
+    check(restored == cold_split,
+          "restored prefix + tail logits bit-identical to cold prefill with the same step split");
+    // C: restore ending inside a page: 1690 tokens (106 pages); the tail step recomputes
+    // positions 1690.. of the last restored page.
+    auto c = s.submit(full, 1);
+    auto table_c = restore_into(c, prefix - 10);
+    s.begin_restore(c, table_c);
+    s.finish_restore(c, prefix - 10);
+    auto partial = run(s, c);
+    {
+        auto p = s.take_pages(c);
+        s.erase(c);
+        s.release_pages(p);
+    }
+    const double ec = rel(partial, cold_split);
+    check(ec < 1e-1 && argmax(partial) == argmax(cold_split),
+          "restore of 1690 tokens (partial page) + 70-token tail vs cold rel_rms=" +
+              std::to_string(ec) + " argmax " + std::to_string(argmax(partial)) + "/" +
+              std::to_string(argmax(cold_split)));
+    const double ed = rel(restored, cold_one);
+    check(ed < 1e-1 && argmax(restored) == argmax(cold_one),
+          "restored prefix + 60-token tail vs one 1760-token cold prefill rel_rms=" +
+              std::to_string(ed) + " argmax " + std::to_string(argmax(restored)) + "/" +
+              std::to_string(argmax(cold_one)));
+    const double es = rel(cold_split, cold_one);
+    std::cout << "reference: cold 1700+60 split vs cold single step rel_rms=" << es << '\n';
+    s.release_pages(spacer);
+    check(s.free_pages() == size_t(pages), "no pages leaked");
+    std::cout << (failures ? "PREFIX CACHE TESTS FAILED" : "PREFIX CACHE TESTS PASSED") << '\n';
+    return failures ? 1 : 0;
+}
 } // namespace
 int main(int argc, char **argv) {
     try {
         if (argc == 3 && std::string(argv[2]) == "prefill")
             return prefill_paths(argv[1]);
+        if (argc == 3 && std::string(argv[2]) == "prefix")
+            return prefix_cache_paths(argv[1]);
         if (argc != 2) {
-            std::cerr << "Usage: behemoth_model_tests MODEL_DIRECTORY [prefill]\n";
+            std::cerr << "Usage: behemoth_model_tests MODEL_DIRECTORY [prefill|prefix]\n";
             return 2;
         }
         RuntimeOptions o;

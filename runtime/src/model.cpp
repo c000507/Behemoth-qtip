@@ -4,6 +4,7 @@
 #include "behemoth/worker.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -14,7 +15,9 @@
 #include <mutex>
 #include <rccl/rccl.h>
 #include <sstream>
+#include <sys/syscall.h>
 #include <thread>
+#include <unistd.h>
 
 namespace behemoth {
 namespace {
@@ -531,6 +534,14 @@ struct Shard {
     bool scratch_busy = false;
     int active_micro_batches = 1;
     size_t sample_capacity = 0;
+    // Prefix-cache KV page transfers (PREFIX_CACHE_REPORT.md): pack/unpack kernels on kv_stream,
+    // copy-engine transfers on kv_copy_stream, ping-pong between two device staging buffers.
+    // kv_ready[b]: staging b holds data for its consumer; kv_free[b]: staging b may be rewritten.
+    int kv_chunk = 0, kv_parity = 0;
+    std::array<DeviceBuffer<uint8_t>, 2> kv_staging;
+    std::array<hipEvent_t, 2> kv_ready{}, kv_free{};
+    hipStream_t kv_stream{}, kv_copy_stream{};
+    DeviceBuffer<KvLayerPointers> kv_layers;
     explicit Shard(int id, int r, Checkpoint &checkpoint, const RuntimeOptions &options)
         : device(id), rank(r) {
         HIP_CHECK(hipSetDevice(device));
@@ -683,6 +694,98 @@ struct Shard {
         for (auto e : {ev_decoded, ev_mb_start})
             if (e)
                 (void)hipEventDestroy(e);
+        for (auto st : {kv_stream, kv_copy_stream})
+            if (st) {
+                (void)hipStreamSynchronize(st);
+                (void)hipStreamDestroy(st);
+            }
+        for (int b = 0; b < 2; ++b)
+            for (auto e : {kv_ready[size_t(b)], kv_free[size_t(b)]})
+                if (e)
+                    (void)hipEventDestroy(e);
+    }
+    static size_t kv_page_bytes() {
+        return kv_layer_page_bytes * 88;
+    }
+    // Staging for prefix-cache transfers; called before the KV pool is sized.
+    void kv_init(int pages) {
+        HIP_CHECK(hipSetDevice(device));
+        kv_chunk = std::min(pages, kv_transfer_max_pages);
+        HIP_CHECK(hipStreamCreateWithFlags(&kv_stream, hipStreamNonBlocking));
+        HIP_CHECK(hipStreamCreateWithFlags(&kv_copy_stream, hipStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            kv_staging[size_t(b)].resize(size_t(kv_chunk) * kv_page_bytes());
+            HIP_CHECK(hipEventCreateWithFlags(&kv_ready[size_t(b)], hipEventDisableTiming));
+            HIP_CHECK(hipEventCreateWithFlags(&kv_free[size_t(b)], hipEventDisableTiming));
+            HIP_CHECK(hipEventRecord(kv_free[size_t(b)], kv_stream));
+        }
+    }
+    // Device table of the final cache allocation's per-layer pointers.
+    void kv_bind() {
+        if (!kv_chunk)
+            return;
+        HIP_CHECK(hipSetDevice(device));
+        std::vector<KvLayerPointers> table;
+        for (auto &l : layers)
+            table.push_back({l.cache_k.data(), l.cache_v.data(), l.k_scale.data(), l.v_scale.data()});
+        kv_layers.upload(table);
+    }
+    // Enqueues one transfer; `host_page(i)` is the pinned address of host page index i.
+    template <class HostPage>
+    void kv_issue(bool save, std::span<const int> gpu, std::span<const int> host,
+                  HostPage host_page, hipEvent_t start, hipEvent_t done) {
+        HIP_CHECK(hipSetDevice(device));
+        const size_t pb = kv_page_bytes(), n = gpu.size();
+        hipStream_t first = save ? kv_stream : kv_copy_stream;
+        for (size_t c0 = 0; c0 < n; c0 += size_t(kv_chunk)) {
+            const size_t count = std::min(n - c0, size_t(kv_chunk));
+            const size_t b = size_t(kv_parity);
+            kv_parity ^= 1;
+            KvPageList list;
+            list.count = int(count);
+            for (size_t i = 0; i < count; ++i)
+                list.ids[i] = gpu[c0 + i];
+            uint8_t *staging = kv_staging[b].data();
+            auto copies = [&](hipStream_t s) {
+                // runs of consecutive host pages inside one arena block -> one copy each
+                for (size_t i = 0; i < count;) {
+                    size_t j = i + 1;
+                    while (j < count && host[c0 + j] == host[c0 + j - 1] + 1 &&
+                           host_page(host[c0 + j]) == host_page(host[c0 + i]) + (j - i) * pb)
+                        ++j;
+                    std::byte *h = host_page(host[c0 + i]);
+                    if (save)
+                        HIP_CHECK(hipMemcpyAsync(h, staging + i * pb, (j - i) * pb,
+                                                 hipMemcpyDeviceToHost, s));
+                    else
+                        HIP_CHECK(hipMemcpyAsync(staging + i * pb, h, (j - i) * pb,
+                                                 hipMemcpyHostToDevice, s));
+                    i = j;
+                }
+            };
+            if (save) {
+                HIP_CHECK(hipStreamWaitEvent(kv_stream, kv_free[b], 0));
+                if (!c0)
+                    HIP_CHECK(hipEventRecord(start, first));
+                kv_pack_pages(kv_layers.data(), 88, list, staging, false, kv_stream);
+                HIP_CHECK(hipEventRecord(kv_ready[b], kv_stream));
+                HIP_CHECK(hipStreamWaitEvent(kv_copy_stream, kv_ready[b], 0));
+                copies(kv_copy_stream);
+                HIP_CHECK(hipEventRecord(kv_free[b], kv_copy_stream));
+            } else {
+                HIP_CHECK(hipStreamWaitEvent(kv_copy_stream, kv_free[b], 0));
+                if (!c0)
+                    HIP_CHECK(hipEventRecord(start, first));
+                copies(kv_copy_stream);
+                HIP_CHECK(hipEventRecord(kv_ready[b], kv_copy_stream));
+                HIP_CHECK(hipStreamWaitEvent(kv_stream, kv_ready[b], 0));
+                kv_pack_pages(kv_layers.data(), 88, list, staging, true, kv_stream);
+                HIP_CHECK(hipEventRecord(kv_free[b], kv_stream));
+            }
+        }
+        if (!n)
+            HIP_CHECK(hipEventRecord(start, first));
+        HIP_CHECK(hipEventRecord(done, save ? kv_copy_stream : kv_stream));
     }
     void reserve(size_t rows) {
         if (qtip) {
@@ -1430,9 +1533,43 @@ struct TensorParallelModel::Impl {
     // vector, blocking pageable D2H and rank-interleave copy.
     float *logits_host = nullptr;
     size_t logits_capacity = 0;
+    // Prefix-cache transfers: pinned host arena (per rank, 64-page blocks on the GPU's NUMA
+    // node), in-flight transfer events (timing-enabled, recycled).
+    static constexpr size_t kv_block_pages = 64;
+    mutable std::mutex kv_mutex;
+    std::mutex kv_alloc_mutex; // serialises arena growth (allocation runs without kv_mutex)
+    std::array<std::vector<std::byte *>, 2> kv_blocks;
+    size_t kv_arena_pages = 0;
+    struct KvTransfer {
+        std::array<hipEvent_t, 2> start{}, done{};
+    };
+    std::map<uint64_t, KvTransfer> kv_transfers;
+    std::vector<KvTransfer> kv_event_pool;
+    uint64_t kv_next = 1;
+    std::byte *kv_host_page(int rank, int page) const {
+        return kv_blocks[size_t(rank)][size_t(page) / kv_block_pages] +
+               (size_t(page) % kv_block_pages) * Shard::kv_page_bytes();
+    }
     ~Impl() {
         for (auto &worker : workers)
             worker.reset();
+        for (auto &shard : shards)
+            if (shard && shard->kv_chunk) {
+                (void)hipSetDevice(shard->device);
+                (void)hipStreamSynchronize(shard->kv_stream);
+                (void)hipStreamSynchronize(shard->kv_copy_stream);
+            }
+        for (auto &blocks : kv_blocks)
+            for (auto *b : blocks)
+                (void)hipHostFree(b);
+        for (auto &[id, t] : kv_transfers) {
+            (void)id;
+            kv_event_pool.push_back(t);
+        }
+        for (auto &t : kv_event_pool)
+            for (auto e : {t.start[0], t.start[1], t.done[0], t.done[1]})
+                if (e)
+                    (void)hipEventDestroy(e);
         if (!aborted)
             for (auto c : comm)
                 if (c)
@@ -1601,10 +1738,15 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
                       << " s\n";
         }
     }
+    if (options.kv_transfer_pages > 0)
+        for (auto &shard : impl_->shards)
+            shard->kv_init(options.kv_transfer_pages);
     impl_->pages = std::min(impl_->shards[0]->page_capacity(options.memory_fraction),
                             impl_->shards[1]->page_capacity(options.memory_fraction));
-    for (auto &shard : impl_->shards)
+    for (auto &shard : impl_->shards) {
         shard->allocate_cache(impl_->pages);
+        shard->kv_bind();
+    }
     impl_->logits_capacity = sampled_capacity(options) * 32768;
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->logits_host),
                             impl_->logits_capacity * sizeof(float), hipHostMallocPortable));
@@ -1782,6 +1924,156 @@ std::span<const float> TensorParallelModel::forward(const InferenceBatch &batch)
     impl_->last_query_rows = int(batch.tokens.size());
     impl_->last_sample_rows = int(n);
     return result;
+}
+namespace {
+int device_numa_node(int device) {
+    char bus[64]{};
+    if (hipDeviceGetPCIBusId(bus, sizeof(bus), device) != hipSuccess)
+        return -1;
+    std::string id(bus);
+    for (auto &c : id)
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+    std::ifstream f(std::filesystem::path("/sys/bus/pci/devices") / id / "numa_node");
+    int node = -1;
+    f >> node;
+    return node;
+}
+} // namespace
+size_t TensorParallelModel::kv_page_bytes() const {
+    return Shard::kv_page_bytes();
+}
+size_t TensorParallelModel::kv_host_bytes() const {
+    std::lock_guard lock(impl_->kv_mutex);
+    return impl_->kv_arena_pages * Shard::kv_page_bytes() * 2;
+}
+std::span<const std::byte> TensorParallelModel::kv_host_page(int rank, int page) const {
+    std::lock_guard lock(impl_->kv_mutex);
+    if (rank < 0 || rank > 1 || page < 0 || size_t(page) >= impl_->kv_arena_pages)
+        throw std::out_of_range("KV host page outside the arena");
+    return {impl_->kv_host_page(rank, page), Shard::kv_page_bytes()};
+}
+size_t TensorParallelModel::kv_host_pages() const {
+    std::lock_guard lock(impl_->kv_mutex);
+    return impl_->kv_arena_pages;
+}
+void TensorParallelModel::kv_host_reserve(size_t pages) {
+    std::lock_guard alloc_lock(impl_->kv_alloc_mutex);
+    static const bool numa = [] {
+        const char *v = std::getenv("BEHEMOTH_KV_NUMA");
+        return !v || std::atoi(v) != 0;
+    }();
+    for (;;) {
+        {
+            std::lock_guard lock(impl_->kv_mutex);
+            if (impl_->kv_arena_pages >= pages)
+                return;
+        }
+        const size_t bytes = Impl::kv_block_pages * Shard::kv_page_bytes();
+        std::array<std::byte *, 2> block{};
+        try {
+            for (int rank = 0; rank < 2; ++rank) {
+                const int device = impl_->shards[size_t(rank)]->device;
+                HIP_CHECK(hipSetDevice(device));
+                // Bind this thread's allocations to the GPU's NUMA node for the allocation
+                // (hipHostMallocNumaUser follows the calling thread's memory policy).
+                const int node = numa ? device_numa_node(device) : -1;
+                unsigned long mask = node >= 0 && node < 64 ? 1UL << node : 0;
+                const bool bound =
+                    mask && syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, &mask, 65UL) == 0;
+                void *p = nullptr;
+                hipError_t e = hipHostMalloc(
+                    &p, bytes, hipHostMallocPortable | (bound ? hipHostMallocNumaUser : 0));
+                if (bound)
+                    (void)syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, nullptr, 0UL);
+                HIP_CHECK(e);
+                block[size_t(rank)] = static_cast<std::byte *>(p);
+            }
+        } catch (...) {
+            for (auto *b : block)
+                if (b)
+                    (void)hipHostFree(b);
+            throw;
+        }
+        std::lock_guard lock(impl_->kv_mutex);
+        for (int rank = 0; rank < 2; ++rank)
+            impl_->kv_blocks[size_t(rank)].push_back(block[size_t(rank)]);
+        impl_->kv_arena_pages += Impl::kv_block_pages;
+    }
+}
+uint64_t TensorParallelModel::kv_start(bool save, std::span<const int> gpu,
+                                       std::span<const int> host) {
+    auto &impl = *impl_;
+    const int pages = impl.pages;
+    std::lock_guard lock(impl.kv_mutex);
+    if (!impl.shards[0]->kv_chunk)
+        throw std::logic_error("KV transfers need RuntimeOptions::kv_transfer_pages");
+    if (gpu.size() != host.size())
+        throw std::invalid_argument("KV transfer page lists differ in length");
+    for (size_t i = 0; i < gpu.size(); ++i)
+        if (gpu[i] < 0 || gpu[i] >= pages || host[i] < 0 || size_t(host[i]) >= impl.kv_arena_pages)
+            throw std::out_of_range("KV transfer page outside the pool or arena");
+    Impl::KvTransfer t;
+    if (!impl.kv_event_pool.empty()) {
+        t = impl.kv_event_pool.back();
+        impl.kv_event_pool.pop_back();
+    } else
+        for (int rank = 0; rank < 2; ++rank) {
+            HIP_CHECK(hipSetDevice(impl.shards[size_t(rank)]->device));
+            HIP_CHECK(hipEventCreate(&t.start[size_t(rank)]));
+            HIP_CHECK(hipEventCreate(&t.done[size_t(rank)]));
+        }
+    for (int rank = 0; rank < 2; ++rank)
+        impl.shards[size_t(rank)]->kv_issue(
+            save, gpu, host, [&](int page) { return impl.kv_host_page(rank, page); },
+            t.start[size_t(rank)], t.done[size_t(rank)]);
+    const uint64_t id = impl.kv_next++;
+    impl.kv_transfers.emplace(id, t);
+    return id;
+}
+uint64_t TensorParallelModel::kv_save(std::span<const int> gpu_pages,
+                                      std::span<const int> host_pages) {
+    return kv_start(true, gpu_pages, host_pages);
+}
+uint64_t TensorParallelModel::kv_restore(std::span<const int> host_pages,
+                                         std::span<const int> gpu_pages) {
+    return kv_start(false, gpu_pages, host_pages);
+}
+bool TensorParallelModel::kv_poll(uint64_t id, std::array<float, 2> *gpu_ms) {
+    std::lock_guard lock(impl_->kv_mutex);
+    auto it = impl_->kv_transfers.find(id);
+    if (it == impl_->kv_transfers.end())
+        throw std::invalid_argument("Unknown KV transfer");
+    auto &t = it->second;
+    for (int rank = 0; rank < 2; ++rank) {
+        HIP_CHECK(hipSetDevice(impl_->shards[size_t(rank)]->device));
+        hipError_t e = hipEventQuery(t.done[size_t(rank)]);
+        if (e == hipErrorNotReady)
+            return false;
+        HIP_CHECK(e);
+    }
+    if (gpu_ms)
+        for (int rank = 0; rank < 2; ++rank) {
+            HIP_CHECK(hipSetDevice(impl_->shards[size_t(rank)]->device));
+            HIP_CHECK(hipEventElapsedTime(&(*gpu_ms)[size_t(rank)], t.start[size_t(rank)],
+                                          t.done[size_t(rank)]));
+        }
+    impl_->kv_event_pool.push_back(t);
+    impl_->kv_transfers.erase(it);
+    return true;
+}
+void TensorParallelModel::kv_wait(uint64_t id) {
+    std::array<hipEvent_t, 2> done{};
+    {
+        std::lock_guard lock(impl_->kv_mutex);
+        auto it = impl_->kv_transfers.find(id);
+        if (it == impl_->kv_transfers.end())
+            throw std::invalid_argument("Unknown KV transfer");
+        done = it->second.done;
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        HIP_CHECK(hipSetDevice(impl_->shards[size_t(rank)]->device));
+        HIP_CHECK(hipEventSynchronize(done[size_t(rank)]));
+    }
 }
 InferenceBatch make_inference_batch(const Scheduler &scheduler, const ScheduledBatch &batch) {
     InferenceBatch input;

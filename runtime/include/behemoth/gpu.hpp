@@ -168,6 +168,23 @@ void quantize_rows(const BFloat16 *, uint8_t *, float *scales, int rows, int wid
 void fp8_conversion_probe(const float *, uint8_t *, int count, hipStream_t);
 void verify_device();
 
+// Prefix-cache KV page transfers (kv_transfer.hip, PREFIX_CACHE_REPORT.md). One rank's KV page
+// of one layer: K (4 heads x 16 tokens x 128 fp8), V, then the 64 FP32 K and V scales.
+struct KvLayerPointers {
+    uint8_t *k{}, *v{};
+    float *k_scale{}, *v_scale{};
+};
+inline constexpr size_t kv_layer_page_bytes = 2 * 4 * 16 * 128 + 2 * 4 * 16 * sizeof(float);
+inline constexpr int kv_transfer_max_pages = 64;
+struct KvPageList {
+    int count = 0;
+    int ids[kv_transfer_max_pages]{};
+};
+// Packs the listed pages of all layers into `staging` (page-major: page i occupies
+// [i * layers * kv_layer_page_bytes, (i + 1) * ...), layer-major inside), or the reverse.
+void kv_pack_pages(const KvLayerPointers *layers, int layer_count, const KvPageList &pages,
+                   uint8_t *staging, bool unpack, hipStream_t);
+
 struct GpuProjection {
     uint64_t tuning_identity = next_projection_identity();
     int in = 0, out = 0;

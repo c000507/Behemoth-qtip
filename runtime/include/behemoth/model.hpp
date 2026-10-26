@@ -1,5 +1,6 @@
 #pragma once
 #include "attention.hpp"
+#include "prefix_cache.hpp"
 #include "scheduler.hpp"
 #include <array>
 #include <filesystem>
@@ -36,11 +37,18 @@ struct RuntimeOptions {
     std::string projection_mode = "auto";
     std::string projection_search = "conservative";
     std::string code_layout = "group-major";
+    // Prefix cache (PREFIX_CACHE_REPORT.md): device staging pages per rank and buffer for KV
+    // page save/restore (two buffers per rank, allocated before the KV pool is sized; 0: no
+    // transfers). The engine sets it when the prefix cache is enabled.
+    int kv_transfer_pages = 0;
+    PrefixCacheOptions prefix_cache{0, 0, 64, true}; // slots 0: disabled (server default 10)
+    double prefix_cache_gb = 64;                     // host memory cap (both ranks), 1e9 bytes
 };
 void tensor_parallel_smoke(std::array<int, 2> devices = {0, 1}, bool rccl_shared_memory = false);
 class TensorParallelModel {
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    uint64_t kv_start(bool save, std::span<const int> gpu, std::span<const int> host);
 
   public:
     explicit TensorParallelModel(const RuntimeOptions &);
@@ -54,6 +62,26 @@ class TensorParallelModel {
     // sample_logits overload; no per-step host staging vectors exist.
     std::span<const float> forward(const InferenceBatch &);
     std::vector<BFloat16> block_for_validation(int layer, std::span<const BFloat16> input);
+
+    // Prefix-cache KV transfers (requires kv_transfer_pages > 0). A host page index names one
+    // 16-token KV page of both ranks (kv_page_bytes() each) in a pinned, NUMA-local arena that
+    // grows in 64-page blocks and is reused, never freed before shutdown.
+    size_t kv_page_bytes() const;
+    // Grows the arena to >= pages (allocates outside the transfer lock, so copies can be issued
+    // meanwhile; ~50 ms per 64-page block per rank here). Thread-safe.
+    void kv_host_reserve(size_t pages);
+    size_t kv_host_pages() const; // host pages backed by the arena
+    size_t kv_host_bytes() const; // pinned bytes allocated, both ranks
+    std::span<const std::byte> kv_host_page(int rank, int page) const;
+    // Asynchronous copies on dedicated streams (pack/unpack kernels + copy engines through two
+    // device staging buffers per rank); they run concurrently with forward() and are executed
+    // in issue order. The caller keeps the GPU pages out of every batch until complete.
+    uint64_t kv_save(std::span<const int> gpu_pages, std::span<const int> host_pages);
+    uint64_t kv_restore(std::span<const int> host_pages, std::span<const int> gpu_pages);
+    // True once complete (the id is then forgotten); gpu_ms: per-rank GPU time of the copy.
+    bool kv_poll(uint64_t transfer, std::array<float, 2> *gpu_ms = nullptr);
+    // Blocks until the transfer is complete (kv_poll then returns true).
+    void kv_wait(uint64_t transfer);
 };
 InferenceBatch make_inference_batch(const Scheduler &, const ScheduledBatch &);
 // QTIP prefill steps of at least `rows` rows run as two overlapped micro-batches (dense path,
