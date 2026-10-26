@@ -1,6 +1,9 @@
 # Plan: GM-CoT calibration + streaming fine-tune for QTIP Behemoth
 
-Status: agreed 2026-10-26, not started (phases 1-4 wait on the QTIP runtime support in `behemoth_server`).
+Status: agreed 2026-10-26. Phase 3's portable trainer and CPU verification are implemented;
+The trainer now has a native adapter to runtime/ QTIP projection kernels and shared SU groups.
+Real-layer/GPU verification, full-logit parity and phases 1/2/4 remain pending.
+See [FINE_TUNING.md](FINE_TUNING.md) for commands, backend contract and current limitations.
 Hardware: 192.168.0.229, 2x Radeon AI PRO R9700 (gfx1201, 32 GB), 377 GB RAM, ROCm 10.1, GPUs at DPM level 1.
 Time and memory numbers are estimates until the pilot measures them.
 
@@ -81,7 +84,9 @@ Output: `Behemoth-R1-123B-v2-QTIP-2bit-gmcot`.
 
 ### Trainable parameters (no LoRA)
 
-- Per linear: SU and SV (the RHT sign vectors, relaxed to real values), and Wscale.
+- SU (RHT input signs, relaxed): shared by q/k/v and by gate/up, separate for o and down,
+  as required by the runtime's stacked projections. These groups are tied during optimization.
+- Per linear: SV (relaxed output signs) and Wscale.
 - RMSNorm weights (input and post-attention per layer, final norm).
 - Frozen: trellis codes, LUT, embeddings, lm_head.
 - Total ~25M parameters. Exported in the same QTIP checkpoint format (only these tensors change).

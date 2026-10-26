@@ -1,0 +1,7 @@
+# Install a PyTorch build matching the ROCm runtime separately. CPU works for verification.
+torch>=2.5
+numpy>=1.26
+safetensors>=0.4.5
+transformers>=4.45
+pytest>=8
+cmake>=3.25

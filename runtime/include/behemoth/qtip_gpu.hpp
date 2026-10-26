@@ -7,6 +7,11 @@
 #include "qtip.hpp"
 
 namespace behemoth::qtip {
+// Non-owning view for externally managed/double-buffered device storage.
+struct LinearView {
+    const uint16_t *trellis = nullptr;
+    int in = 0, rows = 0;
+};
 // One TP shard of a linear (or several linears stacked along the output dimension): whole
 // 32-row block-rows of the kernel-layout trellis, contiguous in device memory.
 struct GpuLinear {
@@ -17,6 +22,7 @@ struct GpuLinear {
     size_t bytes() const {
         return trellis.bytes();
     }
+    LinearView view() const { return {trellis.data(), in, rows}; }
 };
 // Device codebook: 1024 sign-folded bf16x2 entries (Codebook::bf16x2).
 struct GpuCodebook {
@@ -37,9 +43,12 @@ struct MatmulOptions {
 // them (reduce_publish). partial must hold slices * rows * lin.rows floats: query with
 // matmul_slices() first.
 int matmul_slices(const GpuLinear &, int rows, const MatmulOptions & = {});
+int matmul_slices(LinearView, int rows, const MatmulOptions & = {});
 // Occupancy / resources of the matmul kernels on the current device (bench report).
 nlohmann::json kernel_info();
 void matmul(const GpuLinear &, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
+            float *partial, int slices, hipStream_t, const MatmulOptions & = {});
+void matmul(LinearView, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
             float *partial, int slices, hipStream_t, const MatmulOptions & = {});
 // Sum `slices` partial slices of n elements (slice stride n): result fp32 or bf16 into `local`
 // and, when host is non-null, also into the pinned host exchange buffer `host` followed by the
@@ -89,6 +98,7 @@ void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const fl
 void hadamard_rows(const float *x, int n, int rows, bool transpose, float *y, hipStream_t);
 // Dense decode for tests: w[rows][in] = bf16 LUT values of the shard (row-major, as bf16).
 void decode_dense(const GpuLinear &, const uint32_t *lut, BFloat16 *w, hipStream_t);
+void decode_dense(LinearView, const uint32_t *lut, BFloat16 *w, hipStream_t);
 // WMMA layout probe (tests): D = A * B for one 16x16x16 bf16 tile with A/B given row-major as
 // bf16 [16][16] (A: M x K, B: K x N); returns D row-major fp32.
 void wmma_probe(const BFloat16 *a, const BFloat16 *b, float *d, hipStream_t);

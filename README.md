@@ -6,7 +6,9 @@ reference code [Cornell-RelaxML/qtip](https://github.com/Cornell-RelaxML/qtip)) 
 
 Code: the paper's 2-bit HYB code. Bitshift trellis L=16, K=2 bits/weight, V=2, `quantlut_sym` with a
 2^9-entry tunable LUT, 16x16 tiles (one tail-biting trellis of 256 weights per tile), kernel (`for_kernel`) layout.
-There is no fine-tuning: each layer gets one LDLQ/Viterbi pass.
+The quantizer gives each layer one LDLQ/Viterbi pass. A separate streaming QAT
+trainer tunes continuous signs/scales and norms without LoRA; see
+[fine-tuning instructions and verification status](docs/FINE_TUNING.md).
 
 Pipeline:
 

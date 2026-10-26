@@ -754,7 +754,7 @@ void GpuLinear::upload(const std::vector<std::span<const uint16_t>> &parts, int 
     in = in_;
     rows = int(words / per) * 32;
 }
-int matmul_slices(const GpuLinear &l, int rows, const MatmulOptions &o) {
+int matmul_slices(LinearView l, int rows, const MatmulOptions &o) {
     if (o.slices > 0)
         return o.slices;
     const int block_rows = l.rows / 32, n2 = l.in / 32;
@@ -768,13 +768,16 @@ int matmul_slices(const GpuLinear &l, int rows, const MatmulOptions &o) {
         slices *= 2;
     return slices;
 }
-void matmul(const GpuLinear &l, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
+int matmul_slices(const GpuLinear &l, int rows, const MatmulOptions &o) {
+    return matmul_slices(l.view(), rows, o);
+}
+void matmul(LinearView l, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
             float *partial, int slices, hipStream_t stream, const MatmulOptions &o) {
     if (rows < 1 || l.rows % 32 || l.in % 32 || ldx % 8 || slices < 1)
         throw std::invalid_argument("QTIP matmul shape");
     const int block_rows = l.rows / 32, n2 = l.in / 32, per = (n2 + slices - 1) / slices;
     const int copies = o.copies ? o.copies : default_copies(use_wmma(rows, o));
-    const uint2 *tr = reinterpret_cast<const uint2 *>(l.trellis.data());
+    const uint2 *tr = reinterpret_cast<const uint2 *>(l.trellis);
     auto launch = [&](auto kernel, int waves, int items, auto... args) {
         const int threads = waves * 32;
         const int max_blocks = multiprocessors() * occupancy(kernel, threads, 0);
@@ -958,9 +961,16 @@ void hadamard_rows(const float *x, int n, int rows, bool transpose, float *y, hi
         throw std::invalid_argument("QTIP Hadamard size");
     HIP_CHECK(hipGetLastError());
 }
+void matmul(const GpuLinear &l, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
+            float *partial, int slices, hipStream_t stream, const MatmulOptions &o) {
+    matmul(l.view(), lut, x, ldx, rows, partial, slices, stream, o);
+}
 void decode_dense(const GpuLinear &l, const uint32_t *lut, BFloat16 *w, hipStream_t stream) {
+    decode_dense(l.view(), lut, w, stream);
+}
+void decode_dense(LinearView l, const uint32_t *lut, BFloat16 *w, hipStream_t stream) {
     decode_dense_kernel<<<dim3(unsigned(l.in / 32), unsigned(l.rows / 32)), 32, 0, stream>>>(
-        reinterpret_cast<const uint2 *>(l.trellis.data()), l.in / 32, lut,
+        reinterpret_cast<const uint2 *>(l.trellis), l.in / 32, lut,
         reinterpret_cast<uint16_t *>(w), l.in);
     HIP_CHECK(hipGetLastError());
 }

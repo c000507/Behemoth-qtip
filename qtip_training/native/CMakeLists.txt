@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.25)
+project(qtip_training_bridge LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(QTIP_TRAINING_HIP "Build the native gfx1201 training bridge" OFF)
+get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+
+# No downloads, Python headers, libtorch, server, tokenizer, or RCCL needed.
+add_library(qtip_training_host SHARED host_bridge.cpp
+  ${REPO}/runtime/src/qtip.cpp ${REPO}/runtime/src/checkpoint.cpp
+  ${REPO}/runtime/src/attention.cpp ${REPO}/runtime/src/sorted_layout.cpp)
+target_include_directories(qtip_training_host PRIVATE ${REPO}/runtime/include ${REPO}/third_party)
+find_package(OpenMP COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(qtip_training_host PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(QTIP_TRAINING_HIP)
+  set(CMAKE_HIP_ARCHITECTURES gfx1201 CACHE STRING "Runtime architecture")
+  enable_language(HIP)
+  set(CMAKE_HIP_STANDARD 20)
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+  find_package(hip REQUIRED CONFIG)
+  add_library(qtip_training_hip SHARED runtime_bridge.hip ${REPO}/runtime/src/qtip.hip)
+  target_include_directories(qtip_training_hip PRIVATE ${REPO}/runtime/include ${REPO}/third_party)
+  target_compile_options(qtip_training_hip PRIVATE -mno-wavefrontsize64)
+  target_link_libraries(qtip_training_hip PRIVATE hip::host)
+endif()

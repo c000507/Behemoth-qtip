@@ -5,10 +5,13 @@
 //   behemoth_eval MODEL topk PROMPTS_FILE [K=10] [GENERATE=32]
 //       for each prompt (separated by lines "-----", raw text after BOS): top-K next-token logits
 //       and a greedy continuation of GENERATE tokens. One JSON object per line on stdout.
+//   behemoth_eval MODEL trace REQUEST_JSON OUTPUT_JSON [CHUNK=256]
+//       exact token ids (no tokenizer/template/BOS insertion), selected-position logits.
 #include "behemoth/model.hpp"
 #include "behemoth/tokenizer.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -61,7 +64,7 @@ double log_softmax_at(const float *row, int token) {
 int main(int argc, char **argv) {
     try {
         if (argc < 4) {
-            std::cerr << "Usage: behemoth_eval MODEL ppl TEXT [MAX_TOKENS] [CHUNK] | MODEL topk PROMPTS [K] [GEN]\n";
+            std::cerr << "Usage: behemoth_eval MODEL ppl TEXT [MAX_TOKENS] [CHUNK] | MODEL topk PROMPTS [K] [GEN] | MODEL trace REQUEST_JSON OUTPUT_JSON [CHUNK]\n";
             return 2;
         }
         const std::string mode = argv[2];
@@ -69,6 +72,51 @@ int main(int argc, char **argv) {
         if (!f)
             throw std::runtime_error("Cannot read " + std::string(argv[3]));
         std::string text((std::istreambuf_iterator<char>(f)), {});
+        if (mode == "trace") {
+            if (argc < 5)
+                throw std::invalid_argument("trace requires REQUEST_JSON OUTPUT_JSON [CHUNK]");
+            const auto request = nlohmann::json::parse(text);
+            const auto tokens = request.at("tokens").get<std::vector<int>>();
+            const auto selected = request.at("logit_positions").get<std::vector<int>>();
+            const int chunk = argc > 5 ? std::stoi(argv[5]) : 256;
+            if (tokens.empty() || selected.empty() || selected.size() > 128 || chunk < 1)
+                throw std::invalid_argument("trace needs tokens, 1..128 selected positions, and positive chunk");
+            for (int token : tokens)
+                if (token < 0 || token >= 32768)
+                    throw std::invalid_argument("trace token outside vocabulary");
+            for (int position : selected)
+                if (position < 0 || size_t(position) >= tokens.size())
+                    throw std::invalid_argument("trace position outside prompt");
+            RuntimeOptions opts;
+            opts.model = argv[1];
+            opts.zero_copy_transport = true;
+            opts.memory_fraction = .85;
+            opts.token_budget = opts.prefill_chunk = size_t(chunk);
+            TensorParallelModel model(opts);
+            Session session{model};
+            std::vector<std::vector<float>> output(selected.size());
+            for (size_t start = 0; start < tokens.size(); start += size_t(chunk)) {
+                const size_t end = std::min(tokens.size(), start + size_t(chunk));
+                auto logits = session.run(std::vector<int>(tokens.begin() + std::ptrdiff_t(start),
+                                                           tokens.begin() + std::ptrdiff_t(end)));
+                for (size_t i = 0; i < selected.size(); ++i) {
+                    const size_t position = size_t(selected[i]);
+                    if (position >= start && position < end) {
+                        const auto row = logits.begin() + std::ptrdiff_t((position - start) * 32768);
+                        output[i].assign(row, row + 32768);
+                    }
+                }
+            }
+            const char *qp = std::getenv("BEHEMOTH_ATTN_QP");
+            nlohmann::json result = {{"model", argv[1]}, {"tokens", tokens},
+                {"logit_positions", selected}, {"logits", output}, {"chunk", chunk},
+                {"attention_qp", qp && std::string(qp) == "bf16" ? "bf16" : "fp8"}};
+            std::ofstream destination(argv[4]);
+            destination << result.dump() << '\n';
+            if (!destination) throw std::runtime_error("cannot write trace output");
+            std::cout << nlohmann::json({{"trace", argv[4]}, {"positions", selected.size()}}).dump() << '\n';
+            return 0;
+        }
         Tokenizer tokenizer(argv[1]);
         RuntimeOptions options;
         options.model = argv[1];
