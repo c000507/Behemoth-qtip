@@ -1,5 +1,7 @@
 #include "behemoth/sampling.hpp"
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <numeric>
 
 namespace behemoth {
@@ -52,6 +54,41 @@ std::pair<std::string, size_t> utf8_prefix(std::string_view x, bool final) {
 // must not allocate (PERF_ROUND3 item 2).
 thread_local std::vector<size_t> order_buffer;
 thread_local std::vector<double> probability_buffer;
+thread_local std::vector<uint64_t> key_buffer, key_scratch;
+// The exact full order of the sampler (value descending, index ascending; -0 == +0 ties by
+// index) as a radix sort of 64-bit keys: descending-orderable float bits << 32 | index. Same
+// permutation as std::sort with `descending`, ~10x faster than the indirect comparator sort on
+// the full 32768-entry vocabulary (PREFILL_SCHED_REPORT.md).
+template <class Value> void full_order(size_t n, Value value, std::vector<size_t> &order) {
+    auto &keys = key_buffer;
+    auto &tmp = key_scratch;
+    keys.resize(n);
+    tmp.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        float v = value(i);
+        if (v == 0)
+            v = 0; // -0 == +0 in the comparator: same key, tie broken by index
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        const uint32_t ascending = (u & 0x80000000U) ? ~u : (u | 0x80000000U);
+        keys[i] = uint64_t(~ascending) << 32 | uint64_t(i);
+    }
+    for (int shift = 0; shift < 64; shift += 8) {
+        std::array<uint32_t, 257> count{};
+        for (auto k : keys)
+            ++count[size_t((k >> shift) & 0xffU) + 1];
+        if (count[size_t((keys[0] >> shift) & 0xffU) + 1] == n)
+            continue; // every key shares this digit
+        for (size_t d = 0; d < 256; ++d)
+            count[d + 1] += count[d];
+        for (auto k : keys)
+            tmp[count[size_t((k >> shift) & 0xffU)]++] = k;
+        keys.swap(tmp);
+    }
+    order.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        order[i] = size_t(keys[i] & 0xffffffffU);
+}
 } // namespace
 void validate_sampling(const SamplingOptions &p) {
     if (!std::isfinite(p.temperature) || p.temperature < 0 || p.top_k < 0 || p.top_k > 32768 ||
@@ -91,9 +128,9 @@ int sample_logits(std::span<const float> low, std::span<const float> high, const
         std::partial_sort(order.begin(), order.begin() + p.top_k, order.end(), descending);
         order.resize(size_t(p.top_k));
     } else {
-        // Exact path (no top-k cut): keep the full sort; the buffers are
-        // still reused and the probability math below is unchanged.
-        std::sort(order.begin(), order.end(), descending);
+        // Exact path (no top-k cut): the full order, as a radix sort (identical permutation);
+        // the probability math below is unchanged.
+        full_order(n, value, order);
     }
     auto &probabilities = probability_buffer;
     probabilities.clear();

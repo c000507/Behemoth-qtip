@@ -3,12 +3,88 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <thread>
 
 namespace behemoth {
+// Small persistent pool for per-request host sampling (a full-vocabulary sort per request at
+// temperature > 0): run() executes the jobs on the pool and the calling thread and returns when
+// all are done. Exceptions are rethrown on the caller.
+class SamplerPool {
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable work_, done_;
+    const std::vector<std::function<void()>> *jobs_ = nullptr;
+    size_t next_ = 0, finished_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+    std::exception_ptr error_;
+    void drain(std::unique_lock<std::mutex> &lock) {
+        while (jobs_ && next_ < jobs_->size()) {
+            const size_t i = next_++;
+            const auto *jobs = jobs_;
+            lock.unlock();
+            std::exception_ptr e;
+            try {
+                (*jobs)[i]();
+            } catch (...) {
+                e = std::current_exception();
+            }
+            lock.lock();
+            if (e && !error_)
+                error_ = e;
+            if (++finished_ == jobs->size())
+                done_.notify_all();
+        }
+    }
+
+  public:
+    explicit SamplerPool(unsigned n) {
+        for (unsigned t = 0; t < n; ++t)
+            threads_.emplace_back([this] {
+                std::unique_lock lock(mutex_);
+                uint64_t seen = 0;
+                for (;;) {
+                    work_.wait(lock, [&] { return stop_ || generation_ != seen; });
+                    if (stop_)
+                        return;
+                    seen = generation_;
+                    drain(lock);
+                }
+            });
+    }
+    ~SamplerPool() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        work_.notify_all();
+        for (auto &t : threads_)
+            t.join();
+    }
+    void run(const std::vector<std::function<void()>> &jobs) {
+        if (jobs.size() <= 1 || threads_.empty()) {
+            for (const auto &j : jobs)
+                j();
+            return;
+        }
+        std::unique_lock lock(mutex_);
+        jobs_ = &jobs;
+        next_ = finished_ = 0;
+        error_ = nullptr;
+        ++generation_;
+        work_.notify_all();
+        drain(lock);
+        done_.wait(lock, [&] { return finished_ == jobs.size(); });
+        jobs_ = nullptr;
+        if (error_)
+            std::rethrow_exception(error_);
+    }
+};
 struct Engine::Impl {
+    SamplerPool samplers{std::min(7U, std::max(1U, std::thread::hardware_concurrency() / 4))};
     TensorParallelModel model;
     Scheduler scheduler;
     mutable std::mutex mutex;
@@ -25,7 +101,7 @@ struct Engine::Impl {
     std::map<uint64_t, Clock::time_point> submitted, last_token;
     std::deque<double> ttft, itl;
     explicit Impl(const RuntimeOptions &o)
-        : model(o), scheduler(model.cache_pages(), o.token_budget, o.prefill_chunk),
+        : model(o), scheduler(model.cache_pages(), o.token_budget, o.prefill_chunk, o.scheduler),
           worker([this] { loop(); }) {}
     void shutdown() {
         {
@@ -98,20 +174,33 @@ struct Engine::Impl {
                     std::lock_guard lock(mutex);
                     gpu_seconds += elapsed;
                     last_profile = model.last_profile();
-                    size_t index = 0;
-                    for (const auto &request : step.requests) {
-                        const auto &r = scheduler.request(request.id);
-                        // Logits are rank-blocked; sample without an interleave copy.
-                        const size_t row = index++;
-                        int token =
-                            request.sample
-                                ? sample_logits(
-                                      std::span<const float>(logits.data() + row * 16384, 16384),
-                                      std::span<const float>(
-                                          logits.data() + sample_count * 16384 + row * 16384,
-                                          16384),
-                                      r.sampling, rng.at(request.id))
-                                : -1;
+                    // Logits are rank-blocked, one row per *sampled* request in step order
+                    // (make_inference_batch); sample without an interleave copy. Requests own
+                    // their RNGs, so sampling them in parallel gives the same tokens.
+                    std::vector<int> sampled(step.requests.size(), -1);
+                    {
+                        std::vector<std::function<void()>> jobs;
+                        size_t row = 0;
+                        for (size_t i = 0; i < step.requests.size(); ++i) {
+                            const auto &request = step.requests[i];
+                            if (!request.sample)
+                                continue;
+                            const auto *sampling = &scheduler.request(request.id).sampling;
+                            auto *generator = &rng.at(request.id);
+                            const float *low = logits.data() + row * 16384,
+                                        *high = logits.data() + sample_count * 16384 + row * 16384;
+                            ++row;
+                            jobs.push_back([&sampled, i, sampling, generator, low, high] {
+                                sampled[i] = sample_logits(std::span<const float>(low, 16384),
+                                                           std::span<const float>(high, 16384),
+                                                           *sampling, *generator);
+                            });
+                        }
+                        samplers.run(jobs);
+                    }
+                    for (size_t i = 0; i < step.requests.size(); ++i) {
+                        const auto &request = step.requests[i];
+                        const int token = sampled[i];
                         scheduler.complete(request, token, token == 2);
                         const auto &after = scheduler.request(request.id);
                         if (token >= 0) {

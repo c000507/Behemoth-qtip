@@ -29,15 +29,35 @@ struct ScheduledBatch {
     std::vector<ScheduledRequest> requests;
     size_t tokens = 0;
 };
+// Decode-first step composition (PREFILL_SCHED_REPORT.md). Decodes always enter a step first
+// (one token each). While at least one request is decoding, prefill work is limited so a long
+// prompt cannot stretch every decode step:
+//  - mixed_prefill_tokens: at most this many prefill tokens in a step that also carries decodes
+//    (0: no extra cap, i.e. the token budget / prefill chunk as before);
+//  - prefill_interval: with decodes running, only every N-th step carries prefill tokens, the
+//    others are decode-only (1: every step).
+// Without decodes, prefill uses the full token budget in prefill_chunk pieces. Queued prompts
+// prefill in arrival order. max_requests bounds the requests (and sampled rows) per step.
+struct SchedulerPolicy {
+    size_t mixed_prefill_tokens = 0;
+    size_t prefill_interval = 1;
+    size_t max_requests = 256;
+};
 class Scheduler {
     PagePool pool_;
     std::map<uint64_t, Request> requests_;
     uint64_t next_id_ = 1;
     size_t token_budget_, chunk_, cursor_ = 0;
     size_t preemptions_ = 0;
+    SchedulerPolicy policy_;
+    size_t steps_since_prefill_ = 0;
 
   public:
-    Scheduler(int pages, size_t token_budget = 1024, size_t prefill_chunk = 256);
+    Scheduler(int pages, size_t token_budget = 1024, size_t prefill_chunk = 256,
+              SchedulerPolicy policy = {});
+    const SchedulerPolicy &policy() const {
+        return policy_;
+    }
     uint64_t submit(std::span<const int> prompt, size_t max_new, SamplingOptions = {});
     void cancel(uint64_t id);
     ScheduledBatch schedule();

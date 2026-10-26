@@ -317,6 +317,18 @@ int main(int argc, char **argv) {
                 options.token_budget = std::stoul(value);
             else if (key == "--prefill-chunk")
                 options.prefill_chunk = std::stoul(value);
+            else if (key == "--mixed-prefill-tokens")
+                options.scheduler.mixed_prefill_tokens = std::stoul(value);
+            else if (key == "--prefill-interval")
+                options.scheduler.prefill_interval = std::stoul(value);
+            else if (key == "--max-batch-requests")
+                options.scheduler.max_requests = std::stoul(value);
+            else if (key == "--zero-copy-rows")
+                options.zero_copy_rows = std::stoul(value);
+            else if (key == "--qtip-dense-rows")
+                options.qtip_dense_rows = std::stoi(value);
+            else if (key == "--qtip-row-transforms")
+                options.qtip_row_transforms = std::stoi(value);
             else if (key == "--devices") {
                 auto comma = value.find(',');
                 if (comma == std::string::npos)

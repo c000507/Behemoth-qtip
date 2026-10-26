@@ -2,10 +2,12 @@
 #include <algorithm>
 
 namespace behemoth {
-Scheduler::Scheduler(int pages, size_t budget, size_t chunk)
-    : pool_(pages), token_budget_(budget), chunk_(chunk) {
+Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy policy)
+    : pool_(pages), token_budget_(budget), chunk_(chunk), policy_(policy) {
     if (!budget || !chunk || chunk > budget)
         throw std::invalid_argument("Invalid scheduler token budget/chunk");
+    if (!policy_.prefill_interval || !policy_.max_requests)
+        throw std::invalid_argument("Invalid scheduler policy");
 }
 uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, SamplingOptions sampling) {
     if (prompt.empty() || prompt.size() > 131072 || max_new > 131072 ||
@@ -71,12 +73,25 @@ ScheduledBatch Scheduler::schedule() {
         std::rotate(decode.begin(), decode.begin() + std::ptrdiff_t(cursor_ % decode.size()),
                     decode.end());
     ++cursor_;
+    // Prefill allowance of this step (decode-first policy).
+    size_t prefill_cap = token_budget_, prefill_tokens = 0;
+    if (!decode.empty() && !prefill.empty()) {
+        if (++steps_since_prefill_ < policy_.prefill_interval)
+            prefill_cap = 0;
+        else {
+            steps_since_prefill_ = 0;
+            if (policy_.mixed_prefill_tokens)
+                prefill_cap = policy_.mixed_prefill_tokens;
+        }
+    } else
+        steps_since_prefill_ = policy_.prefill_interval; // next mixed step may prefill at once
     auto append = [&](uint64_t id, bool is_decode) {
         auto &r = requests_.at(id);
-        if (r.done || r.inflight || batch.tokens == token_budget_)
+        if (r.done || r.inflight || batch.tokens == token_budget_ ||
+            batch.requests.size() >= policy_.max_requests)
             return;
         size_t count = std::min({r.history.size() - r.cached, token_budget_ - batch.tokens,
-                                 is_decode ? size_t(1) : chunk_});
+                                 is_decode ? size_t(1) : std::min(chunk_, prefill_cap - prefill_tokens)});
         if (!count)
             return;
         // Queued prefills cannot evict older work. Decode growth may reclaim newest unpinned
@@ -100,6 +115,8 @@ ScheduledBatch Scheduler::schedule() {
         }
         batch.requests.push_back({id, r.cached, count, r.cached + count == r.history.size()});
         batch.tokens += count;
+        if (!is_decode)
+            prefill_tokens += count;
         r.inflight = true;
     };
     for (auto id : decode) {
@@ -120,6 +137,7 @@ ScheduledBatch Scheduler::schedule() {
                 it->second.cached = 0;
                 ++preemptions_;
             }
+        prefill_cap = token_budget_;
         append(first->first, first->second.cached > 0 &&
                                  first->second.cached + 1 == first->second.history.size());
     }
