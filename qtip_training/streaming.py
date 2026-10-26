@@ -5,6 +5,7 @@ import torch
 
 from .kernels import cross_entropy, rmsnorm, norm_weight
 from .model import decoder_layer, SU_GROUPS
+from . import fast
 
 
 class Slots:
@@ -23,6 +24,32 @@ class Slots:
         self.inputs = [torch.empty(shape, device=device, dtype=dtype) for _ in range(2)]
         self.checkpoints = [torch.empty(shape, dtype=dtype, pin_memory=self.cuda) for _ in host.layers]
         self.saved = [torch.cuda.Event() for _ in host.layers] if self.cuda else [None] * len(host.layers)
+        self.profile = False
+        self.copy_events = []  # (kind, bytes, start, end) on the copy/offload streams when profiling
+        self.weight_bytes = sum(v.numel() * v.element_size() for v in host.layers[0].values())
+        self.checkpoint_bytes = self.inputs[0].numel() * self.inputs[0].element_size()
+
+    def _mark(self, stream):
+        if not (self.profile and self.cuda):
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    def copy_stats(self):
+        """Seconds the copy engines were busy and bytes moved, per kind, since the last call."""
+        stats = {}
+        if self.copy_events:
+            for *_, end in self.copy_events:
+                end.synchronize()
+        for kind, size, start, end in self.copy_events:
+            entry = stats.setdefault(kind, dict(seconds=0.0, gigabytes=0.0))
+            entry["seconds"] += start.elapsed_time(end) / 1e3
+            entry["gigabytes"] += size / 1e9
+        self.copy_events = []
+        for entry in stats.values():
+            entry["gb_per_s"] = entry["gigabytes"] / max(entry["seconds"], 1e-9)
+        return stats
 
     def save(self, layer, x):
         if self.cuda:
@@ -30,8 +57,11 @@ class Slots:
             produced.record(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self.offload):
                 self.offload.wait_event(produced)
+                start = self._mark(self.offload)
                 self.checkpoints[layer].copy_(x, non_blocking=True)
                 self.saved[layer].record(self.offload)
+                if start is not None:
+                    self.copy_events.append(("d2h_checkpoint", self.checkpoint_bytes, start, self._mark(self.offload)))
                 x.record_stream(self.offload)
         else:
             self.checkpoints[layer].copy_(x)
@@ -40,12 +70,18 @@ class Slots:
         with torch.cuda.stream(self.copy) if self.cuda else nullcontext():
             if self.cuda and self.used_once[slot]:
                 self.copy.wait_event(self.used[slot])
+            start = self._mark(self.copy)
             for key, value in self.host.layers[layer].items():
                 self.weights[slot][key].copy_(value, non_blocking=self.cuda)
+            if start is not None:
+                self.copy_events.append(("h2d_weights", self.weight_bytes, start, self._mark(self.copy)))
             if backward:
                 if self.cuda:
                     self.copy.wait_event(self.saved[layer])
+                start = self._mark(self.copy)
                 self.inputs[slot].copy_(self.checkpoints[layer], non_blocking=self.cuda)
+                if start is not None:
+                    self.copy_events.append(("h2d_checkpoint", self.checkpoint_bytes, start, self._mark(self.copy)))
             if self.cuda:
                 self.ready[slot].record(self.copy)
 
@@ -76,8 +112,13 @@ class Slots:
 
 class Replica:
     def __init__(self, host, device, backend, seqlen, row_chunk=256, attn_block=256, loss_chunk=128,
-                 dtype=None):
+                 dtype=None, engine="autograd", fast_rows=4096, profile=False):
         self.host, self.device, self.backend = host, torch.device(device), backend
+        if engine not in ("autograd", "fast"):
+            raise ValueError("engine must be autograd or fast")
+        if engine == "fast" and not backend.device_rounding:
+            raise ValueError("the fast engine implements runtime (device_rounding) numerics only")
+        self.engine = engine
         self.dtype = dtype or (torch.bfloat16 if self.device.type == "cuda" or backend.device_rounding else torch.float32)
         self.cuda = self.device.type == "cuda"
         self.row_chunk, self.attn_block, self.loss_chunk = row_chunk, attn_block, loss_chunk
@@ -100,6 +141,10 @@ class Replica:
             # Reused pinned buffers for every gradient reduction/checkpoint transfer.
             self.grad_host = torch.empty(count, dtype=torch.float32, pin_memory=self.cuda)
             self.grad_device = torch.empty(count, dtype=torch.float32, device=self.device)
+            self.slots.profile = profile
+            if engine == "fast":
+                self.timer = fast.Timer(profile and self.cuda)
+                self.fast = fast.FastLayer(host.config, self.device, backend, fast_rows, self.timer)
 
     def context(self):
         return torch.cuda.device(self.device) if self.cuda else nullcontext()
@@ -123,6 +168,8 @@ class Replica:
     def run(self, batch, normalizer=1, backward=True):
         if normalizer <= 0:
             raise ValueError("loss normalizer must be positive")
+        if self.engine == "fast":
+            return self.run_fast(batch, normalizer, backward)
         with self.context():
             tokens, labels, segments, positions = batch
             if tokens.shape != self.embedding_stage.shape[:1]:
@@ -155,6 +202,49 @@ class Replica:
                     del out, value
             return loss_value
 
+    def embed(self, tokens):
+        torch.index_select(self.host.embedding, 0, tokens, out=self.embedding_stage)
+        return self.embedding_stage.to(device=self.device, dtype=self.dtype, non_blocking=self.cuda)
+
+    @torch.no_grad()
+    def run_fast(self, batch, normalizer=1, backward=True):
+        import time
+        self.phases = {}
+        started = time.perf_counter()
+        with self.context():
+            tokens, labels, segments, positions = batch
+            if tokens.shape != self.embedding_stage.shape[:1]:
+                raise ValueError("batch length differs from allocated sequence length")
+            x = self.embed(tokens)
+            labels = labels.to(self.device)
+            geometry = fast.Geometry(segments, positions, self.host.config, self.device)
+            eps = self.host.config.get("rms_norm_eps", 1e-5)
+            for layer, weights, _ in self.slots.layers():
+                if backward:
+                    self.slots.save(layer, x)
+                self.fast.decode(weights)
+                x = self.fast.forward(x, self.params[layer], geometry)
+            with self.timer("head"):
+                final, r = fast.final_norm(x, self.norm, eps)
+                loss, dfinal = fast.head_loss(self.fast, final, self.head, labels, 1.0 / normalizer,
+                                              backward=backward)
+            loss_value = loss.item()
+            self.phases["forward_and_head_s"] = time.perf_counter() - started
+            if backward:
+                with self.timer("head"):
+                    acc = {"norm": 0.0}
+                    dx = fast.FastLayer.rms_back(x, r, fast.bf(self.norm), dfinal, acc, "norm")
+                    self.norm.grad = acc["norm"] if self.norm.grad is None else self.norm.grad + acc["norm"]
+                del x, final, dfinal
+                for layer, weights, saved in self.slots.layers(reverse=True):
+                    self.fast.decode(weights)
+                    dx = self.fast.backward(saved, self.params[layer], geometry, dx)
+                del dx
+                if self.cuda:
+                    torch.cuda.current_stream(self.device).synchronize()
+                self.phases["backward_s"] = time.perf_counter() - started - self.phases["forward_and_head_s"]
+            return loss_value
+
     @torch.no_grad()
     def logits(self, batch, indices):
         """Small selected-position logit chunks for offline runtime parity checks."""
@@ -163,6 +253,15 @@ class Replica:
             torch.index_select(self.host.embedding, 0, tokens, out=self.embedding_stage)
             x = self.embedding_stage.to(device=self.device, dtype=self.dtype, non_blocking=self.cuda)
             segments, positions = (value.to(self.device) for value in (segments, positions))
+            if self.engine == "fast":
+                geometry = fast.Geometry(segments, positions, self.host.config, self.device)
+                for layer, weights, _ in self.slots.layers():
+                    self.fast.decode(weights)
+                    x = self.fast.forward(x, self.params[layer], geometry)
+                x, _ = fast.final_norm(x, self.norm, self.host.config.get("rms_norm_eps", 1e-5))
+                for chunk in indices.split(self.loss_chunk):
+                    yield self.fast.mm_nt(x[chunk.to(self.device)], self.head)
+                return
             for layer, weights, _ in self.slots.layers():
                 x = decoder_layer(x, weights, self.params[layer], self.host.config, segments, positions,
                                   self.backend, self.row_chunk, self.attn_block)

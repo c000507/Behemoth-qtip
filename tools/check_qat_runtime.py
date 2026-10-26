@@ -26,10 +26,13 @@ def main():
     parser.add_argument("--trace", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--backend", default="auto")
+    parser.add_argument("--engine", choices=("auto", "fast", "autograd"), default="auto")
     args = parser.parse_args()
     if args.backend == "auto":
         args.backend = "runtime" if torch.device(args.device).type == "cuda" else "runtime-reference"
     backend = load_backend(args.backend)
+    if args.engine == "auto":
+        args.engine = "fast" if args.backend == "runtime" else "autograd"
     trace = load_file(args.trace)
     tokens = trace["tokens"]
     indices = trace["logit_positions"]
@@ -49,16 +52,26 @@ def main():
         parser.error("expected F32 logits[N,vocab]")
     batch = (tokens, torch.full_like(tokens, -100), trace.get("segments", torch.zeros_like(tokens)),
              trace.get("positions", torch.arange(len(tokens))))
-    replica = Replica(host, args.device, backend, len(tokens))
+    replica = Replica(host, args.device, backend, len(tokens), engine=args.engine)
     stager, offset, exact, max_diff = CPUStager(), 0, True, 0.0
+    results = []
     for chunk in replica.logits(batch, indices):
         result = stager.copy(chunk)
         reference = expected[offset:offset + len(result)]
         exact &= torch.equal(result, reference)
         max_diff = max(max_diff, float((result - reference).abs().max()))
+        results.append(result)
         offset += len(result)
+    # Approximate agreement, reported for diagnosis only: it never makes the check pass.
+    actual = torch.cat(results).double()
+    target = expected.double()
+    p, q = target.log_softmax(-1), actual.log_softmax(-1)
+    top5 = [len(set(a.tolist()) & set(b.tolist())) / 5 for a, b in zip(actual.topk(5).indices, target.topk(5).indices)]
+    stats = dict(rel_rms=float((actual - target).norm() / target.norm()),
+                 argmax_agreement=float((actual.argmax(-1) == target.argmax(-1)).double().mean()),
+                 top5_overlap=sum(top5) / len(top5), kl_runtime_to_trainer=float((p.exp() * (p - q)).sum(-1).mean()))
     print(json.dumps(dict(bit_identical=exact, max_abs_diff=max_diff, positions=len(indices),
-                          model_sha256=host.identity, backend=args.backend)))
+                          model_sha256=host.identity, backend=args.backend, engine=args.engine, **stats)))
     if not exact:
         raise SystemExit(1)
 

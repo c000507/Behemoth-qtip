@@ -44,7 +44,9 @@ def host_copy(tensor, pin=False):
 
 class HostModel:
     """Single shared, immutable packed model. GPUs own only the small parameters."""
-    def __init__(self, path, pin=False):
+    def __init__(self, path, pin=False, layers=None, identity=True):
+        """layers: optional subset of layer indices (benchmarks/real-layer checks only).
+        identity=False skips the full-model SHA256 (not resumable; never for training)."""
         self.path = Path(path).resolve()
         self.config = json.loads((self.path / "config.json").read_text())
         c = self.config
@@ -71,7 +73,8 @@ class HostModel:
         inter = c["intermediate_size"]
         shapes = ((nh * hd, n), (nk * hd, n), (nk * hd, n), (n, nh * hd),
                   (inter, n), (inter, n), (n, inter))
-        for layer in range(c["num_hidden_layers"]):
+        self.layer_ids = list(range(c["num_hidden_layers"])) if layers is None else list(layers)
+        for layer in self.layer_ids:
             prefix = f"model.layers.{layer}."
             frozen, initial = {}, {}
             for linear, (m, width) in zip(LINEARS, shapes):
@@ -123,7 +126,7 @@ class HostModel:
         if any(key.endswith(".bias") for key in self.weight_map):
             raise ValueError("checkpoint has unsupported bias tensors")
         # Bind resumes to actual source bytes, including trellises, not just config.
-        self.identity = checkpoint_identity(self.path)
+        self.identity = checkpoint_identity(self.path) if identity else None
 
     def get(self, name, pinned=False):
         with safe_open(self.path / self.weight_map[name], framework="pt", device="cpu") as handle:
