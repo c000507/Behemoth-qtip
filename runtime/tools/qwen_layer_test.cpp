@@ -153,6 +153,27 @@ int main(int argc, char **argv) {
         qn.upload(qn_h);
         kn.upload(kn_h);
         std::printf("stage: rope\n");
+        {
+            // stepwise: rotated input u vs host double replica (qtip::hadamard)
+            auto ug = d_u.download();
+            std::vector<float> xs2(rows * H);
+            for (size_t i = 0; i < xs2.size(); ++i) xs2[i] = b16(x0[i]);
+            double du = 0;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<double> t(H);
+                double ss = 0;
+                for (int i = 0; i < H; ++i) ss += double(xs2[size_t(r) * H + i]) * xs2[size_t(r) * H + i];
+                float inv = float(1.0 / std::sqrt(ss / H + c.eps));
+                for (int i = 0; i < H; ++i) {
+                    float v = b16(to16(xs2[size_t(r) * H + i] * inv));
+                    t[size_t(i)] = double(v * (1.0f + b16(ln_in_h[size_t(i)])) * hq.su[size_t(i)]);
+                }
+                qtip::hadamard(t.data(), H, true);
+                for (int i = 0; i < H; ++i)
+                    du = std::max(du, double(std::fabs(double(b16(ug[size_t(r) * H + size_t(i)])) - t[size_t(i)])));
+            }
+            std::printf("u diff %.5f\n", du);
+        }
         std::printf("rope ptrs q=%p k=%p v=%p g=%p kc=%p vc=%p qn=%p kn=%p\n", (void *)d_q.data(),
                     (void *)d_k.data(), (void *)d_v.data(), (void *)d_g.data(), (void *)kc.data(),
                     (void *)vc.data(), (void *)qn.data(), (void *)kn.data());
