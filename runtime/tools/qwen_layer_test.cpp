@@ -421,6 +421,26 @@ int main(int argc, char **argv) {
             q_sv_cast_f32(zbig.data(), sv.data(), zbig.data() + col, rows, gl.rows, gl.rows, Wz, s);
         };
         input_t(d_state.data(), &ln_in, suq.data(), H, d_u);
+        {
+            auto ug3 = d_u.download();
+            std::vector<float> xs3(rows * H);
+            for (size_t i = 0; i < xs3.size(); ++i) xs3[i] = b16(x0[i]);
+            double du3 = 0;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<double> t3(H);
+                double ss3 = 0;
+                for (int i = 0; i < H; ++i)
+                    ss3 += double(xs3[size_t(r) * H + i]) * xs3[size_t(r) * H + i];
+                float inv3 = float(1.0 / std::sqrt(ss3 / H + c.eps));
+                for (int i = 0; i < H; ++i)
+                    t3[size_t(i)] = double(b16(to16(xs3[size_t(r) * H + i] * inv3)) *
+                                           (1.0f + b16(ln_in_h[size_t(i)])) * hq.su[size_t(i)]);
+                qtip::hadamard(t3.data(), H, true);
+                for (int i = 0; i < H; ++i)
+                    du3 = std::max(du3, double(std::fabs(double(b16(ug3[size_t(r) * H + i])) - t3[i])));
+            }
+            std::printf("delta-branch u diff: %.5f\n", du3);
+        }
         proj_scatter(gq, lq, d_u, H, svq, 0);
         proj_scatter(gz, lq, d_u, H, svz, Wq);
         // b/a: raw bf16 gemms on the plain normed hidden state (mirror QwenModel)
