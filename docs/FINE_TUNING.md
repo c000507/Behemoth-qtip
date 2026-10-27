@@ -133,7 +133,7 @@ build-training/qtip_finetune --eval-only --devices 0 \
   --model /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot-ft \
   --data /mnt/nvme/qtip_quant/heldout_gmcot_24k
 
-# Model, device, sequence length, layer index, MLP chunk rows:
+# Model, device, sequence length, layer index, MLP chunk rows[, arena GB (24)]:
 build-training/qtip_bench /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot 0 24576 0 1024
 ```
 

@@ -6,19 +6,21 @@ using namespace qat;
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "qtip_bench MODEL [DEVICE=cpu|0] [SEQLEN=32] [LAYER=0] [MLP_ROWS=1024]\n";
+            std::cout << "qtip_bench MODEL [DEVICE=cpu|0] [SEQLEN=32] [LAYER=0] [MLP_ROWS=1024] [ARENA_GB=24]\n";
             return argc < 2 ? 1 : 0;
         }
         int device = argc > 2 && std::string(argv[2]) != "cpu" ? std::stoi(argv[2]) : -1,
             T = argc > 3 ? std::stoi(argv[3]) : 32, l = argc > 4 ? std::stoi(argv[4]) : 0,
             chunk = argc > 5 ? std::stoi(argv[5]) : 1024;
+        double arena_gb = argc > 6 ? std::stod(argv[6]) : 24;
         require(T > 0 && chunk > 0, "invalid sequence/chunk");
+        require(arena_gb > 0 && arena_gb <= 1024, "arena GB out of range");
         if (device < 0)
             require(Config(read_json(fs::path(argv[1]) / "config.json")).n <= 1024,
                     "CPU benchmark is for tiny models");
         Model m(argv[1]);
         require(l >= 0 && l < m.config.layers, "invalid layer");
-        Replica r(m, device, T, size_t(24) * 1000000000, true);
+        Replica r(m, device, T, size_t(arena_gb * 1e9), true);
         auto &o = *r.ops;
         Batch b;
         b.tokens.assign(T, 0);
