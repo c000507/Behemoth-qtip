@@ -285,6 +285,39 @@ int main(int argc, char **argv) {
         q_attn(d_q.data(), kc.data(), vc.data(), d_g.data(), d_ao.data(), rows, 0, nq, nkv, hd,
                1.0f / std::sqrt(float(hd)), s);
         std::printf("stage: o input_transform\n");
+        {
+            // attention-only check: CPU attention consuming the GPU's own q/k/v/g
+            auto qg = d_q.download(), kg = d_k.download(), vg = d_v.download(), gg = d_g.download();
+            auto aog = d_ao.download();
+            double da = 0, sa = 1e-9;
+            for (int r = 0; r < rows; ++r)
+                for (int h = 0; h < nq; ++h) {
+                    int kh2 = h / (nq / nkv);
+                    float mx = -INFINITY;
+                    std::vector<float> sc(r + 1);
+                    for (int i = 0; i <= r; ++i) {
+                        float d2 = 0;
+                        for (int d2i = 0; d2i < hd; ++d2i++)
+                            d2 += b16(qg[size_t(r) * nq * 2 * hd + size_t(h) * 2 * hd + size_t(d2i)]) *
+                                  b16(kg[size_t(i) * nkv * hd + size_t(kh2) * hd + size_t(d2i)]);
+                        sc[size_t(i)] = d2 / std::sqrt(float(hd));
+                        mx = std::max(mx, sc[size_t(i)]);
+                    }
+                    float sum = 0;
+                    for (int i = 0; i <= r; ++i) sum += sc[size_t(i)] = std::exp(sc[size_t(i)] - mx);
+                    for (int d2i = 0; d2i < hd; ++d2i) {
+                        float acc = 0;
+                        for (int i = 0; i <= r; ++i)
+                            acc += sc[size_t(i)] / sum *
+                                   b16(vg[size_t(i) * nkv * hd + size_t(kh2) * hd + size_t(d2i)]);
+                        float g2 = b16(gg[size_t(r) * nq * hd + size_t(h) * hd + size_t(d2i)]);
+                        float want = acc / (1.0f + std::exp(-g2));
+                        da = std::max(da, double(std::fabs(double(b16(aog[size_t(r) * nq * hd + size_t(h) * hd + size_t(d2i)])) - want)));
+                        sa = std::max(sa, double(std::fabs(want)));
+                    }
+                }
+            std::printf("attn-only diff: %.5f scale %.3f rel %.2e\n", da, sa, da / sa);
+        }
         input_t(d_ao.data(), nullptr, su_o.data(), nq * hd, d_u);
         std::printf("stage: o matmul\n");
         matmul_z(go, lq, d_u, nq * hd, d_z);
