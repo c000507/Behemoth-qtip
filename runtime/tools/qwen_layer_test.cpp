@@ -150,8 +150,13 @@ int main(int argc, char **argv) {
         DeviceBuffer<uint16_t> kc(size_t(64) * nkv * hd), vc(size_t(64) * nkv * hd);
         auto qn = load16("self_attn.q_norm.weight"), kn = load16("self_attn.k_norm.weight");
         std::printf("stage: rope\n");
+        std::printf("rope ptrs q=%p k=%p v=%p g=%p kc=%p vc=%p qn=%p kn=%p\n", (void *)d_q.data(),
+                    (void *)d_k.data(), (void *)d_v.data(), (void *)d_g.data(), (void *)kc.data(),
+                    (void *)vc.data(), (void *)qn.data(), (void *)kn.data());
         q_qk_norm_rope(d_q.data(), d_k.data(), d_v.data(), d_g.data(), kc.data(), vc.data(), rows, 0,
                        nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        std::printf("rope synced\n");
         std::printf("stage: attn\n");
         q_attn(d_q.data(), kc.data(), vc.data(), d_g.data(), d_ao.data(), rows, 0, nq, nkv, hd,
                1.0f / std::sqrt(float(hd)), s);
