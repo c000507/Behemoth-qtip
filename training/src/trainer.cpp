@@ -122,6 +122,10 @@ double Replica::run(const Batch &b, const Options &o, size_t denominator, bool b
 }
 void save_checkpoint(const fs::path &root, Replica &r, const Progress &p, const json &signature) {
     fs::create_directories(root);
+    // Keep one snapshot: the previous one is removed only after the new one is published.
+    std::string previous;
+    if (fs::exists(root / "latest.json"))
+        previous = read_json(root / "latest.json").at("path").get<std::string>();
     std::string name = "step-" + std::to_string(p.step) + "-" +
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     auto temp = root / (name + ".tmp"), dest = root / name;
@@ -158,6 +162,11 @@ void save_checkpoint(const fs::path &root, Replica &r, const Progress &p, const 
     } catch (...) {
         fs::remove_all(temp);
         throw;
+    }
+    if (!previous.empty() && previous != name && previous.find('/') == std::string::npos &&
+        fs::is_directory(root / previous)) {
+        std::error_code ec;
+        fs::remove_all(root / previous, ec);
     }
 }
 Progress load_checkpoint(const fs::path &input, const std::vector<std::unique_ptr<Replica>> &replicas,
