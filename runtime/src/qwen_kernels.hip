@@ -303,8 +303,6 @@ __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uin
     int r = blockIdx.x % rows;
     int h = blockIdx.x / rows;
     int d = threadIdx.x;
-    if (blockIdx.x < 2 && threadIdx.x == 0)
-        printf("rope blk %d r %d h %d grid %d\n", int(blockIdx.x), r, h, int(gridDim.x));
     if (h >= nq + nkv) {
         int hv = h - nq - nkv;
         uint16_t *vv = v + long(r) * nkv * hd + long(hv) * hd;
@@ -318,13 +316,10 @@ __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uin
     if (is_q)  // raw gate copy (second half of the q head block; never touched by rope)
         G[long(r) * nq * hd + long(h) * hd + d] = vec[hd + d];
     float raw = bf2f(vec[d]);
-    if (blockIdx.x < 2 && threadIdx.x == 0) printf("pre-sum blk %d\n", int(blockIdx.x));
     float ss = block_sum(raw * raw);
-    if (blockIdx.x < 2 && threadIdx.x == 0) printf("post-sum blk %d ss %g\n", int(blockIdx.x), ss);
     __shared__ float inv;
     if (threadIdx.x == 0) inv = rsqrtf(ss / hd + eps);
     __syncthreads();
-    if (blockIdx.x < 2 && threadIdx.x == 0) printf("post-sync blk %d\n", int(blockIdx.x));
     const uint16_t *w = is_q ? q_norm : k_norm;
     float sv = raw * inv * (1.0f + bf2f(w[d]));
     if (d < rot / 2) {
