@@ -381,9 +381,9 @@ void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, 
         const float* vh_base = v.data() + size_t(kh) * hd;
         float mx = -INFINITY;
         for (int i = 0; i <= t; ++i) {
-          const float* qi = q.data() + size_t(i) * nq * 2 * hd + size_t(h) * 2 * hd;
+          const float* ki = kh_base + size_t(i) * nkv * hd;
           float s = 0;
-          for (int d = 0; d < hd; ++d) s += qh[d] * qi[d];
+          for (int d = 0; d < hd; ++d) s += qh[d] * ki[d];
           s *= qk_scale;
           attn_row[size_t(i)] = s;
           mx = std::max(mx, s);
@@ -562,9 +562,9 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
           const float* vh_base = v.data() + size_t(kh) * hd;
           float mx = -INFINITY;
           for (int i = 0; i <= t; ++i) {
-            const float* qi = q.data() + size_t(i) * nq * 2 * hd + size_t(h) * 2 * hd;
+            const float* ki = kh_base + size_t(i) * nkv * hd;
             float s = 0;
-            for (int d = 0; d < hd; ++d) s += qh[d] * qi[d];
+            for (int d = 0; d < hd; ++d) s += qh[d] * ki[d];
             s *= qk_scale;
             attn_row[size_t(i)] = s;
             mx = std::max(mx, s);
