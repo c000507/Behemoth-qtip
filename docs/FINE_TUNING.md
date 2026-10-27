@@ -133,12 +133,20 @@ build-training/qtip_finetune --eval-only --devices 0 \
   --model /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot-ft \
   --data /mnt/nvme/qtip_quant/heldout_gmcot_24k
 
-# Model, device, sequence length, layer index, MLP chunk rows[, arena GB (24)]:
+# Model, device, sequence length, layer index, MLP chunk rows[, arena GB (24), repeats (1)]:
 build-training/qtip_bench /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot 0 24576 0 1024
 ```
 
 The benchmark reports decode, forward, backward seconds and peak arena bytes.
 Training emits JSON loss, gradient norm, LR, step time and packed tokens/second.
+With repeats greater than one, the layer is decoded once and run repeatedly with
+unchanged inputs/parameters and cleared gradients. Each iteration prints timings;
+the final report gives medians excluding the first iteration. This separates
+GEMM tuning and other first-call setup from steady execution:
+
+```sh
+QTIP_TRAIN_GEMM_TUNE=1 build-training/qtip_bench MODEL 0 8192 0 1024 24 4
+```
 
 The native trainer shares the input Hadamard transform across Q/K/V and across
 gate/up. HIP transforms write BF16 GEMM operands directly, including in projection
@@ -210,6 +218,29 @@ instead of five. An extra FP32 softmax-correction buffer uses
 is no quadratic or per-query-head dK/dV workspace. GPU numerical checks and
 timings must run on gfx1201; compilation and CPU tests alone do not establish
 GPU correctness or speedup. `--rows` chunks the MLP and does not shorten attention.
+
+Training forward now uses native gfx1201 BF16 WMMA operands. A wave owns 16
+queries for one head; all query heads sharing a KV head stage K/V together.
+Scores and the output accumulator stay in registers, softmax uses a cross-half
+wave shuffle, and probabilities use BF16 with FP32 accumulation. The forward
+and backward recomputation use the same path. Packed-document starts and causal
+masks are applied per query, including all-masked intermediate key tiles. LSE
+remains in natural-log units for backward even though softmax uses `exp2`.
+The earlier rocWMMA forward is retained for A/B checks and GQA groups above 32:
+
+```sh
+QTIP_TRAIN_ATTN_FORWARD=legacy build-training/qtip_attention_bench 8192 0
+QTIP_TRAIN_ATTN_FORWARD=native build-training/qtip_attention_bench 8192 0
+# Compare full layers with warmup excluded, GEMM tuning disabled in both runs:
+QTIP_TRAIN_ATTN_FORWARD=legacy build-training/qtip_bench MODEL 0 32768 0 1024 24 4
+QTIP_TRAIN_ATTN_FORWARD=native build-training/qtip_bench MODEL 0 32768 0 1024 24 4
+```
+
+The native forward is the default for GQA groups up to 32. This implementation
+uses the runtime kernel's operand layout, register accumulation, and parallel
+softmax; it does not use the runtime's FP8 cache or probability quantization.
+Run GPU correctness tests and measure both paths on gfx1201 before relying on
+speedup estimates. The attention backward kernels have not changed in this update.
 
 For strict runtime parity, make a JSON request containing `tokens` and
 `logit_positions` (1–128 positions). Capture the actual native runtime output:

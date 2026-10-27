@@ -148,8 +148,8 @@ int main() {
             compare(cb[i], gb[i], .04);
         // Exercise both ownership directions, partial tiles, GQA reductions,
         // document boundaries inside key tiles, and nontrivial softmax scores.
-        for (int length : {1, 17, 33, 65, 129}) {
-            for (int group : {1, 4, 12}) {
+        for (int length : {1, 17, 33, 65, 129, 257}) {
+            for (int group : {1, 3, 4, 12}) {
                 Config ac = c;
                 ac.kv = 2;
                 ac.heads = group * ac.kv;
@@ -161,7 +161,7 @@ int main() {
                     ab.segments.resize(length);
                     for (int t = 0; t < length; ++t) {
                         // Include one-token documents and boundaries at 7/31.
-                        int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : 32;
+                        int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : t < 70 ? 32 : 70;
                         ab.segments[t] = start;
                         ab.positions[t] = t - start;
                     }

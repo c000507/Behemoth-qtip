@@ -1,4 +1,5 @@
 #include "train.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -6,14 +7,17 @@ using namespace qat;
 int main(int argc, char **argv) {
     try {
         if (argc < 2 || std::string(argv[1]) == "--help") {
-            std::cout << "qtip_bench MODEL [DEVICE=cpu|0] [SEQLEN=32] [LAYER=0] [MLP_ROWS=1024] [ARENA_GB=24]\n";
+            std::cout << "qtip_bench MODEL [DEVICE=cpu|0] [SEQLEN=32] [LAYER=0] [MLP_ROWS=1024] "
+                         "[ARENA_GB=24] [REPEATS=1]\n";
             return argc < 2 ? 1 : 0;
         }
         int device = argc > 2 && std::string(argv[2]) != "cpu" ? std::stoi(argv[2]) : -1,
             T = argc > 3 ? std::stoi(argv[3]) : 32, l = argc > 4 ? std::stoi(argv[4]) : 0,
             chunk = argc > 5 ? std::stoi(argv[5]) : 1024;
         double arena_gb = argc > 6 ? std::stod(argv[6]) : 24;
+        int repeats = argc > 7 ? std::stoi(argv[7]) : 1;
         require(T > 0 && chunk > 0, "invalid sequence/chunk");
+        require(repeats > 0 && repeats <= 100, "repeats must be 1..100");
         require(arena_gb > 0 && arena_gb <= 1024, "arena GB out of range");
         if (device < 0)
             require(Config(read_json(fs::path(argv[1]) / "config.json")).n <= 1024,
@@ -41,21 +45,45 @@ int main(int argc, char **argv) {
         Layer layer(o, m, l, r.parameters, r.gradients);
         o.synchronize();
         auto decoded = std::chrono::steady_clock::now();
-        auto y = layer.forward(x, b, chunk);
-        o.synchronize();
-        auto fwd = std::chrono::steady_clock::now();
-        auto dx = layer.backward(x, dy, b, chunk);
-        o.synchronize();
-        auto end = std::chrono::steady_clock::now();
         auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-        std::cout << json({{"layer", l},
-                           {"seqlen", T},
-                           {"decode_seconds", sec(start, decoded)},
-                           {"forward_seconds", sec(decoded, fwd)},
-                           {"backward_seconds", sec(fwd, end)},
-                           {"device_peak_bytes", o.peak_bytes()}})
-                         .dump()
-                  << '\n';
+        std::vector<double> forwards, backwards;
+        for (int i = 0; i < repeats; ++i) {
+            o.zero(r.gradients);
+            o.synchronize();
+            auto begin = std::chrono::steady_clock::now();
+            auto y = layer.forward(x, b, chunk);
+            o.synchronize();
+            auto fwd = std::chrono::steady_clock::now();
+            auto dx = layer.backward(x, dy, b, chunk);
+            o.synchronize();
+            auto end = std::chrono::steady_clock::now();
+            bool warmup = repeats > 1 && i == 0;
+            std::cout << json({{"layer", l},
+                               {"seqlen", T},
+                               {"iteration", i},
+                               {"warmup", warmup},
+                               {"decode_seconds", i == 0 ? sec(start, decoded) : 0},
+                               {"forward_seconds", sec(begin, fwd)},
+                               {"backward_seconds", sec(fwd, end)},
+                               {"device_peak_bytes", o.peak_bytes()}})
+                             .dump()
+                      << std::endl;
+            if (!warmup) {
+                forwards.push_back(sec(begin, fwd));
+                backwards.push_back(sec(fwd, end));
+            }
+        }
+        if (repeats > 1) {
+            auto median = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return .5 * (v[(v.size() - 1) / 2] + v[v.size() / 2]);
+            };
+            std::cout << json({{"steady_iterations", forwards.size()},
+                               {"forward_median_seconds", median(forwards)},
+                               {"backward_median_seconds", median(backwards)}})
+                             .dump()
+                      << '\n';
+        }
         o.release(l % 2);
         return 0;
     } catch (const std::exception &e) {
