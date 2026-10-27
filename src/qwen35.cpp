@@ -546,6 +546,12 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
           zc_norm_inplace(vec, h < nq ? l.q_norm.data() : l.k_norm.data(), hd, cfg.eps);
           rope_inplace(vec, cfg.rot_dim, t, cfg.theta);
         }
+      if (const char* dbg = std::getenv("QWEN_DBG_DIR")) {
+        std::ofstream f(std::string(dbg) + "/qkv_L" + std::to_string(L) + ".bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(q.data()), std::streamsize(q.size() * 4));
+        f.write(reinterpret_cast<const char*>(k.data()), std::streamsize(k.size() * 4));
+        f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+      }
       attn_row.assign(T, 0);
       for (int t = 0; t < T; ++t) {
         for (int h = 0; h < nq; ++h) {
