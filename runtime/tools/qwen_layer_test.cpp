@@ -432,7 +432,8 @@ int main(int argc, char **argv) {
             std::memcpy(ba.data() + bt.size() / 2, at.data(), at.size());
             DeviceBuffer<uint16_t> d_ba;
             d_ba.upload(ba);
-            DeviceBuffer<uint16_t> h_norm = d_state;
+            DeviceBuffer<uint16_t> h_norm;
+            h_norm.upload(x0);
             q_zc_norm(h_norm.data(), rows, H, ln_in.data(), c.eps, s);
             qtip::DenseMatmul dense;
             dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
@@ -539,8 +540,6 @@ int main(int argc, char **argv) {
             for (int t = 0; t < rows; ++t) {
                 for (int i = 0; i < Wq; ++i) qkv[size_t(i)] = qkvf[size_t(t) * Wq + i];
                 for (int i = 0; i < V; ++i) zz[size_t(i)] = zf[size_t(t) * V + i];
-                for (int i = 0; i < nv; ++i)
-                    ba[size_t(i)] = bw[size_t(i)].empty() ? 0.f : 0.f;  // replaced below
                 // b/a via dot with xn (bf16 weights)
                 for (int e = 0; e < 2 * nv; ++e) {
                     const std::vector<float> &w = e < nv ? bw : aw;
