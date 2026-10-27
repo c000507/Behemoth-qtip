@@ -456,6 +456,12 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < db.size(); ++i) aux[nv + i] = db[i];
             a_dt.upload(aux);
         }
+        {
+            auto zb = zbig.download();
+            std::printf("zbig t0: qkv[:3] %.4f %.4f | z[:3] %.4f %.4f | b[:2] %.4f %.4f | a[:2] %.4f %.4f\n",
+                        zb[0], zb[1], zb[Wq], zb[Wq + 1], zb[Wq + V], zb[Wq + V + 1],
+                        zb[Wq + V + nv], zb[Wq + V + nv + 1]);
+        }
         HIP_CHECK(hipMemsetAsync(ring.data(), 0, ring.bytes(), s));
         HIP_CHECK(hipMemsetAsync(S.data(), 0, S.bytes(), s));
         for (int t = 0; t < rows; ++t)
