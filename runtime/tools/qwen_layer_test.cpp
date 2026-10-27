@@ -334,6 +334,9 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < vf16.size(); ++i) dv = std::max(dv, double(std::fabs(b16(vf16[i]) - Vv[i])));
             for (size_t i = 0; i < gg.size(); ++i) dg = std::max(dg, double(std::fabs(b16(gg[i]) - G[i])));
             std::printf("pre-attn: dq %.4f dk %.4f dv %.4f dg %.4f\n", dq, dk, dv, dg);
+            std::printf("gate gpu[:4]: %.4f %.4f | qbuf gate region [:4]: %.4f %.4f | cpu G[:4]: %.4f %.4f | ref qf gate[:4]: %.4f %.4f\n",
+                        b16(gg[0]), b16(gg[1]), b16(qg[hd]), b16(qg[hd + 1]), G[0], G[1],
+                        qf[hd], qf[hd + 1]);
         }
         for (int r = 0; r < rows; ++r) {
             for (int h = 0; h < nq; ++h) {
