@@ -133,7 +133,8 @@ int main(int argc, char **argv) {
         lin_gpu(hq, gq, lq, suq, svq);
         lin_gpu(hk, gk, lq, suk, svk);
         lin_gpu(hv, gv, lq, suv, svv);
-        lin_gpu(ho, go, lq, suq /*placeholder*/, svo);
+        DeviceBuffer<float> su_ho;
+        lin_gpu(ho, go, lq, su_ho, svo);
         DeviceBuffer<float> su_o;
         su_o.upload(ho.su);
         {
