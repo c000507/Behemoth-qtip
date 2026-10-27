@@ -80,6 +80,27 @@ int main(int argc, char **argv) {
     std::printf("stage 4: hadamard %d\n", h.out);
     q_hadamard_rows(z.data(), rows, h.out, h.out, false, s);
     HIP_CHECK(hipStreamSynchronize(s));
+    {
+        // correctness vs host double hadamard for several dims
+        for (int n2 : {512, 1024, 2048, 3584, 4096, 6144}) {
+            std::vector<float> v(size_t(rows) * n2);
+            std::mt19937 r2(n2);
+            std::normal_distribution<float> nd2(0, 1);
+            for (auto &vv : v) vv = nd2(r2);
+            DeviceBuffer<float> dv2;
+            dv2.upload(v);
+            q_hadamard_rows(dv2.data(), rows, n2, n2, false, s);
+            auto back = dv2.download();
+            double md = 0;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<double> t2(v.begin() + r * n2, v.begin() + (r + 1) * n2);
+                qtip::hadamard(t2.data(), n2, false);
+                for (int i = 0; i < n2; ++i)
+                    md = std::max(md, double(std::fabs(double(back[size_t(r) * n2 + i]) - t2[size_t(i)])));
+            }
+            std::printf("  hadamard n=%d max|diff| %.5f\n", n2, md);
+        }
+    }
     std::printf("  ok\n");
     if (stage < 5) return 0;
     std::printf("stage 5: sv_cast\n");
