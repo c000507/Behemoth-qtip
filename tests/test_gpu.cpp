@@ -460,7 +460,7 @@ static void test_qwen_layer(const std::string& model_dir, int dev) {
     for (size_t i = 0; i < xc.size(); ++i) {
       double a = std::fabs(xc[i] - bf16_to_f32(xg[i]));
       max_abs = std::max(max_abs, a);
-      denom = std::max(denom, std::fabs(xc[i]));
+      denom = std::max(denom, double(std::fabs(xc[i])));
     }
     gscale = float(denom);
     std::printf("  layer %2d (%s): max|diff| %.5f  scale %.3f  rel %.2e  %s\n", L, ql->full ? "full" : "linear",
