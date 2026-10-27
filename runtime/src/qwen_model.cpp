@@ -23,7 +23,7 @@ using json = nlohmann::json;
 struct QwenCheckpoint {
     std::filesystem::path root;
     std::map<std::string, std::string> index;
-    std::map<std::string, std::shared_ptr<SafeTensorFile>> files;
+    mutable std::map<std::string, std::shared_ptr<SafeTensorFile>> files;
 
     explicit QwenCheckpoint(std::filesystem::path p) : root(std::move(p)) {
         std::ifstream f(root / "model.safetensors.index.json");
@@ -149,7 +149,7 @@ struct QwenModel::Impl {
     size_t max_slices = 0;
 
     void load(const std::filesystem::path &dir);
-    qtip::HostLinear load_host(const Checkpoint &ck, int layer, const std::string &name, int in, int out);
+    qtip::HostLinear load_host(const QwenCheckpoint &ck, int layer, const std::string &name, int in, int out);
     void upload_linear(Linear &L, const qtip::HostLinear &h);
     void forward_chunk(const int *tokens_h, int rows);
     void lm_head_rows(int row0, int nrows);  // logits_all[row0..] from state rows
