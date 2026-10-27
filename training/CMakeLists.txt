@@ -59,16 +59,19 @@ if(QTIP_TRAIN_HIP)
   target_link_libraries(qtip_gpu_tests PRIVATE qtip_train_core)
   add_test(NAME native_gpu COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu PROPERTIES SKIP_RETURN_CODE 77
-    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_GEMM_TUNE=0")
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=wave;QTIP_TRAIN_GEMM_TUNE=0")
   add_test(NAME native_gpu_tuned COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu_tuned PROPERTIES SKIP_RETURN_CODE 77
-    ENVIRONMENT "QTIP_TRAIN_GEMM_TUNE=1;QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native")
+    ENVIRONMENT "QTIP_TRAIN_GEMM_TUNE=1;QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=wave")
   add_test(NAME native_gpu_legacy_attention COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu_legacy_attention PROPERTIES SKIP_RETURN_CODE 77
-    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=legacy;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_GEMM_TUNE=0")
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=legacy;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=wave;QTIP_TRAIN_GEMM_TUNE=0")
   add_test(NAME native_gpu_legacy_backward COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu_legacy_backward PROPERTIES SKIP_RETURN_CODE 77
     ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=legacy;QTIP_TRAIN_GEMM_TUNE=0")
+  add_test(NAME native_gpu_staged_dkv COMMAND qtip_gpu_tests)
+  set_tests_properties(native_gpu_staged_dkv PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=staged;QTIP_TRAIN_GEMM_TUNE=0")
 endif()
 add_test(NAME native_training COMMAND qtip_train_tests)
 if(QTIP_TRAIN_TOKENIZER)

@@ -244,12 +244,20 @@ speedup estimates.
 
 Backward also has native BF16 WMMA kernels. dQ shares K/V staging across a GQA
 group, keeps Q/dO and its output accumulator in registers, and computes score
-and probability derivatives within each wave. dK/dV retain one owner per key
-tile; staging uses swizzled vector operands and transposes Q/dO in place before
-the gradient products. Gradients accumulate in FP32 registers and are rounded
-at the existing HIP boundary. Both kernels preserve document and causal masks;
-there is no quadratic gradient workspace or attention-gradient atomic addition.
-The earlier backward remains available for A/B checks:
+and probability derivatives within each wave. dK/dV use paired waves: one owns
+dK and computes scores/dS, the other owns dV and receives a small BF16 probability
+tile through LDS. Two pairs share a 16-query Q/dO load, staged in both
+orientations directly. K/V, scores/dP, and gradient accumulators stay in registers.
+Compared with the earlier native dK/dV kernel, this halves Q/dO global loads per
+key-query pair and reduces barriers per query tile from five to three. It avoids
+the score/dP exchange and the register-mediated in-place Q/dO transpose.
+
+Heads reduce in a fixed order with one writer per gradient element. Gradients
+accumulate in FP32 registers and are rounded at the existing HIP boundary. Both
+kernels preserve document and causal masks; there is no quadratic or per-query-head
+gradient workspace and no attention-gradient atomic addition. The seven backward
+matrix products per causal pair are unchanged. The earlier backward remains
+available for A/B checks:
 
 ```sh
 ctest --test-dir build-training -R native_gpu --output-on-failure
@@ -258,6 +266,38 @@ QTIP_TRAIN_ATTN_BACKWARD=native build-training/qtip_attention_bench 8192 0
 # Separate GPU-event timings of dQ and dK/dV, in milliseconds on stderr:
 QTIP_TRAIN_ATTN_PROFILE=1 build-training/qtip_attention_bench 32768 0
 ```
+
+`QTIP_TRAIN_ATTN_DKV=wave` selects the paired-wave kernel (default).
+`QTIP_TRAIN_ATTN_DKV=staged` retains the dK/dV kernel from `a067e7e`, keeping
+the same native dQ kernel. This selector only applies to native backward.
+CTest explicitly checks both native dK/dV paths against the CPU reference,
+including strided views, 16/32-key tile tails, GQA groups through 32, packed
+boundaries, one-token documents, and repeat-call determinism. Run these checks
+before measuring the isolated change, then compare the steady medians and
+`dkv_ms` (stderr) for contiguous and packed sequences:
+
+```sh
+cmake --build build-training -j8
+ctest --test-dir build-training --output-on-failure
+for dkv in staged wave; do
+  QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
+    build-training/qtip_attention_bench 8192 0 8192 3 96 8 24
+  QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
+    build-training/qtip_attention_bench 32768 0 32768 3 96 8 24
+  QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
+    build-training/qtip_attention_bench 32768 0 2048 3 96 8 24
+done
+```
+
+ROCm 7.0 clang 20 device compilation for gfx1201 reports 215 VGPRs, zero scratch
+and zero spills, and 17,600 bytes of LDS for the paired-wave kernel. The staged
+kernel uses 159 VGPRs and 30,720 bytes of LDS with the same compiler. The CPU
+training test and a separate host WMMA-layout model passed locally; there was no
+AMD GPU in that environment, so these are **not measured GPU speedups or GPU
+correctness results**. The higher register count and different wave scheduling
+still need on-device timing. A full-layer benchmark is required to translate
+attention gains into step time; dK/dV performs four matrix products versus dQ's
+three, so equal kernel times are a target rather than a consequence of symmetry.
 
 The profile flag adds a synchronization after the two kernels. It excludes the
 softmax-correction kernel, gradient copy/rounding, and forward recomputation;

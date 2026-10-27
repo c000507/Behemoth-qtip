@@ -115,7 +115,7 @@ __global__ void dq_kernel(View q, View k, View v, View lse, View dy, View delta,
 // Four waves own the 128 output dimensions of 16 keys. All GQA heads reduce
 // into those registers. Q/dO staging is transposed in place after scoring so
 // both gradient products use vector LDS loads, with no global atomics.
-__global__ void dkv_kernel(View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
+__global__ void dkv_staged_kernel(View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
                            const int32_t *starts, const int32_t *ends) {
     __shared__ __align__(16) uint16_t kr[16 * 128], vr[16 * 128], qr[32 * 128], dr[32 * 128], p[16 * 32],
         ds[16 * 32];
@@ -196,6 +196,108 @@ __global__ void dkv_kernel(View q, View k, View v, View lse, View dy, View delta
             }
         }
 }
+
+// A pair of waves owns 16 keys: one computes scores/dS and dK, the other
+// accumulates dV. Two pairs share a 16-query Q/dO load. K/V and dK/dV stay in
+// registers; only P crosses between waves. Stage both Q/dO orientations directly
+// to avoid the old score/dP exchange and in-place LDS transpose. Splitting the
+// output accumulators between waves avoids spilling 128 FP32 values per lane.
+__global__ __launch_bounds__(128) void dkv_wave_kernel(
+    View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
+    const int32_t *starts, const int32_t *ends) {
+    __shared__ __align__(16) uint16_t shared[4 * 16 * 128], probs[32 * 16];
+    __shared__ float logs[16], corrections[16];
+    __shared__ int docs[16];
+    uint16_t *qr = shared, *dr = qr + 16 * 128, *qt = dr + 16 * 128, *dt = qt + 16 * 128;
+    int tid = threadIdx.x, wave = tid / 32, c = tid % 16, h = tid % 32 / 16;
+    int begin = blockIdx.x * 32, pair = wave / 2, first = begin + pair * 16;
+    int kh = blockIdx.y, key = first + c;
+    bool live = key < q.rows, value_wave = wave & 1;
+    Reg kr[8], vr[8];
+    // Reuse the query staging space to load the two key tiles once.
+    for (int part = 0; part < 2; ++part) {
+        View src = part ? v : k;
+        for (int i = tid; i < 32 * 128; i += 128) {
+            int row = i / 128, d = i % 128;
+            shared[i] = begin + row < q.rows ? bf16(get(src, begin + row, kh, d)) : 0;
+        }
+        __syncthreads();
+        if (!value_wave)
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                Reg value = __builtin_bit_cast(
+                    Reg, *reinterpret_cast<const uint4 *>(shared + (pair * 16 + c) * 128 + kb(s, h)));
+                if (part)
+                    vr[s] = value;
+                else
+                    kr[s] = value;
+            }
+        __syncthreads();
+    }
+    Acc out[8]{};
+    // The last key can belong to a later packed document. Per-query masking
+    // excludes cross-document pairs, including tiles spanning many documents.
+    int end = ends[min(begin + 31, q.rows - 1)];
+    for (int head = kh * group; head < (kh + 1) * group; ++head)
+        for (int base = begin; base < end; base += 16) {
+            for (int i = tid; i < 16 * 128; i += 128) {
+                int row = i / 128, d = i % 128;
+                uint16_t a = base + row < end ? bf16(get(q, base + row, head, d)) : 0;
+                uint16_t b = base + row < end ? bf16(get(dy, base + row, head, d)) : 0;
+                qr[at<128>(row, d)] = a;
+                dr[at<128>(row, d)] = b;
+                qt[at<16>(d, row)] = a;
+                dt[at<16>(d, row)] = b;
+            }
+            if (tid < 16) {
+                int t = base + tid;
+                logs[tid] = t < end ? lse.p[size_t(head) * lse.ld + t] : 0;
+                corrections[tid] = t < end ? delta.p[size_t(head) * delta.ld + t] : 0;
+                docs[tid] = t < end ? starts[t] : q.rows;
+            }
+            __syncthreads();
+            Reg ds;
+            if (!value_wave) {
+                // C(query,key): lane c owns one key; accumulator components
+                // are queries 8*h..8*h+7. This is the reduction orientation
+                // required by both Q^T*dS and dO^T*P.
+                Acc score{}, dp{};
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    score = mma(load<128>(qr, c, kb(s, h)), kr[s], score);
+                    dp = mma(load<128>(dr, c, kb(s, h)), vr[s], dp);
+                }
+                uint16_t pb[8], sb[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int row = 8 * h + i, t = base + row;
+                    float prob = live && t < end && key <= t && key >= docs[row]
+                                     ? __builtin_amdgcn_exp2f((score[i] * scale - logs[row]) *
+                                                              1.4426950408889634f)
+                                     : 0;
+                    pb[i] = bf16(prob);
+                    sb[i] = bf16(prob * (dp[i] - corrections[row]) * scale);
+                }
+                ds = __builtin_bit_cast(Reg, sb);
+                *reinterpret_cast<uint4 *>(probs + at<16>(pair * 16 + c, 8 * h)) =
+                    __builtin_bit_cast(uint4, pb);
+            }
+            __syncthreads();
+            Reg derivative = value_wave ? load<16>(probs, pair * 16 + c, 8 * h) : ds;
+#pragma unroll
+            for (int nd = 0; nd < 8; ++nd)
+                out[nd] = mma(load<16>(value_wave ? dt : qt, 16 * nd + c, 8 * h), derivative, out[nd]);
+            __syncthreads();
+        }
+    if (live) {
+        View dst = value_wave ? dv : dk;
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                dst.p[size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+    }
+}
 } // namespace
 
 void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View dk, View dv, View delta,
@@ -204,6 +306,10 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
     require(!setting || std::string(setting) == "0" || std::string(setting) == "1",
             "QTIP_TRAIN_ATTN_PROFILE must be 0 or 1");
     bool profile = setting && std::string(setting) == "1";
+    const char *dkv_setting = std::getenv("QTIP_TRAIN_ATTN_DKV");
+    bool staged = dkv_setting && std::string(dkv_setting) == "staged";
+    require(!dkv_setting || staged || std::string(dkv_setting) == "wave",
+            "QTIP_TRAIN_ATTN_DKV must be wave or staged");
     struct Events {
         hipEvent_t begin{}, middle{}, end{};
         ~Events() {
@@ -225,8 +331,12 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
                                                                           starts);
     if (profile)
         HIP_CHECK(hipEventRecord(e.middle, stream));
-    dkv_kernel<<<dim3((q.rows + 15) / 16, kh), 128, 0, stream>>>(q, k, v, lse, dy, delta, dk, dv, h / kh,
-                                                                 starts, ends);
+    if (staged)
+        dkv_staged_kernel<<<dim3((q.rows + 15) / 16, kh), 128, 0, stream>>>(
+            q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
+    else
+        dkv_wave_kernel<<<dim3((q.rows + 31) / 32, kh), 128, 0, stream>>>(
+            q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
     if (profile) {
         HIP_CHECK(hipEventRecord(e.end, stream));
         HIP_CHECK(hipEventSynchronize(e.end));
@@ -239,6 +349,7 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
                            {"seqlen", q.rows},
                            {"heads", h},
                            {"kv_heads", kh},
+                           {"dkv_kernel", staged ? "staged" : "wave"},
                            {"dq_ms", qms},
                            {"dkv_ms", kvms}})
                          .dump()

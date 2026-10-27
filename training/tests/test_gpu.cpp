@@ -148,20 +148,27 @@ int main() {
             compare(cb[i], gb[i], .04);
         // Exercise both ownership directions, partial tiles, GQA reductions,
         // document boundaries inside key tiles, and nontrivial softmax scores.
-        for (int length : {1, 17, 33, 65, 129, 257}) {
-            for (int group : {1, 3, 4, 12}) {
+        for (int length : {1, 17, 33, 63, 64, 65, 129, 257}) {
+            for (int group : {1, 3, 4, 12, 32}) {
+                if (group == 32 && length != 65)
+                    continue;
                 Config ac = c;
                 ac.kv = 2;
                 ac.heads = group * ac.kv;
                 ac.n = ac.heads * ac.dim;
-                for (bool packed : {false, true}) {
+                for (int packing : {0, 1, 2}) {
+                    bool packed = packing != 0;
                     Batch ab;
                     ab.tokens.assign(length, 0);
                     ab.positions.resize(length);
                     ab.segments.resize(length);
                     for (int t = 0; t < length; ++t) {
-                        // Include one-token documents and boundaries at 7/31.
-                        int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : t < 70 ? 32 : 70;
+                        // Include one-token docs and boundaries inside both
+                        // the 16-key wave tile and the 32-key block tile.
+                        int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : t < 63 ? 32
+                                                        : t < 64 ? 63 : t < 70 ? 64 : 70;
+                        if (packing == 2)
+                            start = t; // Every token is its own document.
                         ab.segments[t] = start;
                         ab.positions[t] = t - start;
                     }
