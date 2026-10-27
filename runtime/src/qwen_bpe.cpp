@@ -102,25 +102,27 @@ std::vector<std::string> QwenTokenizer::pre_split(const std::string &text) const
     auto is_space = [](unsigned char c) {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
     };
-    static const char *cts[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
     while (i < text.size()) {
         unsigned char c = unsigned(text[i]);
+        bool have_leading_space = false;
         if (is_space(c)) {
             size_t j = i;
             while (j < text.size() && is_space(unsigned(text[j]))) ++j;
             if (j < text.size() && j - i == 1) {
-                // single space before a word: becomes the word's leading space (below)
-            } else if (j < text.size()) {  // \s+(?!\S): all but the last space
+                have_leading_space = true;  // single space: leads the next word
+            } else if (j < text.size()) {   // \s+(?!\S): all but the last space
                 out.push_back(text.substr(i, j - i - 1));
                 i = j - 1;
+                have_leading_space = true;
             } else {  // trailing whitespace run
                 out.push_back(text.substr(i, j - i));
                 i = j;
+                continue;
             }
-            continue;
         }
-        // contractions: part of the "other" run boundary — emit ('s|'t|'re|'ve|'m|'ll|'d) alone
-        if (c == '\'') {
+        // contractions: ('s|'t|'re|'ve|'m|'ll|'d) form their own chunk (after a leading space)
+        if (!have_leading_space && text[i] == '\'') {
+            static const char *cts[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
             for (auto ct : cts) {
                 size_t cl = std::strlen(ct);
                 if (text.compare(i, cl, ct) == 0) {
@@ -131,8 +133,8 @@ std::vector<std::string> QwenTokenizer::pre_split(const std::string &text) const
             }
         }
         {
-            size_t j = i;
-            if (c == ' ' && i + 1 < text.size() && !is_space(unsigned(text[i + 1]))) ++j;
+            size_t j = have_leading_space ? i + 1 : i;
+            const size_t base = j;
             unsigned char c1 = j < text.size() ? unsigned(text[j]) : 0;
             if (is_letter(c1)) {
                 while (j < text.size() && is_letter(unsigned(text[j]))) ++j;
@@ -142,8 +144,8 @@ std::vector<std::string> QwenTokenizer::pre_split(const std::string &text) const
                 while (j < text.size() && !is_space(unsigned(text[j])) && !is_letter(unsigned(text[j])) &&
                        !is_digit(unsigned(text[j])) && text[j] != '\'')
                     ++j;
-                if (j == i) ++j;  // lone apostrophe
             }
+            if (j == base) ++j;  // at least one byte (e.g. a lone apostrophe)
             out.push_back(text.substr(i, j - i));
             i = j;
         }
