@@ -617,6 +617,7 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     int m = 0, n = 0;
     std::vector<float> w;  // fp32 rows of this linear [m][n]
   };
+  std::vector<QLin> lins;
   auto add_lin = [&](const char* name, int m, int n, std::vector<float> w) {
     QLin q;
     q.name = name, q.m = m, q.n = n, q.w = std::move(w);
