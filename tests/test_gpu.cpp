@@ -434,15 +434,16 @@ static void test_qwen_layer(const std::string& model_dir, int dev) {
       for (auto& kv : st.tensors())
         if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight") embed_name = kv.first;
       const TensorInfo& e = st.info(embed_name);
-      std::vector<uint16_t> emb_row(size_t(e.shape[1]));
-      st.read_into(embed_name, emb_row.data(), emb_row.size() * 2);  // token 0 embedding
+      std::vector<uint8_t> emb_raw = st.read(embed_name);  // first row only is needed
+      const uint16_t* emb16 = reinterpret_cast<const uint16_t*>(emb_raw.data());
       for (int t = 0; t < T; ++t) {
         float noise = float(r.normal()) * 0.05f;
         for (int i = 0; i < cfg.hidden; ++i) {
-          float v = bf16_to_f32(emb_row[size_t(i)]) + noise * float(r.normal());
+          float v = bf16_to_f32(emb16[size_t(i)]) + noise * float(r.normal());
           xb[size_t(t) * cfg.hidden + size_t(i)] = f32_to_bf16(v);
         }
       }
+      (void)e;
     }
     // CPU fp32 reference
     std::vector<float> xc(size_t(T) * cfg.hidden);
