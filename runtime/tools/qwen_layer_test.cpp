@@ -503,55 +503,24 @@ int main(int argc, char **argv) {
         };
         auto bw = b16vec("linear_attn.in_proj_b.weight"), aw = b16vec("linear_attn.in_proj_a.weight");
         std::vector<float> y(rows * H, 0.0f);
-        for (int r = 0; r < rows; ++r) {
-            static thread_local std::vector<float> qkv(Wq), zz(V), ba(2 * size_t(nv));
-            std::vector<float> ringv(size_t(Wq) * c.conv_k, 0.0f);
-            std::vector<float> Sv(size_t(nv) * kd * vd, 0.0f);
-            auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
-            auto sp = [](float x) { return x > 20.0f ? x : std::log(1.0f + std::exp(x)); };
-            for (int t = 0; t <= r; ++t) {
-                (void)t;
-                break;  // placeholder: sequential state per row handled below
-            }
-            for (int t = 0; t <= r; ++t) {
-                // NOTE: this replica recomputes per row from scratch (rows share no state in the
-                // test's single-chunk semantics? they DO: one sequence). We emulate the GPU exactly:
-                // single sequence, tokens 0..rows-1, state carried across t.
-            }
-            // full sequential pass over tokens 0..r for THIS row's output is wrong; instead run one
-            // shared sequence below
-            (void)qkv;
-            (void)zz;
-            (void)ba;
-            (void)ringv;
-            (void)Sv;
-            (void)sig;
-            (void)sp;
-            (void)qkvf;
-            (void)zf;
-            (void)bw;
-            (void)aw;
-            (void)y;
-            break;
-        }
-        // shared-sequence CPU replica
+        // shared-sequence CPU replica (faithful port of the HF-validated qtip_quant CPU reference)
         {
             std::vector<float> qkv(Wq), zz(V), ba(2 * size_t(nv));
             std::vector<float> ringv(size_t(Wq) * c.conv_k, 0.0f);
             std::vector<float> Sv(size_t(nv) * kd * vd, 0.0f);
             auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
             auto sp = [](float x) { return x > 20.0f ? x : std::log(1.0f + std::exp(x)); };
-            std::vector<float> out(rows * V);
+            auto alog = f.floats(p + "linear_attn.A_log");
+            auto dtb = f.floats(p + "linear_attn.dt_bias");
+            std::vector<float> out(rows * V), o(value_dim_dummy(V));
             for (int t = 0; t < rows; ++t) {
                 for (int i = 0; i < Wq; ++i) qkv[size_t(i)] = qkvf[size_t(t) * Wq + i];
                 for (int i = 0; i < V; ++i) zz[size_t(i)] = zf[size_t(t) * V + i];
-                // b/a via dot with xn (bf16 weights)
                 for (int e = 0; e < 2 * nv; ++e) {
                     const std::vector<float> &w = e < nv ? bw : aw;
                     float acc = 0;
                     for (int i = 0; i < H; ++i)
-                        acc += xn[size_t(t) * H + size_t(i)] *
-                               b16(to16(w[size_t(e % nv) * H + size_t(i)]));
+                        acc += xn[size_t(t) * H + size_t(i)] * w[size_t(e % nv) * H + size_t(i)];
                     ba[size_t(e)] = acc;
                 }
                 for (int ch = 0; ch < Wq; ++ch) {
@@ -559,15 +528,15 @@ int main(int argc, char **argv) {
                     for (int j = 0; j + 1 < c.conv_k; ++j) rg[j] = rg[j + 1];
                     rg[c.conv_k - 1] = qkv[size_t(ch)];
                     float acc = 0;
-                    for (int j = 0; j < c.conv_k; ++j)
-                        acc += rg[j] * b16(convw[size_t(ch) * c.conv_k + size_t(j)]);
+                    const uint16_t *cw2 = convw.data() + size_t(ch) * c.conv_k;
+                    for (int j = 0; j < c.conv_k; ++j) acc += rg[j] * b16(cw2[size_t(j)]);
                     qkv[size_t(ch)] = acc / (1.0f + std::exp(-acc));
                 }
                 for (int hv = 0; hv < nv; ++hv) {
-                    int kh2 = hv / (nv / c.lin_nk);
+                    const int kh2 = hv / (nv / c.lin_nk);
                     float *qh = qkv.data() + size_t(kh2) * kd;
                     float *kh_ = qkv.data() + c.key_dim() + size_t(kh2) * kd;
-                    float *vh = qkv.data() + 2 * c.key_dim() + size_t(hv) * vd;
+                    const float *vh = qkv.data() + 2 * c.key_dim() + size_t(hv) * vd;
                     float qs = 0, ks = 0;
                     for (int d2 = 0; d2 < kd; ++d2) {
                         qs += qh[d2] * qh[d2];
@@ -579,44 +548,52 @@ int main(int argc, char **argv) {
                         qh[d2] *= iq;
                         kh_[d2] *= ik;
                     }
-                    float beta = sig(ba[size_t(hv)]);
-                    float al = f.floats(p + "linear_attn.A_log")[size_t(hv)];
-                    float dtb = f.floats(p + "linear_attn.dt_bias")[size_t(hv)];
-                    float g = -std::exp(al) * sp(ba[size_t(nv + hv)] + dtb);
-                    float decay = std::exp(g);
+                    const float beta = sig(ba[size_t(hv)]);
+                    const float g = -std::exp(alog[size_t(hv)]) * sp(ba[size_t(nv + hv)] + dtb[size_t(hv)]);
+                    const float decay = std::exp(g);
                     float *Sh = Sv.data() + size_t(hv) * kd * vd;
-                    std::vector<float> kvm(vd, 0.f), dl(vd), ov(vd, 0.f), o2(vd);
+                    float kvm[256], dl[256], ov[256];
+                    for (int dv2 = 0; dv2 < vd; ++dv2) kvm[dv2] = 0;
                     for (int dk = 0; dk < kd; ++dk) {
-                        float k_dk = kh_[dk];
-                        for (int dv = 0; dv < vd; ++dv) {
-                            Sh[size_t(dk) * vd + dv] *= decay;
-                            kvm[size_t(dv)] += Sh[size_t(dk) * vd + dv] * k_dk;
+                        const float k_dk = kh_[dk];
+                        float *srow = Sh + size_t(dk) * vd;
+                        for (int dv2 = 0; dv2 < vd; ++dv2) {
+                            srow[dv2] *= decay;
+                            kvm[dv2] += srow[dv2] * k_dk;
                         }
                     }
-                    for (int dv = 0; dv < vd; ++dv) {
-                        dl[size_t(dv)] = (vh[dv] - kvm[size_t(dv)]) * beta;
-                        ov[size_t(dv)] = 0;
+                    for (int dv2 = 0; dv2 < vd; ++dv2) {
+                        dl[dv2] = (vh[dv2] - kvm[dv2]) * beta;
+                        ov[dv2] = 0;
                     }
-                    for (int dk = 0; dk < kd; ++dk)
-                        for (int dv = 0; dv < vd; ++dv) {
-                            float sv2 = Sh[size_t(dk) * vd + dv] + kh_[dk] * dl[size_t(dv)];
-                            Sh[size_t(dk) * vd + dv] = sv2;
-                            ov[size_t(dv)] += sv2 * qh[dk];
+                    for (int dk = 0; dk < kd; ++dk) {
+                        const float k_dk = kh_[dk], q_dk = qh[dk];
+                        float *srow = Sh + size_t(dk) * vd;
+                        for (int dv2 = 0; dv2 < vd; ++dv2) {
+                            const float sv2 = srow[dv2] + k_dk * dl[dv2];
+                            srow[dv2] = sv2;
+                            ov[dv2] += sv2 * q_dk;
                         }
+                    }
                     float ss2 = 0;
-                    for (int dv = 0; dv < vd; ++dv) ss2 += ov[dv] * ov[dv];
-                    float oinv = 1.0f / std::sqrt(ss2 / vd + c.eps);
-                    for (int dv = 0; dv < vd; dv++)
-                        o2[size_t(dv)] =
-                            ov[dv] * oinv * b16(dnn[size_t(dv)]) *
-                            (zf[size_t(t) * V + size_t(hv) * vd + dv] /
-                             (1.0f + std::exp(-zf[size_t(t) * V + size_t(hv) * vd + dv])));
-                    for (int dv = 0; dv < vd; dv++) out[size_t(t) * V + size_t(hv) * vd + dv] = o2[size_t(dv)];
+                    for (int dv2 = 0; dv2 < vd; ++dv2) ss2 += ov[dv2] * ov[dv2];
+                    const float oinv = 1.0f / std::sqrt(ss2 / vd + c.eps);
+                    const uint16_t *nw = dnn.data();
+                    for (int dv2 = 0; dv2 < vd; ++dv2) {
+                        float z = zz[size_t(hv) * vd + dv2];
+                        out[size_t(t) * V + size_t(hv) * vd + dv2] =
+                            ov[dv2] * oinv * b16(nw[size_t(dv2)]) * (z / (1.0f + std::exp(-z)));
+                    }
                 }
             }
             std::printf("delta out cpu[:6]: %.4f %.4f %.4f %.4f\n", out[0], out[1], out[2], out[3]);
-            std::printf("t0: zf[:3] %.4f %.4f | ba[:4] %.4f %.4f %.4f %.4f\n", zf[0], zf[1], ba[0],
-                        ba[1], ba[2], ba[3]);
+            auto og = d_o.download();
+            double ddo = 0, sc = 1e-9;
+            for (size_t i = 0; i < out.size(); ++i) {
+                ddo = std::max(ddo, double(std::fabs(double(b16(og[i])) - out[i])));
+                sc = std::max(sc, double(std::fabs(out[i])));
+            }
+            std::printf("delta out diff: %.5f scale %.3f rel %.2e\n", ddo, sc, ddo / sc);
             auto of2 = lin_ref(ho, out);
             for (size_t i = 0; i < y.size(); ++i) y[i] = xs[i] + b16(to16(of2[i]));
         }
