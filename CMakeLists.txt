@@ -15,14 +15,15 @@ find_package(hipblaslt REQUIRED CONFIG)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Threads REQUIRED)
 
-# host-only core (codebook, hadamard reference, reference viterbi, packing, fp64 LDL)
-add_library(qtip_core STATIC src/qtip_core.cpp src/log.cpp src/safetensors.cpp)
+# host-only core (codebook, hadamard reference, reference viterbi, packing, fp64 LDL, qwen3.5 config/ref)
+add_library(qtip_core STATIC src/qtip_core.cpp src/log.cpp src/safetensors.cpp src/qwen35.cpp)
 target_include_directories(qtip_core PUBLIC src third_party)
 target_compile_options(qtip_core PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall -Wextra)
 target_link_libraries(qtip_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 
 # GPU kernels + hipBLASLt wrapper + quantizer + model forward
-add_library(qtip_gpu STATIC src/kernels.hip src/viterbi.hip src/gemm.cpp src/staging.cpp src/quantizer.cpp src/model.cpp)
+add_library(qtip_gpu STATIC src/kernels.hip src/viterbi.hip src/qwen_kernels.hip src/gemm.cpp src/staging.cpp
+                           src/quantizer.cpp src/model.cpp src/qwen_runner.cpp)
 target_include_directories(qtip_gpu PUBLIC src third_party)
 target_link_libraries(qtip_gpu PUBLIC qtip_core hip::host roc::hipblaslt)
 target_compile_options(qtip_gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -O3>
