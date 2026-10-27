@@ -88,6 +88,62 @@ int main() {
         auto cb = cpu->attention_backward(ca, dy, c, b), gb = gpu->attention_backward(ga, gdy, c, b);
         for (int i = 0; i < 3; ++i)
             compare(cb[i], gb[i], .04);
+        // Exercise both ownership directions, partial tiles, GQA reductions,
+        // document boundaries inside key tiles, and nontrivial softmax scores.
+        for (int length : {1, 17, 33, 65, 129}) {
+            for (int group : {1, 4, 12}) {
+                Config ac = c;
+                ac.kv = 2;
+                ac.heads = group * ac.kv;
+                ac.n = ac.heads * ac.dim;
+                for (bool packed : {false, true}) {
+                    Batch ab;
+                    ab.tokens.assign(length, 0);
+                    ab.positions.resize(length);
+                    ab.segments.resize(length);
+                    for (int t = 0; t < length; ++t) {
+                        // Include one-token documents and boundaries at 7/31.
+                        int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : 32;
+                        ab.segments[t] = start;
+                        ab.positions[t] = t - start;
+                    }
+                    ab.boundaries();
+                    gpu->embedding(gw, ab); // Upload packed boundary metadata.
+                    auto attention_pair = [&](int cols, unsigned seed, float scale) {
+                        // Extra columns deliberately exercise strided Q/K/V/dY views.
+                        auto a = cpu->alloc(length, cols + 16).col(0, cols);
+                        auto d = gpu->alloc(length, cols + 16).col(0, cols);
+                        std::vector<float> data(size_t(length) * cols);
+                        for (float &x : data) {
+                            seed = seed * 1664525u + 1013904223u;
+                            x = bf((float(seed >> 8) / 8388608.f - 1.f) * scale);
+                        }
+                        cpu->upload(a, data);
+                        gpu->upload(d, data);
+                        return std::pair(a, d);
+                    };
+                    auto [aq, bq] = attention_pair(ac.n, 11, packed ? 3.f : 1.f);
+                    auto [ak, bk] = attention_pair(ac.kv * 128, 19, packed ? 3.f : 1.f);
+                    auto [av, bv] = attention_pair(ac.kv * 128, 37, 1.f);
+                    auto [ad, bd] = attention_pair(ac.n, 43, 1.f);
+                    auto aa = cpu->attention(aq, ak, av, ac, ab);
+                    auto ba = gpu->attention(bq, bk, bv, ac, ab);
+                    compare(aa.out, ba.out, .012);
+                    compare(aa.lse, ba.lse, .001);
+                    auto ag = cpu->attention_backward(aa, ad, ac, ab);
+                    auto bg = gpu->attention_backward(ba, bd, ac, ab);
+                    for (int i = 0; i < 3; ++i)
+                        compare(ag[i], bg[i], .04);
+                    auto repeated = gpu->attention_backward(ba, bd, ac, ab);
+                    for (int i = 0; i < 3; ++i) {
+                        std::vector<float> x(bg[i].size()), y(repeated[i].size());
+                        gpu->download(bg[i], x);
+                        gpu->download(repeated[i], y);
+                        require(x == y, "attention backward must be deterministic");
+                    }
+                }
+            }
+        }
         auto cx = cpu->mm(ce, cw), gx = gpu->mm(ge, gw);
         compare(cx, gx, .002);
         compare(cpu->mm(cx, cw, true), gpu->mm(gx, gw, true), .005);

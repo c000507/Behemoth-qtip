@@ -127,7 +127,7 @@ struct Hip final : Ops {
     std::vector<std::unique_ptr<Pinned>> checkpoints;
     std::vector<std::shared_ptr<Registration>> registrations;
     std::unique_ptr<Pinned> stage;
-    std::shared_ptr<void> ids, positions, starts, labels;
+    std::shared_ptr<void> ids, positions, starts, ends, labels;
     size_t batch_capacity = 0;
     explicit Hip(int d, size_t bytes) : device(d) {
         rounding = true;
@@ -323,12 +323,14 @@ struct Hip final : Ops {
             ids = arena->alloc(n * 4);
             positions = arena->alloc(n * 4);
             starts = arena->alloc(n * 4);
+            ends = arena->alloc(n * 4);
             labels = arena->alloc(n * 4);
             batch_capacity = n;
         }
         upload_int(ids, b.tokens);
         upload_int(positions, b.positions);
         upload_int(starts, b.starts);
+        upload_int(ends, b.ends);
         auto x = alloc(int(n), w.in);
         gpu::embedding(gpu::view(x), static_cast<const uint16_t *>(w.p),
                        static_cast<const int32_t *>(ids.get()), w.out, stream);
@@ -361,11 +363,12 @@ struct Hip final : Ops {
         auto effective_dy = alloc(dy.rows, dy.cols);
         copy(effective_dy, dy);
         round(effective_dy);
-        auto dq = alloc(a.q.rows, a.q.cols), dk = alloc(a.k.rows, a.k.cols, true),
-             dv = alloc(a.v.rows, a.v.cols, true);
+        auto dq = alloc(a.q.rows, a.q.cols), dk = alloc(a.k.rows, a.k.cols), dv = alloc(a.v.rows, a.v.cols),
+             delta = alloc(c.heads, a.q.rows);
         gpu::flash_back(gpu::view(a.q), gpu::view(a.k), gpu::view(a.v), gpu::view(a.out), gpu::view(a.lse),
-                        gpu::view(effective_dy), gpu::view(dq), gpu::view(dk), gpu::view(dv), c.heads, c.kv,
-                        static_cast<const int32_t *>(starts.get()), stream);
+                        gpu::view(effective_dy), gpu::view(dq), gpu::view(dk), gpu::view(dv),
+                        gpu::view(delta), c.heads, c.kv, static_cast<const int32_t *>(starts.get()),
+                        static_cast<const int32_t *>(ends.get()), stream);
         round(dq);
         round(dk);
         round(dv);

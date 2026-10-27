@@ -20,5 +20,6 @@ void embedding(View, const uint16_t *, const int32_t *, int, hipStream_t);
 void loss(View, const int32_t *, float *, float, bool, hipStream_t);
 void adam(float *, const float *, float *, float *, size_t, bool, uint64_t, float, float, hipStream_t);
 void flash(View, View, View, View, View, int, int, const int32_t *, hipStream_t);
-void flash_back(View, View, View, View, View, View, View, View, View, int, int, const int32_t *, hipStream_t);
+void flash_back(View, View, View, View, View, View, View, View, View, View, int, int, const int32_t *,
+                const int32_t *, hipStream_t);
 } // namespace qat::gpu

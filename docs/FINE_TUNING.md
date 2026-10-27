@@ -140,6 +140,43 @@ build-training/qtip_bench /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot 0
 The benchmark reports decode, forward, backward seconds and peak arena bytes.
 Training emits JSON loss, gradient norm, LR, step time and packed tokens/second.
 
+To isolate training attention without loading a model, run the native attention
+benchmark. Start small, then use the actual packed-row and document lengths:
+
+```sh
+ctest --test-dir build-training -R native_gpu --output-on-failure
+# Sequence length, device, document length, repeats, heads, KV heads, arena GB:
+build-training/qtip_attention_bench 512 0 512 3 96 8 24
+build-training/qtip_attention_bench 24576 0 24576 3 96 8 24
+# Same packed row, with separate causal documents of at most 2048 tokens:
+build-training/qtip_attention_bench 24576 0 2048 3 96 8 24
+```
+
+It reports each iteration immediately, discards the first as warmup, and reports
+median forward/backward time, useful matrix TFLOP/s and peak arena bytes.
+Backward timing includes the gradient copy/rounding and softmax correction.
+Useful FLOPs count causal, unmasked pairs; they exclude tile padding, reductions,
+conversions, and memory traffic. These are attention-only timings, not full-step
+predictions. The CPU mode (`32 cpu 32 1 8 2`) is for checking the executable.
+
+Training attention backward assigns each dQ tile and each dK/dV tile to one
+thread block. It accumulates gradients in registers and writes each element
+once, including the reduction across grouped query heads. It uses document end
+boundaries to stop the dK/dV scan. The previous query-owned backward issued
+contended global atomic additions for every key tile: for one contiguous
+24,576-token sequence with 96 query heads and eight KV heads, that was
+464,460,447,744 FP32 atomic additions per layer. The replacement performs
+50,331,648 ordinary dK/dV element stores per layer, with no attention gradient
+atomics. This operation-count reduction is **not** an equivalent speedup claim.
+
+The tradeoff is recomputation: dQ and dK/dV independently calculate scores and
+probability gradients, giving seven matrix products per causal pair in backward
+instead of five. An extra FP32 softmax-correction buffer uses
+`4 * heads * sequence_length` bytes (9 MiB at 96 heads and 24,576 tokens). There
+is no quadratic or per-query-head dK/dV workspace. GPU numerical checks and
+timings must run on gfx1201; compilation and CPU tests alone do not establish
+GPU correctness or speedup. `--rows` chunks the MLP and does not shorten attention.
+
 For strict runtime parity, make a JSON request containing `tokens` and
 `logit_positions` (1–128 positions). Capture the actual native runtime output:
 
