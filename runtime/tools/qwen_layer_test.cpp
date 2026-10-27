@@ -136,6 +136,31 @@ int main(int argc, char **argv) {
         lin_gpu(ho, go, lq, suq /*placeholder*/, svo);
         DeviceBuffer<float> su_o;
         su_o.upload(ho.su);
+        {
+            // rt_tests-style control: random input through the same kernel call
+            std::vector<uint16_t> rx(size_t(rows) * H);
+            std::vector<float> rxf(size_t(rows) * H);
+            for (size_t i = 0; i < rx.size(); ++i) {
+                float v = 0.5f * nd(rng);
+                rxf[i] = float(BFloat16::from_bits(to16(v)));
+                rx[i] = to16(v);
+            }
+            DeviceBuffer<uint16_t> rd_x, rd_u;
+            rd_x.upload(rx);
+            rd_u.resize(size_t(rows) * H);
+            q_input_transform(rd_x.data(), rows, H, nullptr, 0, suq.data(), H, rd_u.data(), H, s);
+            HIP_CHECK(hipStreamSynchronize(s));
+            auto ug2 = rd_u.download();
+            double du2 = 0;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<double> t2(H);
+                for (int i = 0; i < H; ++i) t2[size_t(i)] = double(rxf[size_t(r) * H + i]) * hq.su[size_t(i)];
+                qtip::hadamard(t2.data(), H, true);
+                for (int i = 0; i < H; ++i)
+                    du2 = std::max(du2, double(std::fabs(double(b16(ug2[size_t(r) * H + i])) - t2[size_t(i)])));
+            }
+            std::printf("control (random, no norm) u diff: %.5f\n", du2);
+        }
         std::printf("stage: qkv input_transform\n");
         input_t(d_state.data(), std::getenv("NONORM") ? nullptr : &ln_in, suq.data(), H, d_u);
         std::printf("stage: q matmul\n");
