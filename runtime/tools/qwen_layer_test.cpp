@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
             }
             return y;
         };
-        std::vector<float> xn = normed(xs, ln_in);
+        std::vector<float> xn = normed(xs, ln_in_h);
         auto qf = proj_ref(hq, xn), kf = proj_ref(hk, xn), vf = proj_ref(hv, xn);
         // q/k norm + rope + attention on CPU (fp32; matches the kernels' semantics)
         auto rope = [&](float *v, int pos) {
