@@ -320,6 +320,17 @@ void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
                                  hipMemcpyDeviceToHost, stream));
     }
     HIP_CHECK(hipStreamSynchronize(stream));
+    if (std::getenv("QWEN_RT_DBG")) {
+        float *row = logits_all.data();
+        for (int k = 0; k < 3; ++k) {
+            int am = 0;
+            for (long v = 1; v < cfg.vocab; ++v)
+                if (row[size_t(v)] > row[size_t(am)]) am = int(v);
+            std::fprintf(stderr, "logit top%d: id %d val %.4f; samples: %.3f %.3f %.3f\n", k, am,
+                         row[size_t(am)], row[0], row[1], row[100]);
+            row[size_t(am)] = -1e30f;
+        }
+    }
 }
 
 void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
