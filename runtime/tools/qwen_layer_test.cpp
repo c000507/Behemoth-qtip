@@ -69,7 +69,9 @@ int main(int argc, char **argv) {
     std::mt19937 rng(3);
     std::normal_distribution<float> nd(0, 1);
     std::vector<uint16_t> x0(size_t(8) * H);
-    {
+    if (std::getenv("RANDX")) {
+        for (auto &v : x0) v = to16(0.5f * nd(rng));
+    } else {
         SafeTensorFile ef(dir / "model-embed.safetensors");
         auto emb = ef.floats("model.language_model.embed_tokens.weight");
         for (int t = 0; t < 8; ++t)
