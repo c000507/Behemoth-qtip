@@ -41,7 +41,7 @@ __device__ __forceinline__ float block_sum(float v) {
 // stage 1: natural-order FWHT on each contiguous chunk of P entries (P power of two, <= 1024)
 __global__ __launch_bounds__(256) void q_fwht_kernel(float *X, long rows, int n, long ld, int P, int K,
                                                      float scale) {
-    __shared__ float v[1024];
+    extern __shared__ float v[];  // P floats (P <= 4096)
     long row = blockIdx.x / K;
     int chunk = blockIdx.x % K;
     float *x = X + row * ld + long(chunk) * P;
@@ -113,7 +113,7 @@ void q_hadamard_rows(float *X, long rows, int n, long ld, bool transpose, hipStr
     int K, P;
     q_had_factor(n, K, P);
     float sc = 1.0f / std::sqrt(float(n));
-    q_fwht_kernel<<<unsigned(rows * K), 256, 0, s>>>(X, rows, n, ld, P, K, K == 1 ? sc : 1.0f);
+    q_fwht_kernel<<<unsigned(rows * K), 256, size_t(P) * 4, s>>>(X, rows, n, ld, P, K, K == 1 ? sc : 1.0f);
     if (K != 1)
         q_had_mix_kernel<<<nblocks(rows * P, 256), 256, 0, s>>>(X, rows, P, K, ld, q_device_had(K, transpose), sc);
     HIP_CHECK(hipGetLastError());
