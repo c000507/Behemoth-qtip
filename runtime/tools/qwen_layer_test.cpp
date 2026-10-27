@@ -160,6 +160,13 @@ int main(int argc, char **argv) {
                     du2 = std::max(du2, double(std::fabs(double(b16(ug2[size_t(r) * H + i])) - t2[size_t(i)])));
             }
             std::printf("control (random, no norm) u diff: %.5f\n", du2);
+            std::printf("ctl gpu[:6]: %.4f %.4f %.4f %.4f\n", b16(ug2[0]), b16(ug2[1]), b16(ug2[2]), b16(ug2[3]));
+            {
+                std::vector<double> t2(H);
+                for (int i = 0; i < H; ++i) t2[size_t(i)] = double(rxf[i]) * hq.su[size_t(i)];
+                qtip::hadamard(t2.data(), H, true);
+                std::printf("ctl cpu[:6]: %.4f %.4f %.4f %.4f\n", t2[0], t2[1], t2[2], t2[3]);
+            }
         }
         std::printf("stage: qkv input_transform\n");
         input_t(d_state.data(), std::getenv("NONORM") ? nullptr : &ln_in, suq.data(), H, d_u);
