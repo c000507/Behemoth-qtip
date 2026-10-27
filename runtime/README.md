@@ -1,10 +1,13 @@
 # Behemoth C++ ROCm runtime
 
-For the new opt-in BF16 prefill-transport experiment, benchmark correction,
-validation status and remaining bottlenecks, see
-[PREFILL_INVESTIGATION.md](PREFILL_INVESTIGATION.md). It is disabled by default;
-`--qtip-bf16-prefill-rows 512` enables it for qualifying pure-prefill micro-batches
-and adds rounding that needs hardware/quality evaluation.
+**`behemoth_server` uses the BF16 QTIP prefill exchange by default** (`--qtip-bf16-prefill-rows
+512`): pure-prefill micro-batches of at least 512 rows exchange BF16 instead of FP32 partial
+sums. Decode-only and mixed decode/prefill steps are never changed. Measured quality-neutral
+(held-out perplexity 2.94004 off vs 2.93983 on, 16k tokens) and +5-13 % prefill throughput; see
+[PREFILL_INVESTIGATION.md](PREFILL_INVESTIGATION.md) and
+[PERF_ROUND5_REPORT.md](PERF_ROUND5_REPORT.md). `--qtip-bf16-prefill-rows 0` restores the FP32
+exchange. The library default (`RuntimeOptions`, used by the tests, `behemoth_eval` and the
+benchmarks) stays 0; those tools take `BEHEMOTH_QTIP_BF16_PREFILL_ROWS`.
 
 Model-specific C++20 implementation for **two Radeon AI PRO R9700 (`gfx1201`) GPUs**.
 It retains AQLM 1x16/8-weight compression, uses native OCP E4M3 matrix operands and

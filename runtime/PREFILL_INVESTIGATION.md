@@ -44,7 +44,8 @@ communication, not 26.4% of whole-model latency. A tentative end-to-end target
 is around 5–15%, depending on exposed communication and attention; it may be
 smaller. This is not a credible route to a 4x speedup.
 
-Use `--qtip-bf16-prefill-rows 512` to experiment. Default: **0 (off)**. The
+`behemoth_server` default: **512 (on)** since round 5 (PERF_ROUND5_REPORT.md); `--qtip-bf16-prefill-rows 0`
+turns it off. Library/tool default (`RuntimeOptions`): 0. The
 threshold applies to each overlap micro-batch; valid nonzero values are 64..4096.
 A step containing **any one-query request** retains the previous precision,
 protecting decode-only and mixed decode/prefill steps. AQLM is unchanged.

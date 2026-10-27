@@ -153,12 +153,21 @@ void set_row_transform_threshold(int rows);
 // as output_residual, then u = input_transform(state, norm, epsilon, su) (12288, with norm).
 // One kernel when rows >= row_transform_threshold(), else the two separate kernels; identical
 // results either way.
+// Decode-sized steps (rows <= residual_sync_rows, below the row-transform threshold) also run
+// one kernel when a ResidualSync is given: the 12 per-chunk residual blocks of a row rendezvous
+// through sync->counters (device memory, zeroed; one 64-bit counter per row, used by one stream)
+// before computing the input transform. Identical results to the two separate kernels.
+struct ResidualSync {
+    unsigned long long *counters = nullptr;
+    int capacity = 0; // counters (rows)
+};
+inline constexpr int residual_sync_rows = 16; // env BEHEMOTH_QTIP_SYNC_ROWS (0 disables)
 void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, hipStream_t);
+                           int ldu, hipStream_t, ResidualSync *sync = nullptr);
 void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, hipStream_t);
+                           int ldu, hipStream_t, ResidualSync *sync = nullptr);
 // WMMA layout probe (tests): D = A * B for one 16x16x16 bf16 tile with A/B given row-major as
 // bf16 [16][16] (A: M x K, B: K x N); returns D row-major fp32.
 void wmma_probe(const BFloat16 *a, const BFloat16 *b, float *d, hipStream_t);

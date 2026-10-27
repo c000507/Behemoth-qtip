@@ -308,6 +308,9 @@ int main(int argc, char **argv) {
     try {
         RuntimeOptions options;
         options.prefix_cache.slots = 10; // PREFIX_CACHE_REPORT.md; --prefix-cache-slots 0 disables
+        // BF16 prefill exchange for pure-prefill micro-batches of >= 512 rows (PREFILL_INVESTIGATION.md,
+        // PERF_ROUND5_REPORT.md: quality-neutral, +5-13 % prefill); --qtip-bf16-prefill-rows 0 disables.
+        options.qtip_bf16_prefill_rows = 512;
         std::string host = "127.0.0.1";
         unsigned short port = 8080;
         int threads = 4;

@@ -658,6 +658,65 @@ void test_row_transforms_gpu() {
         }
     }
 }
+// Decode-sized fused residual + input transform (12-block rendezvous per row through
+// qtip::ResidualSync) vs the two separate kernels: bit-identical, fp32 and bf16 payloads, over a
+// sequence of changing row counts (a row's counter only advances in launches that include it).
+void test_residual_sync_gpu() {
+    const int saved = qtip::row_transform_threshold();
+    qtip::set_row_transform_threshold(0); // per-chunk kernels (the decode-sized path)
+    DeviceBuffer<unsigned long long> counters(64);
+    HIP_CHECK(hipMemset(counters.data(), 0, counters.bytes()));
+    qtip::ResidualSync sync{counters.data(), 64};
+    std::mt19937 rng(17);
+    std::vector<float> signs(12288);
+    for (auto &x : signs)
+        x = (rng() & 1) ? 1.f : -1.f;
+    DeviceBuffer<float> su, sv;
+    su.upload(signs);
+    sv.upload(random_vector(12288, 71, 0.002f));
+    DeviceBuffer<BFloat16> nw;
+    nw.upload(to_bf16(random_vector(12288, 72, 1.f)));
+    const int max_rows = qtip::residual_sync_rows;
+    const auto st0 = to_bf16(random_vector(size_t(max_rows) * 12288, 73, 0.5f));
+    DeviceBuffer<float> all;
+    all.upload(random_vector(size_t(2) * size_t(max_rows) * 6144, 74, 20.f));
+    DeviceBuffer<BFloat16> allb;
+    allb.upload(to_bf16(random_vector(size_t(2) * size_t(max_rows) * 6144, 75, 20.f)));
+    DeviceBuffer<BFloat16> st(size_t(max_rows) * 12288), u(size_t(max_rows) * 12288);
+    hipStream_t stream{};
+    HIP_CHECK(hipStreamCreate(&stream));
+    bool ok = true;
+    int launches = 0;
+    for (int rows : {1, 4, 16, 2, 16, 1, 7, 16, 3}) {
+        for (int bf16 = 0; bf16 < 2; ++bf16) {
+            auto run = [&](qtip::ResidualSync *s) {
+                st.upload(st0);
+                HIP_CHECK(hipMemset(u.data(), 0, u.bytes()));
+                for (int rep = 0; rep < 3; ++rep) { // repeated launches on the same counters
+                    if (bf16)
+                        qtip::output_residual_input(allb.data(), rows, sv.data(), st.data(), nw.data(), 1e-5f,
+                                                    su.data(), u.data(), 12288, stream, s);
+                    else
+                        qtip::output_residual_input(all.data(), rows, sv.data(), st.data(), nw.data(), 1e-5f,
+                                                    su.data(), u.data(), 12288, stream, s);
+                    launches += s ? 1 : 0;
+                }
+                HIP_CHECK(hipStreamSynchronize(stream));
+                auto r = st.download();
+                auto uu = u.download();
+                r.insert(r.end(), uu.begin(), uu.end());
+                return r;
+            };
+            const auto ref = run(nullptr), got = run(&sync);
+            ok = ok && ref.size() == got.size() &&
+                 std::memcmp(ref.data(), got.data(), ref.size() * sizeof(BFloat16)) == 0;
+        }
+    }
+    HIP_CHECK(hipStreamDestroy(stream));
+    qtip::set_row_transform_threshold(saved);
+    check(ok, "gpu decode-sized rendezvous residual + input transform bit-identical (" +
+                  std::to_string(launches) + " fused launches, changing row counts)");
+}
 // Payload conversion is the only new rounding: the BF16 consumers must exactly
 // match existing FP32 consumers given explicitly BF16-rounded FP32 input. Test
 // both rank layouts, per-chunk and row-batched kernels, and fused residual+norm.
@@ -779,6 +838,7 @@ int main(int argc, char **argv) {
         }
         test_epilogues_gpu();
         test_row_transforms_gpu();
+        test_residual_sync_gpu();
         test_bf16_epilogues_gpu();
         if (argc == 3)
             test_real(argv[1], argv[2]);

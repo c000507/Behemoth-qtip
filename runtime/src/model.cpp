@@ -518,6 +518,9 @@ struct Shard {
     int bf16_prefill_rows = 0;
     DeviceBuffer<BFloat16> qtip_u, qtip_h;
     DeviceBuffer<float> qtip_partial, qtip_all;
+    // Fused decode-sized residual + input transform (qtip::ResidualSync): rank stream only.
+    DeviceBuffer<unsigned long long> qtip_sync_counters;
+    qtip::ResidualSync qtip_sync;
     // Dense prefill path (PREFILL_SCHED_REPORT.md): one decoded-weight scratch shared by every
     // linear (pieces of <= qtip::dense_scratch_elements), hipBLASLt plans per shape.
     std::unique_ptr<qtip::DenseMatmul> qtip_dense;
@@ -812,6 +815,9 @@ struct Shard {
             qtip_h.resize(rows * 28672);
             qtip_all.resize(rows * 2 * 14336);
             qtip_partial.resize(std::max<size_t>(rows, 64) * 28672);
+            qtip_sync_counters.resize(64);
+            HIP_CHECK(hipMemset(qtip_sync_counters.data(), 0, qtip_sync_counters.bytes()));
+            qtip_sync = {qtip_sync_counters.data(), 64};
             return;
         }
         state.resize(rows * 12288);
@@ -1235,6 +1241,14 @@ struct Shard {
     BFloat16 *mb_state(const Mb &mb) {
         return state.data() + size_t(mb.r0) * 12288;
     }
+    // The fused decode-sized residual+input kernel needs one stream per counter set: the rank
+    // stream of a non-overlapped step, at or below residual_sync_rows.
+    qtip::ResidualSync *qtip_sync_for(const Mb &mb) {
+        if (mb.overlap || mb.index != 0 || mb.rows > qtip::residual_sync_rows ||
+            (qtip::row_transform_threshold() > 0 && mb.rows >= qtip::row_transform_threshold()))
+            return nullptr;
+        return &qtip_sync;
+    }
     // A: q/k/v input transform (norm + SU + hadUt), stacked matmul, all-gather of the rotated
     // outputs, hadU + SV for this rank's heads, rope, KV append, attention, all-gather of the
     // head-sharded attention output.
@@ -1301,10 +1315,11 @@ struct Shard {
             if (mb.bf16_projection)
                 qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(all), rows,
                     w.sv_o.data(), mb_state(mb), l.post_norm.data(), 1e-5f, w.su_gate_up.data(), u,
-                    12288, mb.s);
+                    12288, mb.s, qtip_sync_for(mb));
             else
                 qtip::output_residual_input(all, rows, w.sv_o.data(), mb_state(mb), l.post_norm.data(),
-                                            1e-5f, w.su_gate_up.data(), u, 12288, mb.s);
+                                            1e-5f, w.su_gate_up.data(), u, 12288, mb.s,
+                                            qtip_sync_for(mb));
         });
     }
     // C: gate/up stacked matmul, bf16 all-gather, silu product, down input transform.
@@ -1329,15 +1344,18 @@ struct Shard {
         qtip_project(mb, w.down, w.lut, 28672, mb.bf16_projection, comm, transport);
         measure(mb, "elementwise_ms", [&] {
             const int t = qtip::row_transform_threshold();
-            if (next && t > 0 && rows >= t) {
+            // row-batched sizes fuse from registers; decode sizes through the rendezvous kernel
+            if (next && ((t > 0 && rows >= t) || qtip_sync_for(mb))) {
                 if (mb.bf16_projection)
                     qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(qtip_block(mb)),
                         rows, w.sv_down.data(), mb_state(mb), next->input_norm.data(), 1e-5f,
-                        next->qtip.su_qkv.data(), qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
+                        next->qtip.su_qkv.data(), qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s,
+                        qtip_sync_for(mb));
                 else
                     qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
                                                 next->input_norm.data(), 1e-5f, next->qtip.su_qkv.data(),
-                                                qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s);
+                                                qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s,
+                                                qtip_sync_for(mb));
                 mb.input_ready = true;
             } else if (mb.bf16_projection)
                 qtip::output_residual(reinterpret_cast<const BFloat16 *>(qtip_block(mb)), rows,

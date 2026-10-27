@@ -82,6 +82,7 @@ AttentionResult reference_attention(const AttentionLayout &l, const AttentionDat
     for (int request = 0; request < l.requests(); ++request)
         for (int query = l.query_offsets[size_t(request)];
              query < l.query_offsets[size_t(request + 1)]; ++query)
+#pragma omp parallel for schedule(static) // rows are independent; deterministic per row
             for (int head = 0; head < l.query_heads; ++head) {
                 const size_t row = size_t(query) * size_t(l.query_heads) + size_t(head);
                 const int kh = head / 12, end = l.positions[size_t(query)] + 1;

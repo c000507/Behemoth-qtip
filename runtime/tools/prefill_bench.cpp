@@ -32,14 +32,15 @@ int main(int argc, char **argv) {
             return 2;
         }
         const auto rows_list = argc > 2 ? list(argv[2]) : std::vector<int>{256, 512, 1024, 2048};
+        // rows "0": decode-only run (BEHEMOTH_BENCH_DECODE), no prefill cases
         const auto ctx_list = argc > 3 ? list(argv[3]) : std::vector<int>{0, 8192};
         const int reps = argc > 4 ? std::stoi(argv[4]) : 3;
         if (rows_list.empty() || ctx_list.empty() || reps < 1 ||
-            *std::min_element(rows_list.begin(), rows_list.end()) < 1 ||
+            *std::min_element(rows_list.begin(), rows_list.end()) < 0 ||
             *std::max_element(rows_list.begin(), rows_list.end()) > 4096 ||
             *std::min_element(ctx_list.begin(), ctx_list.end()) < 0)
             throw std::invalid_argument("need rows 1..4096, nonnegative contexts and positive reps");
-        const int max_rows = *std::max_element(rows_list.begin(), rows_list.end());
+        const int max_rows = std::max(1, *std::max_element(rows_list.begin(), rows_list.end()));
         RuntimeOptions o;
         o.model = argv[1];
         o.token_budget = o.prefill_chunk = size_t(max_rows);
@@ -47,7 +48,84 @@ int main(int argc, char **argv) {
         o.memory_fraction = 0.9;
         if (const char *value = std::getenv("BEHEMOTH_QTIP_BF16_PREFILL_ROWS"))
             o.qtip_bf16_prefill_rows = std::stoi(value);
+        // BEHEMOTH_BENCH_PROFILE=1: GPU event timings of the last timed step (adds overhead).
+        if (const char *value = std::getenv("BEHEMOTH_BENCH_ZC_ROWS"))
+            o.zero_copy_rows = size_t(std::stoi(value)); // zero-copy exchange buffer rows (default 8)
+        o.profile = std::getenv("BEHEMOTH_BENCH_PROFILE") && std::atoi(std::getenv("BEHEMOTH_BENCH_PROFILE"));
+        // BEHEMOTH_BENCH_DECODE="1,4,16": decode steps of c one-token requests at each context
+        // (the prefix pages are shared; each request appends its token to its own page, so
+        // contexts are rounded up to a multiple of 16).
+        const auto decode_list = std::getenv("BEHEMOTH_BENCH_DECODE")
+                                     ? list(std::getenv("BEHEMOTH_BENCH_DECODE")) : std::vector<int>{};
+        if (!decode_list.empty())
+            o.token_budget = o.prefill_chunk = std::max<size_t>(
+                o.token_budget, size_t(*std::max_element(decode_list.begin(), decode_list.end())));
         TensorParallelModel model(o);
+        auto report = [&](const char *name, int rows, int ctx, std::vector<double> ms, int rows_divisor) {
+            ms.erase(ms.begin()); // first: plan creation / warm-up
+            std::sort(ms.begin(), ms.end());
+            const double med = ms[ms.size() / 2];
+            std::cout << name << " rows=" << rows << " ctx=" << ctx << " " << med << " ms "
+                      << rows_divisor / med * 1000 << " tok/s bf16-prefill-rows=" << o.qtip_bf16_prefill_rows << '\n';
+            if (o.profile) {
+                auto p = model.last_profile();
+                std::cout << "  profile execution_wall_ms=" << p.value("execution_wall_ms", 0.0);
+                for (const auto &r : p.at("ranks"))
+                    std::cout << " rank" << r.at("rank") << "=" << r.at("gpu_event_totals").dump();
+                std::cout << '\n';
+            }
+            std::cout << std::flush;
+        };
+        auto decode_cases = [&] {
+          for (int ctx0 : ctx_list)
+            for (int c : decode_list) {
+                const int ctx = int(ceil_div(size_t(ctx0), 16) * 16);
+                InferenceBatch b;
+                auto &l = b.layout;
+                l.physical_pages = model.cache_pages();
+                const int prefix_pages = ctx / 16, per = prefix_pages + 1;
+                if (size_t(per) * size_t(c) > size_t(l.physical_pages)) {
+                    std::cout << "decode rows=" << c << " ctx=" << ctx << " skipped: exceeds the KV pool\n";
+                    continue;
+                }
+                l.table_stride = per;
+                l.query_offsets = {0};
+                for (int r = 0; r < c; ++r) {
+                    l.query_offsets.push_back(r + 1);
+                    l.lengths.push_back(ctx + 1);
+                    l.positions.push_back(ctx);
+                    b.tokens.push_back(100 + (r * 7919) % 30000);
+                    for (int p = 0; p < per; ++p)
+                        l.page_table.push_back(r * per + p);
+                    b.sample_rows.push_back(r);
+                    b.sample_ids.push_back(uint64_t(r));
+                }
+                // every request gets its own prefix KV (no page aliasing): c prefills of ctx tokens
+                for (int r = 0; r < c; ++r)
+                    for (int start = 0; start < ctx; start += max_rows) {
+                        const int end = std::min(ctx, start + max_rows);
+                        InferenceBatch warm;
+                        warm.layout.physical_pages = l.physical_pages;
+                        warm.layout.table_stride = prefix_pages;
+                        for (int p = 0; p < prefix_pages; ++p)
+                            warm.layout.page_table.push_back(r * per + p);
+                        warm.layout.query_offsets = {0, end - start};
+                        warm.layout.lengths = {end};
+                        for (int pos = start; pos < end; ++pos) {
+                            warm.layout.positions.push_back(pos);
+                            warm.tokens.push_back(100 + (pos * 7919) % 30000);
+                        }
+                        (void)model.forward(warm);
+                    }
+                std::vector<double> ms;
+                for (int r = 0; r < reps + 1; ++r) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    (void)model.forward(b);
+                    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                }
+                report("decode", c, ctx, ms, c);
+            }
+        };
         const int dense_default = qtip::dense_rows_threshold();
         struct Path {
             const char *name;
@@ -57,7 +135,7 @@ int main(int argc, char **argv) {
         for (int ctx : ctx_list)
             for (int rows : rows_list)
                 for (const auto &p : paths) {
-                    if (p.dense > 0 && rows < p.dense)
+                    if (rows < 1 || (p.dense > 0 && rows < p.dense))
                         continue;
                     // BEHEMOTH_BENCH_PATHS: subset of "wmma,dense,overlap" (default all)
                     if (const char *only = std::getenv("BEHEMOTH_BENCH_PATHS")) {
@@ -109,15 +187,11 @@ int main(int argc, char **argv) {
                         (void)model.forward(b);
                         ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                     }
-                    ms.erase(ms.begin()); // first: plan creation / warm-up
-                    std::sort(ms.begin(), ms.end());
-                    const double med = ms[ms.size() / 2];
-                    std::cout << p.name << " rows=" << rows << " ctx=" << ctx << " " << med << " ms "
-                              << rows / med * 1000 << " tok/s bf16-prefill-rows=" << o.qtip_bf16_prefill_rows << '\n'
-                              << std::flush;
+                    report(p.name, rows, ctx, ms, rows);
                 }
         qtip::set_dense_rows_threshold(dense_default);
         set_qtip_overlap_rows(-1);
+        decode_cases();
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

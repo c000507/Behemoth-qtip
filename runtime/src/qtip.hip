@@ -563,14 +563,13 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
         s += red[w];
     return s;
 }
-// grid (K, rows), 256 threads.
+// Output chunk k2 of row `row` of the input transform (one 256-thread block).
 template <int K, bool NORM>
-__global__ __launch_bounds__(256) void input_transform_kernel(Source src, const uint16_t *norm,
-                                                              float epsilon, const float *su,
-                                                              uint16_t *u, int ldu) {
-    __shared__ float scratch[1024];
-    __shared__ float red[8];
-    const int k2 = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
+__device__ __forceinline__ void input_transform_chunk(const Source &src, const uint16_t *norm,
+                                                      float epsilon, const float *su, uint16_t *u,
+                                                      int ldu, int k2, int row, float *scratch,
+                                                      float *red) {
+    const int j = 4 * int(threadIdx.x);
     constexpr int n = K * 1024;
     // The block's mix inputs (4 positions of every chunk) are the whole row, so the rms of the
     // row comes from the same registers (no second pass over x).
@@ -617,6 +616,16 @@ __global__ __launch_bounds__(256) void input_transform_kernel(Source src, const 
         make_uint2(uint32_t(device::bf16(v[0] * scale)) | uint32_t(device::bf16(v[1] * scale)) << 16,
                    uint32_t(device::bf16(v[2] * scale)) | uint32_t(device::bf16(v[3] * scale)) << 16);
 }
+// grid (K, rows), 256 threads.
+template <int K, bool NORM>
+__global__ __launch_bounds__(256) void input_transform_kernel(Source src, const uint16_t *norm,
+                                                              float epsilon, const float *su,
+                                                              uint16_t *u, int ldu) {
+    __shared__ float scratch[1024];
+    __shared__ float red[8];
+    input_transform_chunk<K, NORM>(src, norm, epsilon, su, u, ldu, int(blockIdx.x), int(blockIdx.y),
+                                   scratch, red);
+}
 // grid (8, rows): blocks 0..5 = this rank's q chunks, 6 = k, 7 = v.
 template <class T>
 __global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows, int rank,
@@ -653,12 +662,11 @@ __global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows,
             out[size_t(row) * 512 + size_t(j - 512 * rank + i)] = device::bf16(x[i] * scale * sv[j + i]);
     }
 }
-// grid (12, rows)
+// Residual epilogue of output chunk k2 of row `row` (one 256-thread block).
 template <class T>
-__global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int rows,
-                                                              const float *sv, uint16_t *state) {
-    __shared__ float scratch[1024];
-    const int k2 = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
+__device__ __forceinline__ void output_residual_chunk(const T *all, int rows, const float *sv,
+                                                      uint16_t *state, int k2, int row, float *scratch) {
+    const int j = 4 * int(threadIdx.x);
     Source s{all, 6144, size_t(rows) * 6144, 6144, 0};
     float x[4];
     mix<12, false, T>(s, row, k2, x);
@@ -671,6 +679,43 @@ __global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int 
         const float t = device::bf16(device::bf16(x[i] * scale * sv[e + i]));
         st[i] = device::bf16(device::bf16(st[i]) + t);
     }
+}
+// grid (12, rows)
+template <class T>
+__global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int rows,
+                                                              const float *sv, uint16_t *state) {
+    __shared__ float scratch[1024];
+    output_residual_chunk<T>(all, rows, sv, state, int(blockIdx.x), int(blockIdx.y), scratch);
+}
+// grid (12, rows): the residual epilogue of chunk k2, a rendezvous of the row's 12 blocks
+// (sync[row] counts arrivals across calls, a multiple of 12 between launches; the blocks of a row are
+// dispatched consecutively, and rows <= residual_sync_rows keeps them co-resident), then the
+// input transform of the updated row for output chunk k2. Both halves are the per-chunk kernels'
+// code: results are identical to output_residual_kernel + input_transform_kernel<12, true>.
+template <class T>
+__global__ __launch_bounds__(256) void output_residual_input_kernel(
+    const T *all, int rows, const float *sv, uint16_t *state, const uint16_t *norm, float epsilon,
+    const float *su, uint16_t *u, int ldu, unsigned long long *sync) {
+    __shared__ float scratch[1024];
+    __shared__ float red[8];
+    const int k2 = int(blockIdx.x), row = int(blockIdx.y);
+    output_residual_chunk<T>(all, rows, sv, state, k2, row, scratch);
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // The row's counter only advances in launches that include the row (the row count
+        // varies between steps), so each block derives its target from the value it saw: the
+        // 12 arrivals of one launch fill one multiple of 12 (launches on the stream are ordered).
+        const unsigned long long seen =
+            __hip_atomic_fetch_add(sync + row, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        const unsigned long long target = (seen / 12 + 1) * 12;
+        while (__hip_atomic_load(sync + row, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target)
+            __builtin_amdgcn_s_sleep(1);
+    }
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); // every wave: fresh view of `state`
+    input_transform_chunk<12, true>(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, u, ldu, k2,
+                                    row, scratch, red);
 }
 // grid (28, rows)
 __global__ __launch_bounds__(256) void output_gateup_kernel(const uint16_t *all, int rows,
@@ -1231,9 +1276,18 @@ void output_residual_impl(const T *all, int rows, const float *sv, BFloat16 *sta
 template <class T>
 void output_residual_input_impl(const T *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, hipStream_t stream) {
+                           int ldu, ResidualSync *sync, hipStream_t stream) {
     upload_tables();
     if (!row_transforms(rows)) {
+        static const int sync_rows = env_rows("BEHEMOTH_QTIP_SYNC_ROWS", residual_sync_rows);
+        if (sync && sync->counters && rows <= std::min(sync->capacity, sync_rows) && sync_rows > 0) {
+            output_residual_input_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
+                all, rows, sv, reinterpret_cast<uint16_t *>(state),
+                reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u),
+                ldu, sync->counters);
+            HIP_CHECK(hipGetLastError());
+            return;
+        }
         output_residual_impl(all, rows, sv, state, stream);
         input_transform(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, 12288, rows, u, ldu,
                         stream);
@@ -1260,14 +1314,14 @@ void output_residual(const BFloat16 *all, int rows, const float *sv, BFloat16 *s
 }
 void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
-                           hipStream_t s) {
-    output_residual_input_impl(all, rows, sv, state, norm, eps, su, u, ldu, s);
+                           hipStream_t s, ResidualSync *sync) {
+    output_residual_input_impl(all, rows, sv, state, norm, eps, su, u, ldu, sync, s);
 }
 void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
-                           hipStream_t s) {
+                           hipStream_t s, ResidualSync *sync) {
     output_residual_input_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, norm, eps,
-                               su, u, ldu, s);
+                               su, u, ldu, sync, s);
 }
 void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const float *sv_up,
                    BFloat16 *h, hipStream_t stream) {
