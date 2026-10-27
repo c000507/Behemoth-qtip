@@ -148,7 +148,10 @@ int main(int argc, char **argv) {
         q_hadamard_rows(d_z.data(), rows, hv.out, hv.out, false, s);
         q_sv_cast(d_z.data(), svv.data(), d_v.data(), rows, hv.out, hv.out, s);
         DeviceBuffer<uint16_t> kc(size_t(64) * nkv * hd), vc(size_t(64) * nkv * hd);
-        auto qn = load16("self_attn.q_norm.weight"), kn = load16("self_attn.k_norm.weight");
+        auto qn_h = load16("self_attn.q_norm.weight"), kn_h = load16("self_attn.k_norm.weight");
+        DeviceBuffer<uint16_t> qn, kn;
+        qn.upload(qn_h);
+        kn.upload(kn_h);
         std::printf("stage: rope\n");
         std::printf("rope ptrs q=%p k=%p v=%p g=%p kc=%p vc=%p qn=%p kn=%p\n", (void *)d_q.data(),
                     (void *)d_k.data(), (void *)d_v.data(), (void *)d_g.data(), (void *)kc.data(),
@@ -207,7 +210,7 @@ int main(int argc, char **argv) {
                 float inv = float(1.0 / std::sqrt(ss / hd + c.eps));
                 for (int d = 0; d < hd; ++d) {
                     Q[size_t(r) * nq * hd + size_t(h) * hd + d] =
-                        b16(to16(qh[d] * inv)) * (1.0f + b16(qn[size_t(d)]));
+                        b16(to16(qh[d] * inv)) * (1.0f + b16(qn_h[size_t(d)]));
                     G[size_t(r) * nq * hd + size_t(h) * hd + d] = gh[d];
                 }
                 rope(&Q[size_t(r) * nq * hd + size_t(h) * hd], r);
@@ -219,7 +222,7 @@ int main(int argc, char **argv) {
                 float inv = float(1.0 / std::sqrt(ss / hd + c.eps));
                 for (int d = 0; d < hd; ++d)
                     K[size_t(r) * nkv * hd + size_t(h) * hd + d] =
-                        b16(to16(kh[d] * inv)) * (1.0f + b16(kn[size_t(d)]));
+                        b16(to16(kh[d] * inv)) * (1.0f + b16(kn_h[size_t(d)]));
                 rope(&K[size_t(r) * nkv * hd + size_t(h) * hd], r);
             }
         }
