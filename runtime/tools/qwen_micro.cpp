@@ -13,6 +13,7 @@ using namespace behemoth;
 static float b16(uint16_t b) { return float(BFloat16::from_bits(b)); }
 
 int main(int argc, char **argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::filesystem::path dir = argv[1];
     int stage = std::atoi(argv[2]);
     QwenRuntimeConfig c = QwenRuntimeConfig::read(dir);
