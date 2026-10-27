@@ -195,6 +195,16 @@ int main(int argc, char **argv) {
                 }
                 for (int i = 0; i < H; ++i)
                     du = std::max(du, double(std::fabs(double(b16(ug[size_t(r) * H + size_t(i)])) - t[size_t(i)])));
+                if (r == 0) {
+                    // no-hadamard hypothesis: u == bf16(x*inv*(1+w)*su)
+                    double dh = 0;
+                    for (int i = 0; i < H; ++i) {
+                        float v = b16(to16(xs2[size_t(i)] * inv));
+                        v *= (1.0f + b16(ln_in_h[size_t(i)])) * hq.su[size_t(i)];
+                        dh = std::max(dh, double(std::fabs(double(b16(ug[size_t(i)])) - double(v))));
+                    }
+                    std::printf("no-hadamard hypothesis diff: %.5f\n", dh);
+                }
             }
             std::printf("u diff %.5f\n", du);
         }
