@@ -51,27 +51,59 @@ __global__ void convert(View a, uint16_t *b, bool to) {
 void cast(View a, uint16_t *b, bool to, hipStream_t s) {
     convert<<<(size_t(a.rows) * a.cols + 255) / 256, 256, 0, s>>>(a, b, to);
 }
-__global__ void reduction(View a, View b, View d, bool scalar) {
-    int c = blockIdx.x;
-    if (scalar) {
-        size_t n = size_t(a.rows) * a.cols;
-        float x = 0;
-        for (size_t i = size_t(c) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
-            x += read(a, i / a.cols, i % a.cols) * read(b, i / b.cols, i % b.cols);
-        x = sum(x);
-        if (threadIdx.x == 0)
-            atomicAdd(d.p, x);
-    } else {
-        float x = 0;
-        for (int r = threadIdx.x; r < a.rows; r += 256)
-            x += read(a, r, c) * read(b, r, c);
-        x = sum(x);
-        if (threadIdx.x == 0)
-            d.p[c] += x;
+__global__ void reduction(View a, View b, View d) {
+    size_t n = size_t(a.rows) * a.cols;
+    float x = 0;
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
+        x += read(a, i / a.cols, i % a.cols) * read(b, i / b.cols, i % b.cols);
+    x = sum(x);
+    if (threadIdx.x == 0)
+        atomicAdd(d.p, x);
+}
+void scalar_reduce(View a, View b, View d, hipStream_t s) {
+    size_t blocks = (size_t(a.rows) * a.cols + 255) / 256;
+    blocks = blocks < 256 ? blocks : 256;
+    if (blocks)
+        reduction<<<blocks, 256, 0, s>>>(a, b, d);
+}
+// Adjacent lanes read adjacent columns. Eight waves reduce 256 rows into one
+// partial per column; a second pass owns each destination, including accumulation
+// into gradients shared by tied projections and successive MLP chunks.
+__global__ void column_partials(View a, View b, View scale, View partial) {
+    __shared__ float sums[8][32];
+    int lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    int c = blockIdx.x * 32 + lane, first = blockIdx.y * reduction_rows;
+    float value = 0;
+    if (c < a.cols)
+        for (int r = first + wave; r < a.rows && r < first + reduction_rows; r += 8) {
+            float v = read(b, r, c);
+            if (scale.p)
+                v *= read(scale, r, 0);
+            value += read(a, r, c) * v;
+        }
+    sums[wave][lane] = value;
+    __syncthreads();
+    if (wave == 0 && c < a.cols) {
+        float total = 0;
+        for (int w = 0; w < 8; ++w)
+            total += sums[w][lane];
+        at(partial, blockIdx.y, c) = total;
     }
 }
-void reduce(View a, View b, View d, bool scalar, hipStream_t s) {
-    reduction<<<scalar ? 256 : a.cols, 256, 0, s>>>(a, b, d, scalar);
+__global__ void column_finish(View partial, View d) {
+    int c = blockIdx.x * 256 + threadIdx.x;
+    if (c >= d.cols)
+        return;
+    float total = 0;
+    for (int r = 0; r < partial.rows; ++r)
+        total += read(partial, r, c);
+    d.p[c] += total;
+}
+void column_reduce(View a, View b, View scale, View partial, View d, hipStream_t s) {
+    if (a.rows == 0)
+        return;
+    column_partials<<<dim3((a.cols + 31) / 32, partial.rows), 256, 0, s>>>(a, b, scale, partial);
+    column_finish<<<(d.cols + 255) / 256, 256, 0, s>>>(partial, d);
 }
 __global__ void norm(View x, View w, View y, View rr, float eps) {
     int r = blockIdx.x;
@@ -89,7 +121,7 @@ __global__ void norm(View x, View w, View y, View rr, float eps) {
 void rms(View x, View w, View y, View rr, float eps, hipStream_t s) {
     norm<<<x.rows, 256, 0, s>>>(x, w, y, rr, eps);
 }
-__global__ void norm_back(View x, View rr, View w, View dy, View dx, View dw) {
+__global__ void norm_back(View x, View rr, View w, View dy, View dx) {
     int r = blockIdx.x;
     float inv = rr.p[r], dot = 0;
     for (int c = threadIdx.x; c < x.cols; c += 256)
@@ -98,25 +130,36 @@ __global__ void norm_back(View x, View rr, View w, View dy, View dx, View dw) {
     for (int c = threadIdx.x; c < x.cols; c += 256) {
         float xh = read(x, r, c) * inv, d = read(dy, r, c);
         at(dx, r, c) = inv * (d * w.p[c] - xh * dot);
-        atomicAdd(dw.p + c, d * xh);
     }
 }
-void rms_back(View x, View rr, View w, View dy, View dx, View dw, hipStream_t s) {
-    norm_back<<<x.rows, 256, 0, s>>>(x, rr, w, dy, dx, dw);
+void rms_back(View x, View rr, View w, View dy, View dx, hipStream_t s) {
+    norm_back<<<x.rows, 256, 0, s>>>(x, rr, w, dy, dx);
 }
-__global__ void rotary(View x, View y, int heads, int dim, float theta, const int32_t *pos, bool back) {
+__global__ void angles(View table, int dim, float theta, const int32_t *pos) {
+    size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= size_t(table.rows) * (dim / 2))
+        return;
+    int r = i / (dim / 2), j = i % (dim / 2);
+    float angle = pos[r] * powf(theta, -2.f * j / dim);
+    at(table, r, j) = cosf(angle);
+    at(table, r, j + dim / 2) = sinf(angle);
+}
+void rope_angles(View table, int dim, float theta, const int32_t *pos, hipStream_t s) {
+    angles<<<(size_t(table.rows) * (dim / 2) + 255) / 256, 256, 0, s>>>(table, dim, theta, pos);
+}
+__global__ void rotary(View x, View y, int heads, int dim, View table, bool back) {
     size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
     if (i >= size_t(x.rows) * heads * (dim / 2))
         return;
     int j = i % (dim / 2), h = i / (dim / 2) % heads, r = i / (dim / 2) / heads;
-    float angle = pos[r] * powf(theta, -2.f * j / dim), cs = cosf(angle), sn = sinf(angle),
-          u = read(x, r, h * dim + j), v = read(x, r, h * dim + j + dim / 2);
+    float cs = read(table, r, j), sn = read(table, r, j + dim / 2), u = read(x, r, h * dim + j),
+          v = read(x, r, h * dim + j + dim / 2);
     float a = u * cs + (back ? v : -v) * sn, b = v * cs + (back ? -u : u) * sn;
     at(y, r, h * dim + j) = back ? a : f16(bf16(a));
     at(y, r, h * dim + j + dim / 2) = back ? b : f16(bf16(b));
 }
-void rope(View x, View y, int h, int d, float theta, const int32_t *p, bool back, hipStream_t s) {
-    rotary<<<(size_t(x.rows) * h * (d / 2) + 255) / 256, 256, 0, s>>>(x, y, h, d, theta, p, back);
+void rope(View x, View y, int h, int d, View table, bool back, hipStream_t s) {
+    rotary<<<(size_t(x.rows) * h * (d / 2) + 255) / 256, 256, 0, s>>>(x, y, h, d, table, back);
 }
 __global__ void glu(View g, View u, View y) {
     size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;

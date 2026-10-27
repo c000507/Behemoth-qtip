@@ -140,6 +140,40 @@ build-training/qtip_bench /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot 0
 The benchmark reports decode, forward, backward seconds and peak arena bytes.
 Training emits JSON loss, gradient norm, LR, step time and packed tokens/second.
 
+The native trainer shares the input Hadamard transform across Q/K/V and across
+gate/up. HIP transforms write BF16 GEMM operands directly, including in projection
+backward, avoiding an FP32 transform buffer followed by a separate conversion.
+The CPU reference preserves its original rounding behavior. Persistent activations
+and gradients still use FP32 storage; this is not a full BF16 activation-storage
+conversion.
+
+SU/SV and RMSNorm parameter gradients use coalesced two-pass column reductions.
+RMSNorm no longer issues one global atomic addition per activation (about
+53.5 billion per 24,576-token, 88-layer training pass, including final norm).
+Scratch space is `4 * ceil(rows / 256) * columns` bytes, about 4.5 MiB for a
+24,576-by-12,288 reduction. Scalar Wscale reductions still use a small number of
+atomic additions. RoPE caches sine/cosine per batch, dimension and theta; batch
+changes invalidate the cache even when their lengths match. At 24,576 tokens and
+head dimension 128 the cache uses 12 MiB. Contiguous host transfers use up to
+8 MiB per copy; each loss chunk downloads its row losses together rather than
+synchronizing for every four-byte value.
+
+Optional GEMM tuning benchmarks up to eight valid hipBLASLt heuristic candidates
+on the actual device, using one warmup and three timed calls per candidate. The
+winner is cached per matrix geometry for that process. Enable it with:
+
+```sh
+QTIP_TRAIN_GEMM_TUNE=1 build-training/qtip_bench MODEL 0 24576 0 1024
+# The same environment variable works with qtip_finetune.
+```
+
+Tuning is off by default. It prints the selected candidate and timing to stderr
+and adds setup work to the first call of each geometry, so first-step timing
+includes tuning. Choices are not persisted across processes. The GPU test suite
+checks both the default and tuned paths; it skips both when no GPU is available.
+Numerical and performance validation on gfx1201 is still required for these
+optimizations; CPU tests and compilation alone cannot establish GPU speedups.
+
 To isolate training attention without loading a model, run the native attention
 benchmark. Start small, then use the actual packed-row and document lengths:
 

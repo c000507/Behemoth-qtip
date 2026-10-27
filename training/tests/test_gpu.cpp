@@ -74,11 +74,69 @@ int main() {
         auto dw = cpu->alloc(1, 1024, true), gdw = gpu->alloc(1, 1024, true);
         compare(cpu->rms_backward(ce, cn, w, dy, dw), gpu->rms_backward(ge, gn, z, gdy, gdw), .002);
         compare(dw, gdw, .002);
+        for (int rows : {1, 17, 255, 256, 257, 513}) {
+            for (int cols : {31, 128, 1024}) {
+                // Strided views and partial tiles exercise the coalesced, two-pass
+                // reduction. Accumulators start nonzero and are updated twice.
+                auto [ax, bx] = pair(rows, cols + 16, .2);
+                auto [ad, bd] = pair(rows, cols + 16, .7);
+                ax = ax.col(0, cols);
+                bx = bx.col(0, cols);
+                ad = ad.col(0, cols);
+                bd = bd.col(0, cols);
+                auto [ac, bc] = pair(1, cols, .4);
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    cpu->colsum(ax, ad, ac);
+                    gpu->colsum(bx, bd, bc);
+                }
+                compare(ac, bc, .0001);
+                auto [aw, bw] = pair(1, cols, .3);
+                auto an = cpu->rms(ax, aw, c.eps), bn = gpu->rms(bx, bw, c.eps);
+                auto [ag, bg] = pair(1, cols, .5);
+                for (int repeat = 0; repeat < 2; ++repeat)
+                    compare(cpu->rms_backward(ax, an, aw, ad, ag), gpu->rms_backward(bx, bn, bw, bd, bg),
+                            .002);
+                compare(ag, bg, .002);
+            }
+        }
         compare(cpu->swiglu(ce, dy), gpu->swiglu(ge, gdy), .007);
         auto cg = cpu->swiglu_backward(ce, dy, ce), gg = gpu->swiglu_backward(ge, gdy, ge);
         compare(cg.first, gg.first, .002);
         compare(cg.second, gg.second, .002);
         compare(cpu->rope(ce, c.heads, c, b), gpu->rope(ge, c.heads, c, b), .006);
+        Batch shifted = b;
+        for (auto &pos : shifted.positions)
+            pos += 1000;
+        gpu->embedding(gw, shifted);
+        for (float theta : {1000000.f, 10000.f, 1000000.f}) {
+            Config rc = c;
+            rc.theta = theta;
+            for (bool back : {false, true})
+                compare(cpu->rope(ce, c.heads, rc, shifted, back), gpu->rope(ge, c.heads, rc, shifted, back),
+                        .006);
+        }
+        gpu->embedding(gw, b);
+        compare(cpu->rope(ce, c.heads, c, b), gpu->rope(ge, c.heads, c, b), .006);
+        std::vector<Weight> cpu_weights{cw, cw}, gpu_weights{gw, gw};
+        auto cm = cpu->had_mm(ce, cpu_weights, w), gm = gpu->had_mm(ge, gpu_weights, z);
+        for (int i = 0; i < 2; ++i)
+            compare(cm[i], gm[i], .003);
+        for (int width : {1024, 12288, 28672}) {
+            auto [ax, bx] = pair(3, width + 16, .1);
+            ax = ax.col(0, width);
+            bx = bx.col(0, width);
+            auto [ap, bp] = pair(1, width, .3);
+            std::vector<uint16_t> data(size_t(width) * 16);
+            for (size_t i = 0; i < data.size(); ++i)
+                data[i] = behemoth::BFloat16(float(std::sin(i * .17) * .02)).bits;
+            for (bool transposed : {false, true}) {
+                auto aw = cpu->frozen(data, transposed ? width : 16, transposed ? 16 : width);
+                auto bw = gpu->frozen(data, transposed ? width : 16, transposed ? 16 : width);
+                auto am = cpu->had_mm(ax, std::span(&aw, 1), ap, transposed);
+                auto bm = gpu->had_mm(bx, std::span(&bw, 1), bp, transposed);
+                compare(am.front(), bm.front(), .006);
+            }
+        }
         auto [q, gq] = pair(T, 1024, .1);
         auto [k, gk] = pair(T, 256, .4);
         auto [v, gv] = pair(T, 256, .9);
@@ -126,6 +184,8 @@ int main() {
                     auto [ak, bk] = attention_pair(ac.kv * 128, 19, packed ? 3.f : 1.f);
                     auto [av, bv] = attention_pair(ac.kv * 128, 37, 1.f);
                     auto [ad, bd] = attention_pair(ac.n, 43, 1.f);
+                    compare(cpu->rope(aq, ac.heads, ac, ab), gpu->rope(bq, ac.heads, ac, ab), .006);
+                    compare(cpu->rope(ak, ac.kv, ac, ab, true), gpu->rope(bk, ac.kv, ac, ab, true), .006);
                     auto aa = cpu->attention(aq, ak, av, ac, ab);
                     auto ba = gpu->attention(bq, bk, bv, ac, ab);
                     compare(aa.out, ba.out, .012);

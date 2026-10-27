@@ -17,22 +17,29 @@ Mat Layer::effective(const std::string &name) const {
     o_.round(v);
     return v;
 }
-Mat Layer::projection(Mat x, int i, LinearSave *save) {
-    auto su = effective(su_name(i));
-    auto u = o_.had(x, true, su);
-    auto z = o_.mm(u, weights_.at(i));
-    if (i == 4 || i == 5)
-        o_.round(z);
-    auto c = o_.had(z);
-    auto sv = parameter(linears[i] + ".SV"), scale = parameter(linears[i] + ".Wscale");
-    auto svs = o_.alloc(1, sv.cols);
-    o_.mul(svs, sv, scale);
-    auto y = o_.alloc(c.rows, c.cols);
-    o_.mul(y, c, svs);
-    o_.round(y);
-    if (save)
-        *save = {x, c, i};
-    return y;
+Mat Layer::projection(Mat x, int i, LinearSave *save) { return projections(x, i, 1, save).front(); }
+std::vector<Mat> Layer::projections(Mat x, int first, int count, LinearSave *saves) {
+    auto su = effective(su_name(first));
+    for (int i = first; i < first + count; ++i)
+        require(su_name(i) == su_name(first), "grouped projections must share SU");
+    auto result = o_.had_mm(x, std::span(weights_).subspan(first, count), su);
+    for (int j = 0; j < count; ++j) {
+        int i = first + j;
+        auto z = result[j];
+        if (i == 4 || i == 5)
+            o_.round(z);
+        auto c = o_.had(z);
+        auto sv = parameter(linears[i] + ".SV"), scale = parameter(linears[i] + ".Wscale");
+        auto svs = o_.alloc(1, sv.cols);
+        o_.mul(svs, sv, scale);
+        auto y = o_.alloc(c.rows, c.cols);
+        o_.mul(y, c, svs);
+        o_.round(y);
+        if (saves)
+            saves[j] = {x, c, i};
+        result[j] = y;
+    }
+    return result;
 }
 Mat Layer::projection_backward(const LinearSave &s, Mat dy) {
     const auto &name = linears[s.index];
@@ -45,8 +52,7 @@ Mat Layer::projection_backward(const LinearSave &s, Mat dy) {
     o_.scale_sum(dc, sv, gradient(name + ".Wscale"));
     auto svs = o_.alloc(1, sv.cols);
     o_.mul(svs, sv, scale);
-    auto db = o_.had(dy, true, svs);
-    auto da = o_.mm(db, weights_[s.index], true);
+    auto da = o_.had_mm(dy, std::span(weights_).subspan(s.index, 1), svs, true).front();
     auto dxsu = o_.had(da);
     o_.colsum(dxsu, s.x, gradient(su_name(s.index)));
     auto dx = o_.alloc(dxsu.rows, dxsu.cols);
@@ -56,9 +62,9 @@ Mat Layer::projection_backward(const LinearSave &s, Mat dy) {
 Mat Layer::attention_half(Mat x, const Batch &b, AttnSave *save) {
     auto norm = o_.rms(x, effective(norm1), m_.config.eps);
     std::vector<LinearSave> qkv(3);
-    auto q = projection(norm.y, 0, save ? &qkv[0] : nullptr),
-         k = projection(norm.y, 1, save ? &qkv[1] : nullptr),
-         v = projection(norm.y, 2, save ? &qkv[2] : nullptr);
+    auto projected = projections(norm.y, 0, 3, save ? qkv.data() : nullptr);
+    auto q = projected[0], k = projected[1], v = projected[2];
+    projected.clear();
     q = o_.rope(q, m_.config.heads, m_.config, b);
     k = o_.rope(k, m_.config.kv, m_.config, b);
     auto a = o_.attention(q, k, v, m_.config, b);
@@ -72,14 +78,16 @@ Mat Layer::attention_half(Mat x, const Batch &b, AttnSave *save) {
 }
 Mat Layer::mlp(Mat h, MlpSave *save) {
     auto norm = o_.rms(h, effective(norm2), m_.config.eps);
-    LinearSave gs, us, ds;
-    auto g = projection(norm.y, 4, save ? &gs : nullptr), u = projection(norm.y, 5, save ? &us : nullptr);
+    LinearSave gu[2], ds;
+    auto projected = projections(norm.y, 4, 2, save ? gu : nullptr);
+    auto g = projected[0], u = projected[1];
+    projected.clear();
     auto product = o_.swiglu(g, u);
     auto y = projection(product, 6, save ? &ds : nullptr);
     auto out = o_.alloc(h.rows, h.cols);
     o_.add(out, h, y, true);
     if (save)
-        *save = {norm, gs, us, ds, g, u};
+        *save = {norm, gu[0], gu[1], ds, g, u};
     return out;
 }
 Mat Layer::forward(Mat x, const Batch &b, int chunk) {

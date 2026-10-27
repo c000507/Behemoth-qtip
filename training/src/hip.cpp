@@ -2,6 +2,7 @@
 #include "hip_ops.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <hipblaslt/hipblaslt.h>
 #include <iostream>
@@ -96,6 +97,7 @@ struct Plan {
     hipblasLtMatmulDesc_t op{};
     hipblasLtMatrixLayout_t a{}, b{}, c{};
     hipblasLtMatmulAlgo_t algo{};
+    std::vector<hipblasLtMatmulAlgo_t> candidates;
     ~Plan() {
         if (a)
             hipblasLtMatrixLayoutDestroy(a);
@@ -129,7 +131,16 @@ struct Hip final : Ops {
     std::unique_ptr<Pinned> stage;
     std::shared_ptr<void> ids, positions, starts, ends, labels;
     size_t batch_capacity = 0;
+    Mat rope_table;
+    float rope_theta = 0;
+    bool rope_valid = false;
+    bool tune_gemm = false;
     explicit Hip(int d, size_t bytes) : device(d) {
+        if (const char *setting = std::getenv("QTIP_TRAIN_GEMM_TUNE")) {
+            require(std::string(setting) == "0" || std::string(setting) == "1",
+                    "QTIP_TRAIN_GEMM_TUNE must be 0 or 1");
+            tune_gemm = std::string(setting) == "1";
+        }
         rounding = true;
         HIP_CHECK(hipSetDevice(d));
         hipDeviceProp_t prop{};
@@ -182,6 +193,17 @@ struct Hip final : Ops {
     void upload(Mat d, std::span<const float> v) override {
         enter();
         require(d.size() == v.size(), "upload shape");
+        if (d.ld == d.cols) {
+            for (size_t off = 0; off < v.size();) {
+                size_t take = std::min(v.size() - off, stage->bytes / 4);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                std::memcpy(stage->p, v.data() + off, take * 4);
+                HIP_CHECK(hipMemcpyAsync(d.p + off, stage->p, take * 4, hipMemcpyHostToDevice, stream));
+                off += take;
+            }
+            HIP_CHECK(hipStreamSynchronize(stream));
+            return;
+        }
         for (int r = 0; r < d.rows; ++r) {
             size_t off = 0;
             while (off < size_t(d.cols)) {
@@ -198,6 +220,16 @@ struct Hip final : Ops {
     void download(Mat s, std::span<float> v) override {
         enter();
         require(s.size() == v.size(), "download shape");
+        if (s.ld == s.cols) {
+            for (size_t off = 0; off < v.size();) {
+                size_t take = std::min(v.size() - off, stage->bytes / 4);
+                HIP_CHECK(hipMemcpyAsync(stage->p, s.p + off, take * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+                std::memcpy(v.data() + off, stage->p, take * 4);
+                off += take;
+            }
+            return;
+        }
         for (int r = 0; r < s.rows; ++r) {
             size_t off = 0;
             while (off < size_t(s.cols)) {
@@ -218,11 +250,14 @@ struct Hip final : Ops {
         gpu::binary(gpu::view(d), gpu::view(a), gpu::view(b), 1, false, stream);
     }
     void round(Mat d) override { gpu::rounded(gpu::view(d), stream); }
-    void colsum(Mat a, Mat b, Mat d) override {
-        gpu::reduce(gpu::view(a), gpu::view(b), gpu::view(d), false, stream);
+    void colsum(Mat a, Mat b, Mat d) override { column_reduce(a, b, {}, d); }
+    void column_reduce(Mat a, Mat b, Mat scale, Mat d) {
+        auto partial = alloc((a.rows + gpu::reduction_rows - 1) / gpu::reduction_rows, a.cols);
+        gpu::column_reduce(gpu::view(a), gpu::view(b), gpu::view(scale), gpu::view(partial), gpu::view(d),
+                           stream);
     }
     void scale_sum(Mat a, Mat b, Mat d) override {
-        gpu::reduce(gpu::view(a), gpu::view(b), gpu::view(d), true, stream);
+        gpu::scalar_reduce(gpu::view(a), gpu::view(b), gpu::view(d), stream);
     }
     Mat had(Mat x, bool tr = false, Mat pre = {}) override {
         auto y = alloc(x.rows, x.cols);
@@ -237,8 +272,8 @@ struct Hip final : Ops {
     }
     Mat rms_backward(Mat x, Norm n, Mat w, Mat dy, Mat dw) override {
         auto dx = alloc(x.rows, x.cols);
-        gpu::rms_back(gpu::view(x), gpu::view(n.r), gpu::view(w), gpu::view(dy), gpu::view(dx), gpu::view(dw),
-                      stream);
+        gpu::rms_back(gpu::view(x), gpu::view(n.r), gpu::view(w), gpu::view(dy), gpu::view(dx), stream);
+        column_reduce(dy, x, n.r, dw);
         return dx;
     }
     Weight frozen(std::span<const uint16_t> v, int out, int in) override {
@@ -284,28 +319,98 @@ struct Hip final : Ops {
         blas(hipblasLtMatmulPreferenceCreate(&pref));
         blas(hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws,
                                                    sizeof(ws)));
-        hipblasLtMatmulHeuristicResult_t result{};
+        hipblasLtMatmulHeuristicResult_t results[8]{};
         int count = 0;
-        auto status =
-            hipblasLtMatmulAlgoGetHeuristic(handle, p->op, p->a, p->b, p->c, p->c, pref, 1, &result, &count);
+        auto status = hipblasLtMatmulAlgoGetHeuristic(handle, p->op, p->a, p->b, p->c, p->c, pref,
+                                                      tune_gemm ? 8 : 1, results, &count);
         hipblasLtMatmulPreferenceDestroy(pref);
         blas(status);
-        require(count > 0 && result.state == HIPBLAS_STATUS_SUCCESS, "no BF16 GEMM algorithm");
-        p->algo = result.algo;
+        for (int i = 0; i < count; ++i)
+            if (results[i].state == HIPBLAS_STATUS_SUCCESS && results[i].workspaceSize <= ws)
+                p->candidates.push_back(results[i].algo);
+        require(!p->candidates.empty(), "no BF16 GEMM algorithm");
+        p->algo = p->candidates.front();
+        if (!tune_gemm)
+            p->candidates.clear();
         auto &ref = *p;
         plans.emplace(key, std::move(p));
         return ref;
     }
     Mat mm(Mat x, const Weight &w, bool tr = false) override {
-        int k = tr ? w.out : w.in, m = tr ? w.in : w.out;
-        require(x.cols == k, "GEMM shape");
-        auto y = alloc(x.rows, m);
         auto input = arena->alloc(x.size() * 2);
         gpu::cast(gpu::view(x), static_cast<uint16_t *>(input.get()), true, stream);
-        auto &p = plan(m, x.rows, k, w.in, tr);
+        return gemm(input.get(), x.rows, x.cols, w, tr);
+    }
+    std::vector<Mat> had_mm(Mat x, std::span<const Weight> weights, Mat pre = {}, bool tr = false) override {
+        auto input = arena->alloc(x.size() * 2);
+        qtip_training::had_rows(x.p, 0, x.ld, x.rows, x.cols, true, pre.p, 0, nullptr, 0,
+                                static_cast<uint16_t *>(input.get()), x.cols, nullptr, stream);
+        std::vector<Mat> result;
+        for (const auto &w : weights)
+            result.push_back(gemm(input.get(), x.rows, x.cols, w, tr));
+        return result;
+    }
+    Mat gemm(const void *input, int rows, int cols, const Weight &w, bool tr) {
+        int k = tr ? w.out : w.in, m = tr ? w.in : w.out;
+        require(cols == k, "GEMM shape");
+        auto y = alloc(rows, m);
+        auto &p = plan(m, rows, k, w.in, tr);
         float one = 1, zero = 0;
-        blas(hipblasLtMatmul(handle, p.op, &one, w.p, p.a, input.get(), p.b, &zero, y.p, p.c, y.p, p.c,
-                             &p.algo, workspace.get(), ws, stream));
+        if (!p.candidates.empty()) {
+            // beta=0: trials overwrite only this operation's output. Inputs and
+            // parameters are immutable. Cache the winner for this geometry.
+            struct Events {
+                hipEvent_t begin{}, end{};
+                ~Events() {
+                    if (begin)
+                        (void)hipEventDestroy(begin);
+                    if (end)
+                        (void)hipEventDestroy(end);
+                }
+            } events;
+            HIP_CHECK(hipEventCreate(&events.begin));
+            HIP_CHECK(hipEventCreate(&events.end));
+            float best = INFINITY;
+            int winner = -1;
+            auto launch = [&](const hipblasLtMatmulAlgo_t &algo) {
+                return hipblasLtMatmul(handle, p.op, &one, w.p, p.a, input, p.b, &zero, y.p, p.c, y.p, p.c,
+                                       &algo, workspace.get(), ws, stream);
+            };
+            for (size_t i = 0; i < p.candidates.size(); ++i) {
+                if (launch(p.candidates[i]) != HIPBLAS_STATUS_SUCCESS)
+                    continue;
+                HIP_CHECK(hipEventRecord(events.begin, stream));
+                bool success = true;
+                for (int repeat = 0; repeat < 3; ++repeat)
+                    if (launch(p.candidates[i]) != HIPBLAS_STATUS_SUCCESS) {
+                        success = false;
+                        break;
+                    }
+                HIP_CHECK(hipEventRecord(events.end, stream));
+                HIP_CHECK(hipEventSynchronize(events.end));
+                float elapsed = 0;
+                HIP_CHECK(hipEventElapsedTime(&elapsed, events.begin, events.end));
+                if (success && elapsed < best) {
+                    best = elapsed;
+                    winner = int(i);
+                    p.algo = p.candidates[i];
+                }
+            }
+            require(winner >= 0, "no runnable BF16 GEMM tuning candidate");
+            std::cerr << json({{"gemm_tune_device", device},
+                               {"m", m},
+                               {"n", rows},
+                               {"k", k},
+                               {"transpose", tr},
+                               {"candidate", winner},
+                               {"candidates", p.candidates.size()},
+                               {"milliseconds", best / 3}})
+                             .dump()
+                      << '\n';
+            p.candidates.clear();
+        }
+        blas(hipblasLtMatmul(handle, p.op, &one, w.p, p.a, input, p.b, &zero, y.p, p.c, y.p, p.c, &p.algo,
+                             workspace.get(), ws, stream));
         return y;
     }
     void upload_int(std::shared_ptr<void> &p, std::span<const int32_t> v) {
@@ -331,6 +436,7 @@ struct Hip final : Ops {
         upload_int(positions, b.positions);
         upload_int(starts, b.starts);
         upload_int(ends, b.ends);
+        rope_valid = false;
         auto x = alloc(int(n), w.in);
         gpu::embedding(gpu::view(x), static_cast<const uint16_t *>(w.p),
                        static_cast<const int32_t *>(ids.get()), w.out, stream);
@@ -338,8 +444,15 @@ struct Hip final : Ops {
     }
     Mat rope(Mat x, int h, const Config &c, const Batch &, bool back = false) override {
         auto y = alloc(x.rows, x.cols);
-        gpu::rope(gpu::view(x), gpu::view(y), h, c.dim, c.theta,
-                  static_cast<const int32_t *>(positions.get()), back, stream);
+        if (!rope_valid || rope_table.rows != x.rows || rope_table.cols != c.dim || rope_theta != c.theta) {
+            if (rope_table.rows != x.rows || rope_table.cols != c.dim)
+                rope_table = alloc(x.rows, c.dim);
+            gpu::rope_angles(gpu::view(rope_table), c.dim, c.theta,
+                             static_cast<const int32_t *>(positions.get()), stream);
+            rope_theta = c.theta;
+            rope_valid = true;
+        }
+        gpu::rope(gpu::view(x), gpu::view(y), h, c.dim, gpu::view(rope_table), back, stream);
         return y;
     }
     Mat swiglu(Mat g, Mat u) override {

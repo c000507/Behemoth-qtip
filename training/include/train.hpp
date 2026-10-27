@@ -112,6 +112,16 @@ struct Ops {
     virtual Weight frozen(std::span<const uint16_t>, int out, int in) = 0;
     virtual std::vector<Weight> decode(const LayerData &) = 0;
     virtual Mat mm(Mat x, const Weight &, bool transpose = false) = 0;
+    // Shared input transform; HIP writes BF16 GEMM operands directly. CPU keeps
+    // the reference operation order (and unrounded finite-difference mode).
+    virtual std::vector<Mat> had_mm(Mat x, std::span<const Weight> weights, Mat pre = {},
+                                    bool transpose = false) {
+        auto u = had(x, true, pre);
+        std::vector<Mat> result;
+        for (const auto &w : weights)
+            result.push_back(mm(u, w, transpose));
+        return result;
+    }
     virtual Mat embedding(const Weight &, const Batch &) = 0;
     virtual Mat rope(Mat, int heads, const Config &, const Batch &, bool backward = false) = 0;
     virtual Mat swiglu(Mat gate, Mat up) = 0;
@@ -147,6 +157,7 @@ class Layer {
     Mat gradient(const std::string &) const;
     Mat effective(const std::string &) const;
     Mat projection(Mat, int, LinearSave *save = nullptr);
+    std::vector<Mat> projections(Mat, int first, int count, LinearSave *saves = nullptr);
     Mat projection_backward(const LinearSave &, Mat);
     struct AttnSave {
         Norm norm;

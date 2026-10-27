@@ -10,10 +10,13 @@ inline View view(Mat m) { return {m.p, m.rows, m.cols, m.ld}; }
 void binary(View, View, View, int, bool, hipStream_t);
 void cast(View, uint16_t *, bool, hipStream_t);
 void rounded(View, hipStream_t);
-void reduce(View, View, View, bool, hipStream_t);
+void scalar_reduce(View, View, View, hipStream_t);
+inline constexpr int reduction_rows = 256;
+void column_reduce(View, View, View, View, View, hipStream_t);
 void rms(View, View, View, View, float, hipStream_t);
-void rms_back(View, View, View, View, View, View, hipStream_t);
-void rope(View, View, int, int, float, const int32_t *, bool, hipStream_t);
+void rms_back(View, View, View, View, View, hipStream_t);
+void rope_angles(View, int, float, const int32_t *, hipStream_t);
+void rope(View, View, int, int, View, bool, hipStream_t);
 void swiglu(View, View, View, hipStream_t);
 void swiglu_back(View, View, View, View, View, hipStream_t);
 void embedding(View, const uint16_t *, const int32_t *, int, hipStream_t);
