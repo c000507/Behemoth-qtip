@@ -268,7 +268,7 @@ void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
         int nr = std::min(16, nrows - r0);
         dense.gemm(cfg.vocab, H,
                    reinterpret_cast<const BFloat16 *>(state.data() + size_t(row0 + r0) * H), H, nr,
-                   logits_d.data() + size_t(r0) * cfg.vocab, cfg.vocab, embed.data(), stream);
+                   logits_d.data() + size_t(r0) * cfg.vocab, cfg.vocab, reinterpret_cast<const BFloat16 *>(embed.data()), stream);
         HIP_CHECK(hipMemcpyAsync(logits_all.data() + size_t(r0) * cfg.vocab,
                                  logits_d.data() + size_t(r0) * cfg.vocab, size_t(nr) * cfg.vocab * 4,
                                  hipMemcpyDeviceToHost, stream));
