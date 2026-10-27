@@ -1,6 +1,7 @@
 // Micro bisect for the Qwen runtime kernel hang: stage-by-stage pipeline pieces.
 // usage: qwen_micro <model_dir> <stage 1..6>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -88,6 +89,24 @@ int main(int argc, char **argv) {
     std::printf("  ok\n");
     if (stage < 6) return 0;
     std::printf("stage 6: attention kernels\n");
+    if (std::getenv("ROPE_ONLY")) {
+        DeviceBuffer<uint16_t> q3(size_t(rows) * nq * 2 * hd), k3(size_t(rows) * nkv * hd),
+            v3(size_t(rows) * nkv * hd), g3(size_t(rows) * nq * hd), kc3(size_t(64) * nkv * hd),
+            vc3(size_t(64) * nkv * hd);
+        std::vector<uint16_t> qn(hd, 0x3f80), kn(hd, 0x3f80);
+        std::printf("  rope only\n");
+        q_qk_norm_rope(q3.data(), k3.data(), v3.data(), g3.data(), kc3.data(), vc3.data(), rows, 0,
+                       nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        std::printf("  rope ok\n");
+        DeviceBuffer<uint16_t> ao3(size_t(rows) * nq * hd);
+        std::printf("  attn only\n");
+        q_attn(q3.data(), kc3.data(), vc3.data(), g3.data(), ao3.data(), rows, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        std::printf("  attn ok\n");
+        return 0;
+    }
     DeviceBuffer<uint16_t> q(size_t(rows) * nq * 2 * hd), k(size_t(rows) * nkv * hd),
         v2(size_t(rows) * nkv * hd), g(size_t(rows) * nq * hd), ao(size_t(rows) * nq * hd);
     DeviceBuffer<uint16_t> kc(size_t(64) * nkv * hd), vc(size_t(64) * nkv * hd);
