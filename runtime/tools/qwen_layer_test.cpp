@@ -160,6 +160,12 @@ int main(int argc, char **argv) {
                        nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
         HIP_CHECK(hipStreamSynchronize(s));
         std::printf("rope synced\n");
+        {
+            auto qg = d_q.download();
+            // compare with the CPU replica below is done later; print a sample of the GPU q
+            std::printf("gpu q row0 head0 [:6]: %.4f %.4f %.4f %.4f %.4f %.4f\n", b16(qg[0]),
+                        b16(qg[1]), b16(qg[2]), b16(qg[3]), b16(qg[4]), b16(qg[5]));
+        }
         std::printf("stage: attn\n");
         q_attn(d_q.data(), kc.data(), vc.data(), d_g.data(), d_ao.data(), rows, 0, nq, nkv, hd,
                1.0f / std::sqrt(float(hd)), s);
