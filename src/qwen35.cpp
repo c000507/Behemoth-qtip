@@ -401,10 +401,6 @@ void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, 
         for (int d = 0; d < hd; ++d) acc[d] *= sigmoid_f(gate[d]);
       }
     }
-    if (const char* dbg = std::getenv("QWEN_DBG_DIR")) {
-      std::ofstream f(std::string(dbg) + "/attnout_L" + std::to_string(L) + ".bin", std::ios::binary);
-      f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size() * 4));
-    }
     mm_bf16w(y.data(), out.data(), l.w_o.data(), T, H, nq * hd, nthreads);
   } else {
     // Gated DeltaNet: sequential over tokens, fp32 state per layer
@@ -585,6 +581,10 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
           }
           for (int d = 0; d < hd; ++d) acc[d] *= sigmoid_f(gate[d]);
         }
+      }
+      if (const char* dbg = std::getenv("QWEN_DBG_DIR")) {
+        std::ofstream f(std::string(dbg) + "/attnout_L" + std::to_string(L) + ".bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size() * 4));
       }
       mm_bf16w(y.data(), out.data(), l.w_o.data(), T, H, nq * hd, nthreads);
     } else {
