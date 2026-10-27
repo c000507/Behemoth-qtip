@@ -3,6 +3,7 @@
 // (device rounding) for every linear. usage: qwen_rt_tests <model_dir> layer
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -134,7 +135,7 @@ int main(int argc, char **argv) {
         DeviceBuffer<float> su_o;
         su_o.upload(ho.su);
         std::printf("stage: qkv input_transform\n");
-        input_t(d_state.data(), &ln_in, suq.data(), H, d_u);
+        input_t(d_state.data(), std::getenv("NONORM") ? nullptr : &ln_in, suq.data(), H, d_u);
         std::printf("stage: q matmul\n");
         matmul_z(gq, lq, d_u, H, d_z);
         q_hadamard_rows(d_z.data(), rows, hq.out, hq.out, false, s);
@@ -166,7 +167,8 @@ int main(int argc, char **argv) {
                 float inv = float(1.0 / std::sqrt(ss / H + c.eps));
                 for (int i = 0; i < H; ++i) {
                     float v = b16(to16(xs2[size_t(r) * H + i] * inv));
-                    t[size_t(i)] = double(v * (1.0f + b16(ln_in_h[size_t(i)])) * hq.su[size_t(i)]);
+                    if (!std::getenv("NONORM")) v *= (1.0f + b16(ln_in_h[size_t(i)]));
+                    t[size_t(i)] = double(v * hq.su[size_t(i)]);
                 }
                 qtip::hadamard(t.data(), H, true);
                 if (r == 0) {
