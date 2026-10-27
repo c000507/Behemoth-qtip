@@ -1,8 +1,168 @@
+#include "common.hpp"
 #include "hip_ops.hpp"
+#include "safetensors.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <deque>
+#include <map>
 #include <iostream>
+#include <random>
+#include <unistd.h>
 using namespace qat;
+namespace {
+// One-layer model with HIP-supported widths (hidden = intermediate = 1024,
+// eight 128-wide heads) for whole-layer CPU/GPU gradient comparisons.
+void write_layer_model(const fs::path &p) {
+    fs::create_directories(p);
+    const int n = 1024, inter = 1024, vocab = 64;
+    json c = {{"hidden_size", n},
+              {"intermediate_size", inter},
+              {"num_attention_heads", 8},
+              {"num_key_value_heads", 8},
+              {"head_dim", 128},
+              {"num_hidden_layers", 1},
+              {"vocab_size", vocab},
+              {"rms_norm_eps", 1e-5},
+              {"rope_theta", 10000},
+              {"hidden_act", "silu"},
+              {"quip_params",
+               {{"L", 16},
+                {"K", 2},
+                {"V", 2},
+                {"tlut_bits", 9},
+                {"decode_mode", "quantlut_sym"},
+                {"td_x", 16},
+                {"td_y", 16}}}};
+    durable_json(p / "config.json", c);
+    qtip::SafeTensorsWriter w;
+    json index = {{"weight_map", json::object()}};
+    std::deque<std::vector<uint16_t>> keep16; // stable references
+    std::deque<std::vector<float>> keep32;
+    auto add = [&](std::string name, std::string type, std::vector<int64_t> shape, const void *data,
+                   size_t bytes) {
+        w.add(name, type, shape, data, bytes);
+        index["weight_map"][name] = "model.safetensors";
+    };
+    std::mt19937 rng(23);
+    std::normal_distribution<float> normal(0, 1);
+    auto dense = [&](std::string name, int r, int cols, float scale, float bias) {
+        auto &v = keep16.emplace_back(size_t(r) * cols);
+        for (auto &x : v)
+            x = behemoth::BFloat16(bias + scale * normal(rng)).bits;
+        add(name, "BF16", cols == 1 ? std::vector<int64_t>{r} : std::vector<int64_t>{r, cols}, v.data(),
+            v.size() * 2);
+    };
+    std::string prefix = "model.layers.0.";
+    auto &lut = keep16.emplace_back(1024);
+    for (auto &x : lut)
+        x = qtip::f32_to_fp16(.5f * normal(rng));
+    for (int i = 0; i < 7; ++i) {
+        int out = i == 4 || i == 5 ? inter : n, in = i == 6 ? inter : n;
+        std::string b = prefix + linears[i] + ".";
+        auto &codes = keep16.emplace_back(size_t(out) * in / 8);
+        for (auto &x : codes)
+            x = uint16_t(rng());
+        add(b + "trellis", "I16", {out / 16 * (in / 16), 32}, codes.data(), codes.size() * 2);
+        add(b + "tlut", "F16", {512, 2}, lut.data(), lut.size() * 2);
+        // q/k/v and gate/up share (tie) SU.
+        int group = i <= 2 ? 0 : i == 3 ? 3 : i <= 5 ? 4 : 6;
+        auto &su = keep16.emplace_back(in);
+        for (int j = 0; j < in; ++j)
+            su[j] = behemoth::BFloat16((j * 7 + group) % 3 == 0 ? -1.f : 1.f).bits;
+        add(b + "SU", "BF16", {in}, su.data(), su.size() * 2);
+        auto &sv = keep32.emplace_back(out);
+        for (int j = 0; j < out; ++j)
+            sv[j] = (j % 2 ? -.02f : .02f) * (1 + .3f * std::sin(j * .7f));
+        add(b + "SV", "F32", {out}, sv.data(), sv.size() * 4);
+        static int64_t rcp = 0, tp = 8;
+        add(b + "rcp", "I64", {}, &rcp, 8);
+        add(b + "tp_rank", "I64", {}, &tp, 8);
+    }
+    dense(prefix + norm1, n, 1, .1f, 1.f);
+    dense(prefix + norm2, n, 1, .1f, 1.f);
+    dense("model.norm.weight", n, 1, .1f, 1.f);
+    dense("model.embed_tokens.weight", vocab, n, .5f, 0.f);
+    dense("lm_head.weight", vocab, n, .05f, 0.f);
+    w.write((p / "model.safetensors").string());
+    durable_json(p / "model.safetensors.index.json", index);
+}
+// Full forward/backward of a one-layer model on CPU (BF16-boundary emulation)
+// and GPU in both activation storage modes. Exercises every fused path.
+void layer_check() {
+    fs::path root = fs::temp_directory_path() / ("qtip-gpu-layer-" + std::to_string(getpid()));
+    fs::create_directories(root);
+    struct Cleanup {
+        fs::path p;
+        ~Cleanup() { fs::remove_all(p); }
+    } cleanup{root};
+    write_layer_model(root / "model");
+    Model m(root / "model");
+    const int T = 40;
+    Batch b;
+    for (int t = 0; t < T; ++t) {
+        b.tokens.push_back((t * 13 + 5) % m.config.vocab);
+        b.segments.push_back(t < 17 ? 0 : 17);
+        b.positions.push_back(t < 17 ? t : t - 17);
+        b.labels.push_back(t % 5 == 0 ? -100 : (t * 7 + 3) % m.config.vocab);
+    }
+    b.boundaries();
+    Options o;
+    o.rows = 16; // three MLP chunks, the last one partial
+    o.loss_rows = 16;
+    size_t denominator = b.targets();
+    Replica cpu(m, -1, T, 0, true);
+    double cl = cpu.run(b, o, denominator, true);
+    auto cg = cpu.grad_values();
+    const char *saved = std::getenv("QTIP_TRAIN_STORAGE");
+    std::string restore = saved ? saved : "";
+    std::vector<float> fp32_grads;
+    double fp32_loss = 0;
+    for (const char *storage : {"fp32", "bf16"}) {
+        setenv("QTIP_TRAIN_STORAGE", storage, 1);
+        Replica gpu(m, 0, T, size_t(2) << 30, true);
+        double gl = gpu.run(b, o, denominator, true);
+        auto gg = gpu.grad_values();
+        // Relative L2 error per parameter kind; scalar Wscale gradients are
+        // cancellation-heavy sums and get a looser bound.
+        std::map<std::string, std::pair<double, double>> kinds;
+        for (auto &p : m.params) {
+            auto kind = p.name.substr(p.name.rfind('.') + 1);
+            for (size_t i = p.offset; i < p.offset + p.size; ++i) {
+                require(std::isfinite(gg[i]), "nonfinite GPU layer gradient");
+                kinds[kind].first += double(gg[i] - cg[i]) * (gg[i] - cg[i]);
+                kinds[kind].second += double(cg[i]) * cg[i];
+            }
+        }
+        json report = {{"storage", storage}, {"cpu_loss", cl / denominator}, {"gpu_loss", gl / denominator}};
+        for (auto &[kind, e] : kinds) {
+            double rel = std::sqrt(e.first / std::max(e.second, 1e-30));
+            report[kind + "_rel_error"] = rel;
+            require(rel < (kind == "Wscale" ? .06 : .02), "GPU layer " + kind + " gradient differs from CPU");
+        }
+        std::cout << report.dump() << '\n';
+        require(std::abs(cl - gl) < 2e-3 * std::abs(cl), "GPU layer loss differs from CPU");
+        if (std::string(storage) == "fp32") {
+            fp32_grads = gg;
+            fp32_loss = gl;
+        } else {
+            double ss = 0, ref = 0;
+            for (size_t i = 0; i < gg.size(); ++i) {
+                ss += double(gg[i] - fp32_grads[i]) * (gg[i] - fp32_grads[i]);
+                ref += double(fp32_grads[i]) * fp32_grads[i];
+            }
+            std::cout << json({{"bf16_vs_fp32_gradient_rel_error", std::sqrt(ss / ref)},
+                               {"bf16_vs_fp32_loss_diff", (gl - fp32_loss) / denominator}})
+                             .dump()
+                      << '\n';
+        }
+    }
+    if (saved)
+        setenv("QTIP_TRAIN_STORAGE", restore.c_str(), 1);
+    else
+        unsetenv("QTIP_TRAIN_STORAGE");
+}
+} // namespace
 int main() {
     int count = 0;
     if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {
@@ -219,7 +379,8 @@ int main() {
         double cl = cpu->cross_entropy(cx, labels, T, true), gl = gpu->cross_entropy(gx, labels, T, true);
         require(std::abs(cl - gl) < .001, "GPU CE loss");
         compare(cx, gx, .003);
-        std::cout << "native GPU primitives and packed GQA attention gradients passed\n";
+        layer_check();
+        std::cout << "native GPU primitives, packed GQA attention gradients and fused layers passed\n";
         return 0;
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

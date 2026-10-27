@@ -73,11 +73,15 @@ class Dataset {
 };
 // Float tensors are views into a shared allocation. GPU buffers are allocated
 // from a fixed arena; all temporary reuse stays ordered on one compute stream.
+// `half` marks BF16 element storage (HIP activation storage only): p then
+// addresses uint16_t elements and ld/rows/cols still count elements.
 struct Mat {
     std::shared_ptr<void> owner;
     float *p = nullptr;
     int rows = 0, cols = 0, ld = 0;
+    bool half = false;
     size_t size() const { return size_t(rows) * cols; }
+    size_t element() const { return half ? 2 : 4; }
     Mat row(int a, int b) const;
     Mat col(int a, int b) const;
 };
@@ -93,10 +97,22 @@ struct Norm {
 struct Attention {
     Mat q, k, v, out, lse;
 };
+// Output transform of a QTIP linear, c = had(round_in ? bf16(z) : z) and
+// y = bf16(c * post * post_scale[0]), optionally y = bf16(residual + y).
+// The default implementation may round z in place.
+struct Transform {
+    bool round_in = false, keep_c = false, want_y = true;
+    Mat post, post_scale, residual, y;
+};
+struct Transformed {
+    Mat y, c;
+};
 struct Ops {
     bool rounding = false;
     virtual ~Ops() = default;
     virtual Mat alloc(int, int, bool zero = false) = 0;
+    // Activation and activation-gradient storage (HIP may use BF16).
+    virtual Mat act(int r, int c) { return alloc(r, c); }
     virtual void copy(Mat, Mat) = 0;
     virtual void upload(Mat, std::span<const float>) = 0;
     virtual void download(Mat, std::span<float>) = 0;
@@ -114,13 +130,90 @@ struct Ops {
     virtual Mat mm(Mat x, const Weight &, bool transpose = false) = 0;
     // Shared input transform; HIP writes BF16 GEMM operands directly. CPU keeps
     // the reference operation order (and unrounded finite-difference mode).
+    // `rounded`: the caller rounds every output to BF16 before use, so a backend
+    // may return BF16 GEMM outputs.
     virtual std::vector<Mat> had_mm(Mat x, std::span<const Weight> weights, Mat pre = {},
-                                    bool transpose = false) {
+                                    bool transpose = false, bool rounded = false) {
+        (void)rounded;
         auto u = had(x, true, pre);
         std::vector<Mat> result;
         for (const auto &w : weights)
             result.push_back(mm(u, w, transpose));
         return result;
+    }
+    // Fusable compositions. Defaults define the reference operation order;
+    // HIP replaces them with fused kernels.
+    virtual std::vector<Mat> rms_had_mm(Mat x, Mat w, float eps, Mat su, std::span<const Weight> weights,
+                                        Norm &norm, bool rounded = false) {
+        norm = rms(x, w, eps);
+        return had_mm(norm.y, weights, su, false, rounded);
+    }
+    virtual Transformed transform(Mat z, const Transform &t) {
+        if (t.round_in)
+            round(z);
+        Transformed r;
+        auto c = had(z);
+        if (t.keep_c)
+            r.c = c;
+        if (!t.want_y)
+            return r;
+        auto y = alloc(c.rows, c.cols);
+        if (t.post.p) {
+            auto s = t.post;
+            if (t.post_scale.p) {
+                s = alloc(1, t.post.cols);
+                mul(s, t.post, t.post_scale);
+            }
+            mul(y, c, s);
+        } else
+            copy(y, c);
+        round(y);
+        if (t.residual.p) {
+            auto h = t.y.p ? t.y : alloc(y.rows, y.cols);
+            add(h, t.residual, y, true);
+            y = h;
+        } else if (t.y.p) {
+            copy(t.y, y);
+            y = t.y;
+        }
+        r.y = y;
+        return r;
+    }
+    // sum_j mm(had(x_j * sv_j * scale_j, transposed), w_j, transposed GEMM).
+    virtual Mat had_mm_sum(std::span<const Mat> x, std::span<const Mat> sv, std::span<const Mat> scale,
+                           std::span<const Weight> weights) {
+        Mat total;
+        for (size_t j = 0; j < x.size(); ++j) {
+            auto svs = alloc(1, sv[j].cols);
+            mul(svs, sv[j], scale[j]);
+            auto d = had_mm(x[j], weights.subspan(j, 1), svs, true).front();
+            if (!total.p)
+                total = d;
+            else
+                add(total, total, d);
+        }
+        return total;
+    }
+    // SV/Wscale gradients from dy and the saved output transform c.
+    virtual void sv_grads(Mat dy, Mat c, Mat sv, Mat scale, Mat gsv, Mat gscale) {
+        auto dc = alloc(1, sv.cols, true);
+        colsum(dy, c, dc);
+        auto temp = alloc(1, sv.cols);
+        mul(temp, dc, scale);
+        add(gsv, gsv, temp);
+        scale_sum(dc, sv, gscale);
+    }
+    virtual std::pair<Mat, Mat> swiglu_backward_su(Mat gate, Mat up, Mat dxsu, Mat su) {
+        auto dp = alloc(dxsu.rows, dxsu.cols);
+        mul(dp, dxsu, su);
+        return swiglu_backward(gate, up, dp);
+    }
+    // dh += rms_backward(x, dy = dxsu * su); dw += norm-weight gradient.
+    virtual void rms_backward_su(Mat x, Norm n, Mat w, Mat su, Mat dxsu, Mat dw, Mat dh) {
+        auto dy = alloc(dxsu.rows, dxsu.cols);
+        mul(dy, dxsu, su);
+        auto d = rms_backward(x, n, w, dy, dw);
+        add(dh, dh, d);
     }
     virtual Mat embedding(const Weight &, const Batch &) = 0;
     virtual Mat rope(Mat, int heads, const Config &, const Batch &, bool backward = false) = 0;
@@ -153,12 +246,16 @@ class Layer {
     const LayerData &data_;
     Mat parameters_, gradients_;
     std::vector<Weight> weights_;
+    mutable std::map<std::string, Mat> effective_;
     Mat parameter(const std::string &) const;
     Mat gradient(const std::string &) const;
-    Mat effective(const std::string &) const;
-    Mat projection(Mat, int, LinearSave *save = nullptr);
-    std::vector<Mat> projections(Mat, int first, int count, LinearSave *saves = nullptr);
-    Mat projection_backward(const LinearSave &, Mat);
+    Mat effective(const std::string &, bool rounded = true) const;
+    std::vector<Mat> epilogues(std::vector<Mat> z, int first, LinearSave *saves, Mat input, Mat residual = {},
+                               Mat dst = {});
+    Mat projection(Mat, int, LinearSave *save = nullptr, Mat residual = {}, Mat dst = {});
+    // Backward through `count` projections sharing one input (and SU): returns
+    // dxsu = had(sum_j W_j^T had^T(dy_j * svs_j)) and, if requested, bf16(dxsu * su).
+    Transformed projections_backward(const LinearSave *, int count, Mat *dy, bool rounded_dx);
     struct AttnSave {
         Norm norm;
         Mat xn, h;
@@ -172,7 +269,7 @@ class Layer {
         LinearSave gate, up, down;
         Mat g, u;
     };
-    Mat mlp(Mat, MlpSave *);
+    Mat mlp(Mat, MlpSave *, Mat dst = {});
 
   public:
     Layer(Ops &, const Model &, int layer, Mat parameters, Mat gradients);

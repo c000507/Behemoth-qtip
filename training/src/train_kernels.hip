@@ -1,9 +1,8 @@
-// Native training row transforms, shared with the standalone C++/HIP backend.
+// Native training row transforms and fused elementwise epilogues.
 // One 256-thread block per row; thread t holds positions 4t..4t+3 of each 1024-chunk, so a row
 // is read once and every output chunk is mixed from registers (as runtime/src/qtip.hip's row
-// kernels). y = hadU(x') or hadUt(x') / sqrt(n), x' = pre (.) [bf16](x); optional fp32 output y
-// and bf16 output bf16(post (.) y). Strided rows: the trainer passes column slices of stacked
-// q|k|v and gate|up GEMM outputs directly.
+// kernels). Inputs and outputs are FP32 or BF16 (activation storage); arithmetic is FP32.
+#include "hip_ops.hpp"
 #include "../../runtime/src/device_numeric.hpp"
 #include "../../runtime/src/qtip_tables.hpp"
 #include <hip/hip_runtime.h>
@@ -99,28 +98,48 @@ template <bool BF16> __device__ __forceinline__ void load4(const void *p, size_t
     }
 }
 
-template <int K, bool IN_BF16>
-__global__ __launch_bounds__(256) void had_rows_kernel(const void *in, long ld_in, const float *pre,
-                                                       int round_in, int transpose, float *out32, long ld32,
-                                                       uint16_t *out16, long ld16, const float *post) {
+
+__device__ __forceinline__ float rnd(float x) { return bf16(bf16(x)); }
+__device__ __forceinline__ float4 ld4(const float *p) { return *reinterpret_cast<const float4 *>(p); }
+__device__ __forceinline__ void load4v(const void *p, int half, size_t i, float out[4]) {
+    if (half)
+        load4<true>(p, i, out);
+    else
+        load4<false>(p, i, out);
+}
+__device__ __forceinline__ void store4v(void *p, int half, size_t i, const float v[4]) {
+    if (half)
+        *reinterpret_cast<uint2 *>(static_cast<uint16_t *>(p) + i) =
+            make_uint2(uint32_t(bf16(v[0])) | uint32_t(bf16(v[1])) << 16,
+                       uint32_t(bf16(v[2])) | uint32_t(bf16(v[3])) << 16);
+    else
+        *reinterpret_cast<float4 *>(static_cast<float *>(p) + i) = make_float4(v[0], v[1], v[2], v[3]);
+}
+
+// See qtip_training::RowTransform. The output transform of every projection
+// (GEMM output -> saved c, scaled/rounded y, optional residual add) and every
+// input transform (activation or gradient -> BF16 GEMM operand) is one launch.
+template <int K, bool IN_HALF>
+__global__ __launch_bounds__(256) void transform_kernel(qtip_training::RowTransform a) {
     __shared__ float scratch[1024];
     const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
     constexpr int n = K * 1024;
+    const float pre_scale = a.pre_scale ? *a.pre_scale : 1.f, post_scale = a.post_scale ? *a.post_scale : 1.f;
     float t[K][4];
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-        load4<IN_BF16>(in, size_t(row) * size_t(ld_in) + size_t(k * 1024 + j), t[k]);
-        if (round_in) {
+        load4<IN_HALF>(a.in, size_t(row) * size_t(a.ld_in) + size_t(k * 1024 + j), t[k]);
+        if (a.round_in) {
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                t[k][i] = bf16(bf16(t[k][i]));
+                t[k][i] = rnd(t[k][i]);
         }
-        if (pre) {
-            const float4 s = *reinterpret_cast<const float4 *>(pre + k * 1024 + j);
-            t[k][0] *= s.x;
-            t[k][1] *= s.y;
-            t[k][2] *= s.z;
-            t[k][3] *= s.w;
+        if (a.pre) {
+            const float4 s = ld4(a.pre + k * 1024 + j);
+            t[k][0] *= s.x * pre_scale;
+            t[k][1] *= s.y * pre_scale;
+            t[k][2] *= s.z * pre_scale;
+            t[k][3] *= s.w * pre_scale;
         }
     }
     const float scale = rsqrtf(float(n));
@@ -133,7 +152,7 @@ __global__ __launch_bounds__(256) void had_rows_kernel(const void *in, long ld_i
         } else {
 #pragma unroll
             for (int k = 0; k < K; ++k) {
-                const float s = transpose ? sign<K>(k, k2) : sign<K>(k2, k);
+                const float s = a.transpose ? sign<K>(k, k2) : sign<K>(k2, k);
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
                     v[i] += s * t[k][i];
@@ -144,21 +163,28 @@ __global__ __launch_bounds__(256) void had_rows_kernel(const void *in, long ld_i
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             v[i] *= scale;
-        if (out32)
-            *reinterpret_cast<float4 *>(out32 + size_t(row) * size_t(ld32) + size_t(e)) =
-                make_float4(v[0], v[1], v[2], v[3]);
-        if (out16) {
+        if (a.c)
+            store4v(a.c, a.c_half, size_t(row) * size_t(a.ldc) + size_t(e), v);
+        if (a.y) {
             float w[4] = {v[0], v[1], v[2], v[3]};
-            if (post) {
-                const float4 s = *reinterpret_cast<const float4 *>(post + e);
-                w[0] *= s.x;
-                w[1] *= s.y;
-                w[2] *= s.z;
-                w[3] *= s.w;
+            if (a.post) {
+                const float4 s = ld4(a.post + e);
+                w[0] *= s.x * post_scale;
+                w[1] *= s.y * post_scale;
+                w[2] *= s.z * post_scale;
+                w[3] *= s.w * post_scale;
             }
-            *reinterpret_cast<uint2 *>(out16 + size_t(row) * size_t(ld16) + size_t(e)) =
-                make_uint2(uint32_t(bf16(w[0])) | uint32_t(bf16(w[1])) << 16,
-                           uint32_t(bf16(w[2])) | uint32_t(bf16(w[3])) << 16);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                w[i] = rnd(w[i]);
+            if (a.res) {
+                float r[4];
+                load4v(a.res, a.res_half, size_t(row) * size_t(a.ldres) + size_t(e), r);
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    w[i] = rnd(r[i] + w[i]);
+            }
+            store4v(a.y, a.y_half, size_t(row) * size_t(a.ldy) + size_t(e), w);
         }
     }
 }
@@ -177,18 +203,13 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
     return s;
 }
 
-__device__ __forceinline__ void store_bf16x4(uint16_t *p, const float v[4]) {
-    *reinterpret_cast<uint2 *>(p) = make_uint2(uint32_t(bf16(v[0])) | uint32_t(bf16(v[1])) << 16,
-                                               uint32_t(bf16(v[2])) | uint32_t(bf16(v[3])) << 16);
-}
-__device__ __forceinline__ float4 ld4(const float *p) { return *reinterpret_cast<const float4 *>(p); }
-
-// Fused RMSNorm + input transform (n = 12288): xn = bf16((x * r) * w), r = rsqrt(mean(x^2) + eps),
-// u = bf16(hadUt(su (.) xn)). Optional xn / r outputs (backward needs them). grid (rows).
-__global__ __launch_bounds__(256) void rms_had_kernel(const uint16_t *x, long ld, const float *w, float eps,
-                                                      const float *su, uint16_t *xn, long ldxn, float *r,
-                                                      uint16_t *u, long ldu) {
-    constexpr int K = 12, n = K * 1024;
+// Fused RMSNorm + input transform: xn = bf16((x * r) * w), r = rsqrt(mean(x^2) + eps),
+// u = bf16(hadUt(su (.) xn) / sqrt(n)). Optional xn / r outputs (backward needs them). grid (rows).
+template <int K, bool IN_HALF>
+__global__ __launch_bounds__(256) void rms_had_kernel(const void *x, long ld, const float *w, float eps,
+                                                      const float *su, void *xn, int xn_half, long ldxn,
+                                                      float *r, uint16_t *u, long ldu) {
+    constexpr int n = K * 1024;
     __shared__ float scratch[1024];
     __shared__ float red[8];
     const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
@@ -196,7 +217,7 @@ __global__ __launch_bounds__(256) void rms_had_kernel(const uint16_t *x, long ld
     float ss = 0.f;
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-        load4<true>(x, size_t(row) * size_t(ld) + size_t(k * 1024 + j), t[k]);
+        load4<IN_HALF>(x, size_t(row) * size_t(ld) + size_t(k * 1024 + j), t[k]);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             ss += t[k][i] * t[k][i];
@@ -210,9 +231,9 @@ __global__ __launch_bounds__(256) void rms_had_kernel(const uint16_t *x, long ld
         float y[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            y[i] = bf16(bf16(t[k][i] * factor * ww[i]));
+            y[i] = rnd(t[k][i] * factor * ww[i]);
         if (xn)
-            store_bf16x4(xn + size_t(row) * size_t(ldxn) + size_t(e), y);
+            store4v(xn, xn_half, size_t(row) * size_t(ldxn) + size_t(e), y);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             t[k][i] = ss4[i] * y[i];
@@ -222,133 +243,59 @@ __global__ __launch_bounds__(256) void rms_had_kernel(const uint16_t *x, long ld
     const float scale = rsqrtf(float(n));
     for (int k2 = 0; k2 < K; ++k2) {
         float v[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int k = 0; k < K; ++k) {
-            const float s = sign<K>(k, k2); // hadUt
+        if constexpr (K == 1) {
 #pragma unroll
             for (int i = 0; i < 4; ++i)
-                v[i] += s * t[k][i];
+                v[i] = t[0][i];
+        } else {
+#pragma unroll
+            for (int k = 0; k < K; ++k) {
+                const float s = sign<K>(k, k2); // hadUt
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    v[i] += s * t[k][i];
+            }
         }
         fwht1024(v, scratch);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             v[i] *= scale;
-        store_bf16x4(u + size_t(row) * size_t(ldu) + size_t(k2 * 1024 + j), v);
+        store4v(u, 1, size_t(row) * size_t(ldu) + size_t(k2 * 1024 + j), v);
     }
 }
 
-// gate|up epilogue + SwiGLU (I = 28672): z fp32 [rows][ldz] (gate at 0, up at I); gate/up use
-// bf16(z) (the runtime's bf16 exchange), c = hadU(.)/sqrt(I), g = bf16(c_g svs_g), u = bf16(c_u svs_u),
-// product = bf16(silu(g) u). Optional fp32 c_g / c_u. grid (rows).
-__global__ __launch_bounds__(256) void gateup_kernel(const float *z, long ldz, const float *svs_g,
-                                                     const float *svs_u, uint16_t *gate, uint16_t *up,
-                                                     uint16_t *product, long ldo, float *cg, float *cu,
-                                                     long ldc) {
-    constexpr int K = 28, I = K * 1024;
-    __shared__ float scratch[1024];
-    const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
-    const float scale = rsqrtf(float(I));
-    float t[K][4];
-    for (int part = 0; part < 2; ++part) {
-#pragma unroll
-        for (int k = 0; k < K; ++k) {
-            load4<false>(z, size_t(row) * size_t(ldz) + size_t(part * I + k * 1024 + j), t[k]);
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                t[k][i] = bf16(bf16(t[k][i]));
-        }
-        const float *svs = part ? svs_u : svs_g;
-        float *c = part ? cu : cg;
-        for (int k2 = 0; k2 < K; ++k2) {
-            float v[4] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-            for (int k = 0; k < K; ++k) {
-                const float s = sign<K>(k2, k); // hadU
-#pragma unroll
-                for (int i = 0; i < 4; ++i)
-                    v[i] += s * t[k][i];
-            }
-            fwht1024(v, scratch);
-            const int e = k2 * 1024 + j;
-            const size_t o = size_t(row) * size_t(ldo) + size_t(e);
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                v[i] *= scale;
-            if (c)
-                *reinterpret_cast<float4 *>(c + size_t(row) * size_t(ldc) + size_t(e)) =
-                    make_float4(v[0], v[1], v[2], v[3]);
-            const float4 sv = ld4(svs + e);
-            float y[4] = {v[0] * sv.x, v[1] * sv.y, v[2] * sv.z, v[3] * sv.w};
-            if (!part) {
-                store_bf16x4(gate + o, y);
-            } else {
-                store_bf16x4(up + o, y);
-                const uint2 gv = *reinterpret_cast<const uint2 *>(gate + o); // this thread's own store
-                const float g[4] = {bf16(uint16_t(gv.x & 0xffffU)), bf16(uint16_t(gv.x >> 16)),
-                                    bf16(uint16_t(gv.y & 0xffffU)), bf16(uint16_t(gv.y >> 16))};
-                float p[4];
-#pragma unroll
-                for (int i = 0; i < 4; ++i)
-                    p[i] = g[i] / (1.f + expf(-g[i])) * bf16(bf16(y[i]));
-                store_bf16x4(product + o, p);
-            }
-        }
-    }
-}
-
-// Column sums with atomics: acc[c] += sum_r a[r][c] * b[r][c] (* rs[r]). a fp32, b fp32/bf16.
-// Block: 256 threads x 4 columns, ROWS rows. grid (n / 1024, ceil(rows / ROWS)).
-template <bool B16>
-__global__ __launch_bounds__(256) void colsum_kernel(const float *a, long lda, const void *b, long ldb,
-                                                     const float *rs, int rows, int rows_per_block,
-                                                     float *acc) {
-    const int c = int(blockIdx.x) * 1024 + 4 * int(threadIdx.x);
-    const int r0 = int(blockIdx.y) * rows_per_block, r1 = min(rows, r0 + rows_per_block);
-    float s[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int r = r0; r < r1; ++r) {
-        const float4 av = ld4(a + size_t(r) * size_t(lda) + size_t(c));
-        float bv[4];
-        load4<B16>(b, size_t(r) * size_t(ldb) + size_t(c), bv);
-        const float f = rs ? rs[r] : 1.f;
-        s[0] += av.x * bv[0] * f;
-        s[1] += av.y * bv[1] * f;
-        s[2] += av.z * bv[2] * f;
-        s[3] += av.w * bv[3] * f;
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-        atomicAdd(acc + c + i, s[i]);
-}
-
-// SwiGLU backward: dp = dxsu * su_d; dg = dp * u * silu'(g); du = dp * silu(g) (fp32 outputs, may alias
-// dxsu for dg). Elementwise over [rows][I]; grid (I / 1024, rows).
-__global__ __launch_bounds__(256) void swiglu_bwd_kernel(const float *dxsu, const float *su,
-                                                         const uint16_t *gate, const uint16_t *up, float *dg,
-                                                         float *du, int cols) {
-    const size_t o = size_t(blockIdx.y) * size_t(cols) + size_t(blockIdx.x) * 1024 + 4 * threadIdx.x;
+// SwiGLU backward: dp = dxsu * su; dg = dp * u * silu'(g); du = dp * silu(g).
+// Elementwise over [rows][cols]; grid (cols / 1024, rows).
+__global__ __launch_bounds__(256) void swiglu_bwd_kernel(const void *dxsu, int dxsu_half, long ldd,
+                                                         const float *su, const void *gate, int gate_half,
+                                                         long ldg, const void *up, int up_half, long ldu,
+                                                         void *dg, void *du, int out_half, long ldo) {
+    const size_t row = blockIdx.y;
     const int e = int(blockIdx.x) * 1024 + 4 * int(threadIdx.x);
-    const float4 d = ld4(dxsu + o), s = ld4(su + e);
-    float g[4], u[4];
-    load4<true>(gate, o, g);
-    load4<true>(up, o, u);
-    const float dp[4] = {d.x * s.x, d.y * s.y, d.z * s.z, d.w * s.w};
+    float d[4], g[4], u[4];
+    load4v(dxsu, dxsu_half, row * size_t(ldd) + size_t(e), d);
+    load4v(gate, gate_half, row * size_t(ldg) + size_t(e), g);
+    load4v(up, up_half, row * size_t(ldu) + size_t(e), u);
+    const float4 s = ld4(su + e);
+    const float dp[4] = {d[0] * s.x, d[1] * s.y, d[2] * s.z, d[3] * s.w};
     float a[4], b[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const float sg = 1.f / (1.f + expf(-g[i]));
+        a[i] = dp[i] * u[i] * sg * (1.f + g[i] * (1.f - sg));
         b[i] = dp[i] * g[i] * sg;
-        a[i] = dp[i] * u[i] * (sg * (1.f + g[i] * (1.f - sg)));
     }
-    *reinterpret_cast<float4 *>(dg + o) = make_float4(a[0], a[1], a[2], a[3]);
-    *reinterpret_cast<float4 *>(du + o) = make_float4(b[0], b[1], b[2], b[3]);
+    store4v(dg, out_half, row * size_t(ldo) + size_t(e), a);
+    store4v(du, out_half, row * size_t(ldo) + size_t(e), b);
 }
 
-// RMSNorm backward, row part (n = 12288): dxhat = dxsu * su * w, xhat = x * r,
+// RMSNorm backward, row part: dxhat = dxsu * su * w, xhat = x * r,
 // dh += r * (dxhat - xhat * mean(dxhat * xhat)). grid (rows).
-__global__ __launch_bounds__(256) void rms_bwd_kernel(const uint16_t *x, long ldx, const float *r,
-                                                      const float *w, const float *su, const float *dxsu,
-                                                      long ldd, float *dh, long ldh) {
-    constexpr int K = 12, n = K * 1024;
+template <int K>
+__global__ __launch_bounds__(256) void rms_bwd_kernel(const void *x, int x_half, long ldx, const float *r,
+                                                      const float *w, const float *su, const void *dxsu,
+                                                      int dxsu_half, long ldd, float *dh, long ldh) {
+    constexpr int n = K * 1024;
     __shared__ float red[8];
     const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
     const float rr = r[row];
@@ -357,12 +304,14 @@ __global__ __launch_bounds__(256) void rms_bwd_kernel(const uint16_t *x, long ld
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int e = k * 1024 + j;
-        load4<true>(x, size_t(row) * size_t(ldx) + size_t(e), xh[k]);
-        const float4 d = ld4(dxsu + size_t(row) * size_t(ldd) + size_t(e)), s = ld4(su + e), ww = ld4(w + e);
-        dx[k][0] = d.x * s.x * ww.x;
-        dx[k][1] = d.y * s.y * ww.y;
-        dx[k][2] = d.z * s.z * ww.z;
-        dx[k][3] = d.w * s.w * ww.w;
+        float d[4];
+        load4v(x, x_half, size_t(row) * size_t(ldx) + size_t(e), xh[k]);
+        load4v(dxsu, dxsu_half, size_t(row) * size_t(ldd) + size_t(e), d);
+        const float4 s = ld4(su + e), ww = ld4(w + e);
+        dx[k][0] = d[0] * s.x * ww.x;
+        dx[k][1] = d[1] * s.y * ww.y;
+        dx[k][2] = d[2] * s.z * ww.z;
+        dx[k][3] = d[3] * s.w * ww.w;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             xh[k][i] *= rr;
@@ -382,132 +331,101 @@ __global__ __launch_bounds__(256) void rms_bwd_kernel(const uint16_t *x, long ld
     }
 }
 
-// RoPE on head_dim 128 (pairs d, d + 64): forward bf16 [rows][ld] (heads x 128) -> bf16 [rows][heads][128];
-// backward (adjoint) bf16 -> fp32. cos/sin fp32 [rows][128]. grid (heads, rows), 64 threads.
-template <bool BACKWARD>
-__global__ __launch_bounds__(64) void rope_kernel(const uint16_t *in, long ld, const float *cs,
-                                                  const float *sn, void *out, int heads) {
-    const int h = int(blockIdx.x), row = int(blockIdx.y), d = int(threadIdx.x);
-    const uint16_t *p = in + size_t(row) * size_t(ld) + size_t(h) * 128;
-    const float a = bf16(p[d]), b = bf16(p[d + 64]);
-    const float c0 = cs[size_t(row) * 128 + d], c1 = cs[size_t(row) * 128 + d + 64];
-    const float s0 = sn[size_t(row) * 128 + d], s1 = sn[size_t(row) * 128 + d + 64];
-    const size_t o = (size_t(row) * size_t(heads) + size_t(h)) * 128;
-    if constexpr (!BACKWARD) {
-        uint16_t *q = static_cast<uint16_t *>(out) + o;
-        q[d] = bf16(a * c0 + (-b) * s0);
-        q[d + 64] = bf16(b * c1 + a * s1);
-    } else {
-        float *q = static_cast<float *>(out) + o;
-        q[d] = a * c0 + b * s1;
-        q[d + 64] = b * c1 - a * s0;
-    }
-}
-
-template <int K>
-void launch(const void *in, int in_bf16, long ld_in, int rows, const float *pre, int round_in, int transpose,
-            float *out32, long ld32, uint16_t *out16, long ld16, const float *post, hipStream_t stream) {
-    if (in_bf16)
-        had_rows_kernel<K, true>
-            <<<rows, 256, 0, stream>>>(in, ld_in, pre, round_in, transpose, out32, ld32, out16, ld16, post);
+template <int K> void launch(const qtip_training::RowTransform &a, int rows, hipStream_t stream) {
+    if (a.in_half)
+        transform_kernel<K, true><<<rows, 256, 0, stream>>>(a);
     else
-        had_rows_kernel<K, false>
-            <<<rows, 256, 0, stream>>>(in, ld_in, pre, round_in, transpose, out32, ld32, out16, ld16, post);
+        transform_kernel<K, false><<<rows, 256, 0, stream>>>(a);
     check(hipGetLastError());
 }
+bool aligned(const void *p, size_t a) { return (reinterpret_cast<uintptr_t>(p) % a) == 0; }
+size_t width(int half) { return half ? 8 : 16; }
 } // namespace
 
 namespace qtip_training {
+bool transform_supported(int n) { return n == 1024 || n == 12288 || n == 28672; }
+void transform(const RowTransform &a, int rows, int n, hipStream_t stream) {
+    if (rows <= 0)
+        return;
+    if (!a.c && !a.y)
+        throw std::invalid_argument("row transform needs an output");
+    if (!aligned(a.in, width(a.in_half)) || a.ld_in % 4 || a.ldc % 4 || a.ldy % 4 || a.ldres % 4 ||
+        (a.c && !aligned(a.c, width(a.c_half))) || (a.y && !aligned(a.y, width(a.y_half))) ||
+        (a.res && !aligned(a.res, width(a.res_half))) || (a.pre && !aligned(a.pre, 16)) ||
+        (a.post && !aligned(a.post, 16)))
+        throw std::invalid_argument("row transform alignment");
+    tables();
+    if (n == 1024)
+        launch<1>(a, rows, stream);
+    else if (n == 12288)
+        launch<12>(a, rows, stream);
+    else if (n == 28672)
+        launch<28>(a, rows, stream);
+    else
+        throw std::invalid_argument("row transform supports n = 1024, 12288, 28672");
+}
 void had_rows(const void *in, int in_bf16, long ld_in, int rows, int n, int transpose, const float *pre,
               int round_in, float *out32, long ld32, uint16_t *out16, long ld16, const float *post,
               hipStream_t stream) {
+    RowTransform a;
+    a.in = in;
+    a.in_half = in_bf16;
+    a.ld_in = ld_in;
+    a.transpose = transpose;
+    a.pre = pre;
+    a.round_in = round_in;
+    a.c = out32;
+    a.ldc = ld32;
+    a.y = out16;
+    a.ldy = ld16;
+    a.y_half = 1;
+    a.post = post;
+    transform(a, rows, n, stream);
+}
+void rms_had(const void *x, int x_half, long ld, int rows, int n, const float *w, float eps, const float *su,
+             void *xn, int xn_half, long ldxn, float *r, uint16_t *u, long ldu, hipStream_t stream) {
     if (rows <= 0)
         return;
-    if (!out32 && !out16)
-        throw std::invalid_argument("had_rows needs an output");
-    auto aligned = [](const void *p, size_t a) { return (reinterpret_cast<uintptr_t>(p) % a) == 0; };
-    if (!aligned(in, in_bf16 ? 8 : 16) || ld_in % 4 || ld32 % 4 || ld16 % 4 ||
-        (out32 && !aligned(out32, 16)) || (out16 && !aligned(out16, 8)) || (pre && !aligned(pre, 16)) ||
-        (post && !aligned(post, 16)))
-        throw std::invalid_argument("had_rows alignment");
+    if ((n != 12288 && n != 1024) || ld % 4 || ldxn % 4 || ldu % 4 || !aligned(x, width(x_half)) ||
+        (xn && !aligned(xn, width(xn_half))) || !aligned(u, 8) || !aligned(w, 16) || !aligned(su, 16))
+        throw std::invalid_argument("rms_had supports n = 1024 or 12288 with 4-element aligned rows");
     tables();
+    if (n == 1024) {
+        if (x_half)
+            rms_had_kernel<1, true><<<rows, 256, 0, stream>>>(x, ld, w, eps, su, xn, xn_half, ldxn, r, u, ldu);
+        else
+            rms_had_kernel<1, false><<<rows, 256, 0, stream>>>(x, ld, w, eps, su, xn, xn_half, ldxn, r, u, ldu);
+    } else {
+        if (x_half)
+            rms_had_kernel<12, true><<<rows, 256, 0, stream>>>(x, ld, w, eps, su, xn, xn_half, ldxn, r, u, ldu);
+        else
+            rms_had_kernel<12, false>
+                <<<rows, 256, 0, stream>>>(x, ld, w, eps, su, xn, xn_half, ldxn, r, u, ldu);
+    }
+    check(hipGetLastError());
+}
+void swiglu_bwd(const void *dxsu, int dxsu_half, long ldd, const float *su, const void *gate, int gate_half,
+                long ldg, const void *up, int up_half, long ldu, void *dg, void *du, int out_half, long ldo,
+                int rows, int cols, hipStream_t stream) {
+    if (rows <= 0)
+        return;
+    if (cols % 1024 || ldd % 4 || ldg % 4 || ldu % 4 || ldo % 4)
+        throw std::invalid_argument("swiglu_bwd needs cols % 1024 == 0 and aligned rows");
+    swiglu_bwd_kernel<<<dim3(unsigned(cols / 1024), unsigned(rows)), 256, 0, stream>>>(
+        dxsu, dxsu_half, ldd, su, gate, gate_half, ldg, up, up_half, ldu, dg, du, out_half, ldo);
+    check(hipGetLastError());
+}
+void rms_bwd(const void *x, int x_half, long ldx, const float *r, const float *w, const float *su,
+             const void *dxsu, int dxsu_half, long ldd, float *dh, long ldh, int rows, int n,
+             hipStream_t stream) {
+    if (rows <= 0)
+        return;
+    if ((n != 12288 && n != 1024) || ldx % 4 || ldd % 4 || ldh % 4)
+        throw std::invalid_argument("rms_bwd supports n = 1024 or 12288");
     if (n == 1024)
-        launch<1>(in, in_bf16, ld_in, rows, pre, round_in, transpose, out32, ld32, out16, ld16, post, stream);
-    else if (n == 12288)
-        launch<12>(in, in_bf16, ld_in, rows, pre, round_in, transpose, out32, ld32, out16, ld16, post,
-                   stream);
-    else if (n == 28672)
-        launch<28>(in, in_bf16, ld_in, rows, pre, round_in, transpose, out32, ld32, out16, ld16, post,
-                   stream);
+        rms_bwd_kernel<1><<<rows, 256, 0, stream>>>(x, x_half, ldx, r, w, su, dxsu, dxsu_half, ldd, dh, ldh);
     else
-        throw std::invalid_argument("had_rows supports n = 1024, 12288, 28672");
-}
-void rms_had(const uint16_t *x, long ld, int rows, int n, const float *w, float eps, const float *su,
-             uint16_t *xn, long ldxn, float *r, uint16_t *u, long ldu, hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (n != 12288 || ld % 4 || ldxn % 4 || ldu % 4)
-        throw std::invalid_argument("rms_had supports n = 12288 with 4-element aligned rows");
-    tables();
-    rms_had_kernel<<<rows, 256, 0, stream>>>(x, ld, w, eps, su, xn, ldxn, r, u, ldu);
-    check(hipGetLastError());
-}
-void gateup(const float *z, long ldz, int rows, int inter, const float *svs_g, const float *svs_u,
-            uint16_t *gate, uint16_t *up, uint16_t *product, long ldo, float *cg, float *cu, long ldc,
-            hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (inter != 28672 || ldz % 4 || ldo % 4 || ldc % 4)
-        throw std::invalid_argument("gateup supports intermediate 28672");
-    tables();
-    gateup_kernel<<<rows, 256, 0, stream>>>(z, ldz, svs_g, svs_u, gate, up, product, ldo, cg, cu, ldc);
-    check(hipGetLastError());
-}
-void colsum(const float *a, long lda, const void *b, int b16, long ldb, const float *rs, int rows, int n,
-            float *acc, hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (n % 1024 || lda % 4 || ldb % 4)
-        throw std::invalid_argument("colsum needs n % 1024 == 0");
-    const int per = 64;
-    const dim3 grid(unsigned(n / 1024), unsigned((rows + per - 1) / per));
-    if (b16)
-        colsum_kernel<true><<<grid, 256, 0, stream>>>(a, lda, b, ldb, rs, rows, per, acc);
-    else
-        colsum_kernel<false><<<grid, 256, 0, stream>>>(a, lda, b, ldb, rs, rows, per, acc);
-    check(hipGetLastError());
-}
-void swiglu_bwd(const float *dxsu, const float *su, const uint16_t *gate, const uint16_t *up, float *dg,
-                float *du, int rows, int cols, hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (cols % 1024)
-        throw std::invalid_argument("swiglu_bwd needs cols % 1024 == 0");
-    swiglu_bwd_kernel<<<dim3(unsigned(cols / 1024), unsigned(rows)), 256, 0, stream>>>(dxsu, su, gate, up, dg,
-                                                                                       du, cols);
-    check(hipGetLastError());
-}
-void rms_bwd(const uint16_t *x, long ldx, const float *r, const float *w, const float *su, const float *dxsu,
-             long ldd, float *dh, long ldh, int rows, int n, hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (n != 12288)
-        throw std::invalid_argument("rms_bwd supports n = 12288");
-    rms_bwd_kernel<<<rows, 256, 0, stream>>>(x, ldx, r, w, su, dxsu, ldd, dh, ldh);
-    check(hipGetLastError());
-}
-void rope(const uint16_t *in, long ld, int rows, int heads, int head_dim, const float *cs, const float *sn,
-          void *out, int backward, hipStream_t stream) {
-    if (rows <= 0)
-        return;
-    if (head_dim != 128)
-        throw std::invalid_argument("rope kernel supports head_dim 128");
-    if (backward)
-        rope_kernel<true>
-            <<<dim3(unsigned(heads), unsigned(rows)), 64, 0, stream>>>(in, ld, cs, sn, out, heads);
-    else
-        rope_kernel<false>
-            <<<dim3(unsigned(heads), unsigned(rows)), 64, 0, stream>>>(in, ld, cs, sn, out, heads);
+        rms_bwd_kernel<12><<<rows, 256, 0, stream>>>(x, x_half, ldx, r, w, su, dxsu, dxsu_half, ldd, dh, ldh);
     check(hipGetLastError());
 }
 } // namespace qtip_training

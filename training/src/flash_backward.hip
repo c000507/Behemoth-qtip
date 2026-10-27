@@ -2,6 +2,7 @@
 #include "../../runtime/src/device_numeric.hpp"
 #include "behemoth/gpu.hpp"
 #include "hip_ops.hpp"
+#include "view_device.hpp"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -17,7 +18,7 @@ __device__ __forceinline__ Acc mma(Reg a, Reg b, Acc c) {
 }
 __device__ __forceinline__ int kb(int s, int h) { return 32 * (s >> 1) + 16 * h + 8 * (s & 1); }
 __device__ __forceinline__ float get(View x, int t, int head, int d) {
-    return x.p[size_t(t) * x.ld + head * 128 + d];
+    return qat::gpu::load(x, size_t(t) * x.ld + head * 128 + d);
 }
 // Row-major tiles are XOR-swizzled in eight-BF16 chunks. The same helper
 // handles 128-wide feature rows and 32-wide query/probability rows.
@@ -109,7 +110,7 @@ __global__ void dq_kernel(View q, View k, View v, View lse, View dy, View delta,
         for (int nd = 0; nd < 8; ++nd)
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                dq.p[size_t(t) * dq.ld + head * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+                store_rounded(dq, size_t(t) * dq.ld + head * 128 + 16 * nd + 8 * h + i, out[nd][i]);
 }
 
 // Four waves own the 128 output dimensions of 16 keys. All GQA heads reduce
@@ -191,8 +192,8 @@ __global__ void dkv_staged_kernel(View q, View k, View v, View lse, View dy, Vie
         for (int i = 0; i < 8; ++i) {
             int t = first + 8 * h + i, d = (wave + j * 4) * 16 + c;
             if (t < q.rows) {
-                dk.p[size_t(t) * dk.ld + kh * 128 + d] = ak[j][i];
-                dv.p[size_t(t) * dv.ld + kh * 128 + d] = av[j][i];
+                store_rounded(dk, size_t(t) * dk.ld + kh * 128 + d, ak[j][i]);
+                store_rounded(dv, size_t(t) * dv.ld + kh * 128 + d, av[j][i]);
             }
         }
 }
@@ -295,7 +296,7 @@ __global__ __launch_bounds__(128) void dkv_wave_kernel(
         for (int nd = 0; nd < 8; ++nd)
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                dst.p[size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+                store_rounded(dst, size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i, out[nd][i]);
     }
 }
 
@@ -407,7 +408,7 @@ __global__ __launch_bounds__(KeyTiles * 64) void dkv_balanced_kernel(
         for (int nd = 0; nd < 8; ++nd)
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                dst.p[size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+                store_rounded(dst, size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i, out[nd][i]);
     }
 }
 } // namespace

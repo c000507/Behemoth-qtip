@@ -151,9 +151,26 @@ QTIP_TRAIN_GEMM_TUNE=1 build-training/qtip_bench MODEL 0 8192 0 1024 24 4
 The native trainer shares the input Hadamard transform across Q/K/V and across
 gate/up. HIP transforms write BF16 GEMM operands directly, including in projection
 backward, avoiding an FP32 transform buffer followed by a separate conversion.
-The CPU reference preserves its original rounding behavior. Persistent activations
-and gradients still use FP32 storage; this is not a full BF16 activation-storage
-conversion.
+The CPU reference preserves its original rounding behavior.
+
+Activation storage is BF16 by default (`QTIP_TRAIN_STORAGE=bf16`): activations,
+saved Hadamard outputs, attention Q/K/V/O, intra-layer activation gradients and the
+gate/up GEMM outputs are stored as BF16, with FP32 arithmetic inside kernels. The
+residual-stream gradient, the remaining single-use GEMM outputs, LSE/delta, logits,
+parameters, parameter gradients and AdamW state stay FP32. `QTIP_TRAIN_STORAGE=fp32`
+restores FP32 storage. Measured on gfx1201 (layer 0, 8,192 tokens): forward/backward
+0.268/0.713 s with FP32 storage vs 0.228/0.649 s with BF16, VRAM peak 11.0 vs 8.9 GB;
+a 4,096-token fine-tune step 42.8 vs 39.1 s. Real-data layer-0 parameter and input
+gradients differ by 0.2-0.3% (cosine >= 0.9999) between the two modes, and three-step
+losses agree within 0.002, which is inside the run-to-run spread caused by changing
+GEMM algorithms alone.
+
+Element-wise work is fused: each projection's output transform, SV/Wscale scaling,
+BF16 rounding and residual add run in one kernel; RMSNorm and its input Hadamard
+transform are one kernel; Q/K/V and gate/up backward share one accumulating GEMM and
+one Hadamard transform; SU is folded into the SwiGLU and RMSNorm backward kernels;
+attention kernels round dY/dQ/dK/dV themselves. `qtip_gradcheck` compares parameter
+gradients between two configurations or builds.
 
 SU/SV and RMSNorm parameter gradients use coalesced two-pass column reductions.
 RMSNorm no longer issues one global atomic addition per activation (about

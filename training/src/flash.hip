@@ -2,6 +2,7 @@
 // Q/K/V stay token-major; GQA and packed-document boundaries are explicit.
 #include "../../runtime/src/device_numeric.hpp"
 #include "hip_ops.hpp"
+#include "view_device.hpp"
 #include <cmath>
 #include <cstdlib>
 #include <rocwmma/rocwmma.hpp>
@@ -11,7 +12,7 @@ using behemoth::device::bf16;
 #if defined(__HIP_DEVICE_COMPILE__)
 static_assert(rocwmma::Constants::AMDGCN_WAVE_SIZE == 32);
 #endif
-__device__ float val(View x, int t, int h, int d) { return x.p[size_t(t) * x.ld + h * 128 + d]; }
+__device__ float val(View x, int t, int h, int d) { return load(x, size_t(t) * x.ld + h * 128 + d); }
 // C16x16 = op(A)16xK * op(B)Kx16, with general leading dimensions.
 template <bool TA, bool TB>
 __device__ void product(const uint16_t *a, int lda, const uint16_t *b, int ldb, float *c, int ldc, int k) {
@@ -89,8 +90,7 @@ __global__ void forward(View qv, View kv, View vv, View ov, View lv, int heads, 
     for (int i = tid; i < 16 * 128; i += 128) {
         int t = first + i / 128;
         if (t < T)
-            ov.p[size_t(t) * ov.ld + head * 128 + i % 128] =
-                __uint_as_float(uint32_t(bf16(acc[i] / den[i / 128])) << 16);
+            store_rounded(ov, size_t(t) * ov.ld + head * 128 + i % 128, acc[i] / den[i / 128]);
     }
     if (tid < 16 && first + tid < T)
         lv.p[size_t(head) * lv.ld + first + tid] = mx[tid] + logf(den[tid]);
@@ -214,8 +214,7 @@ __global__ void forward_native(View qv, View kv, View vv, View ov, View lv, int 
         for (int nd = 0; nd < 8; ++nd)
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                ov.p[size_t(query) * ov.ld + head * 128 + 16 * nd + 8 * h + i] =
-                    __uint_as_float(uint32_t(bf16(acc[nd][i] * inv)) << 16);
+                store_rounded(ov, size_t(query) * ov.ld + head * 128 + 16 * nd + 8 * h + i, acc[nd][i] * inv);
         if (h == 0)
             lv.p[size_t(head) * lv.ld + query] = mx * 0.6931471805599453f + logf(den);
     }
@@ -277,7 +276,7 @@ __global__ void backward_q(View qv, View kv, View vv, View lv, View dy, View dqv
     for (int i = tid; i < 16 * 128; i += 128) {
         int t = first + i / 128;
         if (t < T)
-            dqv.p[size_t(t) * dqv.ld + head * 128 + i % 128] = tile[i];
+            store_rounded(dqv, size_t(t) * dqv.ld + head * 128 + i % 128, tile[i]);
     }
 }
 // One wave computes each softmax row's correction once for both backward passes.
@@ -289,7 +288,7 @@ __global__ void backward_delta(View out, View dy, View delta, int heads) {
     int t = row / heads, h = row % heads;
     float sum = 0;
     for (int d = lane; d < 128; d += 32)
-        sum += val(out, t, h, d) * val(dy, t, h, d);
+        sum += val(out, t, h, d) * rnd(val(dy, t, h, d)); // dY is consumed as BF16
     for (int offset = 16; offset; offset /= 2)
         sum += __shfl_down(sum, offset);
     if (lane == 0)
@@ -358,14 +357,14 @@ __global__ void backward_kv(View qv, View kv, View vv, View lv, View dy, View de
     __syncthreads();
     for (int i = tid; i < 16 * 128; i += 128)
         if (first + i / 128 < T)
-            dkv.p[size_t(first + i / 128) * dkv.ld + kh * 128 + i % 128] = tile[i];
+            store_rounded(dkv, size_t(first + i / 128) * dkv.ld + kh * 128 + i % 128, tile[i]);
     __syncthreads();
     for (int j = 0; j < 2; ++j)
         rocwmma::store_matrix_sync(tile + (wave + j * 4) * 16, dv[j], 128, rocwmma::mem_row_major);
     __syncthreads();
     for (int i = tid; i < 16 * 128; i += 128)
         if (first + i / 128 < T)
-            dvv.p[size_t(first + i / 128) * dvv.ld + kh * 128 + i % 128] = tile[i];
+            store_rounded(dvv, size_t(first + i / 128) * dvv.ld + kh * 128 + i % 128, tile[i]);
 }
 
 void flash(View q, View k, View v, View out, View lse, int h, int kh, const int32_t *b, hipStream_t s) {

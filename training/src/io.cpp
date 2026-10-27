@@ -384,10 +384,12 @@ Batch Dataset::get(size_t i) const {
 }
 Mat Mat::row(int a, int b) const {
     require(a >= 0 && b >= a && b <= rows, "bad row slice");
-    return {owner, p + size_t(a) * ld, b - a, cols, ld};
+    return {owner, reinterpret_cast<float *>(reinterpret_cast<char *>(p) + size_t(a) * ld * element()), b - a, cols,
+            ld, half};
 }
 Mat Mat::col(int a, int b) const {
     require(a >= 0 && b >= a && b <= cols, "bad column slice");
-    return {owner, p + a, rows, b - a, ld};
+    return {owner, reinterpret_cast<float *>(reinterpret_cast<char *>(p) + size_t(a) * element()), rows, b - a, ld,
+            half};
 }
 } // namespace qat

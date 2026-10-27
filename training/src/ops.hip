@@ -1,11 +1,9 @@
-#include "../../runtime/src/device_numeric.hpp"
-#include "hip_ops.hpp"
+#include "view_device.hpp"
 #include <cmath>
 namespace qat::gpu {
 using behemoth::device::bf16;
 __device__ float f16(uint16_t x) { return __uint_as_float(uint32_t(x) << 16); }
-__device__ float read(View a, int r, int c) { return a.p[size_t(r) * a.ld + c]; }
-__device__ float &at(View a, int r, int c) { return a.p[size_t(r) * a.ld + c]; }
+__device__ float read(View a, int r, int c) { return load(a, r, c); }
 __device__ float sum(float x) {
     __shared__ float s[8];
     int l = threadIdx.x % 32, w = threadIdx.x / 32;
@@ -31,8 +29,8 @@ __global__ void bin(View d, View a, View b, int mode, bool round) {
     float x = read(a, r, c), y = read(b, b.rows == 1 ? 0 : r, b.cols == 1 ? 0 : c);
     float z = mode == 0 ? x + y : mode == 1 ? x * y : x;
     if (round)
-        z = f16(bf16(z));
-    at(d, r, c) = z;
+        z = rnd(z);
+    store(d, r, c, z);
 }
 void binary(View d, View a, View b, int mode, bool round, hipStream_t s) {
     bin<<<(size_t(d.rows) * d.cols + 255) / 256, 256, 0, s>>>(d, a, b, mode, round);
@@ -44,9 +42,9 @@ __global__ void convert(View a, uint16_t *b, bool to) {
         return;
     int r = i / a.cols, c = i % a.cols;
     if (to)
-        b[i] = bf16(read(a, r, c));
+        b[i] = load_bits(a, size_t(r) * a.ld + c);
     else
-        at(a, r, c) = f16(b[i]);
+        store(a, r, c, f16(b[i]));
 }
 void cast(View a, uint16_t *b, bool to, hipStream_t s) {
     convert<<<(size_t(a.rows) * a.cols + 255) / 256, 256, 0, s>>>(a, b, to);
@@ -55,7 +53,7 @@ __global__ void reduction(View a, View b, View d) {
     size_t n = size_t(a.rows) * a.cols;
     float x = 0;
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
-        x += read(a, i / a.cols, i % a.cols) * read(b, i / b.cols, i % b.cols);
+        x += read(a, int(i / a.cols), int(i % a.cols)) * read(b, int(i / b.cols), int(i % b.cols));
     x = sum(x);
     if (threadIdx.x == 0)
         atomicAdd(d.p, x);
@@ -87,7 +85,7 @@ __global__ void column_partials(View a, View b, View scale, View partial) {
         float total = 0;
         for (int w = 0; w < 8; ++w)
             total += sums[w][lane];
-        at(partial, blockIdx.y, c) = total;
+        store(partial, int(blockIdx.y), c, total);
     }
 }
 __global__ void column_finish(View partial, View d) {
@@ -105,6 +103,41 @@ void column_reduce(View a, View b, View scale, View partial, View d, hipStream_t
     column_partials<<<dim3((a.cols + 31) / 32, partial.rows), 256, 0, s>>>(a, b, scale, partial);
     column_finish<<<(d.cols + 255) / 256, 256, 0, s>>>(partial, d);
 }
+__global__ void column_finish_factor(View partial, View factor, View d) {
+    int c = blockIdx.x * 256 + threadIdx.x;
+    if (c >= d.cols)
+        return;
+    float total = 0;
+    for (int r = 0; r < partial.rows; ++r)
+        total += read(partial, r, c);
+    d.p[c] += total * factor.p[c];
+}
+void column_reduce_factor(View a, View b, View scale, View factor, View partial, View d, hipStream_t s) {
+    if (a.rows == 0)
+        return;
+    column_partials<<<dim3((a.cols + 31) / 32, partial.rows), 256, 0, s>>>(a, b, scale, partial);
+    column_finish_factor<<<(d.cols + 255) / 256, 256, 0, s>>>(partial, factor, d);
+}
+// Finishes SV/Wscale gradients: dc[c] = sum of partials; gsv[c] += dc[c] * scale;
+// gscale += sum_c dc[c] * sv[c] (one atomic per block).
+__global__ void sv_finish(View partial, View sv, View scale, View gsv, View gscale) {
+    int c = blockIdx.x * 256 + threadIdx.x;
+    float dc = 0;
+    if (c < gsv.cols) {
+        for (int r = 0; r < partial.rows; ++r)
+            dc += read(partial, r, c);
+        gsv.p[c] += dc * scale.p[0];
+    }
+    float w = sum(c < gsv.cols ? dc * sv.p[c] : 0.f);
+    if (threadIdx.x == 0)
+        atomicAdd(gscale.p, w);
+}
+void sv_reduce(View dy, View c, View sv, View scale, View partial, View gsv, View gscale, hipStream_t s) {
+    if (dy.rows == 0)
+        return;
+    column_partials<<<dim3((dy.cols + 31) / 32, partial.rows), 256, 0, s>>>(dy, c, View{}, partial);
+    sv_finish<<<(gsv.cols + 255) / 256, 256, 0, s>>>(partial, sv, scale, gsv, gscale);
+}
 __global__ void norm(View x, View w, View y, View rr, float eps) {
     int r = blockIdx.x;
     float ss = 0;
@@ -116,7 +149,7 @@ __global__ void norm(View x, View w, View y, View rr, float eps) {
     if (threadIdx.x == 0)
         rr.p[r] = inv;
     for (int c = threadIdx.x; c < x.cols; c += 256)
-        at(y, r, c) = f16(bf16(read(x, r, c) * inv * w.p[c]));
+        store_rounded(y, size_t(r) * y.ld + c, read(x, r, c) * inv * w.p[c]);
 }
 void rms(View x, View w, View y, View rr, float eps, hipStream_t s) {
     norm<<<x.rows, 256, 0, s>>>(x, w, y, rr, eps);
@@ -129,7 +162,7 @@ __global__ void norm_back(View x, View rr, View w, View dy, View dx) {
     dot = sum(dot) / x.cols;
     for (int c = threadIdx.x; c < x.cols; c += 256) {
         float xh = read(x, r, c) * inv, d = read(dy, r, c);
-        at(dx, r, c) = inv * (d * w.p[c] - xh * dot);
+        store(dx, r, c, inv * (d * w.p[c] - xh * dot));
     }
 }
 void rms_back(View x, View rr, View w, View dy, View dx, hipStream_t s) {
@@ -141,8 +174,8 @@ __global__ void angles(View table, int dim, float theta, const int32_t *pos) {
         return;
     int r = i / (dim / 2), j = i % (dim / 2);
     float angle = pos[r] * powf(theta, -2.f * j / dim);
-    at(table, r, j) = cosf(angle);
-    at(table, r, j + dim / 2) = sinf(angle);
+    store(table, r, j, cosf(angle));
+    store(table, r, j + dim / 2, sinf(angle));
 }
 void rope_angles(View table, int dim, float theta, const int32_t *pos, hipStream_t s) {
     angles<<<(size_t(table.rows) * (dim / 2) + 255) / 256, 256, 0, s>>>(table, dim, theta, pos);
@@ -155,8 +188,8 @@ __global__ void rotary(View x, View y, int heads, int dim, View table, bool back
     float cs = read(table, r, j), sn = read(table, r, j + dim / 2), u = read(x, r, h * dim + j),
           v = read(x, r, h * dim + j + dim / 2);
     float a = u * cs + (back ? v : -v) * sn, b = v * cs + (back ? -u : u) * sn;
-    at(y, r, h * dim + j) = back ? a : f16(bf16(a));
-    at(y, r, h * dim + j + dim / 2) = back ? b : f16(bf16(b));
+    store(y, r, h * dim + j, back ? a : rnd(a));
+    store(y, r, h * dim + j + dim / 2, back ? b : rnd(b));
 }
 void rope(View x, View y, int h, int d, View table, bool back, hipStream_t s) {
     rotary<<<(size_t(x.rows) * h * (d / 2) + 255) / 256, 256, 0, s>>>(x, y, h, d, table, back);
@@ -167,7 +200,7 @@ __global__ void glu(View g, View u, View y) {
         return;
     int r = i / g.cols, c = i % g.cols;
     float x = read(g, r, c);
-    at(y, r, c) = f16(bf16(x / (1 + expf(-x)) * read(u, r, c)));
+    store_rounded(y, size_t(r) * y.ld + c, x / (1 + expf(-x)) * read(u, r, c));
 }
 void swiglu(View g, View u, View y, hipStream_t s) {
     glu<<<(size_t(g.rows) * g.cols + 255) / 256, 256, 0, s>>>(g, u, y);
@@ -178,8 +211,8 @@ __global__ void glu_back(View g, View u, View dy, View dg, View du) {
         return;
     int r = i / g.cols, c = i % g.cols;
     float x = read(g, r, c), sig = 1 / (1 + expf(-x)), d = read(dy, r, c);
-    at(dg, r, c) = d * read(u, r, c) * sig * (1 + x * (1 - sig));
-    at(du, r, c) = d * x * sig;
+    store(dg, r, c, d * read(u, r, c) * sig * (1 + x * (1 - sig)));
+    store(du, r, c, d * x * sig);
 }
 void swiglu_back(View g, View u, View dy, View dg, View du, hipStream_t s) {
     glu_back<<<(size_t(g.rows) * g.cols + 255) / 256, 256, 0, s>>>(g, u, dy, dg, du);
@@ -189,7 +222,7 @@ __global__ void embed(View x, const uint16_t *w, const int32_t *ids, int vocab) 
     if (i >= size_t(x.rows) * x.cols)
         return;
     int r = i / x.cols, c = i % x.cols;
-    at(x, r, c) = ids[r] >= 0 && ids[r] < vocab ? f16(w[size_t(ids[r]) * x.cols + c]) : NAN;
+    store(x, r, c, ids[r] >= 0 && ids[r] < vocab ? f16(w[size_t(ids[r]) * x.cols + c]) : NAN);
 }
 void embedding(View x, const uint16_t *w, const int32_t *ids, int vocab, hipStream_t s) {
     embed<<<(size_t(x.rows) * x.cols + 255) / 256, 256, 0, s>>>(x, w, ids, vocab);
@@ -201,7 +234,7 @@ __global__ void ce(View x, const int32_t *labels, float *loss, float den, bool b
             loss[r] = 0;
         if (back)
             for (int c = threadIdx.x; c < x.cols; c += 256)
-                at(x, r, c) = 0;
+                store(x, r, c, 0.f);
         return;
     }
     if (label < 0 || label >= x.cols) {
@@ -236,7 +269,7 @@ __global__ void ce(View x, const int32_t *labels, float *loss, float den, bool b
     __syncthreads();
     if (back)
         for (int c = threadIdx.x; c < x.cols; c += 256)
-            at(x, r, c) = (expf(read(x, r, c) - lse) - (c == label)) / den;
+            store(x, r, c, (expf(read(x, r, c) - lse) - (c == label)) / den);
 }
 void loss(View x, const int32_t *l, float *out, float den, bool back, hipStream_t s) {
     ce<<<x.rows, 256, 0, s>>>(x, l, out, den, back);
