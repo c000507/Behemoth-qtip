@@ -108,14 +108,14 @@ std::vector<std::string> QwenTokenizer::pre_split(const std::string &text) const
         if (is_space(c)) {
             size_t j = i;
             while (j < text.size() && is_space(unsigned(text[j]))) ++j;
-            if (j < text.size() && j - i > 1) {  // \s+(?!\S): last space leads the next word
+            if (j < text.size() && j - i == 1) {
+                // single space before a word: becomes the word's leading space (below)
+            } else if (j < text.size()) {  // \s+(?!\S): all but the last space
                 out.push_back(text.substr(i, j - i - 1));
                 i = j - 1;
-            } else if (j < text.size() || j - i > 1) {
+            } else {  // trailing whitespace run
                 out.push_back(text.substr(i, j - i));
                 i = j;
-            } else {
-                i = j;  // single trailing space: the \s+$ case keeps it via the next-word rule
             }
             continue;
         }
