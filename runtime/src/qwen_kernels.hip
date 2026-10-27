@@ -96,12 +96,16 @@ const int8_t *q_device_had(int K, bool transpose) {
     return d;
 }
 void q_had_factor(int n, int &K, int &P) {
+    // P = power of two <= 4096 with K = n/P in {1, 12, 28} (covers 32/512/1024/2048/4096 pow2,
+    // 3584 = 28*128, 6144 = 12*512)
+    for (P = 4096; P > 1; P >>= 1) {
+        if (n % P) continue;
+        K = n / P;
+        if (K == 1 || K == 12 || K == 28) return;
+    }
     P = 1;
-    while (n % (2 * P) == 0 && P < 1024) P *= 2;
-    K = n / P;
-    if (K == 1) return;
-    if (K != 12 && K != 28 && K != 20)
-        throw std::runtime_error("unsupported hadamard dim " + std::to_string(n));
+    K = n;
+    throw std::runtime_error("unsupported hadamard dim " + std::to_string(n));
 }
 }  // namespace
 
