@@ -318,6 +318,16 @@ int main(int argc, char **argv) {
                 }
             std::printf("attn-only diff: %.5f scale %.3f rel %.2e\n", da, sa, da / sa);
         }
+        {
+            auto kg2 = d_k.download(), vg2 = d_v.download();
+            auto kc2 = kc.download(), vc2 = vc.download();
+            double dkc = 0, dvc = 0;
+            for (size_t i = 0; i < kg2.size(); ++i) {
+                dkc = std::max(dkc, double(std::fabs(double(b16(kc2[i]) - b16(kg2[i])))));
+                dvc = std::max(dvc, double(std::fabs(double(b16(vc2[i]) - b16(vg2[i])))));
+            }
+            std::printf("cache vs buf: dk %.4f dv %.4f\n", dkc, dvc);
+        }
         input_t(d_ao.data(), nullptr, su_o.data(), nq * hd, d_u);
         std::printf("stage: o matmul\n");
         matmul_z(go, lq, d_u, nq * hd, d_z);

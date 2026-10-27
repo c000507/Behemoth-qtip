@@ -148,5 +148,47 @@ int main(int argc, char **argv) {
            1.0f / std::sqrt(float(hd)), s);
     HIP_CHECK(hipStreamSynchronize(s));
     std::printf("  attn ok\n");
+    // crafted: rows=3, q=k (all equal) => uniform softmax over [0..t] => out = mean(v[0..t]) * sig(g)
+    {
+        const int R3 = 3;
+        DeviceBuffer<uint16_t> q4(size_t(R3) * nq * 2 * hd), k4(size_t(R3) * nkv * hd),
+            v4(size_t(R3) * nkv * hd), g4(size_t(R3) * nq * hd), ao4(size_t(R3) * nq * hd);
+        DeviceBuffer<uint16_t> kc4(size_t(64) * nkv * hd), vc4(size_t(64) * nkv * hd);
+        std::vector<uint16_t> qh2(size_t(R3) * nq * 2 * hd, 0), kh4(size_t(R3) * nkv * hd, 0),
+            vh4(size_t(R3) * nkv * hd, 0), gh4(size_t(R3) * nq * hd, 0);
+        for (int r = 0; r < R3; ++r) {
+            for (int i = 0; i < nq * 2 * hd; ++i) qh2[size_t(r) * nq * 2 * hd + size_t(i)] = uint16_t(0x3f80);
+            for (int h = 0; h < nkv; ++h) {
+                float base = 1.0f + 0.25f * r + 0.5f * h;
+                for (int d = 0; d < hd; ++d) {
+                    vh4[size_t(r) * nkv * hd + size_t(h) * hd + size_t(d)] = uint16_t(0x3f80 + d % 4);
+                    kh4[size_t(r) * nkv * hd + size_t(h) * hd + size_t(d)] = uint16_t(0x3f80);
+                    (void)base;
+                }
+            }
+        }
+        // gate = large positive => sigmoid ~ 1
+        for (auto &g5 : gh4) g5 = uint16_t(0x4248);  // ~50
+        HIP_CHECK(hipMemcpy(q4.data(), qh2.data(), qh2.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(k4.data(), kh4.data(), kh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(v4.data(), vh4.data(), vh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(g4.data(), gh4.data(), gh4.size() * 2, hipMemcpyHostToDevice));
+        q_attn(q4.data(), kc4.data(), vc4.data(), g4.data(), ao4.data(), R3, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        // simulate the cache: k/v of rows 0..2 written by the same kernel? no cache here, so feed
+        // the cache manually first
+        std::printf("(cache empty variant above; refill)\n");
+        HIP_CHECK(hipMemcpy(kc4.data(), kh4.data(), kh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(vc4.data(), vh4.data(), vh4.size() * 2, hipMemcpyHostToDevice));
+        q_attn(q4.data(), kc4.data(), vc4.data(), g4.data(), ao4.data(), R3, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        auto out4 = ao4.download();
+        // expected: scores all equal (q=k=1 vectors scaled) => p uniform over [0..t] => mean of v
+        std::printf("crafted attn out r0 [0:4]: %.4f %.4f (want ~1.0..1.75 mean of v) r2: %.4f %.4f\n",
+                    b16x(out4[0]), b16x(out4[1]), b16x[size_t>(2) * nq * hd], 0.0f);
+        (void)0;
+    }
     return 0;
 }
