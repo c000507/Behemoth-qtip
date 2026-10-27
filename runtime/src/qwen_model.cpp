@@ -321,6 +321,14 @@ void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
                                  hipMemcpyDeviceToHost, stream));
     }
     HIP_CHECK(hipStreamSynchronize(stream));
+    if (const char *lp = std::getenv("QWEN_LOGITS_OUT")) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            std::ofstream f(lp, std::ios::binary);
+            f.write(reinterpret_cast<const char *>(logits_all.data()), std::streamsize(size_t(nrows) * cfg.vocab * 4));
+        }
+    }
     if (std::getenv("QWEN_RT_DBG")) {
         float *row = logits_all.data();
         for (int k = 0; k < 3; ++k) {
