@@ -94,7 +94,9 @@ int main(int argc, char **argv) {
             v3(size_t(rows) * nkv * hd), g3(size_t(rows) * nq * hd), kc3(size_t(64) * nkv * hd),
             vc3(size_t(64) * nkv * hd);
         std::vector<uint16_t> qn(hd, 0x3f80), kn(hd, 0x3f80);
-        std::printf("  rope only\n");
+        std::printf("  rope only: q3=%p k3=%p v3=%p g3=%p kc3=%p vc3=%p qn=%p kn=%p\n",
+                    (void *)q3.data(), (void *)k3.data(), (void *)v3.data(), (void *)g3.data(),
+                    (void *)kc3.data(), (void *)vc3.data(), (void *)qn.data(), (void *)kn.data());
         q_qk_norm_rope(q3.data(), k3.data(), v3.data(), g3.data(), kc3.data(), vc3.data(), rows, 0,
                        nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
         HIP_CHECK(hipStreamSynchronize(s));
