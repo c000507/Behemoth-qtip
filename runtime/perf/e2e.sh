@@ -27,14 +27,10 @@ run_config() {
     timeout 600 build-rocm/behemoth_load_bench $PROMPT $c $c 24 > /dev/null 2>&1 || { echo "$name c$c HANG/timeout in warmup 2"; break; }
     timeout 900 build-rocm/behemoth_load_bench $PROMPT $c $((c*2)) 96 > $OUT/${name}_c${c}.json 2> $OUT/${name}_c${c}.err || { echo "$name c$c HANG/timeout in measurement"; break; }
     curl -s http://127.0.0.1:8080/metrics > $OUT/${name}_c${c}_metrics.json
-    python3 - "$OUT/${name}_c${c}.json" $name $c <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-m=d.get("server_rolling_metrics",{})
-keys=[k for k in d if "token" in k or "second" in k or "latency" in k or "ms" in k]
-m=d.get("server_rolling_metrics",{})
-print(sys.argv[2], "concurrency", sys.argv[3], "load_bench tok/s=%.2f"%d["completion_tokens_per_second"], "p50 latency=%.1fs"%d["request_latency_p50_seconds"], "server inter_token p50=%.1f ms p95=%.1f ms ttft p50=%.0f ms"%(m["inter_token_p50_ms"],m["inter_token_p95_ms"],m["ttft_p50_ms"]))
-PY
+    jq -r --arg name "$name" --arg c "$c" '
+      .server_rolling_metrics as $m
+      | "\($name) concurrency \($c) load_bench tok/s=\(.completion_tokens_per_second) p50 latency=\(.request_latency_p50_seconds)s server inter_token p50=\($m.inter_token_p50_ms) ms p95=\($m.inter_token_p95_ms) ms ttft p50=\($m.ttft_p50_ms) ms"
+    ' "$OUT/${name}_c${c}.json"
   done
   kill $pid; for i in $(seq 1 30); do kill -0 $pid 2>/dev/null || break; sleep 1; done; kill -9 $pid 2>/dev/null
   sleep 3

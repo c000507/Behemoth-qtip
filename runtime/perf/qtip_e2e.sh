@@ -18,7 +18,7 @@ cd $ROOT
 run() { # name prompt conc requests tokens
   timeout 3600 $B $2 $3 $4 $5 127.0.0.1 1337 > $OUT/${TAG}_$1.json 2> $OUT/${TAG}_$1.err || echo "$TAG $1 FAILED"
 }
-metric() { curl -s $M | python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"; }
+metric() { curl -fsS "$M" | jq -er --arg key "$1" '.[$key]'; }
 # warm-up (first-use autotuning of lm_head / attention shapes, first long-prefill effects)
 timeout 900 $B $EVAL/prompt_short.txt 1 2 32 127.0.0.1 1337 > /dev/null 2>&1
 timeout 900 $B $EVAL/prompt_short.txt 4 4 32 127.0.0.1 1337 > /dev/null 2>&1
@@ -34,27 +34,19 @@ run ttft2k $EVAL/prompt_2k.txt 1 2 1
 run ttft13k $EVAL/prompt_13k.txt 1 1 1
 run dec13k $EVAL/prompt_13k.txt 1 1 128
 curl -s $M > $OUT/${TAG}_final_metrics.json
-python3 - $OUT $TAG $s0 $t0 $s1 $t1 $s2 $t2 $itl <<'PY'
-import json, sys
-out, tag = sys.argv[1], sys.argv[2]
-s0, t0, s1, t1, s2, t2, itl = map(float, sys.argv[3:10])
-def j(n):
-    try: return json.load(open(f"{out}/{tag}_{n}.json"))
-    except Exception: return {}
-c1, c4, a, b, d = j("c1"), j("c4"), j("ttft2k"), j("ttft13k"), j("dec13k")
-fm = json.load(open(f"{out}/{tag}_final_metrics.json"))
-lat = lambda r: r.get("request_latency_p50_seconds", float("nan"))
-dec13 = (lat(d) - lat(b)) / 127 * 1000
-res = {"tag": tag,
-       "c1_inter_token_p50_ms": itl,
-       "c1_gpu_step_mean_ms": (s1 - s0) / max(t1 - t0, 1) * 1000,
-       "c1_tok_s_load_bench": c1.get("completion_tokens_per_second"),
-       "c4_aggregate_tok_s_load_bench": c4.get("completion_tokens_per_second"),
-       "c4_gpu_step_mean_ms": (s2 - s1) / max((t2 - t1) / 4, 1) * 1000,
-       "ttft_2k_s": lat(a), "prompt_2k_tokens": a.get("mean_prompt_tokens"),
-       "ttft_13k_s": lat(b), "prompt_13k_tokens": b.get("mean_prompt_tokens"),
-       "decode_13k_ms_per_token": dec13,
-       "kv_pages_total": fm.get("kv_pages_total")}
-json.dump(res, open(f"{out}/{tag}_summary.json", "w"), indent=1)
-print(json.dumps(res))
-PY
+jq -n --arg tag "$TAG" \
+  --argjson s0 "$s0" --argjson t0 "$t0" --argjson s1 "$s1" --argjson t1 "$t1" \
+  --argjson s2 "$s2" --argjson t2 "$t2" --argjson itl "$itl" \
+  --slurpfile c1 "$OUT/${TAG}_c1.json" --slurpfile c4 "$OUT/${TAG}_c4.json" \
+  --slurpfile a "$OUT/${TAG}_ttft2k.json" --slurpfile b "$OUT/${TAG}_ttft13k.json" \
+  --slurpfile d "$OUT/${TAG}_dec13k.json" --slurpfile fm "$OUT/${TAG}_final_metrics.json" '
+    {tag: $tag, c1_inter_token_p50_ms: $itl,
+     c1_gpu_step_mean_ms: (($s1-$s0) / ([$t1-$t0, 1] | max) * 1000),
+     c1_tok_s_load_bench: $c1[0].completion_tokens_per_second,
+     c4_aggregate_tok_s_load_bench: $c4[0].completion_tokens_per_second,
+     c4_gpu_step_mean_ms: (($s2-$s1) / ([($t2-$t1)/4, 1] | max) * 1000),
+     ttft_2k_s: $a[0].request_latency_p50_seconds, prompt_2k_tokens: $a[0].mean_prompt_tokens,
+     ttft_13k_s: $b[0].request_latency_p50_seconds, prompt_13k_tokens: $b[0].mean_prompt_tokens,
+     decode_13k_ms_per_token: (($d[0].request_latency_p50_seconds - $b[0].request_latency_p50_seconds) / 127 * 1000),
+     kv_pages_total: $fm[0].kv_pages_total}
+  ' | tee "$OUT/${TAG}_summary.json"

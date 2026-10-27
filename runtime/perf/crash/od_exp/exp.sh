@@ -13,15 +13,15 @@ W=$!
 bench() { timeout $1 $B ~/stress/prompt.txt $2 $3 96 127.0.0.1 1337 > $4 2>> $E/$TAG.err & echo $! > $E/bench.pid; wait $!; }
 t0=$(date +%s); end=$((t0+MIN*60))
 bench 300 1 2 $E/${TAG}_c1.json
-echo "$(date +%F_%T) c1 rc=$? tok/s,itl_p50=$(python3 -c "import json;d=json.load(open(\"$E/${TAG}_c1.json\"));print(d[\"completion_tokens_per_second\"], d[\"server_rolling_metrics\"][\"inter_token_p50_ms\"])" 2>/dev/null)" >> $L
+echo "$(date +%F_%T) c1 rc=$? tok/s,itl_p50=$(jq -r '[.completion_tokens_per_second, .server_rolling_metrics.inter_token_p50_ms] | @tsv' "$E/${TAG}_c1.json" 2>/dev/null)" >> $L
 n=0
 while [ $(date +%s) -lt $end ] && [ ! -e $E/$TAG.crash ]; do
   n=$((n+1))
   bench 600 4 8 $E/${TAG}_b.json; rc=$?
-  echo "$(date +%F_%T) batch $n rc=$rc tok/s=$(python3 -c "import json;print(json.load(open(\"$E/${TAG}_b.json\"))[\"completion_tokens_per_second\"])" 2>/dev/null)" >> $L
+  echo "$(date +%F_%T) batch $n rc=$rc tok/s=$(jq -r '.completion_tokens_per_second' "$E/${TAG}_b.json" 2>/dev/null)" >> $L
   [ $rc -ne 0 ] && { echo "$(date +%F_%T) load failed rc=$rc" >> $L; break; }
 done
 if [ ! -e $E/$TAG.crash ]; then bench 300 1 2 $E/${TAG}_c1b.json
-  echo "$(date +%F_%T) c1end tok/s,itl_p50=$(python3 -c "import json;d=json.load(open(\"$E/${TAG}_c1b.json\"));print(d[\"completion_tokens_per_second\"], d[\"server_rolling_metrics\"][\"inter_token_p50_ms\"])" 2>/dev/null)" >> $L; fi
+  echo "$(date +%F_%T) c1end tok/s,itl_p50=$(jq -r '[.completion_tokens_per_second, .server_rolling_metrics.inter_token_p50_ms] | @tsv' "$E/${TAG}_c1b.json" 2>/dev/null)" >> $L; fi
 kill $W 2>/dev/null
 echo "$(date +%F_%T) END tag=$TAG elapsed=$(( $(date +%s)-t0 ))s batches=$n crashed=$([ -e $E/$TAG.crash ] && echo yes || echo no)" >> $L

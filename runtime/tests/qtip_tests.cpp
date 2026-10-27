@@ -1,8 +1,8 @@
 // QTIP runtime tests (CPU references + GPU kernels).
 //   behemoth_qtip_tests                       synthetic tests only (CPU + one GPU, < 1 GB)
 //   behemoth_qtip_tests LAYER_FILE REFVEC     + real-tensor tests on one qtip_quant layer file
-//       (model-layer-XXXXX.safetensors) against the python reference vectors written by
-//       tools/qtip_ref_vectors.py (decode_compressed rows, QuantizedLinear forward).
+//       (model-layer-XXXXX.safetensors) against the saved reference vectors
+//       (decode_compressed rows, QuantizedLinear forward).
 #include "behemoth/qtip_gpu.hpp"
 #include <cmath>
 #include <filesystem>

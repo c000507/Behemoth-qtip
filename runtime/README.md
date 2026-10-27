@@ -168,8 +168,9 @@ Enabled by default (`--prefix-cache-slots 10`, `--prefix-cache-gb 64`, `--prefix
 whose token ids start with a cached sequence restores that KV (from pinned host memory, or by taking over the
 pages a recent sequence left on the GPUs) and prefills only the remainder; finished and cancelled requests are
 cached. Design, tests and measurements: [PREFIX_CACHE_REPORT.md](PREFIX_CACHE_REPORT.md). Tests:
-`behemoth_model_tests MODEL prefix` (save/restore round trip, logits vs cold prefill) and, against a running
-server, `python3 tests/prefix_cache_e2e.py --port PORT`.
+`behemoth_model_tests MODEL prefix` (save/restore round trip, logits vs cold prefill).
+Against a running server, use the native `behemoth_http_tests HOST PORT` for HTTP coverage.
+Benchmark shell scripts require `jq` for JSON processing; legacy scripting clients have been removed.
 
 The HTTP test exercises protocol errors, deterministic streaming/nonstreaming
 output, concurrent requests, stop strings, client disconnects, and page reclamation.

@@ -8,7 +8,6 @@ REPO=/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/qtip_quant
 RT=/home/charles/Development/Behemoth-R1-123B-v2-aqlm-codebase/cpp_runtime
 BIN=$REPO/build/qtip_quant
 TOK=$Q/calib_2048x2048.i32
-PYREF="env QTIP_DIR=/mnt/nvme/quantbench/qtip /home/charles/venvs/quantbench/bin/python"
 STEPS=${1:-"1 2 3 4 5 6"}
 LOG=$Q/window.log
 exec >> $LOG 2>&1
@@ -70,12 +69,8 @@ for s in $STEPS; do
   4) # quantize layers 40 and 41 concurrently on both GPUs
      rm -rf $Q/q2 && $BIN --mode quantize --layers 40:42 --gpus 0,1 --hess-dir $Q/par/hess --keep-hessians \
         --work $Q/q2/work --out $Q/q2/out ;;
-  5) # python reference QTIP on layer 40, same Hessians (row subsets for the MLP)
-     cd $REPO/tools
-     $PYREF ref_quantize.py --hess $Q/par/hess/layer40.safetensors --layer 40 --results $Q/ref_results.jsonl \
-        --linears self_attn.k_proj,self_attn.v_proj,self_attn.q_proj,self_attn.o_proj --device cuda:0
-     $PYREF ref_quantize.py --hess $Q/par/hess/layer40.safetensors --layer 40 --results $Q/ref_results.jsonl \
-        --linears mlp.gate_proj,mlp.up_proj,mlp.down_proj --rows 4096 --device cuda:0 ;;
+  5) # native CPU reference checks against the committed numerical fixtures
+     "$REPO/build/qtip_tests_cpu" "$REPO/tests/refvec" ;;
   6) # full pipeline with 4.19M tokens on both GPUs, layers 0..1 (collect + quantize)
      rm -rf $Q/run && $BIN --mode run --layers 0:2 --ntok 4194304 --gpus 0,1 --tokens $TOK \
         --work $Q/run/work --out $Q/run/out ;;

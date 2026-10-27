@@ -5,8 +5,7 @@
 // Hadamard factorisation of the reference (hadK (x) H_2^p), a double-precision reference linear and
 // a reference transformer block. Every function here mirrors github.com/Cornell-RelaxML/qtip
 // (lib/utils/kernel_decompress.py, lib/codebook/bitshift.py, lib/utils/matmul_had.py,
-// lib/linear/quantized_linear.py) and is validated against it (tests/qtip_tests.cpp,
-// tools/qtip_ref_vectors.py).
+// lib/linear/quantized_linear.py) and is validated against committed fixtures by tests/qtip_tests.cpp.
 #include "checkpoint.hpp"
 #include <array>
 #include <cstdint>

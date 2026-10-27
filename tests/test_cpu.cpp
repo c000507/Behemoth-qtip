@@ -1,4 +1,4 @@
-// CPU unit tests vs reference vectors produced by tools/ref_vectors.py (unmodified QTIP python code).
+// CPU unit tests vs committed vectors from the unmodified upstream QTIP reference.
 // usage: qtip_tests_cpu <refvec_dir>
 #include <cmath>
 #include <cstdio>

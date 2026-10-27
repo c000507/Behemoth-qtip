@@ -19,21 +19,14 @@ for c in $CONCURRENCIES; do
   curl -s http://127.0.0.1:1337/metrics > $OUT/${TAG}_c${c}_before.json
   timeout 1800 build-rocm/behemoth_load_bench $PROMPT $c $((c*2)) $TOKENS 127.0.0.1 1337 > $OUT/${TAG}_c${c}.json 2> $OUT/${TAG}_c${c}.err || { echo "$TAG c$c measurement failed"; continue; }
   curl -s http://127.0.0.1:1337/metrics > $OUT/${TAG}_c${c}_after.json
-  python3 - $OUT $TAG $c $TOKENS <<'PY'
-import json, sys
-out, tag, c, tokens = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-d = json.load(open(f"{out}/{tag}_c{c}.json"))
-b = json.load(open(f"{out}/{tag}_c{c}_before.json"))
-a = json.load(open(f"{out}/{tag}_c{c}_after.json"))
-m = d.get("server_rolling_metrics", {})
-toks = a["completion_tokens"] - b["completion_tokens"]
-secs = a["gpu_step_seconds"] - b["gpu_step_seconds"]
-# 2 waves of c requests: each wave = 1 prefill step + (tokens-1) decode steps
-steps = 2 * tokens
-step_ms = secs / steps * 1000
-print(f"{tag} c={c}: load_bench {d['completion_tokens_per_second']:.2f} tok/s, request p50 {d['request_latency_p50_seconds']:.2f} s, "
-      f"gpu step mean {step_ms:.1f} ms ({toks} tokens, {secs:.1f} s GPU over {steps} steps), "
-      f"steady aggregate {c * 1000 / step_ms:.2f} tok/s, server ttft p50 {m.get('ttft_p50_ms', 0):.0f} ms")
-PY
+  jq -nr --arg tag "$TAG" --argjson c "$c" --argjson tokens "$TOKENS" \
+    --slurpfile d "$OUT/${TAG}_c${c}.json" \
+    --slurpfile b "$OUT/${TAG}_c${c}_before.json" \
+    --slurpfile a "$OUT/${TAG}_c${c}_after.json" '
+      ($a[0].completion_tokens - $b[0].completion_tokens) as $toks
+      | ($a[0].gpu_step_seconds - $b[0].gpu_step_seconds) as $secs
+      | (2 * $tokens) as $steps | ($secs / $steps * 1000) as $ms
+      | "\($tag) c=\($c): load_bench \($d[0].completion_tokens_per_second) tok/s, request p50 \($d[0].request_latency_p50_seconds) s, gpu step mean \($ms) ms (\($toks) tokens, \($secs) s GPU over \($steps) steps), steady aggregate \(if $ms > 0 then $c * 1000 / $ms else null end) tok/s, server ttft p50 \($d[0].server_rolling_metrics.ttft_p50_ms // 0) ms"
+    '
 done
 echo "$TAG DONE"

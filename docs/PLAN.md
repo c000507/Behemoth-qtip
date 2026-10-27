@@ -1,7 +1,8 @@
 # Plan: GM-CoT calibration + streaming fine-tune for QTIP Behemoth
 
-Status: agreed 2026-10-26. Phase 3's portable trainer and CPU verification are implemented;
-The trainer now has a native adapter to runtime/ QTIP projection kernels and shared SU groups.
+Status: native C++20/HIP conversion 2026-10-27. Phase 3 uses standalone training/ executables;
+training, data preparation, checkpointing and export have no Python dependency. Shared SU groups
+and the native runtime QTIP decoder are preserved.
 Real-layer/GPU verification, full-logit parity and phases 1/2/4 remain pending.
 See [FINE_TUNING.md](FINE_TUNING.md) for commands, backend contract and current limitations.
 Hardware: 192.168.0.229, 2x Radeon AI PRO R9700 (gfx1201, 32 GB), 377 GB RAM, ROCm 10.1, GPUs at DPM level 1.
@@ -24,7 +25,7 @@ Two levers:
   ~72M characters (~18M tokens), median conversation ~28k tokens / 37 messages.
 - CoT is in assistant `reasoning_content`; Behemoth's chat template ignores that field, so it is inlined as
   `<think>\n...\n</think>\n\n` + content (legacy inline `<think>` blocks in `content` are stripped).
-  Implemented in `tools/make_calib_gmcot.py`.
+  Implemented by the native `qtip_prepare` executable.
 - Held-out set: 73 conversations (10 %, seed 0), ids recorded in the calibration `.json` files. Never used for
   calibration or training.
 - General text share: from the existing calibration mix (OpenWebText + smol-smoltalk).
@@ -38,7 +39,7 @@ Two levers:
 - QTIP decode support in `behemoth_server` (trellis-decode GEMV/GEMM, RHT/Hadamard, TP design). The trainer
   reuses these kernels.
 - Done: GM-CoT calibration files `calib_gmcot_512x8192.i32` and `calib_gmcot_2048x2048.i32` (4.19M tokens each,
-  75/25 mix) and the generator script.
+  75/25 mix). The legacy generator is retired; new data uses `qtip_prepare`.
 
 ## Phase 1 - long-context calibration and re-quant (`qtip_quant`)
 
@@ -46,8 +47,8 @@ Two levers:
    Replace it with query-block tiling (e.g. 4,096 query rows per tile) or a flash-style kernel, so memory is
    O(T x block).
 2. Process the per-token buffers (qkv, gate/up, y) in row chunks so 24-32k sequences fit in VRAM.
-3. Calibration file at 24k with document masking (extend `make_calib_gmcot.py`, plus a mask/segment-id file
-   that the attention honours).
+3. Calibration file at 24k from native `qtip_prepare`, with mask/segment-id files
+   that the quantizer attention must honour.
 4. Parity: tiled attention vs the current implementation on layers 0-1 at seq 2k and 8k (activations and
    Hessians within bf16 noise).
 5. Full re-quant from GM-CoT Hessians (~5-6 h on both GPUs).
@@ -115,7 +116,7 @@ Output: `Behemoth-R1-123B-v2-QTIP-2bit-gmcot`.
 ### Verification before any real run
 
 - Finite-difference gradient checks for every backward kernel on a tiny random model.
-- One layer forward + backward vs PyTorch using the reference QTIP decoder.
+- GPU layer forward + backward against the standalone C++ reference and runtime QTIP decoder.
 - Streaming forward logits bit-identical to `behemoth_server` on the same model and prompt.
 - Overfit a single batch (loss must fall towards zero).
 
@@ -146,7 +147,7 @@ Output: `Behemoth-R1-123B-v2-QTIP-2bit-gmcot-ft`, served by `behemoth_server` wi
 | Overfitting to GM style | low LR, <= 1 epoch, 20 % general text, held-out evaluation |
 | Signs/scales/norms alone recover too little | measure after the 5M run; next options are a trainable lm_head or a full-weight fine-tune before quantisation (needs more host memory) |
 | GPU stability on long runs | DPM level 1, pollers, MES-safe pinned transfers, resumable checkpoints |
-| Backward bugs | gradient checks, PyTorch single-layer comparison, single-batch overfit, before real runs |
+| Backward bugs | gradient checks, GPU/C++ reference comparisons, single-batch overfit, before real runs |
 | Power loss mid-run | checkpoint every N steps; quantiser and trainer both resume |
 
 ## Order of work

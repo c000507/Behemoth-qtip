@@ -10,6 +10,6 @@ perf/gpu_check.sh lane3 "1 2 4" sorted-lane 1
 M=/mnt/nvme/models/Behemoth-R1-123B-v2-aqlm-output
 for pol in 0 1 16 17 24 25; do for r in 1 4; do
   BEHEMOTH_LANE_POLICY=$pol timeout 900 build-rocm/behemoth_projection_bench $M $r 0 1 lane > $OUT/lane3_pol${pol}_rows$r.json 2>/dev/null
-  echo "policy $pol rows $r: $(python3 perf/summarize_round2.py $OUT/lane3_pol${pol}_rows$r.json | grep -E '^  lane')"
+  echo "policy $pol rows $r: $(bash perf/summarize_round2.sh $OUT/lane3_pol${pol}_rows$r.json | grep -E '^  lane')"
 done; done
 echo ALLDONE

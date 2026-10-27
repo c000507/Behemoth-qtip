@@ -13,6 +13,6 @@ fi
 for r in $ROWS; do
   echo "$(date +%T) bench rows=$r"
   timeout 1800 build-rocm/behemoth_projection_bench $MODEL $r 0 $DEV $LAYOUTS > $OUT/${TAG}_bench_rows$r.json 2> $OUT/${TAG}_bench_rows$r.err; echo "bench rows=$r rc=$?"
-  python3 perf/summarize_round2.py $OUT/${TAG}_bench_rows$r.json
+  bash perf/summarize_round2.sh $OUT/${TAG}_bench_rows$r.json
 done
 echo "$TAG DONE"

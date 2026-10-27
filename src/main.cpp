@@ -54,7 +54,7 @@ static void usage() {
       "usage: qtip_quant --out DIR --work DIR [--tokens FILE] [options]\n"
       "  --mode run|collect|quantize|assemble  (default run: collect Hessians + quantize)\n"
       "  --model DIR          FP8-Dynamic checkpoint (default /mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic)\n"
-      "  --tokens FILE        calibration tokens, raw int32 [nseq][seq_len] (tools/make_calib.py)\n"
+      "  --tokens FILE        calibration tokens, raw int32 [nseq][seq_len]\n"
       "  --ntok N             calibration tokens to use (default 4194304)\n"
       "  --seq-len N          sequence length of the token file (default 2048)\n"
       "  --layers A:B         layer range [A, B) (default all)\n"
