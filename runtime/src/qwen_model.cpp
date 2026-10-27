@@ -17,8 +17,39 @@
 #include "behemoth/qwen_kernels.hpp"
 
 namespace behemoth {
-namespace {
+// Minimal safetensors-directory reader for the qwen path (behemoth::Checkpoint validates the
+// Mistral config and cannot load qwen3_5 checkpoints).
 using json = nlohmann::json;
+struct QwenCheckpoint {
+    std::filesystem::path root;
+    std::map<std::string, std::string> index;
+    std::map<std::string, std::shared_ptr<SafeTensorFile>> files;
+
+    explicit QwenCheckpoint(std::filesystem::path p) : root(std::move(p)) {
+        std::ifstream f(root / "model.safetensors.index.json");
+        if (!f) throw std::runtime_error("no model.safetensors.index.json in " + root.string());
+        json idx = json::parse(f);
+        for (auto it = idx["weight_map"].begin(); it != idx["weight_map"].end(); ++it)
+            index[it.key()] = it.value();
+    }
+    const SafeTensorFile &tensor(const std::string &name) const {
+        auto it = index.find(name);
+        if (it == index.end()) throw std::runtime_error("tensor not found: " + name);
+        auto &ptr = files[it->second];
+        if (!ptr) ptr = std::make_shared<SafeTensorFile>(root / it->second);
+        return *ptr;
+    }
+    std::vector<BFloat16> bf16(const std::string &name) const {
+        auto v = tensor(name).floats(name);
+        std::vector<BFloat16> r(v.size());
+        for (size_t i = 0; i < v.size(); ++i) r[i] = BFloat16(v[i]);
+        return r;
+    }
+};
+}  // namespace behemoth
+
+namespace behemoth {
+namespace {
 
 json read_json(const std::filesystem::path &p) {
     std::ifstream f(p);
@@ -26,7 +57,7 @@ json read_json(const std::filesystem::path &p) {
     return json::parse(f);
 }
 
-std::vector<uint16_t> bf16_raw(const Checkpoint &ck, const std::string &name) {
+std::vector<uint16_t> bf16_raw(const QwenCheckpoint &ck, const std::string &name) {
     auto v = ck.bf16(name);
     std::vector<uint16_t> r(v.size());
     for (size_t i = 0; i < v.size(); ++i) {
@@ -129,7 +160,7 @@ struct QwenModel::Impl {
     double perplexity(const int *tokens, size_t n);
 };
 
-qtip::HostLinear QwenModel::Impl::load_host(const Checkpoint &ck, int layer, const std::string &name,
+qtip::HostLinear QwenModel::Impl::load_host(const QwenCheckpoint &ck, int layer, const std::string &name,
                                             int in, int out) {
     const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
     ck.tensor(base + "trellis");  // existence + index check
@@ -161,7 +192,7 @@ void QwenModel::Impl::upload_linear(Linear &L, const qtip::HostLinear &h) {
 }
 
 void QwenModel::Impl::load(const std::filesystem::path &dir) {
-    Checkpoint ck(dir);
+    QwenCheckpoint ck(dir);
     cfg = QwenRuntimeConfig::read(dir);
     if (cfg.num_experts > 0)
         throw std::runtime_error("Qwen3.5 MoE checkpoints are not supported by this runtime yet");
