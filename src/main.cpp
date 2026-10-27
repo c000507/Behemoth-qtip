@@ -892,7 +892,7 @@ void Pipeline::run() {
     std::string embed_name = "model.embed_tokens.weight";
     if (qwen_) {
       for (auto& kv : st_.tensors())
-        if (kv.first.size() > 18 && kv.first.substr(kv.first.size() - 18) == "embed_tokens.weight")
+        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight")
           embed_name = kv.first;
     }
     const TensorInfo& ei = st_.info(embed_name);
@@ -970,10 +970,10 @@ void Pipeline::assemble() {
     if (qwen_) {
       std::string norm_name = "model.norm.weight", embed_name = "model.embed_tokens.weight";
       for (auto& kv : st_.tensors()) {
-        if (kv.first.size() >= 16 && kv.first.substr(kv.first.size() - 16) == "norm.weight" &&
+        if (kv.first.size() >= 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
             kv.first.find("layers.") == std::string::npos)
           norm_name = kv.first;
-        if (kv.first.size() > 18 && kv.first.substr(kv.first.size() - 18) == "embed_tokens.weight")
+        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight")
           embed_name = kv.first;
       }
       for (std::string nm : {embed_name, norm_name}) {
