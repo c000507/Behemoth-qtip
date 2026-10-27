@@ -52,6 +52,8 @@ int main(int argc, char **argv) {
         if (const char *value = std::getenv("BEHEMOTH_BENCH_ZC_ROWS"))
             o.zero_copy_rows = size_t(std::stoi(value)); // zero-copy exchange buffer rows (default 8)
         o.profile = std::getenv("BEHEMOTH_BENCH_PROFILE") && std::atoi(std::getenv("BEHEMOTH_BENCH_PROFILE"));
+        const char *qp = std::getenv("BEHEMOTH_ATTN_QP");
+        const char *attention_precision = qp && std::string(qp) == "bf16" ? "bf16" : "fp8";
         // BEHEMOTH_BENCH_DECODE="1,4,16": decode steps of c one-token requests at each context
         // (the prefix pages are shared; each request appends its token to its own page, so
         // contexts are rounded up to a multiple of 16).
@@ -66,12 +68,15 @@ int main(int argc, char **argv) {
             std::sort(ms.begin(), ms.end());
             const double med = ms[ms.size() / 2];
             std::cout << name << " rows=" << rows << " ctx=" << ctx << " " << med << " ms "
-                      << rows_divisor / med * 1000 << " tok/s bf16-prefill-rows=" << o.qtip_bf16_prefill_rows << '\n';
+                      << rows_divisor / med * 1000 << " tok/s bf16-prefill-rows=" << o.qtip_bf16_prefill_rows
+                      << " attention-qp=" << attention_precision << '\n';
             if (o.profile) {
                 auto p = model.last_profile();
-                std::cout << "  profile execution_wall_ms=" << p.value("execution_wall_ms", 0.0);
+                std::cout << "  profile execution_wall_ms=" << p.value("execution_wall_ms", 0.0)
+                          << " event_totals=sum_across_streams_not_wall_busy_time";
                 for (const auto &r : p.at("ranks"))
-                    std::cout << " rank" << r.at("rank") << "=" << r.at("gpu_event_totals").dump();
+                    std::cout << " rank" << r.at("rank") << "_micro_batches=" << r.value("qtip_micro_batches", 1)
+                              << " events=" << r.at("gpu_event_totals").dump();
                 std::cout << '\n';
             }
             std::cout << std::flush;

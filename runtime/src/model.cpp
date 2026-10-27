@@ -537,7 +537,7 @@ struct Shard {
     hipEvent_t ev_decoded{}, ev_mb_start{};
     GpuMetadata mb_metadata[max_micro_batches];
     bool scratch_busy = false;
-    int active_micro_batches = 1;
+    int active_micro_batches = 1, last_qtip_micro_batches = 1;
     size_t sample_capacity = 0;
     // Prefix-cache KV page transfers (PREFIX_CACHE_REPORT.md): pack/unpack kernels on kv_stream,
     // copy-engine transfers on kv_copy_stream, ping-pong between two device staging buffers.
@@ -1091,10 +1091,9 @@ struct Shard {
         bool bf16_projection = false; // q/k/v, o and down payloads for pure prefill only
     };
     template <class F> void measure(const Mb &mb, const char *name, F f) {
-        if (mb.index == 0)
-            timings.measure(name, mb.s, f);
-        else
-            f();
+        // Include every micro-batch. Summed event intervals on concurrent streams
+        // are not wall-clock busy time; profile() marks that distinction explicitly.
+        timings.measure(name, mb.s, f);
     }
     // Rank-blocked all-gather of `words` 32-bit words per rank through the micro-batch's block
     // of qtip_all ([2][rows][W] at word offset 2 * r0 * 14336): this rank's half must already
@@ -1204,8 +1203,21 @@ struct Shard {
             const bool whole = size_t(w.rows) * size_t(w.in) <= qtip_dense_scratch.size();
             measure(mb, "dense_projections_ms", [&] {
                 if (!mb.overlap) {
-                    qtip_dense->run(w.view(), lut.lut.data(), u, ldu, rows, partial,
-                                    qtip_dense_scratch.data(), qtip_dense_scratch.size(), mb.s);
+                    if (whole) {
+                        measure(mb, "qtip_weight_decode_ms", [&] {
+                            qtip::decode_dense(w.view(), lut.lut.data(), qtip_dense_scratch.data(), mb.s);
+                        });
+                        measure(mb, "qtip_gemm_ms", [&] {
+                            qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
+                                            qtip_dense_scratch.data(), mb.s);
+                        });
+                    } else {
+                        // Bounded-scratch fallback still contains interleaved decode/GEMMs.
+                        measure(mb, "qtip_tiled_decode_gemm_ms", [&] {
+                            qtip_dense->run(w.view(), lut.lut.data(), u, ldu, rows, partial,
+                                            qtip_dense_scratch.data(), qtip_dense_scratch.size(), mb.s);
+                        });
+                    }
                     return;
                 }
                 if (!whole)
@@ -1214,12 +1226,16 @@ struct Shard {
                     // every other micro-batch's previous GEMM released the scratch
                     for (int i = 1; scratch_busy && i < active_micro_batches; ++i)
                         HIP_CHECK(hipStreamWaitEvent(mb.s, ev_gemm_done[size_t(i)], 0));
-                    qtip::decode_dense(w.view(), lut.lut.data(), qtip_dense_scratch.data(), mb.s);
+                    measure(mb, "qtip_weight_decode_ms", [&] {
+                        qtip::decode_dense(w.view(), lut.lut.data(), qtip_dense_scratch.data(), mb.s);
+                    });
                     HIP_CHECK(hipEventRecord(ev_decoded, mb.s));
                 } else
                     HIP_CHECK(hipStreamWaitEvent(mb.s, ev_decoded, 0));
-                qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
-                                 qtip_dense_scratch.data(), mb.s);
+                measure(mb, "qtip_gemm_ms", [&] {
+                    qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
+                                     qtip_dense_scratch.data(), mb.s);
+                });
                 if (mb.index > 0) {
                     HIP_CHECK(hipEventRecord(ev_gemm_done[size_t(mb.index)], mb.s));
                     scratch_busy = true;
@@ -1417,6 +1433,7 @@ struct Shard {
         };
         const int count = only_layer >= 0 ? 1 : qtip_micro_batches(rows, decode, transport);
         active_micro_batches = count;
+        last_qtip_micro_batches = count;
         std::array<Mb, max_micro_batches> mbs{};
         bool has_decode = false;
         for (int r = 0; r < batch.layout.requests(); ++r)
@@ -1467,6 +1484,8 @@ struct Shard {
     nlohmann::json profile() const {
         return {{"rank", rank},
                 {"device", device},
+                {"qtip_micro_batches", last_qtip_micro_batches},
+                {"gpu_event_totals_are_sums_across_streams", true},
                 {"gpu_event_totals", timings.summary()},
                 {"projection_dispatch", runner->profile(false)},
                 {"projection_kernel_resources", runner->resources()}};

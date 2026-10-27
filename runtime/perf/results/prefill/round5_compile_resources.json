@@ -1,0 +1,13 @@
+{
+  "kind": "compile_only_not_measured_occupancy",
+  "source_commit": "c42cf03",
+  "target": "gfx1201",
+  "compiler": "AMD clang 20, ROCm 7.1",
+  "flags": "-std=c++20 -O3 --offload-arch=gfx1201 -mno-wavefrontsize64 -Rpass-analysis=kernel-resource-usage",
+  "variants": [
+    {"kernel": "gqa_prefill_v1_kernel", "qp": "fp8", "vgprs": 204, "scratch_bytes_per_lane": 0, "waves_per_simd_limit": 7, "lds_bytes_per_block": 24576},
+    {"kernel": "gqa_prefill_kernel", "qp": "fp8", "vgprs": 169, "scratch_bytes_per_lane": 0, "waves_per_simd_limit": 8, "lds_bytes_per_block": 12288},
+    {"kernel": "gqa_prefill_v1_kernel", "qp": "bf16", "vgprs": 256, "scratch_bytes_per_lane": 64, "waves_per_simd_limit": 5, "lds_bytes_per_block": 28928},
+    {"kernel": "gqa_prefill_kernel", "qp": "bf16", "vgprs": 230, "scratch_bytes_per_lane": 80, "waves_per_simd_limit": 6, "lds_bytes_per_block": 17664}
+  ]
+}

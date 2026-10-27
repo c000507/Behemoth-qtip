@@ -38,3 +38,7 @@ Hardware: 2-GPU tensor parallel (`--devices 0,1`), Behemoth-R1-123B-v2-QTIP-2bit
 Raising the zero-copy exchange buffer to 16 rows does not remove the step from
 8 to 12+ rows, so the copy-engine fallback for >8-row all-gathers is not the cause
 of the decode slowdown. Still open.
+
+Further analysis: [matrix compute, peak-normalized throughput, compiler resources,
+and remaining prefill opportunities](PREFILL_COMPUTE_REPORT.md). This uses the
+measurements above and does not claim new GPU timings.

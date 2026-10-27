@@ -1,0 +1,316 @@
+{
+  "analysis_only": true,
+  "reviewed_commit": "c42cf03",
+  "throughput_source": "runtime/PERF_ROUND5_REPORT.md",
+  "attention_mode_assumption": "fp8 (runtime default; original report does not record BEHEMOTH_ATTN_QP)",
+  "cases": [
+    {
+      "attention_gflop_per_token": 4.431347712,
+      "attention_precision": "fp8",
+      "bf16_exchange_gb_per_rank_per_direction": 19.562233856,
+      "bf16_peak_tflops_per_gpu": 191.4,
+      "exchange_floor_seconds_at_12_5_gb_s": 1.56497870848,
+      "fp8_peak_tflops_per_gpu": 382.8,
+      "gpus": 2,
+      "ideal_matrix_only_tokens_per_second": 1557.2303714757252,
+      "ideal_serial_matrix_time_seconds": 1.3151554436092792,
+      "kind": "analytical_useful_matrix_work_not_hardware_counters",
+      "measured_step_seconds": 4.149949341438703,
+      "measured_tokens_per_second": 493.5,
+      "precision_weighted_peak_fraction": 0.31690879463924765,
+      "prefix_tokens": 0,
+      "projection_gflop_per_token": 243.60517632,
+      "projection_only_peak_fraction": 0.3140521277793103,
+      "projection_weights_all_layers": 121802588160.0,
+      "projections": [
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "q",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "k",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "v",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "o",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "gate",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "up",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 28672.0,
+          "name": "down",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 63.496796504064
+        }
+      ],
+      "query_rows": 2048,
+      "sampled_rows": 1,
+      "step_attention_tflop_pair": 9.075400114176,
+      "step_head_tflop_pair": 0.000805306368,
+      "step_projection_tflop_pair": 498.90340110336,
+      "useful_all_matrix_tflops_per_gpu_over_wall": 61.203109330943995,
+      "useful_projection_tflops_per_gpu_over_wall": 60.109577256959994
+    },
+    {
+      "attention_gflop_per_token": 39.864827904,
+      "attention_precision": "fp8",
+      "bf16_exchange_gb_per_rank_per_direction": 19.562233856,
+      "bf16_peak_tflops_per_gpu": 191.4,
+      "exchange_floor_seconds_at_12_5_gb_s": 1.56497870848,
+      "fp8_peak_tflops_per_gpu": 382.8,
+      "gpus": 2,
+      "ideal_matrix_only_tokens_per_second": 1452.54312306381,
+      "ideal_serial_matrix_time_seconds": 1.4099409287623825,
+      "kind": "analytical_useful_matrix_work_not_hardware_counters",
+      "measured_step_seconds": 4.839319470699433,
+      "measured_tokens_per_second": 423.2,
+      "precision_weighted_peak_fraction": 0.2913510747325392,
+      "prefix_tokens": 8192,
+      "projection_gflop_per_token": 243.60517632,
+      "projection_only_peak_fraction": 0.26931481352827585,
+      "projection_weights_all_layers": 121802588160.0,
+      "projections": [
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "q",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "k",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "v",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "o",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "gate",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "up",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 28672.0,
+          "name": "down",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 63.496796504064
+        }
+      ],
+      "query_rows": 2048,
+      "sampled_rows": 1,
+      "step_attention_tflop_pair": 81.643167547392,
+      "step_head_tflop_pair": 0.000805306368,
+      "step_projection_tflop_pair": 498.90340110336,
+      "useful_all_matrix_tflops_per_gpu_over_wall": 59.982336098304,
+      "useful_projection_tflops_per_gpu_over_wall": 51.546855309312
+    },
+    {
+      "attention_gflop_per_token": 75.298308096,
+      "attention_precision": "fp8",
+      "bf16_exchange_gb_per_rank_per_direction": 19.562233856,
+      "bf16_peak_tflops_per_gpu": 191.4,
+      "exchange_floor_seconds_at_12_5_gb_s": 1.56497870848,
+      "fp8_peak_tflops_per_gpu": 382.8,
+      "gpus": 2,
+      "ideal_matrix_only_tokens_per_second": 1361.0447594063617,
+      "ideal_serial_matrix_time_seconds": 1.504726413915486,
+      "kind": "analytical_useful_matrix_work_not_hardware_counters",
+      "measured_step_seconds": 5.539626724371112,
+      "measured_tokens_per_second": 369.7,
+      "precision_weighted_peak_fraction": 0.27162956798073984,
+      "prefix_tokens": 16384,
+      "projection_gflop_per_token": 243.60517632,
+      "projection_only_peak_fraction": 0.23526863554206895,
+      "projection_weights_all_layers": 121802588160.0,
+      "projections": [
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "q",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "k",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "v",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "o",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "gate",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "up",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 28672.0,
+          "name": "down",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 63.496796504064
+        }
+      ],
+      "query_rows": 2048,
+      "sampled_rows": 1,
+      "step_attention_tflop_pair": 154.210934980608,
+      "step_head_tflop_pair": 0.000805306368,
+      "step_projection_tflop_pair": 498.90340110336,
+      "useful_all_matrix_tflops_per_gpu_over_wall": 58.9493817802752,
+      "useful_projection_tflops_per_gpu_over_wall": 45.030416842752
+    },
+    {
+      "attention_gflop_per_token": 146.16526848,
+      "attention_precision": "fp8",
+      "bf16_exchange_gb_per_rank_per_direction": 19.562233856,
+      "bf16_peak_tflops_per_gpu": 191.4,
+      "exchange_floor_seconds_at_12_5_gb_s": 1.56497870848,
+      "fp8_peak_tflops_per_gpu": 382.8,
+      "gpus": 2,
+      "ideal_matrix_only_tokens_per_second": 1208.7606456057813,
+      "ideal_serial_matrix_time_seconds": 1.6942973842216928,
+      "kind": "analytical_useful_matrix_work_not_hardware_counters",
+      "measured_step_seconds": 7.042640990371389,
+      "measured_tokens_per_second": 290.8,
+      "precision_weighted_peak_fraction": 0.24057699186116616,
+      "prefix_tokens": 32768,
+      "projection_gflop_per_token": 243.60517632,
+      "projection_only_peak_fraction": 0.18505847772689657,
+      "projection_weights_all_layers": 121802588160.0,
+      "projections": [
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "q",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "k",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 2.214592512,
+          "input": 12288.0,
+          "name": "v",
+          "output": 1024.0,
+          "step_tflop_per_gpu": 2.267742732288
+        },
+        {
+          "gflop_per_token_all_layers": 26.575110144,
+          "input": 12288.0,
+          "name": "o",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 27.212912787456
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "gate",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 12288.0,
+          "name": "up",
+          "output": 28672.0,
+          "step_tflop_per_gpu": 63.496796504064
+        },
+        {
+          "gflop_per_token_all_layers": 62.008590336,
+          "input": 28672.0,
+          "name": "down",
+          "output": 12288.0,
+          "step_tflop_per_gpu": 63.496796504064
+        }
+      ],
+      "query_rows": 2048,
+      "sampled_rows": 1,
+      "step_attention_tflop_pair": 299.34646984704,
+      "step_head_tflop_pair": 0.000805306368,
+      "step_projection_tflop_pair": 498.90340110336,
+      "useful_all_matrix_tflops_per_gpu_over_wall": 56.6726798475264,
+      "useful_projection_tflops_per_gpu_over_wall": 35.420192636928
+    }
+  ]
+}
