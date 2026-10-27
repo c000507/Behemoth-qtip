@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 
@@ -389,6 +390,16 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             q_hadamard_rows(z.data(), rows, H, H, false, stream);
             q_sv_add(z.data(), w.l_out.sv.data(), state.data(), rows, H, H, H, stream);
         }
+        if (std::getenv("QWEN_RT_DBG")) {
+            std::vector<uint16_t> h = state.download();
+            double ss = 0;
+            for (int i = 0; i < H; ++i) {
+                float v = float(BFloat16(h[size_t(i)]));
+                ss += double(v) * v;
+            }
+            std::fprintf(stderr, "L%d %s post-attn norm %.4f\n", L, w.full ? "full" : "lin",
+                         std::sqrt(ss / H));
+        }
         q_input_transform(state.data(), rows, H, w.ln_post.data(), c.eps, w.su2.data(), H, u.data(), H,
                           stream);
         proj(w.lgate, H, z.data());
@@ -401,6 +412,15 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
         proj(w.ldown, F, z.data());
         q_hadamard_rows(z.data(), rows, H, H, false, stream);
         q_sv_add(z.data(), w.ldown.sv.data(), state.data(), rows, H, H, H, stream);
+        if (std::getenv("QWEN_RT_DBG")) {
+            std::vector<uint16_t> h = state.download();
+            double ss = 0;
+            for (int i = 0; i < H; ++i) {
+                float v = float(BFloat16(h[size_t(i)]));
+                ss += double(v) * v;
+            }
+            std::fprintf(stderr, "L%d mlp norm %.4f\n", L, std::sqrt(ss / H));
+        }
     }
     pos += rows;
 }
