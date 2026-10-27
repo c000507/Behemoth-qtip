@@ -331,8 +331,8 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
     if (std::getenv("QWEN_RT_DBG")) {
         std::vector<uint16_t> h = state.download();
         std::fprintf(stderr, "embed row0: %.4f %.4f %.4f %.4f  raw %04x %04x\n",
-                     float(BFloat16(h[0])), float(BFloat16(h[1])), float(BFloat16(h[2])),
-                     float(BFloat16(h[3])), h[0], h[1]);
+                     float(BFloat16::from_bits(h[0])), float(BFloat16::from_bits(h[1])),
+                     float(BFloat16::from_bits(h[2])), float(BFloat16::from_bits(h[3])), h[0], h[1]);
     }
     // one trellis projection: rotated input is already in u (row stride n); z <- sum slices (dense f32)
     auto proj = [&](const Linear &lin, int n, float *zdst) {
@@ -400,11 +400,13 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             std::vector<uint16_t> h = state.download();
             double ss = 0;
             for (int i = 0; i < H; ++i) {
-                float v = float(BFloat16(h[size_t(i)]));
+                float v;
+                uint16_t b = h[size_t(i)];
+                uint32_t u = uint32_t(b) << 16;
+                std::memcpy(&v, &u, 4);
                 ss += double(v) * v;
             }
-            std::fprintf(stderr, "L%d %s post-attn norm %.4f\n", L, w.full ? "full" : "lin",
-                         std::sqrt(ss / H));
+            std::fprintf(stderr, "L%d %s post-attn norm %.4f\n", L, w.full ? "full" : "lin", std::sqrt(ss / H));
         }
         q_input_transform(state.data(), rows, H, w.ln_post.data(), c.eps, w.su2.data(), H, u.data(), H,
                           stream);
@@ -422,7 +424,10 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             std::vector<uint16_t> h = state.download();
             double ss = 0;
             for (int i = 0; i < H; ++i) {
-                float v = float(BFloat16(h[size_t(i)]));
+                float v;
+                uint16_t b = h[size_t(i)];
+                uint32_t u = uint32_t(b) << 16;
+                std::memcpy(&v, &u, 4);
                 ss += double(v) * v;
             }
             std::fprintf(stderr, "L%d mlp norm %.4f\n", L, std::sqrt(ss / H));

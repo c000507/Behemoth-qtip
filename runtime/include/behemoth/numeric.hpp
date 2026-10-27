@@ -11,6 +11,11 @@ namespace behemoth {
 struct BFloat16 {
     uint16_t bits{};
     BFloat16() = default;
+    static BFloat16 from_bits(uint16_t b) {
+        BFloat16 r;
+        r.bits = b;
+        return r;
+    }
     explicit BFloat16(float x) {
         auto u = std::bit_cast<uint32_t>(x);
         if ((u & 0x7fffffffU) > 0x7f800000U)
