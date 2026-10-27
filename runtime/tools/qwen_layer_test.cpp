@@ -26,6 +26,7 @@ uint16_t to16(float f) {
 }  // namespace
 
 int main(int argc, char **argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
         std::fprintf(stderr, "usage: qwen_rt_tests <model_dir> layer\n");
         return 1;
@@ -129,23 +130,31 @@ int main(int argc, char **argv) {
         lin_gpu(ho, go, lq, suq /*placeholder*/, svo);
         DeviceBuffer<float> su_o;
         su_o.upload(ho.su);
+        std::printf("stage: qkv input_transform\n");
         input_t(d_state.data(), &ln_in, suq.data(), H, d_u);
+        std::printf("stage: q matmul\n");
         matmul_z(gq, lq, d_u, H, d_z);
         q_hadamard_rows(d_z.data(), rows, hq.out, hq.out, false, s);
         q_sv_cast(d_z.data(), svq.data(), d_q.data(), rows, hq.out, hq.out, s);
+        std::printf("stage: k\n");
         matmul_z(gk, lq, d_u, H, d_z);
         q_hadamard_rows(d_z.data(), rows, hk.out, hk.out, false, s);
         q_sv_cast(d_z.data(), svk.data(), d_k.data(), rows, hk.out, hk.out, s);
+        std::printf("stage: v\n");
         matmul_z(gv, lq, d_u, H, d_z);
         q_hadamard_rows(d_z.data(), rows, hv.out, hv.out, false, s);
         q_sv_cast(d_z.data(), svv.data(), d_v.data(), rows, hv.out, hv.out, s);
         DeviceBuffer<uint16_t> kc(size_t(64) * nkv * hd), vc(size_t(64) * nkv * hd);
         auto qn = load16("self_attn.q_norm.weight"), kn = load16("self_attn.k_norm.weight");
+        std::printf("stage: rope\n");
         q_qk_norm_rope(d_q.data(), d_k.data(), d_v.data(), d_g.data(), kc.data(), vc.data(), rows, 0,
                        nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
+        std::printf("stage: attn\n");
         q_attn(d_q.data(), kc.data(), vc.data(), d_g.data(), d_ao.data(), rows, 0, nq, nkv, hd,
                1.0f / std::sqrt(float(hd)), s);
+        std::printf("stage: o input_transform\n");
         input_t(d_ao.data(), nullptr, su_o.data(), nq * hd, d_u);
+        std::printf("stage: o matmul\n");
         matmul_z(go, lq, d_u, nq * hd, d_z);
         q_hadamard_rows(d_z.data(), rows, H, H, false, s);
         q_sv_add(d_z.data(), svo.data(), d_state.data(), rows, H, H, H, s);
