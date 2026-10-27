@@ -328,6 +328,12 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
     const int pos0 = pos;
     HIP_CHECK(hipMemcpyAsync(tokens_d.data(), tokens_h, size_t(rows) * 4, hipMemcpyHostToDevice, stream));
     q_embed_gather(embed.data(), tokens_d.data(), state.data(), rows, H, stream);
+    if (std::getenv("QWEN_RT_DBG")) {
+        std::vector<uint16_t> h = state.download();
+        std::fprintf(stderr, "embed row0: %.4f %.4f %.4f %.4f  raw %04x %04x\n",
+                     float(BFloat16(h[0])), float(BFloat16(h[1])), float(BFloat16(h[2])),
+                     float(BFloat16(h[3])), h[0], h[1]);
+    }
     // one trellis projection: rotated input is already in u (row stride n); z <- sum slices (dense f32)
     auto proj = [&](const Linear &lin, int n, float *zdst) {
         int slices = qtip::matmul_slices(lin.lin.view(), rows);
