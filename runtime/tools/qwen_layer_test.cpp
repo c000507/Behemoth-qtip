@@ -690,5 +690,100 @@ int main(int argc, char **argv) {
     }
     std::printf("layer %d (%s) post-attn: max|diff| %.5f scale %.3f rel %.2e -> %s\n", layer,
                 full ? "full" : "lin", maxd, scale, maxd / scale, maxd / scale < 5e-2 ? "ok" : "FAIL");
-    return maxd / scale < 5e-2 ? 0 : 1;
+    // ---- MLP stage (mirrors QwenModel)
+    auto hgate = load_lin("mlp.gate_proj"), hup = load_lin("mlp.up_proj"),
+         hdown = load_lin("mlp.down_proj");
+    qtip::GpuLinear ggate, gup, gdown;
+    qtip::GpuCodebook lq2;
+    DeviceBuffer<float> sug, svg2, suu, svu2, sud, svd2, su2b, su3b;
+    lin_gpu(hgate, ggate, lq2, su2b, svg2);
+    lin_gpu(hup, gup, lq2, su2b, svu2);
+    lin_gpu(hdown, gdown, lq2, su3b, svd2);
+    {
+        DeviceBuffer<float> s2;
+        s2.upload(hgate.su);
+        su2b = std::move(s2);
+    }
+    {
+        DeviceBuffer<float> s3;
+        s3.upload(hdown.su);
+        su3b = std::move(s3);
+    }
+    d_gu.resize(size_t(rows) * F);
+    d_z.resize(size_t(rows) * std::max(F, H));
+    d_z2.resize(size_t(rows) * std::max(F, H));
+    DeviceBuffer<uint16_t> u2(size_t(rows) * F);
+    input_t(d_state.data(), &ln_post, su2b.data(), H, d_u);
+    {
+        int slices = qtip::matmul_slices(ggate.view(), rows);
+        static DeviceBuffer<float> pg;
+        pg.resize(size_t(slices) * rows * hgate.out);
+        qtip::matmul(ggate.view(), lq2.lut.data(), reinterpret_cast<const BFloat16 *>(d_u.data()), H,
+                     rows, pg.data(), slices, s);
+        q_sum_slices(pg.data(), slices, size_t(rows) * hgate.out, d_z.data(), s);
+        q_hadamard_rows(d_z.data(), rows, hgate.out, hgate.out, false, s);
+    }
+    {
+        int slices = qtip::matmul_slices(gup.view(), rows);
+        static DeviceBuffer<float> pu;
+        pu.resize(size_t(slices) * rows * hup.out);
+        qtip::matmul(gup.view(), lq2.lut.data(), reinterpret_cast<const BFloat16 *>(d_u.data()), H,
+                     rows, pu.data(), slices, s);
+        q_sum_slices(pu.data(), slices, size_t(rows) * hup.out, d_z2.data(), s);
+        q_hadamard_rows(d_z2.data(), rows, hup.out, hup.out, false, s);
+    }
+    q_gateup(d_z.data(), d_z2.data(), svg2.data(), svu2.data(), d_gu.data(), rows, F, F, s);
+    input_t(d_gu.data(), nullptr, su3b.data(), F, d_u);
+    {
+        int slices = qtip::matmul_slices(gdown.view(), rows);
+        static DeviceBuffer<float> pd;
+        pd.resize(size_t(slices) * rows * hdown.out);
+        qtip::matmul(gdown.view(), lq2.lut.data(), reinterpret_cast<const BFloat16 *>(d_u.data()), F,
+                     rows, pd.data(), slices, s);
+        q_sum_slices(pd.data(), slices, size_t(rows) * hdown.out, d_z.data(), s);
+        q_hadamard_rows(d_z.data(), rows, hdown.out, hdown.out, false, s);
+    }
+    q_sv_add(d_z.data(), svd2.data(), d_state.data(), rows, H, H, H, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    // CPU replica
+    std::vector<float> y2(rows * H);
+    {
+        auto normed2 = [&](const std::vector<float> &x) {
+            std::vector<float> y2v(x.size());
+            for (int r = 0; r < rows; ++r) {
+                double ss = 0;
+                for (int i = 0; i < H; ++i) ss += double(x[size_t(r) * H + i]) * x[size_t(r) * H + i];
+                float inv = float(1.0 / std::sqrt(ss / H + c.eps));
+                for (int i = 0; i < H; ++i)
+                    y2v[size_t(r) * H + i] =
+                        b16(to16(x[size_t(r) * H + i] * inv)) * (1.0f + b16(ln_post_h[size_t(i)]));
+            }
+            return y2v;
+        };
+        // GPU post-attn state as the shared starting point
+        std::vector<float> y1f(rows * H);
+        auto gs0 = gpu_state;  // post-attn (pre-MLP): reuse the earlier download
+        for (size_t i = 0; i < y1f.size(); ++i) y1f[i] = b16(gs0[i]);
+        auto xn2 = normed2(y1f);
+        auto gr = qtip::reference_forward(hgate, xn2, true);
+        auto ur = qtip::reference_forward(hup, xn2, true);
+        std::vector<float> act2(rows * F);
+        for (size_t i = 0; i < act2.size(); ++i) {
+            float g2 = b16(to16(gr[i] * hgate.sv[i % size_t(F)]));
+            float u2v = b16(to16(ur[i] * hup.sv[i % size_t(F)]));
+            act2[i] = b16(to16((g2 / (1.0f + std::exp(-g2))) * u2v));
+        }
+        auto dr = qtip::reference_forward(hdown, act2, true);
+        for (size_t i = 0; i < y2.size(); ++i) y2[i] = y1f[i] + b16(to16(dr[i]));
+    }
+    auto gpu_state2 = d_state.download();
+    double maxd2 = 0, scale2 = 1e-9;
+    for (size_t i = 0; i < y2.size(); ++i) {
+        double g2 = b16(gpu_state2[i]);
+        maxd2 = std::max(maxd2, std::fabs(g2 - y2[i]));
+        scale2 = std::max(scale2, double(std::fabs(y2[i])));
+    }
+    std::printf("layer %d MLP: max|diff| %.5f scale %.3f rel %.2e -> %s\n", layer, maxd2, scale2,
+                maxd2 / scale2, maxd2 / scale2 < 5e-2 ? "ok" : "FAIL");
+    return (maxd / scale < 5e-2 && maxd2 / scale2 < 5e-2) ? 0 : 1;
 }
