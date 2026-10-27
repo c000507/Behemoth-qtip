@@ -512,7 +512,7 @@ int main(int argc, char **argv) {
             auto sp = [](float x) { return x > 20.0f ? x : std::log(1.0f + std::exp(x)); };
             auto alog = f.floats(p + "linear_attn.A_log");
             auto dtb = f.floats(p + "linear_attn.dt_bias");
-            std::vector<float> out(rows * V), o(value_dim_dummy(V));
+            std::vector<float> out(rows * V);
             for (int t = 0; t < rows; ++t) {
                 for (int i = 0; i < Wq; ++i) qkv[size_t(i)] = qkvf[size_t(t) * Wq + i];
                 for (int i = 0; i < V; ++i) zz[size_t(i)] = zf[size_t(t) * V + i];
