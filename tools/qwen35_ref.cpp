@@ -57,5 +57,28 @@ int main(int argc, char** argv) {
     std::ofstream f(argv[5], std::ios::binary);
     f.write(reinterpret_cast<const char*>(all_layers.data()), std::streamsize(all_layers.size() * 4));
   }
+  if (argc >= 7 && std::string(argv[6]) == "--ppl") {
+    // continuous-window perplexity: slices share no state, but each window is fully causal inside;
+    // use 512-token slices for a closer match to long-context scoring
+    std::ifstream tf(argv[2], std::ios::binary | std::ios::ate);
+    QCHECK(tf, "reopen tokens");
+    size_t n = size_t(tf.tellg()) / 4;
+    tf.seekg(0);
+    const int SL = 512;
+    double nll = 0;
+    long cnt = 0;
+    std::vector<int32_t> buf(SL);
+    std::vector<float> lg(size_t(1) * cfg.vocab);
+    for (size_t i = 0; i + SL + 1 < n; i += SL - 64) {  // overlap keeps some continuity
+      tf.seekg(std::streamsize(i * 4));
+      tf.read(reinterpret_cast<char*>(buf.data()), std::streamsize(SL * 4));
+      double part = 0;
+      qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, buf.data(), SL, lg.data(), 64, -1, nullptr,
+                       nullptr, buf.data(), &part);
+      nll += part;
+      cnt += SL - 1;
+    }
+    std::printf("ppl over %ld predictions (512-token windows): %.4f\n", cnt, std::exp(nll / cnt));
+  }
   return 0;
 }

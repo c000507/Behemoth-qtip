@@ -492,7 +492,8 @@ void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, 
 void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
                       const std::vector<std::shared_ptr<QwenLayer>>& layers, const QwenCpuRefs& refs,
                       const int32_t* tokens, int T, float* logits, int nthreads, int capture_layer,
-                      std::vector<float>* captured, std::vector<float>* all_layers) {
+                      std::vector<float>* captured, std::vector<float>* all_layers,
+                      const int32_t* ppl_next, double* ppl_nll) {
   static std::string prefix;
   if (prefix.empty()) prefix = detect_prefix(st);
   const int H = cfg.hidden, hd = cfg.hd, nq = cfg.nq, nkv = cfg.nkv, gq = nq / nkv;
@@ -769,7 +770,17 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
   std::vector<float> xf(size_t(T) * H);
   std::memcpy(xf.data(), x.data(), size_t(T) * H * 4);
   for (int t = 0; t < T; ++t) zc_norm_inplace(xf.data() + size_t(t) * H, final_norm.data(), H, cfg.eps);
-  mm_bf16w(logits, xf.data(), head->data(), T, cfg.vocab, H, nthreads);
+  if (ppl_next && ppl_nll) {
+    // streaming: one row of the lm_head per target (avoids the [T][vocab] logits buffer)
+    double nll = 0;
+    for (int t = 0; t + 1 < T; ++t) {
+      mm_bf16w(logits, xf.data() + size_t(t) * H, head->data(), 1, cfg.vocab, H, nthreads);
+      nll += -std::log(std::max(logits[size_t(ppl_next[size_t(t + 1)])], 1e-30f));
+    }
+    *ppl_nll += nll;
+  } else {
+    mm_bf16w(logits, xf.data(), head->data(), T, cfg.vocab, H, nthreads);
+  }
 }
 
 }  // namespace qtip
