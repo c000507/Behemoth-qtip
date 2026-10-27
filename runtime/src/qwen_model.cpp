@@ -264,8 +264,16 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
         up16(w.ln_in, "input_layernorm.weight");
         up16(w.ln_post, "post_attention_layernorm.weight");
     }
-    embed.upload(bf16_raw(ck, "model.embed_tokens.weight"));
-    final_norm.upload(bf16_raw(ck, "model.norm.weight"));
+    std::string embed_name = "model.embed_tokens.weight", norm_name = "model.norm.weight";
+    for (auto &kv : ck.index) {
+        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight")
+            embed_name = kv.first;
+        if (kv.first.size() > 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
+            kv.first.find("layers.") == std::string::npos)
+            norm_name = kv.first;
+    }
+    embed.upload(bf16_raw(ck, embed_name));
+    final_norm.upload(bf16_raw(ck, norm_name));
     // scratch
     const int R = chunk;
     const int Wz = std::max({cfg.nq * 2 * cfg.hd + 2 * cfg.nkv * cfg.hd,
