@@ -36,8 +36,10 @@ int main(int argc, char **argv) {
         std::memcpy(h.trellis.data(), tre.data(), tre.size());
         auto su_v = f.floats(base + "SU");
         auto sv_v = f.floats(base + "SV");
-        h.su.assign(su_v.begin(), su_v.end());
-        h.sv.assign(sv_v.begin(), sv_v.end());
+        h.su.resize(su_v.size());
+        for (size_t i = 0; i < su_v.size(); ++i) h.su[i] = su_v[i];
+        h.sv.resize(sv_v.size());
+        for (size_t i = 0; i < sv_v.size(); ++i) h.sv[i] = sv_v[i];
         auto tl = rd("tlut");
         h.tlut.resize(tl.size() / 2);
         std::memcpy(h.tlut.data(), tl.data(), tl.size());
@@ -94,7 +96,7 @@ int main(int argc, char **argv) {
         b.bits = gpu[i];
         double g = float(b);
         maxd = std::max(maxd, std::fabs(g - ref[i]));
-        scale = std::max(scale, std::fabs(ref[i]));
+        scale = std::max(scale, double(std::fabs(ref[i])));
     }
     std::printf("linear %s L%d: %dx%d slices %d max|diff| %.5f scale %.3f rel %.2e -> %s\n", name.c_str(),
                 layer, m, n, slices, maxd, scale, maxd / scale, maxd / scale < 2e-2 ? "ok" : "FAIL");
