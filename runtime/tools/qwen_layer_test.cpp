@@ -168,6 +168,10 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < H; ++i)
                     dinv = std::max(dinv, double(std::fabs(g[size_t(i)] - double(rxf[size_t(i)]) * hq.su[size_t(i)])));
                 std::printf("ctl inverse-hadamard residual: %.5f (su-consistent if ~0)\n", dinv);
+                std::printf("inv[:5]: %.4f %.4f %.4f | xsu[:5]: %.4f %.4f %.4f | su[:5]: %.1f %.1f %.1f | xs[:5]: %.4f %.4f %.4f\n",
+                            g[0], g[1], g[2], double(rxf[0]) * hq.su[0], double(rxf[1]) * hq.su[1],
+                            double(rxf[2]) * hq.su[2], hq.su[0], hq.su[1], hq.su[2], rxf[0], rxf[1],
+                            rxf[2]);
             }
             std::printf("ctl gpu[:6]: %.4f %.4f %.4f %.4f\n", b16(ug2[0]), b16(ug2[1]), b16(ug2[2]), b16(ug2[3]));
             {
