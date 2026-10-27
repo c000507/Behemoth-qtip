@@ -333,7 +333,8 @@ __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uin
     } else if (d >= rot) {
         vec[d] = f2bf(sv);
     }
-    if (!is_q) {  // append k to cache
+    if (!is_q) {  // append k to cache (after ALL rope writes of this head: sync)
+        __syncthreads();
         uint16_t *kdst = kc + (long(pos0 + r) * nkv + long(h - nq)) * hd;
         kdst[d] = vec[d];
     }
