@@ -416,8 +416,13 @@ double QwenModel::Impl::perplexity(const int *tokens, size_t n) {
             lm_head_rows(r0, nr);
             for (int r = 0; r < nr; ++r) {
                 size_t predict_at = i + size_t(r0 + r) + 1;
-                float lp = logits_all[size_t(r) * cfg.vocab + size_t(tokens[predict_at])];
-                nll += -std::log(std::max(lp, 1e-30f));
+                const float *row = logits_all.data() + size_t(r) * cfg.vocab;
+                float mx = -INFINITY;
+                for (long v = 0; v < cfg.vocab; ++v) mx = std::max(mx, row[size_t(v)]);
+                double lse = 0;
+                for (long v = 0; v < cfg.vocab; ++v) lse += std::exp(double(row[size_t(v)]) - mx);
+                lse = std::log(lse) + mx;
+                nll += lse - row[size_t(tokens[predict_at])];
                 count++;
             }
         }

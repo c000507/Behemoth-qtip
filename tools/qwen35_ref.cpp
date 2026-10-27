@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
   qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, toks.data(), T, logits.data(), 64, -1, nullptr,
                    argc >= 6 ? &all_layers : nullptr);
   std::printf("forward: %d tokens in %.1fs (%.0f tok/s)\n", T, now_s() - t0, T / (now_s() - t0));
-  for (int t = 0; t < T; ++t) {
+  for (int t = 0; t < std::min(T, 16); ++t) {
     int am = 0;
     for (int v = 1; v < cfg.vocab; ++v)
       if (logits[size_t(t) * cfg.vocab + v] > logits[size_t(t) * cfg.vocab + am]) am = v;

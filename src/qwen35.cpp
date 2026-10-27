@@ -771,11 +771,16 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
   std::memcpy(xf.data(), x.data(), size_t(T) * H * 4);
   for (int t = 0; t < T; ++t) zc_norm_inplace(xf.data() + size_t(t) * H, final_norm.data(), H, cfg.eps);
   if (ppl_next && ppl_nll) {
-    // streaming: one row of the lm_head per target (avoids the [T][vocab] logits buffer)
+    // streaming: one row of the lm_head per target; proper log-softmax
     double nll = 0;
     for (int t = 0; t + 1 < T; ++t) {
       mm_bf16w(logits, xf.data() + size_t(t) * H, head->data(), 1, cfg.vocab, H, nthreads);
-      nll += -std::log(std::max(logits[size_t(ppl_next[size_t(t + 1)])], 1e-30f));
+      float mx = -INFINITY;
+      for (long v = 0; v < cfg.vocab; ++v) mx = std::max(mx, logits[size_t(v)]);
+      double lse = 0;
+      for (long v = 0; v < cfg.vocab; ++v) lse += std::exp(double(logits[size_t(v)]) - mx);
+      lse = std::log(lse) + mx;
+      nll += lse - logits[size_t(ppl_next[size_t(t + 1)])];
     }
     *ppl_nll += nll;
   } else {
