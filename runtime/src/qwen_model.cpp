@@ -444,7 +444,6 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             }
             std::fprintf(stderr, "L%d mlp norm %.4f\n", L, std::sqrt(ss / H));
         }
-    }
         if (const char *dbg = std::getenv("QWEN_DUMP_LAYERS")) {
             static int dump_rows = 0;
             if (!dump_rows) dump_rows = rows;
@@ -456,6 +455,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
                         std::streamsize(size_t(rows) * H * 2));
             }
         }
+    }
     pos += rows;
 }
 
