@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <fstream>
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
