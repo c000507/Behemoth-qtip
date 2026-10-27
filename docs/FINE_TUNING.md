@@ -274,11 +274,12 @@ QTIP_TRAIN_ATTN_PROFILE=1 build-training/qtip_attention_bench 32768 0
 | --- | --- |
 | `balanced` (default) | Balanced score work; four wave pairs own 64 keys |
 | `balanced32` | Same algorithm; two wave pairs own 32 keys |
+| `balanced128` | Optional experiment; eight wave pairs own 128 keys |
 | `wave` | GPU-validated paired-wave kernel from `04a8fc9` |
 | `staged` | Native dK/dV kernel from `a067e7e` |
 
-CTest registers all four native dK/dV paths against the CPU reference,
-including strided views, 16/32/64-key tile tails, GQA groups through 32, packed
+CTest registers all five native dK/dV paths against the CPU reference,
+including strided views, 16/32/64/128-key tile tails, GQA groups through 32, packed
 boundaries, one-token documents, and repeat-call determinism. Run these checks
 before measuring the isolated change, then compare the steady medians and
 `dkv_ms` (stderr) for contiguous and packed sequences:
@@ -286,7 +287,7 @@ before measuring the isolated change, then compare the steady medians and
 ```sh
 cmake --build build-training -j8
 ctest --test-dir build-training --output-on-failure
-for dkv in wave balanced32 balanced; do
+for dkv in balanced balanced128; do
   QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
     build-training/qtip_attention_bench 8192 0 8192 3 96 8 24
   QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
@@ -296,9 +297,11 @@ for dkv in wave balanced32 balanced; do
 done
 ```
 
-The user reported all seven CTest tests passing on `04a8fc9`, no MES errors,
-and 32k layer time improving from 28.4 to 10.2 seconds. The balanced variants
-compile for gfx1201 with zero spills but still require GPU execution and timing.
+The user reported all nine CTest tests passing on `5ee3d77`, no MES errors,
+and 32k layer time improving from 10.2 to 8.1 seconds. The validated `balanced`
+kernel remains the default. The new `balanced128` experiment doubles Q/dO
+reuse again, but its larger block and packed-document padding need GPU timing;
+it has only been compiled and checked with a host layout model locally.
 See [training attention performance](TRAINING_ATTENTION_PERF.md) for the measured
 baseline, compiler resource counts, and step-time bounds.
 
@@ -339,6 +342,6 @@ normal CPU execution emulates BF16 boundaries.
 
 Both CPU and gfx1201 HIP builds compile and link (GPU compile checked with ROCm 7.1).
 The user reported passing GPU execution/gradient checks and real-layer timings
-on `04a8fc9`; the new balanced dK/dV variants still need those GPU checks.
+on `5ee3d77`; the optional `balanced128` variant still needs those GPU checks.
 Full-logit runtime parity, held-out quality, and the 0.5M/5M-token runs remain
 separate validation steps. No speed or quality result is inferred from CPU tests.

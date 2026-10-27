@@ -78,6 +78,9 @@ if(QTIP_TRAIN_HIP)
   add_test(NAME native_gpu_balanced32_dkv COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu_balanced32_dkv PROPERTIES SKIP_RETURN_CODE 77
     ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=balanced32;QTIP_TRAIN_GEMM_TUNE=0")
+  add_test(NAME native_gpu_balanced128_dkv COMMAND qtip_gpu_tests)
+  set_tests_properties(native_gpu_balanced128_dkv PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_ATTN_DKV=balanced128;QTIP_TRAIN_GEMM_TUNE=0")
 endif()
 add_test(NAME native_training COMMAND qtip_train_tests)
 if(QTIP_TRAIN_TOKENIZER)

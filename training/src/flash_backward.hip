@@ -302,15 +302,17 @@ __global__ __launch_bounds__(128) void dkv_wave_kernel(
 // Balance score work between the pair: the dK wave computes QK^T, the dV
 // wave computes dO*V^T. Only dP and P cross waves; each gradient still has
 // one writer and reduces query heads in a fixed order. Four pairs share
-// Q/dO loads over 64 keys, twice the reuse of dkv_wave_kernel.
+// Q/dO loads over 64 keys; eight pairs extend that reuse to 128 keys.
 template <int KeyTiles>
 __global__ __launch_bounds__(KeyTiles * 64) void dkv_balanced_kernel(
     View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
     const int32_t *starts, const int32_t *ends) {
-    static_assert(KeyTiles == 2 || KeyTiles == 4);
+    static_assert(KeyTiles == 2 || KeyTiles == 4 || KeyTiles == 8);
     constexpr int KeyRows = KeyTiles * 16, Threads = KeyTiles * 64;
     constexpr int StageSize = 4 * 16 * 128;
-    // KeyRows<=64: query staging can also hold the initial K/V tile.
+    constexpr int LoadRows = KeyRows < 64 ? KeyRows : 64;
+    // Reuse query staging for up to 64 K/V rows at a time, so the 128-key
+    // variant needs no larger query buffer. These batches run only at entry.
     __shared__ __align__(16) uint16_t shared[StageSize], probs[KeyRows * 16];
     // A padded 20-float row keeps both halves aligned for vector LDS access
     // while distributing neighboring key rows across the memory banks.
@@ -325,17 +327,20 @@ __global__ __launch_bounds__(KeyTiles * 64) void dkv_balanced_kernel(
     Reg kv[8];
     for (int part = 0; part < 2; ++part) {
         View src = part ? v : k;
-        for (int i = tid; i < KeyRows * 128; i += Threads) {
-            int row = i / 128, d = i % 128;
-            shared[i] = begin + row < q.rows ? bf16(get(src, begin + row, kh, d)) : 0;
-        }
-        __syncthreads();
-        if (value_wave == bool(part))
+        for (int lo = 0; lo < KeyRows; lo += LoadRows) {
+            for (int i = tid; i < LoadRows * 128; i += Threads) {
+                int row = i / 128, d = i % 128;
+                shared[i] = begin + lo + row < q.rows ? bf16(get(src, begin + lo + row, kh, d)) : 0;
+            }
+            __syncthreads();
+            if (value_wave == bool(part) &&
+                (KeyRows <= 64 || (pair * 16 >= lo && pair * 16 < lo + LoadRows)))
 #pragma unroll
-            for (int s = 0; s < 8; ++s)
-                kv[s] = __builtin_bit_cast(
-                    Reg, *reinterpret_cast<const uint4 *>(shared + (pair * 16 + c) * 128 + kb(s, h)));
-        __syncthreads();
+                for (int s = 0; s < 8; ++s)
+                    kv[s] = __builtin_bit_cast(
+                        Reg, *reinterpret_cast<const uint4 *>(shared + (pair * 16 - lo + c) * 128 + kb(s, h)));
+            __syncthreads();
+        }
     }
     Acc out[8]{};
     int end = ends[min(begin + KeyRows - 1, q.rows - 1)];
@@ -415,8 +420,9 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
     bool profile = setting && std::string(setting) == "1";
     const char *dkv_setting = std::getenv("QTIP_TRAIN_ATTN_DKV");
     std::string dkv = dkv_setting ? dkv_setting : "balanced";
-    require(dkv == "balanced" || dkv == "balanced32" || dkv == "wave" || dkv == "staged",
-            "QTIP_TRAIN_ATTN_DKV must be balanced, balanced32, wave or staged");
+    require(dkv == "balanced" || dkv == "balanced32" || dkv == "balanced128" || dkv == "wave" ||
+                dkv == "staged",
+            "QTIP_TRAIN_ATTN_DKV must be balanced, balanced32, balanced128, wave or staged");
     struct Events {
         hipEvent_t begin{}, middle{}, end{};
         ~Events() {
@@ -446,6 +452,9 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
             q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
     else if (dkv == "balanced32")
         dkv_balanced_kernel<2><<<dim3((q.rows + 31) / 32, kh), 128, 0, stream>>>(
+            q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
+    else if (dkv == "balanced128")
+        dkv_balanced_kernel<8><<<dim3((q.rows + 127) / 128, kh), 512, 0, stream>>>(
             q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
     else
         dkv_balanced_kernel<4><<<dim3((q.rows + 63) / 64, kh), 256, 0, stream>>>(

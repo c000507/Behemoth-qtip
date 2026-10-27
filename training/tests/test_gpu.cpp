@@ -164,7 +164,7 @@ int main() {
                     ab.segments.resize(length);
                     for (int t = 0; t < length; ++t) {
                         // Include one-token docs and boundaries inside the
-                        // 16-key wave tile and the 32/64-key block tiles.
+                        // 16-key wave tile and the 32/64/128-key block tiles.
                         int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : t < 63 ? 32
                                                         : t < 64 ? 63 : t < 70 ? 64 : 70;
                         if (packing == 2)
