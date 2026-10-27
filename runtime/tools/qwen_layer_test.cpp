@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
         qtip::Codebook cb = qtip::make_codebook(std::span<const uint16_t>(h.tlut));
         lut.upload(cb);
     };
-    auto input_t = [&](const uint16_t *x, const std::vector<uint16_t> *norm, const float *su, int n,
+    auto input_t = [&](const uint16_t *x, const DeviceBuffer<uint16_t> *norm, const float *su, int n,
                        DeviceBuffer<uint16_t> &u) {
         q_input_transform(x, rows, n, norm ? norm->data() : nullptr, c.eps, su, n, u.data(), n, s);
     };
@@ -115,7 +115,10 @@ int main(int argc, char **argv) {
     d_ao.resize(size_t(rows) * nq * hd);
     d_o.resize(size_t(rows) * V);
     d_gu.resize(size_t(rows) * F);
-    auto ln_in = load16("input_layernorm.weight"), ln_post = load16("post_attention_layernorm.weight");
+    auto ln_in_h = load16("input_layernorm.weight"), ln_post_h = load16("post_attention_layernorm.weight");
+    DeviceBuffer<uint16_t> ln_in, ln_post;
+    ln_in.upload(ln_in_h);
+    ln_post.upload(ln_post_h);
     std::vector<float> y_cpu;  // computed alongside
 
     if (full) {
