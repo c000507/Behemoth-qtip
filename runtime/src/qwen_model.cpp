@@ -445,6 +445,17 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             std::fprintf(stderr, "L%d mlp norm %.4f\n", L, std::sqrt(ss / H));
         }
     }
+        if (const char *dbg = std::getenv("QWEN_DUMP_LAYERS")) {
+            static int dump_rows = 0;
+            if (!dump_rows) dump_rows = rows;
+            if (rows == dump_rows && pos == 0) {
+                std::vector<uint16_t> h = state.download();
+                std::ofstream f(std::string(dbg) + "/rt_layer" + std::to_string(L) + ".bin",
+                                std::ios::binary);
+                f.write(reinterpret_cast<const char *>(h.data()),
+                        std::streamsize(size_t(rows) * H * 2));
+            }
+        }
     pos += rows;
 }
 
