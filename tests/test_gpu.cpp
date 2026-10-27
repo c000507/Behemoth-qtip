@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -10,6 +11,8 @@
 #include "gpu.hpp"
 #include "qtip_core.hpp"
 #include "quantizer.hpp"
+#include "qwen35.hpp"
+#include "qwen_runner.hpp"
 
 using namespace qtip;
 static int g_fail = 0;
@@ -406,6 +409,66 @@ static void shape_bench(int m, int n, int nsamp) {
               out[0].proxy_rot_reg, t / (double(m) * n / 1e6), tm.ldlq / (double(m) * n / 1e6));
 }
 
+// Qwen3.5 layer forward parity: QwenLayerRunner (GPU, bf16) vs qwen_cpu_layer (fp32). Runs when
+// QWEN35_MODEL points at a dense Qwen3.5 checkpoint (e.g. Qwen3.5-0.8B); tests layers 0 (linear) and
+// the first full-attention layer.
+static void test_qwen_layer(const std::string& model_dir, int dev) {
+  std::printf("[qwen35] layer forward parity vs CPU (%s)\n", model_dir.c_str());
+  QwenConfig cfg = load_qwen_config(model_dir);
+  QCHECK(!cfg.moe(), "MoE checkpoint not supported by the parity test");
+  SafeTensorsReader st(model_dir);
+  const int T = 64;
+  std::vector<int> layers = {0};
+  for (int L = 0; L < cfg.layers; ++L)
+    if (cfg.is_full(L)) {
+      layers.push_back(L);
+      break;
+    }
+  for (int L : layers) {
+    auto ql = read_qwen_layer(st, cfg, L);
+    // input: bf16 activations around token 0's embedding + small noise
+    std::vector<uint16_t> xb(size_t(T) * cfg.hidden);
+    {
+      Rng r(1234 + L);
+      std::string embed_name;
+      for (auto& kv : st.tensors())
+        if (kv.first.size() > 18 && kv.first.substr(kv.first.size() - 18) == "embed_tokens.weight") embed_name = kv.first;
+      const TensorInfo& e = st.info(embed_name);
+      std::vector<uint16_t> emb_row(size_t(e.shape[1]));
+      st.read_into(embed_name, emb_row.data(), emb_row.size() * 2);  // token 0 embedding
+      for (int t = 0; t < T; ++t) {
+        float noise = float(r.normal()) * 0.05f;
+        for (int i = 0; i < cfg.hidden; ++i) {
+          float v = bf16_to_f32(emb_row[size_t(i)]) + noise * float(r.normal());
+          xb[size_t(t) * cfg.hidden + size_t(i)] = f32_to_bf16(v);
+        }
+      }
+    }
+    // CPU fp32 reference
+    std::vector<float> xc(size_t(T) * cfg.hidden);
+    for (size_t i = 0; i < xc.size(); ++i) xc[i] = bf16_to_f32(xb[i]);
+    qwen_cpu_layer(cfg, *ql, xc.data(), T, 32);
+    // GPU forward (bf16 in/out)
+    std::vector<uint16_t> xg = xb;
+    {
+      QwenLayerRunner R(dev, cfg, T, T);
+      R.upload(*ql);
+      R.forward(xg.data(), 1, nullptr);
+    }
+    double max_abs = 0, denom = 1e-9;
+    float gscale = 0;
+    for (size_t i = 0; i < xc.size(); ++i) {
+      double a = std::fabs(xc[i] - bf16_to_f32(xg[i]));
+      max_abs = std::max(max_abs, a);
+      denom = std::max(denom, std::fabs(xc[i]));
+    }
+    gscale = float(denom);
+    std::printf("  layer %2d (%s): max|diff| %.5f  scale %.3f  rel %.2e  %s\n", L, ql->full ? "full" : "linear",
+                max_abs, gscale, max_abs / gscale, max_abs / gscale < 3e-2 ? "ok" : "FAIL");
+    EXPECT(max_abs / gscale < 3e-2, "qwen layer %d forward parity", L);
+  }
+}
+
 int main(int argc, char** argv) {
   int dev = 0, bench = 0, sm = 0, sn = 0;
   for (int i = 1; i < argc; ++i) {
@@ -424,6 +487,7 @@ int main(int argc, char** argv) {
   test_viterbi(bench);
   test_ldlq();
   test_group();
+  if (const char* m = std::getenv("QWEN35_MODEL")) test_qwen_layer(m, dev);
   std::printf(g_fail ? "GPU TESTS FAILED (%d)\n" : "ALL GPU TESTS PASSED\n", g_fail);
   return g_fail ? 1 : 0;
 }

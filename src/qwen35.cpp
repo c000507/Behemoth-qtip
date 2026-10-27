@@ -332,6 +332,146 @@ inline void rope_inplace(float* v, int rot, long pos, float theta) {
 
 }  // namespace
 
+// Single Qwen3.5 layer forward on the residual stream x[T][hidden] (fp32, in place). Delta state starts
+// at zero — used by qwen_cpu_forward and the GPU parity test.
+void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, int nthreads) {
+  const int H = cfg.hidden, hd = cfg.hd, nq = cfg.nq, nkv = cfg.nkv, gq = nq / nkv;
+  const float qk_scale = 1.0f / std::sqrt(float(hd));
+  std::vector<float> xn(size_t(T) * H), y(size_t(T) * H);
+  std::memcpy(xn.data(), x, size_t(T) * H * 4);
+#pragma omp parallel for num_threads(nthreads)
+  for (int t = 0; t < T; ++t) zc_norm_inplace(xn.data() + size_t(t) * H, l.ln_in.data(), H, cfg.eps);
+  if (l.full) {
+    std::vector<float> q(size_t(T) * nq * 2 * hd), k(size_t(T) * nkv * hd), v(size_t(T) * nkv * hd),
+        out(size_t(T) * nq * hd), attn_row(T);
+    mm_bf16w(q.data(), xn.data(), l.w_q.data(), T, nq * 2 * hd, H, nthreads);
+    mm_bf16w(k.data(), xn.data(), l.w_k.data(), T, nkv * hd, H, nthreads);
+    mm_bf16w(v.data(), xn.data(), l.w_v.data(), T, nkv * hd, H, nthreads);
+#pragma omp parallel for num_threads(nthreads) collapse(2)
+    for (int t = 0; t < T; ++t)
+      for (int h = 0; h < nq + nkv; ++h) {
+        float* vec = h < nq ? q.data() + size_t(t) * nq * 2 * hd + size_t(h) * 2 * hd
+                            : k.data() + size_t(t) * nkv * hd + size_t(h - nq) * hd;
+        zc_norm_inplace(vec, h < nq ? l.q_norm.data() : l.k_norm.data(), hd, cfg.eps);
+        rope_inplace(vec, cfg.rot_dim, t, cfg.theta);
+      }
+    for (int t = 0; t < T; ++t) {
+      for (int h = 0; h < nq; ++h) {
+        const float* qh = q.data() + size_t(t) * nq * 2 * hd + size_t(h) * 2 * hd;
+        const float* gate = qh + hd;
+        const int kh = h / gq;
+        const float* kh_base = k.data() + size_t(kh) * hd;
+        const float* vh_base = v.data() + size_t(kh) * hd;
+        float mx = -INFINITY;
+        for (int i = 0; i <= t; ++i) {
+          const float* qi = q.data() + size_t(i) * nq * 2 * hd + size_t(h) * 2 * hd;
+          float s = 0;
+          for (int d = 0; d < hd; ++d) s += qh[d] * qi[d];
+          s *= qk_scale;
+          attn_row[size_t(i)] = s;
+          mx = std::max(mx, s);
+        }
+        float sum = 0;
+        for (int i = 0; i <= t; ++i) sum += attn_row[size_t(i)] = std::exp(attn_row[size_t(i)] - mx);
+        float inv = 1.0f / sum;
+        float* acc = out.data() + size_t(t) * nq * hd + size_t(h) * hd;
+        for (int d = 0; d < hd; ++d) acc[d] = 0;
+        for (int i = 0; i <= t; ++i) {
+          const float* vi = vh_base + size_t(i) * nkv * hd;
+          float w = attn_row[size_t(i)] * inv;
+          for (int d = 0; d < hd; ++d) acc[d] += w * vi[d];
+        }
+        for (int d = 0; d < hd; ++d) acc[d] *= sigmoid_f(gate[d]);
+      }
+    }
+    mm_bf16w(y.data(), out.data(), l.w_o.data(), T, H, nq * hd, nthreads);
+  } else {
+    // Gated DeltaNet: sequential over tokens, fp32 state per layer
+    const int kd = cfg.lin_kd, vd = cfg.lin_vd, nv = cfg.lin_nv;
+    const int key_dim = cfg.key_dim(), value_dim = cfg.value_dim(), conv_dim = cfg.conv_dim();
+    const int group = cfg.lin_group();
+    std::vector<float> qkv(conv_dim), zz(value_dim), ba(2 * nv);
+    std::vector<float> ring(size_t(conv_dim) * cfg.conv_k, 0.0f);
+    std::vector<float> S(size_t(nv) * kd * vd, 0.0f);  // [hv][kd][vd]
+    std::vector<float> kv_mem(vd), delta(vd), ov(vd), o(value_dim);
+    for (int t = 0; t < T; ++t) {
+      const float* xn_t = xn.data() + size_t(t) * H;
+      mm_bf16w(qkv.data(), xn_t, l.w_in_qkv.data(), 1, conv_dim, H, 1);
+      mm_bf16w(zz.data(), xn_t, l.w_in_z.data(), 1, value_dim, H, 1);
+      mm_bf16w(ba.data(), xn_t, l.w_in_ba.data(), 1, 2 * nv, H, 1);
+      // conv: shift ring, push raw qkv, causal dot + silu
+      for (int c = 0; c < conv_dim; ++c) {
+        float* rg = ring.data() + size_t(c) * cfg.conv_k;
+        for (int j = 0; j + 1 < cfg.conv_k; ++j) rg[j] = rg[j + 1];
+        rg[cfg.conv_k - 1] = qkv[size_t(c)];
+        float acc = 0;
+        const uint16_t* cw = l.conv_w.data() + size_t(c) * cfg.conv_k;
+        for (int j = 0; j < cfg.conv_k; ++j) acc += rg[j] * bf16_to_f32(cw[j]);
+        qkv[size_t(c)] = silu_f(acc);
+      }
+      for (int hv = 0; hv < nv; ++hv) {
+        const int kh = hv / group;
+        float* qh = qkv.data() + size_t(kh) * kd;
+        float* kh_vec = qkv.data() + key_dim + size_t(kh) * kd;
+        const float* vh = qkv.data() + 2 * key_dim + size_t(hv) * vd;
+        l2_norm_inplace(qh, kd, 1e-6f);
+        for (int d = 0; d < kd; ++d) qh[d] *= 1.0f / std::sqrt(float(kd));
+        l2_norm_inplace(kh_vec, kd, 1e-6f);
+        const float beta = sigmoid_f(ba[hv]);
+        const float g = -std::exp(l.a_log[size_t(hv)]) * softplus_f(ba[nv + hv] + l.dt_bias[size_t(hv)]);
+        const float decay = std::exp(g);
+        float* Sh = S.data() + size_t(hv) * kd * vd;
+        for (int dv = 0; dv < vd; ++dv) kv_mem[dv] = 0;
+        for (int dk = 0; dk < kd; ++dk) {
+          const float k_dk = kh_vec[dk];
+          float* srow = Sh + size_t(dk) * vd;
+          for (int dv = 0; dv < vd; ++dv) {
+            srow[dv] *= decay;
+            kv_mem[dv] += srow[dv] * k_dk;
+          }
+        }
+        for (int dv = 0; dv < vd; ++dv) {
+          delta[dv] = (vh[dv] - kv_mem[dv]) * beta;
+          ov[dv] = 0;
+        }
+        for (int dk = 0; dk < kd; ++dk) {
+          const float k_dk = kh_vec[dk], q_dk = qh[dk];
+          float* srow = Sh + size_t(dk) * vd;
+          for (int dv = 0; dv < vd; ++dv) {
+            const float s = srow[dv] + k_dk * delta[dv];
+            srow[dv] = s;
+            ov[dv] += s * q_dk;
+          }
+        }
+        float ss = 0;
+        for (int dv = 0; dv < vd; ++dv) ss += ov[dv] * ov[dv];
+        const float inv = 1.0f / std::sqrt(ss / vd + cfg.eps);
+        const uint16_t* nw = l.dn_norm.data();
+        for (int dv = 0; dv < vd; ++dv)
+          o[size_t(hv) * vd + dv] = ov[dv] * inv * bf16_to_f32(nw[dv]) * silu_f(zz[size_t(hv) * vd + dv]);
+      }
+      mm_bf16w(y.data() + size_t(t) * H, o.data(), l.w_out.data(), 1, H, value_dim, 1);
+    }
+  }
+#pragma omp parallel for num_threads(nthreads)
+  for (long i = 0; i < long(T) * H; ++i) x[size_t(i)] += y[size_t(i)];
+  // MLP (dense)
+  QCHECK(!l.moe, "qwen_cpu_layer: MoE layer unsupported here");
+  std::memcpy(xn.data(), x, size_t(T) * H * 4);
+#pragma omp parallel for num_threads(nthreads)
+  for (int t = 0; t < T; ++t) zc_norm_inplace(xn.data() + size_t(t) * H, l.ln_post.data(), H, cfg.eps);
+  std::vector<float> gu(size_t(T) * 2 * cfg.inter), act(size_t(T) * cfg.inter);
+  mm_bf16w(gu.data(), xn.data(), l.w_gate.data(), T, cfg.inter, H, nthreads);
+  {
+    std::vector<float> up(size_t(T) * cfg.inter);
+    mm_bf16w(up.data(), xn.data(), l.w_up.data(), T, cfg.inter, H, nthreads);
+    for (long i = 0; i < long(T) * cfg.inter; ++i) act[size_t(i)] = silu_f(gu[size_t(i)]) * up[size_t(i)];
+  }
+  mm_bf16w(y.data(), act.data(), l.w_down.data(), T, H, cfg.inter, nthreads);
+#pragma omp parallel for num_threads(nthreads)
+  for (long i = 0; i < long(T) * H; ++i) x[size_t(i)] += y[size_t(i)];
+}
+
 void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
                       const std::vector<std::shared_ptr<QwenLayer>>& layers, const QwenCpuRefs& refs,
                       const int32_t* tokens, int T, float* logits, int nthreads, int capture_layer,

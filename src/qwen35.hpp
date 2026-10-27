@@ -106,6 +106,8 @@ struct QwenCpuRefs {
   const std::vector<uint16_t>* embed = nullptr;
   const std::vector<uint16_t>* lm_head = nullptr;
 };
+// One dense (non-MoE) layer on the residual stream, fp32 in place; delta state starts at zero.
+void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, int nthreads = 32);
 void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
                       const std::vector<std::shared_ptr<QwenLayer>>& layers, const QwenCpuRefs& refs,
                       const int32_t* tokens, int T, float* logits, int nthreads = 32,
