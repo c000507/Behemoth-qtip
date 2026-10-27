@@ -462,6 +462,11 @@ int main(int argc, char **argv) {
             q_delta_step(zbig.data(), d_conv.data(), d_dn.data(), a_dt.data(), ring.data(), S.data(),
                          d_o.data(), rows, t, Wq, V, kd, vd, c.lin_nk, nv, c.conv_k, c.eps, s);
         HIP_CHECK(hipStreamSynchronize(s));
+        {
+            auto og = d_o.download();
+            std::printf("delta out gpu[:6]: %.4f %.4f %.4f %.4f\n", b16(og[0]), b16(og[1]), b16(og[2]),
+                        b16(og[3]));
+        }
         input_t(d_o.data(), nullptr, su_o.data(), V, d_u);
         int slices = qtip::matmul_slices(go.view(), rows);
         static DeviceBuffer<float> part2;
@@ -609,6 +614,7 @@ int main(int argc, char **argv) {
                     for (int dv = 0; dv < vd; dv++) out[size_t(t) * V + size_t(hv) * vd + dv] = o2[size_t(dv)];
                 }
             }
+            std::printf("delta out cpu[:6]: %.4f %.4f %.4f %.4f\n", out[0], out[1], out[2], out[3]);
             auto of2 = lin_ref(ho, out);
             for (size_t i = 0; i < y.size(); ++i) y[i] = xs[i] + b16(to16(of2[i]));
         }
