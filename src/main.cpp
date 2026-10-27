@@ -617,12 +617,6 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     int m = 0, n = 0;
     std::vector<float> w;  // fp32 rows of this linear [m][n]
   };
-  auto rows16 = [&](const std::vector<uint16_t>& w, long r0, long nr, long n) {
-    std::vector<float> o(size_t(nr) * n);
-    for (long i = 0; i < nr * n; ++i) o[size_t(i)] = bf16_to_f32(w[size_t(r0) * n + size_t(i)]);
-    return o;
-  };
-  std::vector<QLin> lins;
   auto add_lin = [&](const char* name, int m, int n, std::vector<float> w) {
     QLin q;
     q.name = name, q.m = m, q.n = n, q.w = std::move(w);
@@ -641,8 +635,6 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     const long nv = qcfg_.lin_nv, V = qcfg_.value_dim();
     add_lin("linear_attn.in_proj_qkv", qcfg_.conv_dim(), Hid, bf16_to_f32_vec(QL->w_in_qkv));
     add_lin("linear_attn.in_proj_z", int(V), Hid, bf16_to_f32_vec(QL->w_in_z));
-    add_lin("linear_attn.in_proj_b", int(nv), Hid, rows16(QL->w_in_ba, 0, nv, Hid));
-    add_lin("linear_attn.in_proj_a", int(nv), Hid, rows16(QL->w_in_ba, nv, nv, Hid));
     add_lin("linear_attn.out_proj", Hid, int(V), bf16_to_f32_vec(QL->w_out));
     add_lin("mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate));
     add_lin("mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up));
@@ -653,7 +645,7 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     std::vector<int> lins;
   };
   std::vector<Grp> groups = full ? std::vector<Grp>{{0, {0, 1, 2}}, {1, {3}}, {2, {4, 5}}, {3, {6}}}
-                                 : std::vector<Grp>{{0, {0, 1, 2, 3}}, {1, {4}}, {2, {5, 6}}, {3, {7}}};
+                                 : std::vector<Grp>{{0, {0, 1}}, {1, {2}}, {2, {3, 4}}, {3, {5}}};
   std::vector<LinearOut> outs(lins.size());
   json jl = json::object();
   std::vector<HessPrep> preps(groups.size());
@@ -737,6 +729,12 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
   } else {
     w.add(pre + "linear_attn.conv1d.weight", "BF16", {qcfg_.conv_dim(), 1, qcfg_.conv_k}, QL->conv_w.data(),
           QL->conv_w.size() * 2);
+    {  // in_proj_b / in_proj_a stay bf16 (16 rows: below the 32-row trellis minimum)
+      std::vector<uint16_t> b(QL->w_in_ba.begin(), QL->w_in_ba.begin() + size_t(qcfg_.lin_nv) * Hid);
+      std::vector<uint16_t> a(QL->w_in_ba.begin() + size_t(qcfg_.lin_nv) * Hid, QL->w_in_ba.end());
+      w.add(pre + "linear_attn.in_proj_b.weight", "BF16", {qcfg_.lin_nv, Hid}, b.data(), b.size() * 2);
+      w.add(pre + "linear_attn.in_proj_a.weight", "BF16", {qcfg_.lin_nv, Hid}, a.data(), a.size() * 2);
+    }
     w.add(pre + "linear_attn.A_log", "F32", {qcfg_.lin_nv}, QL->a_log.data(), QL->a_log.size() * 4);
     w.add(pre + "linear_attn.dt_bias", "F32", {qcfg_.lin_nv}, QL->dt_bias.data(), QL->dt_bias.size() * 4);
     w.add(pre + "linear_attn.norm.weight", "BF16", {qcfg_.lin_vd}, QL->dn_norm.data(), QL->dn_norm.size() * 2);

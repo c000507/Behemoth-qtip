@@ -92,7 +92,8 @@ struct QwenModel::Impl {
     struct LayerW {
         bool full = false;
         Linear lq, lk, lv, lo, lgate, lup, ldown;   // full attention + dense mlp
-        Linear l_in_qkv, l_in_z, l_in_b, l_in_a, l_out;  // linear attention
+        Linear l_in_qkv, l_in_z, l_out;                 // linear attention (b/a stay bf16)
+        DeviceBuffer<uint16_t> w_ba;                     // [2*nv][hidden] bf16 in_proj_b|a
         DeviceBuffer<uint16_t> ln_in, ln_post;      // raw zc weights (kernels add 1)
         DeviceBuffer<uint16_t> q_norm, k_norm;      // full attention (raw zc)
         DeviceBuffer<uint16_t> conv_w, dn_norm;     // linear attention
@@ -109,7 +110,7 @@ struct QwenModel::Impl {
     std::vector<LayerW> layers;
     DeviceBuffer<uint16_t> embed, final_norm;
     // scratch (sized for chunk rows)
-    DeviceBuffer<uint16_t> state, u, q, k, v, gate, attn_out, o_in, gu;
+    DeviceBuffer<uint16_t> state, h_norm, u, q, k, v, gate, attn_out, o_in, gu;
     DeviceBuffer<float> partial, z, z2, logits_d;
     DeviceBuffer<int> tokens_d;
     std::vector<float> logits_h, logits_all;
@@ -199,9 +200,13 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
             auto hq = load_host(ck, L, "linear_attn.in_proj_qkv", H, cfg.conv_dim());
             upload_linear(w.l_in_qkv, hq);
             upload_linear(w.l_in_z, load_host(ck, L, "linear_attn.in_proj_z", H, V));
-            upload_linear(w.l_in_b, load_host(ck, L, "linear_attn.in_proj_b", H, cfg.lin_nv));
-            upload_linear(w.l_in_a, load_host(ck, L, "linear_attn.in_proj_a", H, cfg.lin_nv));
             upload_linear(w.l_out, load_host(ck, L, "linear_attn.out_proj", V, H));
+            {  // b|a: raw bf16 rows [2nv][H]
+                std::vector<uint16_t> b = bf16_raw(ck, p + "linear_attn.in_proj_b.weight");
+                std::vector<uint16_t> a = bf16_raw(ck, p + "linear_attn.in_proj_a.weight");
+                b.insert(b.end(), a.begin(), a.end());
+                w.w_ba.upload(b);
+            }
             up_su(w.su0, hq);
             auto ho = load_host(ck, L, "linear_attn.out_proj", V, H);
             up_su(w.su1, ho);
@@ -235,6 +240,7 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
     const int Wz = std::max({cfg.nq * 2 * cfg.hd + 2 * cfg.nkv * cfg.hd,
                              cfg.conv_dim() + V + 2 * cfg.lin_nv, 2 * cfg.inter});
     state.resize(size_t(R) * H);
+    h_norm.resize(size_t(R) * H);
     u.resize(size_t(R) * std::max({H, V, A, cfg.inter}));
     q.resize(size_t(R) * cfg.nq * 2 * cfg.hd);
     k.resize(size_t(R) * cfg.nkv * cfg.hd);
@@ -250,7 +256,7 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
         qtip::LinearView views[] = {w.lq.lin.view(),  w.lk.lin.view(),  w.lv.lin.view(),
                                     w.lo.lin.view(),  w.lgate.lin.view(), w.lup.lin.view(),
                                     w.ldown.lin.view(), w.l_in_qkv.lin.view(), w.l_in_z.lin.view(),
-                                    w.l_in_b.lin.view(), w.l_in_a.lin.view(), w.l_out.lin.view()};
+                                    w.l_out.lin.view()};
         for (auto gv : views)
             if (gv.rows) max_slices = std::max<size_t>(max_slices, qtip::matmul_slices(gv, R));
     }
@@ -325,8 +331,16 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             };
             proj_scatter(w.l_in_qkv, H, 0);
             proj_scatter(w.l_in_z, H, Wq);
-            proj_scatter(w.l_in_b, H, Wq + V);
-            proj_scatter(w.l_in_a, H, Wq + V + nv);
+            // b/a: unquantised bf16 GEMMs on the plain (zc-normed) hidden state
+            HIP_CHECK(hipMemcpyAsync(h_norm.data(), state.data(), size_t(rows) * H * 2,
+                                     hipMemcpyDeviceToDevice, stream));
+            q_zc_norm(h_norm.data(), rows, H, w.ln_in.data(), c.eps, stream);
+            dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
+                       z.data() + Wq + V, Wz, reinterpret_cast<const BFloat16 *>(w.w_ba.data()), stream);
+            dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
+                       z.data() + Wq + V + nv, Wz,
+                       reinterpret_cast<const BFloat16 *>(w.w_ba.data()) + size_t(cfg.lin_nv) * H,
+                       stream);
             for (int t = 0; t < rows; ++t)
                 q_delta_step(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
                              w.dstate.data(), o_in.data(), rows, t, Wq, V, c.lin_kd, c.lin_vd,
