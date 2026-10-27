@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
         DeviceBuffer<uint16_t> q3(size_t(rows) * nq * 2 * hd), k3(size_t(rows) * nkv * hd),
             v3(size_t(rows) * nkv * hd), g3(size_t(rows) * nq * hd), kc3(size_t(64) * nkv * hd),
             vc3(size_t(64) * nkv * hd);
-        std::vector<uint16_t> qn(hd, 0x3f80), kn(hd, 0x3f80);
+        DeviceBuffer<uint16_t> qn(hd), kn(hd);  // device buffers (kernel args)
         std::printf("  rope only: q3=%p k3=%p v3=%p g3=%p kc3=%p vc3=%p qn=%p kn=%p\n",
                     (void *)q3.data(), (void *)k3.data(), (void *)v3.data(), (void *)g3.data(),
                     (void *)kc3.data(), (void *)vc3.data(), (void *)qn.data(), (void *)kn.data());
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMemcpy(k.data(), kv.data(), kv.size() * 2, hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(v2.data(), vv.data(), vv.size() * 2, hipMemcpyHostToDevice));
     }
-    std::vector<uint16_t> qn(hd), kn(hd);
+    DeviceBuffer<uint16_t> qn(hd), kn(hd);  // device buffers (kernel args)
     q_qk_norm_rope(q.data(), k.data(), v2.data(), g.data(), kc.data(), vc.data(), rows, 0, nq, nkv,
                    hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
     HIP_CHECK(hipStreamSynchronize(s));
