@@ -207,6 +207,19 @@ int main(int argc, char **argv) {
             }
         };
         std::vector<float> Q(rows * nq * hd), K(rows * nkv * hd), Vv = vf, G(rows * nq * hd);
+        {
+            auto qg = d_q.download(), kg = d_k.download(), gg = d_g.download();
+            auto vf16 = d_v.download();
+            double dq = 0, dk = 0, dv = 0, dg = 0;
+            for (int r = 0; r < rows; ++r)
+                for (int h = 0; h < nq; ++h)
+                    for (int d = 0; d < hd; ++d)
+                        dq = std::max(dq, double(std::fabs(b16(qg[size_t(r) * nq * 2 * hd + size_t(h) * 2 * hd + size_t(d)]) - Q[size_t(r) * nq * hd + size_t(h) * hd + size_t(d)])));
+            for (size_t i = 0; i < kg.size(); ++i) dk = std::max(dk, double(std::fabs(b16(kg[i]) - K[i])));
+            for (size_t i = 0; i < vf16.size(); ++i) dv = std::max(dv, double(std::fabs(b16(vf16[i]) - Vv[i])));
+            for (size_t i = 0; i < gg.size(); ++i) dg = std::max(dg, double(std::fabs(b16(gg[i]) - G[i])));
+            std::printf("pre-attn: dq %.4f dk %.4f dv %.4f dg %.4f\n", dq, dk, dv, dg);
+        }
         for (int r = 0; r < rows; ++r) {
             for (int h = 0; h < nq; ++h) {
                 float *qh = &qf[size_t(r) * nq * 2 * hd + size_t(h) * 2 * hd];
