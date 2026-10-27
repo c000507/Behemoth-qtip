@@ -610,7 +610,7 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
   int dev = 0;
   HIP_CHECK(hipGetDevice(&dev));
   const bool full = qcfg_.is_full(L);
-  const int H = qcfg_.hidden;
+  const int Hid = qcfg_.hidden;
   // linear index space of this layer type -> output tensor name, host fp32 weight and dims
   struct QLin {
     const char* name;
@@ -625,23 +625,23 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
   std::vector<QLin> lins;
   if (full) {
     const int A = qcfg_.nq * qcfg_.hd;
-    lins = {{"self_attn.q_proj", qcfg_.nq * 2 * qcfg_.hd, H, bf16_to_f32_vec(QL->w_q)},
-            {"self_attn.k_proj", qcfg_.nkv * qcfg_.hd, H, bf16_to_f32_vec(QL->w_k)},
-            {"self_attn.v_proj", qcfg_.nkv * qcfg_.hd, H, bf16_to_f32_vec(QL->w_v)},
-            {"self_attn.o_proj", H, A, bf16_to_f32_vec(QL->w_o)},
-            {"mlp.gate_proj", qcfg_.inter, H, bf16_to_f32_vec(QL->w_gate)},
-            {"mlp.up_proj", qcfg_.inter, H, bf16_to_f32_vec(QL->w_up)},
-            {"mlp.down_proj", H, qcfg_.inter, bf16_to_f32_vec(QL->w_down)}};
+    lins = {{"self_attn.q_proj", qcfg_.nq * 2 * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_q)},
+            {"self_attn.k_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_k)},
+            {"self_attn.v_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_v)},
+            {"self_attn.o_proj", Hid, A, bf16_to_f32_vec(QL->w_o)},
+            {"mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate)},
+            {"mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up)},
+            {"mlp.down_proj", Hid, qcfg_.inter, bf16_to_f32_vec(QL->w_down)}};
   } else {
     const long nv = qcfg_.lin_nv, V = qcfg_.value_dim();
-    lins = {{"linear_attn.in_proj_qkv", qcfg_.conv_dim(), H, bf16_to_f32_vec(QL->w_in_qkv)},
-            {"linear_attn.in_proj_z", V, H, bf16_to_f32_vec(QL->w_in_z)},
-            {"linear_attn.in_proj_b", int(nv), H, rows16(QL->w_in_ba, 0, nv, H)},
-            {"linear_attn.in_proj_a", int(nv), H, rows16(QL->w_in_ba, nv, nv, H)},
-            {"linear_attn.out_proj", H, V, bf16_to_f32_vec(QL->w_out)},
-            {"mlp.gate_proj", qcfg_.inter, H, bf16_to_f32_vec(QL->w_gate)},
-            {"mlp.up_proj", qcfg_.inter, H, bf16_to_f32_vec(QL->w_up)},
-            {"mlp.down_proj", H, qcfg_.inter, bf16_to_f32_vec(QL->w_down)}};
+    lins = {{"linear_attn.in_proj_qkv", qcfg_.conv_dim(), Hid, bf16_to_f32_vec(QL->w_in_qkv)},
+            {"linear_attn.in_proj_z", V, Hid, bf16_to_f32_vec(QL->w_in_z)},
+            {"linear_attn.in_proj_b", int(nv), H, rows16(QL->w_in_ba, 0, nv, Hid)},
+            {"linear_attn.in_proj_a", int(nv), H, rows16(QL->w_in_ba, nv, nv, Hid)},
+            {"linear_attn.out_proj", Hid, V, bf16_to_f32_vec(QL->w_out)},
+            {"mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate)},
+            {"mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up)},
+            {"mlp.down_proj", Hid, qcfg_.inter, bf16_to_f32_vec(QL->w_down)}};
   }
   struct Grp {
     int hess;
