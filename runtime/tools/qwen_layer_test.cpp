@@ -297,7 +297,7 @@ int main(int argc, char **argv) {
                     std::vector<float> sc(r + 1);
                     for (int i = 0; i <= r; ++i) {
                         float d2 = 0;
-                        for (int d2i = 0; d2i < hd; ++d2i++)
+                        for (int d2i = 0; d2i < hd; ++d2i)
                             d2 += b16(qg[size_t(r) * nq * 2 * hd + size_t(h) * 2 * hd + size_t(d2i)]) *
                                   b16(kg[size_t(i) * nkv * hd + size_t(kh2) * hd + size_t(d2i)]);
                         sc[size_t(i)] = d2 / std::sqrt(float(hd));
