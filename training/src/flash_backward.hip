@@ -1,0 +1,248 @@
+// Native gfx1201 BF16 attention adjoints. Each output tile has one owner.
+#include "../../runtime/src/device_numeric.hpp"
+#include "behemoth/gpu.hpp"
+#include "hip_ops.hpp"
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+
+namespace qat::gpu {
+namespace {
+using Reg = __bf16 __attribute__((ext_vector_type(8)));
+using Acc = float __attribute__((ext_vector_type(8)));
+using behemoth::device::bf16;
+constexpr float scale = .08838834764831845f;
+__device__ __forceinline__ Acc mma(Reg a, Reg b, Acc c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+}
+__device__ __forceinline__ int kb(int s, int h) { return 32 * (s >> 1) + 16 * h + 8 * (s & 1); }
+__device__ __forceinline__ float get(View x, int t, int head, int d) {
+    return x.p[size_t(t) * x.ld + head * 128 + d];
+}
+// Row-major tiles are XOR-swizzled in eight-BF16 chunks. The same helper
+// handles 128-wide feature rows and 32-wide query/probability rows.
+template <int Width> __device__ __forceinline__ int at(int r, int d) {
+    return r * Width + (d ^ ((r & (Width / 8 - 1)) * 8));
+}
+template <int Width> __device__ __forceinline__ Reg load(const uint16_t *p, int row, int d) {
+    return __builtin_bit_cast(Reg, *reinterpret_cast<const uint4 *>(p + at<Width>(row, d)));
+}
+
+// One wave per query head, sharing K/V across its GQA group. Q and dO are
+// resident in registers. K is staged in both orientations for QK and dQ.
+__global__ void dq_kernel(View q, View k, View v, View lse, View dy, View delta, View dq, int group,
+                          const int32_t *starts) {
+    __shared__ __align__(16) uint16_t shared[3 * 32 * 128];
+    uint16_t *kr = shared, *vr = kr + 32 * 128, *kt = vr + 32 * 128;
+    int tid = threadIdx.x, wave = tid / 32, c = tid % 16, h = tid % 32 / 16;
+    int first = blockIdx.x * 16, kh = blockIdx.y, head = kh * group + wave, t = first + c;
+    bool live = t < q.rows;
+    Reg qr[8], dr[8];
+    // Stage four heads at a time; shared storage is reused by the key loop.
+    for (int part = 0; part < 2; ++part) {
+        View src = part ? dy : q;
+        for (int lo = 0; lo < group; lo += 4) {
+            int count = min(4, group - lo);
+            for (int i = tid; i < count * 16 * 128; i += blockDim.x) {
+                int row = i / 128 % 16, w = i / (16 * 128), d = i % 128;
+                shared[i] = first + row < q.rows ? bf16(get(src, first + row, kh * group + lo + w, d)) : 0;
+            }
+            __syncthreads();
+            if (wave >= lo && wave < lo + count)
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    Reg value = __builtin_bit_cast(
+                        Reg,
+                        *reinterpret_cast<const uint4 *>(shared + ((wave - lo) * 16 + c) * 128 + kb(s, h)));
+                    if (part)
+                        dr[s] = value;
+                    else
+                        qr[s] = value;
+                }
+            __syncthreads();
+        }
+    }
+    Acc out[8]{};
+    float logsum = live ? lse.p[size_t(head) * lse.ld + t] : 0;
+    float correction = live ? delta.p[size_t(head) * delta.ld + t] : 0;
+    int doc = live ? starts[t] : q.rows;
+    int limit = min(first + 16, q.rows);
+    for (int base = starts[first]; base < limit; base += 32) {
+        for (int i = tid; i < 32 * 128; i += blockDim.x) {
+            int row = i / 128, d = i % 128;
+            uint16_t key = base + row < limit ? bf16(get(k, base + row, kh, d)) : 0;
+            kr[at<128>(row, d)] = key;
+            vr[at<128>(row, d)] = base + row < limit ? bf16(get(v, base + row, kh, d)) : 0;
+            kt[at<32>(d, row)] = key;
+        }
+        __syncthreads();
+        Reg ds[2];
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            Acc score{}, dp{};
+            int row = 16 * (c >> 3) + 8 * n + (c & 7);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                score = mma(load<128>(kr, row, kb(s, h)), qr[s], score);
+                dp = mma(load<128>(vr, row, kb(s, h)), dr[s], dp);
+            }
+            uint16_t bits[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int key = base + 16 * h + 8 * n + i;
+                float p = live && key >= doc && key <= t
+                              ? __builtin_amdgcn_exp2f((score[i] * scale - logsum) * 1.4426950408889634f)
+                              : 0;
+                bits[i] = bf16(p * (dp[i] - correction) * scale);
+            }
+            ds[n] = __builtin_bit_cast(Reg, bits);
+        }
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd)
+#pragma unroll
+            for (int s = 0; s < 2; ++s)
+                out[nd] = mma(load<32>(kt, 16 * nd + c, kb(s, h)), ds[s], out[nd]);
+        __syncthreads();
+    }
+    if (live)
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                dq.p[size_t(t) * dq.ld + head * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+}
+
+// Four waves own the 128 output dimensions of 16 keys. All GQA heads reduce
+// into those registers. Q/dO staging is transposed in place after scoring so
+// both gradient products use vector LDS loads, with no global atomics.
+__global__ void dkv_kernel(View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
+                           const int32_t *starts, const int32_t *ends) {
+    __shared__ __align__(16) uint16_t kr[16 * 128], vr[16 * 128], qr[32 * 128], dr[32 * 128], p[16 * 32],
+        ds[16 * 32];
+    __shared__ float scores[16 * 32], dps[16 * 32];
+    int tid = threadIdx.x, wave = tid / 32, c = tid % 16, h = tid % 32 / 16;
+    int first = blockIdx.x * 16, kh = blockIdx.y;
+    Acc ak[2]{}, av[2]{};
+    for (int i = tid; i < 16 * 128; i += 128) {
+        int row = i / 128, d = i % 128;
+        kr[at<128>(row, d)] = first + row < q.rows ? bf16(get(k, first + row, kh, d)) : 0;
+        vr[at<128>(row, d)] = first + row < q.rows ? bf16(get(v, first + row, kh, d)) : 0;
+    }
+    int end = ends[min(first + 15, q.rows - 1)];
+    for (int head = kh * group; head < (kh + 1) * group; ++head)
+        for (int base = first; base < end; base += 32) {
+            for (int i = tid; i < 32 * 128; i += 128) {
+                int row = i / 128, d = i % 128;
+                qr[at<128>(row, d)] = base + row < end ? bf16(get(q, base + row, head, d)) : 0;
+                dr[at<128>(row, d)] = base + row < end ? bf16(get(dy, base + row, head, d)) : 0;
+            }
+            __syncthreads();
+            Acc result{};
+            int sub = (wave % 2) * 16;
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                result = mma(load<128>(wave < 2 ? kr : vr, c, kb(s, h)),
+                             load<128>(wave < 2 ? qr : dr, sub + c, kb(s, h)), result);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                (wave < 2 ? scores : dps)[(8 * h + i) * 32 + sub + c] = result[i];
+            __syncthreads();
+            for (int i = tid; i < 16 * 32; i += 128) {
+                int key = first + i / 32, t = base + i % 32;
+                bool valid = key < q.rows && t < end && key <= t && key >= starts[t];
+                float prob =
+                    valid ? __builtin_amdgcn_exp2f((scores[i] * scale - lse.p[size_t(head) * lse.ld + t]) *
+                                                   1.4426950408889634f)
+                          : 0;
+                float correction = t < end ? delta.p[size_t(head) * delta.ld + t] : 0;
+                p[at<32>(i / 32, i % 32)] = bf16(prob);
+                ds[at<32>(i / 32, i % 32)] = bf16(prob * (dps[i] - correction) * scale);
+            }
+            // Each thread owns one feature column while transposing all 32 rows.
+            Reg tq[4], td[4];
+#pragma unroll
+            for (int s = 0; s < 4; ++s)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    tq[s][e] = __builtin_bit_cast(__bf16, qr[at<128>(8 * s + e, tid)]);
+                    td[s][e] = __builtin_bit_cast(__bf16, dr[at<128>(8 * s + e, tid)]);
+                }
+            __syncthreads();
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                *reinterpret_cast<uint4 *>(qr + at<32>(tid, 8 * s)) = __builtin_bit_cast(uint4, tq[s]);
+                *reinterpret_cast<uint4 *>(dr + at<32>(tid, 8 * s)) = __builtin_bit_cast(uint4, td[s]);
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                int d = (wave + j * 4) * 16 + c;
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    ak[j] = mma(load<32>(ds, c, kb(s, h)), load<32>(qr, d, kb(s, h)), ak[j]);
+                    av[j] = mma(load<32>(p, c, kb(s, h)), load<32>(dr, d, kb(s, h)), av[j]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int t = first + 8 * h + i, d = (wave + j * 4) * 16 + c;
+            if (t < q.rows) {
+                dk.p[size_t(t) * dk.ld + kh * 128 + d] = ak[j][i];
+                dv.p[size_t(t) * dv.ld + kh * 128 + d] = av[j][i];
+            }
+        }
+}
+} // namespace
+
+void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View dk, View dv, View delta,
+                       int h, int kh, const int32_t *starts, const int32_t *ends, hipStream_t stream) {
+    const char *setting = std::getenv("QTIP_TRAIN_ATTN_PROFILE");
+    require(!setting || std::string(setting) == "0" || std::string(setting) == "1",
+            "QTIP_TRAIN_ATTN_PROFILE must be 0 or 1");
+    bool profile = setting && std::string(setting) == "1";
+    struct Events {
+        hipEvent_t begin{}, middle{}, end{};
+        ~Events() {
+            if (begin)
+                (void)hipEventDestroy(begin);
+            if (middle)
+                (void)hipEventDestroy(middle);
+            if (end)
+                (void)hipEventDestroy(end);
+        }
+    } e;
+    if (profile) {
+        HIP_CHECK(hipEventCreate(&e.begin));
+        HIP_CHECK(hipEventCreate(&e.middle));
+        HIP_CHECK(hipEventCreate(&e.end));
+        HIP_CHECK(hipEventRecord(e.begin, stream));
+    }
+    dq_kernel<<<dim3((q.rows + 15) / 16, kh), (h / kh) * 32, 0, stream>>>(q, k, v, lse, dy, delta, dq, h / kh,
+                                                                          starts);
+    if (profile)
+        HIP_CHECK(hipEventRecord(e.middle, stream));
+    dkv_kernel<<<dim3((q.rows + 15) / 16, kh), 128, 0, stream>>>(q, k, v, lse, dy, delta, dk, dv, h / kh,
+                                                                 starts, ends);
+    if (profile) {
+        HIP_CHECK(hipEventRecord(e.end, stream));
+        HIP_CHECK(hipEventSynchronize(e.end));
+        float qms = 0, kvms = 0;
+        HIP_CHECK(hipEventElapsedTime(&qms, e.begin, e.middle));
+        HIP_CHECK(hipEventElapsedTime(&kvms, e.middle, e.end));
+        int device = 0;
+        HIP_CHECK(hipGetDevice(&device));
+        std::cerr << json({{"attention_backward_device", device},
+                           {"seqlen", q.rows},
+                           {"heads", h},
+                           {"kv_heads", kh},
+                           {"dq_ms", qms},
+                           {"dkv_ms", kvms}})
+                         .dump()
+                  << '\n';
+    }
+}
+} // namespace qat::gpu

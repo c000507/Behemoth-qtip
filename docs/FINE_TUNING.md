@@ -240,7 +240,32 @@ The native forward is the default for GQA groups up to 32. This implementation
 uses the runtime kernel's operand layout, register accumulation, and parallel
 softmax; it does not use the runtime's FP8 cache or probability quantization.
 Run GPU correctness tests and measure both paths on gfx1201 before relying on
-speedup estimates. The attention backward kernels have not changed in this update.
+speedup estimates.
+
+Backward also has native BF16 WMMA kernels. dQ shares K/V staging across a GQA
+group, keeps Q/dO and its output accumulator in registers, and computes score
+and probability derivatives within each wave. dK/dV retain one owner per key
+tile; staging uses swizzled vector operands and transposes Q/dO in place before
+the gradient products. Gradients accumulate in FP32 registers and are rounded
+at the existing HIP boundary. Both kernels preserve document and causal masks;
+there is no quadratic gradient workspace or attention-gradient atomic addition.
+The earlier backward remains available for A/B checks:
+
+```sh
+ctest --test-dir build-training -R native_gpu --output-on-failure
+QTIP_TRAIN_ATTN_BACKWARD=legacy build-training/qtip_attention_bench 8192 0
+QTIP_TRAIN_ATTN_BACKWARD=native build-training/qtip_attention_bench 8192 0
+# Separate GPU-event timings of dQ and dK/dV, in milliseconds on stderr:
+QTIP_TRAIN_ATTN_PROFILE=1 build-training/qtip_attention_bench 32768 0
+```
+
+The profile flag adds a synchronization after the two kernels. It excludes the
+softmax-correction kernel, gradient copy/rounding, and forward recomputation;
+the benchmark's backward wall time includes the correction and copy/rounding.
+Native backward is used by default for GQA groups up to 32; larger groups use
+the earlier kernels. These new kernels require on-device numerical validation
+and timings; compilation and CPU tests alone do not establish GPU correctness
+or throughput.
 
 For strict runtime parity, make a JSON request containing `tokens` and
 `logit_positions` (1–128 positions). Capture the actual native runtime output:

@@ -382,6 +382,14 @@ void flash(View q, View k, View v, View out, View lse, int h, int kh, const int3
 void flash_back(View q, View k, View v, View out, View lse, View dy, View dq, View dk, View dv, View delta,
                 int h, int kh, const int32_t *b, const int32_t *ends, hipStream_t s) {
     backward_delta<<<(size_t(q.rows) * h + 7) / 8, 256, 0, s>>>(out, dy, delta, h);
+    const char *setting = std::getenv("QTIP_TRAIN_ATTN_BACKWARD");
+    bool legacy = setting && std::string(setting) == "legacy";
+    require(!setting || legacy || std::string(setting) == "native",
+            "QTIP_TRAIN_ATTN_BACKWARD must be native or legacy");
+    if (!legacy && h / kh <= 32) {
+        flash_back_native(q, k, v, lse, dy, dq, dk, dv, delta, h, kh, b, ends, s);
+        return;
+    }
     backward_q<<<dim3((q.rows + 15) / 16, h), 128, 0, s>>>(q, k, v, lse, dy, dq, delta, h, kh, b);
     backward_kv<<<dim3((q.rows + 15) / 16, kh), 128, 0, s>>>(q, k, v, lse, dy, delta, dk, dv, h, kh, b, ends);
 }

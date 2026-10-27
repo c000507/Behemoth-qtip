@@ -28,7 +28,7 @@ if(QTIP_TRAIN_HIP)
   target_compile_definitions(qtip_train_core PUBLIC __HIP_PLATFORM_AMD__=1)
   find_package(hipblaslt REQUIRED CONFIG)
   find_package(rocwmma QUIET CONFIG)
-  target_sources(qtip_train_core PRIVATE src/hip.cpp src/ops.hip src/flash.hip
+  target_sources(qtip_train_core PRIVATE src/hip.cpp src/ops.hip src/flash.hip src/flash_backward.hip
     ${REPO}/runtime/src/qtip.hip src/train_kernels.hip)
   set_target_properties(qtip_train_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
   if(TARGET roc::rocwmma)
@@ -58,12 +58,17 @@ if(QTIP_TRAIN_HIP)
   add_executable(qtip_gpu_tests tests/test_gpu.cpp)
   target_link_libraries(qtip_gpu_tests PRIVATE qtip_train_core)
   add_test(NAME native_gpu COMMAND qtip_gpu_tests)
-  set_tests_properties(native_gpu PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(native_gpu PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_GEMM_TUNE=0")
   add_test(NAME native_gpu_tuned COMMAND qtip_gpu_tests)
-  set_tests_properties(native_gpu_tuned PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "QTIP_TRAIN_GEMM_TUNE=1")
+  set_tests_properties(native_gpu_tuned PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QTIP_TRAIN_GEMM_TUNE=1;QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=native")
   add_test(NAME native_gpu_legacy_attention COMMAND qtip_gpu_tests)
   set_tests_properties(native_gpu_legacy_attention PROPERTIES SKIP_RETURN_CODE 77
-    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=legacy")
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=legacy;QTIP_TRAIN_ATTN_BACKWARD=native;QTIP_TRAIN_GEMM_TUNE=0")
+  add_test(NAME native_gpu_legacy_backward COMMAND qtip_gpu_tests)
+  set_tests_properties(native_gpu_legacy_backward PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "QTIP_TRAIN_ATTN_FORWARD=native;QTIP_TRAIN_ATTN_BACKWARD=legacy;QTIP_TRAIN_GEMM_TUNE=0")
 endif()
 add_test(NAME native_training COMMAND qtip_train_tests)
 if(QTIP_TRAIN_TOKENIZER)
