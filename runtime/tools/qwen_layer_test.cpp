@@ -101,7 +101,8 @@ int main(int argc, char **argv) {
                      partial.data(), slices, s);
         q_sum_slices(partial.data(), slices, size_t(rows) * gl.rows, z.data(), s);
     };
-    DeviceBuffer<uint16_t> d_state, d_u, d_z, d_z2, d_q, d_k, d_v, d_g, d_ao, d_o, d_gu;
+    DeviceBuffer<uint16_t> d_state, d_u, d_q, d_k, d_v, d_g, d_ao, d_o, d_gu;
+    DeviceBuffer<float> d_z, d_z2;
     d_state.upload(x0);
     d_u.resize(size_t(rows) * std::max({H, V, F, nq * hd}));
     d_z.resize(size_t(rows) * std::max({2 * F, H, V}));
