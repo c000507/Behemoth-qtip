@@ -416,9 +416,9 @@ int main(int argc, char **argv) {
             part.resize(size_t(slices) * rows * gl.rows);
             qtip::matmul(gl.view(), lut.lut.data(), reinterpret_cast<const BFloat16 *>(uu.data()), n,
                          rows, part.data(), slices, s);
-            q_sum_slices(part.data(), slices, size_t(rows) * gl.rows, zbig.data(), s);
-            q_hadamard_rows(zbig.data(), rows, gl.rows, gl.rows, false, s);
-            q_sv_cast_f32(zbig.data(), sv.data(), zbig.data() + col, rows, gl.rows, gl.rows, Wz, s);
+            q_sum_slices(part.data(), slices, size_t(rows) * gl.rows, d_z2.data(), s);
+            q_hadamard_rows(d_z2.data(), rows, gl.rows, gl.rows, false, s);
+            q_sv_cast_f32(d_z2.data(), sv.data(), zbig.data() + col, rows, gl.rows, gl.rows, Wz, s);
         };
         input_t(d_state.data(), &ln_in, suq.data(), H, d_u);
         {
