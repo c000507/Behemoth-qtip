@@ -117,6 +117,11 @@ void decode_dense(LinearView, const uint32_t *lut, BFloat16 *w, hipStream_t);
 class DenseMatmul {
     struct State;
     std::unique_ptr<State> s_;
+    // out_type: hipDataType of the output (HIP_R_32F or HIP_R_16BF)
+    void gemm_typed(int m, int in, const BFloat16 *x, int ldx, int rows, void *out, int ldo, int out_type,
+                    const BFloat16 *w, hipStream_t);
+    double tune_typed(int m, int in, const BFloat16 *x, int ldx, int rows, void *out, int ldo,
+                      int out_type, const BFloat16 *w, hipStream_t, int max_candidates);
 
   public:
     DenseMatmul();
@@ -129,11 +134,17 @@ class DenseMatmul {
     // out[r * ldo + j] = sum_i x[r * ldx + i] * w[j * in + i], j < m, r < rows.
     void gemm(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
               const BFloat16 *w, hipStream_t);
+    // The same GEMM with a bf16 output (fp32 accumulation, rounded once by hipBLASLt): its own
+    // plans and tuning, keyed by output type.
+    void gemm(int m, int in, const BFloat16 *x, int ldx, int rows, BFloat16 *out, int ldo,
+              const BFloat16 *w, hipStream_t);
     // Times up to max_candidates hipBLASLt algorithms for this GEMM shape on the given buffers
     // (synchronous; overwrites out) and keeps the fastest for (m, in, ldx, ldo) at batch `rows`:
     // later GEMMs of that shape use the algorithm tuned at the nearest batch >= their rows when
     // the heuristic offers it for their size. Returns the best TFLOP/s.
     double tune(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
+                const BFloat16 *w, hipStream_t, int max_candidates = 64);
+    double tune(int m, int in, const BFloat16 *x, int ldx, int rows, BFloat16 *out, int ldo,
                 const BFloat16 *w, hipStream_t, int max_candidates = 64);
 };
 // Scratch elements of one whole decoded shard of every linear of the model (the largest is a

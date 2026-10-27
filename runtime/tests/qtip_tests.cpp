@@ -530,6 +530,39 @@ void test_dense_matmul_gpu(const qtip::HostLinear &l, int block_row, int count, 
         check(e.rel_rms < 1e-5 && ew.rel_rms < 1e-5,
               "gpu dense prefill matmul " + name + " rows=" + std::to_string(rows) + " scratch_rows=" +
                   std::to_string(scratch_rows) + " vs double " + describe(e) + " | vs wmma " + describe(ew));
+        // bf16-output GEMM (direct exchange payload) on the whole decoded shard vs the fp32 GEMM
+        // rounded once: equal up to 1-ulp differences from a different accumulation order.
+        {
+            DeviceBuffer<BFloat16> whole(size_t(g.rows) * size_t(l.in)), ob(size_t(rows) * size_t(g.rows));
+            DeviceBuffer<float> of(size_t(rows) * size_t(g.rows));
+            qtip::decode_dense(g.view(), lut.lut.data(), whole.data(), nullptr);
+            dense.gemm(g.rows, l.in, dx.data(), l.in, rows, of.data(), g.rows, whole.data(), nullptr);
+            dense.gemm(g.rows, l.in, dx.data(), l.in, rows, ob.data(), g.rows, whole.data(), nullptr);
+            HIP_CHECK(hipDeviceSynchronize());
+            auto f = of.download();
+            auto bb = ob.download();
+            double ref_rms = 0;
+            for (double r : ref)
+                ref_rms += r * r;
+            ref_rms = std::sqrt(ref_rms / double(std::max<size_t>(ref.size(), 1)));
+            size_t differ = 0, far = 0;
+            std::vector<float> bf(bb.size());
+            for (size_t i = 0; i < bb.size(); ++i) {
+                bf[i] = float(bb[i]);
+                const float rf = float(BFloat16(f[i]));
+                differ += BFloat16(f[i]).bits != bb[i].bits;
+                // one bf16 ulp is at most 2^-7 of the magnitude; plus the fp32 accumulation-order
+                // difference (~1e-5 of the output rms) for values near zero
+                far += std::fabs(bf[i] - rf) >
+                       std::ldexp(std::max(std::fabs(rf), std::fabs(bf[i])), -7) + 1e-4 * ref_rms;
+            }
+            auto eb = compare(bf, ref);
+            check(far == 0 && differ * 100 <= bb.size() && eb.rel_rms < 3e-3,
+                  "gpu dense bf16-output GEMM " + name + " rows=" + std::to_string(rows) +
+                      " vs rounded fp32: 1-ulp differences " + std::to_string(differ) + "/" +
+                      std::to_string(bb.size()) + ", larger " + std::to_string(far) + " | vs double " +
+                      describe(eb));
+        }
     }
 }
 // Row-batched transforms (one block per row) vs the per-chunk kernels: bit-identical, and the fused

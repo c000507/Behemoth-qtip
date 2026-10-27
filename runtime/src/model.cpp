@@ -1065,14 +1065,27 @@ struct Shard {
         std::erase_if(sizes, [&](int n) { return n < dense; });
         const std::pair<const char *, const qtip::GpuLinear *> shapes[] = {
             {"qkv", &w0.qkv}, {"o", &w0.o}, {"gate_up", &w0.gate_up}, {"down", &w0.down}};
+        // Output types the dense path uses: bf16 (direct exchange payload) for gate/up always
+        // and for q/k/v, o, down in bf16-exchange prefill steps; fp32 for the rest.
+        const bool bf16_direct = qtip_bf16_direct();
         std::ostringstream log;
         log << "rank " << rank << " dense GEMM autotune (TFLOP/s):";
         for (int n : sizes)
             for (const auto &[name, w] : shapes) {
-                const double tflops = qtip_dense->tune(w->rows, w->in, qtip_u.data(), w->in, n,
-                                                       qtip_partial.data(), w->rows,
-                                                       qtip_dense_scratch.data(), stream, candidates);
-                log << ' ' << name << '@' << n << '=' << int(tflops);
+                const bool gate_up = w == &w0.gate_up;
+                if (!(gate_up && bf16_direct)) {
+                    const double tflops = qtip_dense->tune(w->rows, w->in, qtip_u.data(), w->in, n,
+                                                           qtip_partial.data(), w->rows,
+                                                           qtip_dense_scratch.data(), stream, candidates);
+                    log << ' ' << name << '@' << n << '=' << int(tflops);
+                }
+                if (bf16_direct && (gate_up || (bf16_prefill_rows > 0 && n >= bf16_prefill_rows))) {
+                    const double tflops = qtip_dense->tune(
+                        w->rows, w->in, qtip_u.data(), w->in, n,
+                        reinterpret_cast<BFloat16 *>(qtip_partial.data()), w->rows,
+                        qtip_dense_scratch.data(), stream, candidates);
+                    log << ' ' << name << "/bf16@" << n << '=' << int(tflops);
+                }
             }
         std::cerr << log.str() << '\n';
     }
@@ -1162,6 +1175,15 @@ struct Shard {
     }
     // Copy-engine all-gathers for every QTIP step of more than BEHEMOTH_QTIP_DMA_ROWS - 1 rows
     // (default 9; smaller steps keep the fused zero-copy kernels).
+    // bf16-output dense GEMMs straight into the exchange block (env BEHEMOTH_QTIP_BF16_DIRECT,
+    // default 1; 0 restores the fp32 GEMM + reduce_publish rounding kernel).
+    static bool qtip_bf16_direct() {
+        static const bool on = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_BF16_DIRECT");
+            return !v || std::atoi(v) != 0;
+        }();
+        return on;
+    }
     static bool qtip_use_dma(int rows, HostTransport *transport) {
         static const int min_rows = [] {
             const char *v = std::getenv("BEHEMOTH_QTIP_DMA_ROWS");
@@ -1193,24 +1215,35 @@ struct Shard {
             partial = qtip_partial.data();
         }
         const size_t elements = size_t(rows) * size_t(w.rows);
-        // fp32 payloads on the copy-engine path: the dense GEMM writes this rank's half of the
-        // exchange block directly (one slice: the reduce kernel would be a plain copy)
-        const bool direct = use_dense && !bf16 && qtip_use_dma(rows, transport);
-        if (direct)
-            partial = qtip_block(mb) + size_t(rank) * elements;
-        if (use_dense) {
+        if (use_dense)
             qtip_dense_scratch.resize(qtip::dense_scratch_elements); // no-op when reserved
-            const bool whole = size_t(w.rows) * size_t(w.in) <= qtip_dense_scratch.size();
+        const bool whole = use_dense && size_t(w.rows) * size_t(w.in) <= qtip_dense_scratch.size();
+        // Copy-engine path: the dense GEMM writes this rank's half of the exchange block directly
+        // (one slice: the reduce kernel would be a plain copy / bf16 rounding). bf16 payloads use
+        // a hipBLASLt bf16-output plan (fp32 accumulation) on whole-shard GEMMs.
+        const bool direct =
+            use_dense && qtip_use_dma(rows, transport) && (!bf16 || (whole && qtip_bf16_direct()));
+        BFloat16 *direct_bf16 = nullptr;
+        if (direct && bf16)
+            direct_bf16 = reinterpret_cast<BFloat16 *>(qtip_block(mb)) + size_t(rank) * elements;
+        else if (direct)
+            partial = qtip_block(mb) + size_t(rank) * elements;
+        auto gemm = [&] {
+            if (direct_bf16)
+                qtip_dense->gemm(w.rows, w.in, u, ldu, rows, direct_bf16, w.rows,
+                                 qtip_dense_scratch.data(), mb.s);
+            else
+                qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
+                                 qtip_dense_scratch.data(), mb.s);
+        };
+        if (use_dense) {
             measure(mb, "dense_projections_ms", [&] {
                 if (!mb.overlap) {
                     if (whole) {
                         measure(mb, "qtip_weight_decode_ms", [&] {
                             qtip::decode_dense(w.view(), lut.lut.data(), qtip_dense_scratch.data(), mb.s);
                         });
-                        measure(mb, "qtip_gemm_ms", [&] {
-                            qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
-                                            qtip_dense_scratch.data(), mb.s);
-                        });
+                        measure(mb, "qtip_gemm_ms", gemm);
                     } else {
                         // Bounded-scratch fallback still contains interleaved decode/GEMMs.
                         measure(mb, "qtip_tiled_decode_gemm_ms", [&] {
@@ -1232,10 +1265,7 @@ struct Shard {
                     HIP_CHECK(hipEventRecord(ev_decoded, mb.s));
                 } else
                     HIP_CHECK(hipStreamWaitEvent(mb.s, ev_decoded, 0));
-                measure(mb, "qtip_gemm_ms", [&] {
-                    qtip_dense->gemm(w.rows, w.in, u, ldu, rows, partial, w.rows,
-                                     qtip_dense_scratch.data(), mb.s);
-                });
+                measure(mb, "qtip_gemm_ms", gemm);
                 if (mb.index > 0) {
                     HIP_CHECK(hipEventRecord(ev_gemm_done[size_t(mb.index)], mb.s));
                     scratch_busy = true;
@@ -1246,7 +1276,7 @@ struct Shard {
                 qtip::matmul(w, lut.lut.data(), u, ldu, rows, partial, slices, mb.s);
             });
         if (direct)
-            qtip_exchange(mb, nullptr, 0, 0, false, elements, comm, transport);
+            qtip_exchange(mb, nullptr, 0, 0, false, bf16 ? elements / 2 : elements, comm, transport);
         else
             qtip_exchange(mb, partial, slices, elements, bf16, bf16 ? elements / 2 : elements, comm,
                           transport);

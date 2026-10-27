@@ -39,10 +39,11 @@ struct DensePlan {
 struct DenseMatmul::State {
     hipblasLtHandle_t handle{};
     int device = 0;
-    // (m, n, k, ldb, ldc) -> plan
-    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<DensePlan>> plans;
-    // autotuned algorithms: (m, k, ldb, ldc) -> [(n, algo)]
-    std::map<std::tuple<int, int, int, int>, std::vector<std::pair<int, hipblasLtMatmulAlgo_t>>> tuned;
+    // (m, n, k, ldb, ldc, output type) -> plan
+    std::map<std::tuple<int, int, int, int, int, int>, std::unique_ptr<DensePlan>> plans;
+    // autotuned algorithms: (m, k, ldb, ldc, output type) -> [(n, algo)]
+    std::map<std::tuple<int, int, int, int, int>, std::vector<std::pair<int, hipblasLtMatmulAlgo_t>>>
+        tuned;
     DeviceBuffer<std::byte> workspace;
     ~State() {
         plans.clear();
@@ -50,9 +51,10 @@ struct DenseMatmul::State {
             hipblasLtDestroy(handle);
     }
     // Layouts of D[m][n] (column-major, ld ldc) = A^T B: A = decoded weight bf16 (k x m, ld k),
-    // B = x bf16 (k x n, ld ldb), fp32 output and accumulation; up to `want` heuristic results.
+    // B = x bf16 (k x n, ld ldb), fp32 accumulation, fp32 or bf16 output (out_type); up to
+    // `want` heuristic results.
     std::vector<hipblasLtMatmulHeuristicResult_t> candidates(DensePlan &p, int m, int n, int k, int ldb,
-                                                             int ldc, int want) {
+                                                             int ldc, hipDataType out_type, int want) {
         QTIP_BLAS_CHECK(hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F));
         hipblasOperation_t trans = HIPBLAS_OP_T, none = HIPBLAS_OP_N;
         QTIP_BLAS_CHECK(hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &trans,
@@ -61,7 +63,7 @@ struct DenseMatmul::State {
                                                         sizeof(none)));
         QTIP_BLAS_CHECK(hipblasLtMatrixLayoutCreate(&p.a, HIP_R_16BF, uint64_t(k), uint64_t(m), k));
         QTIP_BLAS_CHECK(hipblasLtMatrixLayoutCreate(&p.b, HIP_R_16BF, uint64_t(k), uint64_t(n), ldb));
-        QTIP_BLAS_CHECK(hipblasLtMatrixLayoutCreate(&p.c, HIP_R_32F, uint64_t(m), uint64_t(n), ldc));
+        QTIP_BLAS_CHECK(hipblasLtMatrixLayoutCreate(&p.c, out_type, uint64_t(m), uint64_t(n), ldc));
         hipblasLtMatmulPreference_t pref{};
         QTIP_BLAS_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
         size_t max_workspace = workspace.size();
@@ -77,19 +79,20 @@ struct DenseMatmul::State {
         results.resize(size_t(std::max(count, 0)));
         std::erase_if(results, [](const auto &r) { return r.state != HIPBLAS_STATUS_SUCCESS; });
         if (results.empty())
-            throw std::runtime_error("QTIP dense prefill: no hipBLASLt bf16->fp32 algorithm for m=" +
+            throw std::runtime_error(std::string("QTIP dense prefill: no hipBLASLt bf16->") +
+                                     (out_type == HIP_R_16BF ? "bf16" : "fp32") + " algorithm for m=" +
                                      std::to_string(m) + " n=" + std::to_string(n) +
                                      " k=" + std::to_string(k));
         return results;
     }
-    DensePlan &plan(int m, int n, int k, int ldb, int ldc) {
-        auto key = std::make_tuple(m, n, k, ldb, ldc);
+    DensePlan &plan(int m, int n, int k, int ldb, int ldc, hipDataType out_type) {
+        auto key = std::make_tuple(m, n, k, ldb, ldc, int(out_type));
         auto it = plans.find(key);
         if (it != plans.end())
             return *it->second;
         auto p = std::make_unique<DensePlan>();
-        auto t = tuned.find(std::make_tuple(m, k, ldb, ldc));
-        const auto results = candidates(*p, m, n, k, ldb, ldc, t == tuned.end() ? 1 : 64);
+        auto t = tuned.find(std::make_tuple(m, k, ldb, ldc, int(out_type)));
+        const auto results = candidates(*p, m, n, k, ldb, ldc, out_type, t == tuned.end() ? 1 : 64);
         size_t pick = 0;
         if (t != tuned.end() && !t->second.empty()) {
             // the algorithm tuned at the nearest batch size >= n (else the largest), if the
@@ -138,10 +141,11 @@ void DenseMatmul::run(LinearView l, const uint32_t *lut, const BFloat16 *x, int 
         gemm(m, l.in, x, ldx, rows, out + r0, l.rows, scratch, stream);
     }
 }
-double DenseMatmul::tune(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
-                         const BFloat16 *w, hipStream_t stream, int max_candidates) {
+double DenseMatmul::tune_typed(int m, int in, const BFloat16 *x, int ldx, int rows, void *out, int ldo,
+                               int out_type_, const BFloat16 *w, hipStream_t stream, int max_candidates) {
+    const auto out_type = hipDataType(out_type_);
     DensePlan probe;
-    const auto results = s_->candidates(probe, m, rows, in, ldx, ldo, std::clamp(max_candidates, 1, 64));
+    const auto results = s_->candidates(probe, m, rows, in, ldx, ldo, out_type, std::clamp(max_candidates, 1, 64));
     hipEvent_t a, b;
     HIP_CHECK(hipEventCreate(&a));
     HIP_CHECK(hipEventCreate(&b));
@@ -175,24 +179,41 @@ double DenseMatmul::tune(int m, int in, const BFloat16 *x, int ldx, int rows, fl
     }
     HIP_CHECK(hipEventDestroy(a));
     HIP_CHECK(hipEventDestroy(b));
-    auto &list = s_->tuned[std::make_tuple(m, in, ldx, ldo)];
+    auto &list = s_->tuned[std::make_tuple(m, in, ldx, ldo, int(out_type))];
     std::erase_if(list, [&](const auto &e) { return e.first == rows; });
     list.emplace_back(rows, results[best].algo);
     // plans created before this tuning keep their algorithm unless rebuilt
     std::erase_if(s_->plans, [&](const auto &e) {
-        const auto &[pm, pn, pk, pb, pc] = e.first;
-        return pm == m && pk == in && pb == ldx && pc == ldo;
+        const auto &[pm, pn, pk, pb, pc, pt] = e.first;
+        return pm == m && pk == in && pb == ldx && pc == ldo && pt == int(out_type);
     });
     return 2.0 * m * rows * double(in) / best_ms / 1e9;
 }
-void DenseMatmul::gemm(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
-                       const BFloat16 *w, hipStream_t stream) {
+void DenseMatmul::gemm_typed(int m, int in, const BFloat16 *x, int ldx, int rows, void *out, int ldo,
+                             int out_type, const BFloat16 *w, hipStream_t stream) {
     if (rows < 1 || m < 1 || ldx < in || ldo < m)
         throw std::invalid_argument("QTIP dense gemm shape");
     const float one = 1.f, zero = 0.f;
-    auto &p = s_->plan(m, rows, in, ldx, ldo);
+    auto &p = s_->plan(m, rows, in, ldx, ldo, hipDataType(out_type));
     QTIP_BLAS_CHECK(hipblasLtMatmul(s_->handle, p.op, &one, w, p.a, x, p.b, &zero, out, p.c, out, p.c,
                                     &p.algo, s_->workspace.data(), s_->workspace.size(), stream));
+}
+
+double DenseMatmul::tune(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
+                         const BFloat16 *w, hipStream_t stream, int max_candidates) {
+    return tune_typed(m, in, x, ldx, rows, out, ldo, int(HIP_R_32F), w, stream, max_candidates);
+}
+double DenseMatmul::tune(int m, int in, const BFloat16 *x, int ldx, int rows, BFloat16 *out, int ldo,
+                         const BFloat16 *w, hipStream_t stream, int max_candidates) {
+    return tune_typed(m, in, x, ldx, rows, out, ldo, int(HIP_R_16BF), w, stream, max_candidates);
+}
+void DenseMatmul::gemm(int m, int in, const BFloat16 *x, int ldx, int rows, float *out, int ldo,
+                       const BFloat16 *w, hipStream_t stream) {
+    gemm_typed(m, in, x, ldx, rows, out, ldo, int(HIP_R_32F), w, stream);
+}
+void DenseMatmul::gemm(int m, int in, const BFloat16 *x, int ldx, int rows, BFloat16 *out, int ldo,
+                       const BFloat16 *w, hipStream_t stream) {
+    gemm_typed(m, in, x, ldx, rows, out, ldo, int(HIP_R_16BF), w, stream);
 }
 
 } // namespace behemoth::qtip

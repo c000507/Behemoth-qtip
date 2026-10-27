@@ -42,3 +42,5 @@ of the decode slowdown. Still open.
 Further analysis: [matrix compute, peak-normalized throughput, compiler resources,
 and remaining prefill opportunities](PREFILL_COMPUTE_REPORT.md). This uses the
 measurements above and does not claim new GPU timings.
+
+Next: [PERF_ROUND6_REPORT.md](PERF_ROUND6_REPORT.md) (BF16-output GEMMs into the exchange block, prefill attention VALU work).
