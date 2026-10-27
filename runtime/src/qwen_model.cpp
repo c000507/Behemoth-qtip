@@ -142,7 +142,9 @@ qtip::HostLinear QwenModel::Impl::load_host(const Checkpoint &ck, int layer, con
     auto floats = [&](const std::string &n, size_t size) {
         auto v = f.floats(n);
         if (v.size() != size) throw std::runtime_error("invalid QTIP vector " + n);
-        return std::vector<float>(v.begin(), v.end());
+        std::vector<float> r(size);
+        for (size_t i = 0; i < size; ++i) r[i] = v[i];
+        return r;
     };
     l.su = floats(base + "SU", size_t(in));
     l.sv = floats(base + "SV", size_t(out));
@@ -208,8 +210,9 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
             {
                 auto al = ck.tensor(p + "linear_attn.A_log").floats(p + "linear_attn.A_log");
                 auto db = ck.tensor(p + "linear_attn.dt_bias").floats(p + "linear_attn.dt_bias");
-                std::vector<float> aux(al.begin(), al.end());
-                aux.insert(aux.end(), db.begin(), db.end());
+                std::vector<float> aux;
+                for (size_t i = 0; i < al.size(); ++i) aux.push_back(al[i]);
+                for (size_t i = 0; i < db.size(); ++i) aux.push_back(db[i]);
                 w.a_dt.upload(aux);
             }
             w.ring.resize(size_t(cfg.conv_dim()) * cfg.conv_k);
@@ -263,7 +266,8 @@ void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
     q_zc_norm(state.data() + size_t(row0) * H, nrows, H, final_norm.data(), cfg.eps, stream);
     for (int r0 = 0; r0 < nrows; r0 += 16) {
         int nr = std::min(16, nrows - r0);
-        dense.gemm(cfg.vocab, H, state.data() + size_t(row0 + r0) * H, H, nr,
+        dense.gemm(cfg.vocab, H,
+                   reinterpret_cast<const BFloat16 *>(state.data() + size_t(row0 + r0) * H), H, nr,
                    logits_d.data() + size_t(r0) * cfg.vocab, cfg.vocab, embed.data(), stream);
         HIP_CHECK(hipMemcpyAsync(logits_all.data() + size_t(r0) * cfg.vocab,
                                  logits_d.data() + size_t(r0) * cfg.vocab, size_t(nr) * cfg.vocab * 4,
@@ -281,8 +285,8 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
     // one trellis projection: rotated input is already in u (row stride n); z <- sum slices (dense f32)
     auto proj = [&](const Linear &lin, int n, float *zdst) {
         int slices = qtip::matmul_slices(lin.lin.view(), rows);
-        qtip::matmul(lin.lin.view(), codebook.lut.data(), u.data(), n, rows, partial.data(), slices,
-                     stream);
+        qtip::matmul(lin.lin.view(), codebook.lut.data(), reinterpret_cast<const BFloat16 *>(u.data()), n,
+                     rows, partial.data(), slices, stream);
         q_sum_slices(partial.data(), slices, size_t(rows) * lin.lin.rows, zdst, stream);
     };
     for (int L = 0; L < c.layers; ++L) {
