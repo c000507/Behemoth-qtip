@@ -160,6 +160,15 @@ int main(int argc, char **argv) {
                     du2 = std::max(du2, double(std::fabs(double(b16(ug2[size_t(r) * H + i])) - t2[size_t(i)])));
             }
             std::printf("control (random, no norm) u diff: %.5f\n", du2);
+            {
+                std::vector<double> g(H);
+                for (int i = 0; i < H; ++i) g[size_t(i)] = double(b16(ug2[i]));
+                qtip::hadamard(g.data(), H, false);  // inverse (same FWHT)
+                double dinv = 0;
+                for (int i = 0; i < H; ++i)
+                    dinv = std::max(dinv, double(std::fabs(g[size_t(i)] - double(rxf[size_t(i)]) * hq.su[size_t(i)])));
+                std::printf("ctl inverse-hadamard residual: %.5f (su-consistent if ~0)\n", dinv);
+            }
             std::printf("ctl gpu[:6]: %.4f %.4f %.4f %.4f\n", b16(ug2[0]), b16(ug2[1]), b16(ug2[2]), b16(ug2[3]));
             {
                 std::vector<double> t2(H);
