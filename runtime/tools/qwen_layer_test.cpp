@@ -393,8 +393,236 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < y1.size(); ++i) y1[i] = xs[i] + b16(to16(of[i]));
         y_cpu = y1;
     } else {
-        std::fprintf(stderr, "linear layer test TODO here\n");
-        return 2;
+        // ---------------- linear (Gated DeltaNet) layer
+        auto hq = load_lin("linear_attn.in_proj_qkv"), hz = load_lin("linear_attn.in_proj_z"),
+             ho = load_lin("linear_attn.out_proj");
+        qtip::GpuLinear gq, gz, go;
+        qtip::GpuCodebook lq;
+        DeviceBuffer<float> suq, svq, svz, svo, su_o;
+        lin_gpu(hq, gq, lq, suq, svq);
+        lin_gpu(hz, gz, lq, suq /*same su: group shared*/, svz);
+        DeviceBuffer<float> su_z;
+        su_z.upload(hz.su);
+        lin_gpu(ho, go, lq, su_o, svo);
+        const int Wq = c.conv_dim(), nv = c.lin_nv, kd = c.lin_kd, vd = c.lin_vd;
+        const int Wz = Wq + V + 2 * nv;
+        d_z.resize(size_t(rows) * Wz);
+        d_z2.resize(size_t(rows) * Wz);
+        DeviceBuffer<float> zbig(size_t(rows) * Wz);
+        auto proj_scatter = [&](qtip::GpuLinear &gl, qtip::GpuCodebook &lut, DeviceBuffer<uint16_t> &uu,
+                                int n, DeviceBuffer<float> &sv, long col) {
+            int slices = qtip::matmul_slices(gl.view(), rows);
+            static DeviceBuffer<float> part;
+            part.resize(size_t(slices) * rows * gl.rows);
+            qtip::matmul(gl.view(), lut.lut.data(), reinterpret_cast<const BFloat16 *>(uu.data()), n,
+                         rows, part.data(), slices, s);
+            q_sum_slices(part.data(), slices, size_t(rows) * gl.rows, zbig.data(), s);
+            q_hadamard_rows(zbig.data(), rows, gl.rows, gl.rows, false, s);
+            q_sv_cast_f32(zbig.data(), sv.data(), zbig.data() + col, rows, gl.rows, gl.rows, Wz, s);
+        };
+        input_t(d_state.data(), &ln_in, suq.data(), H, d_u);
+        proj_scatter(gq, lq, d_u, H, svq, 0);
+        proj_scatter(gz, lq, d_u, H, svz, Wq);
+        // b/a: raw bf16 gemms on the plain normed hidden state (mirror QwenModel)
+        {
+            auto bt = f.bytes(p + "linear_attn.in_proj_b.weight");
+            auto at = f.bytes(p + "linear_attn.in_proj_a.weight");
+            std::vector<uint16_t> ba(bt.size() / 2 + at.size() / 2);
+            std::memcpy(ba.data(), bt.data(), bt.size());
+            std::memcpy(ba.data() + bt.size() / 2, at.data(), at.size());
+            DeviceBuffer<uint16_t> d_ba;
+            d_ba.upload(ba);
+            DeviceBuffer<uint16_t> h_norm = d_state;
+            q_zc_norm(h_norm.data(), rows, H, ln_in.data(), c.eps, s);
+            qtip::DenseMatmul dense;
+            dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
+                       zbig.data() + Wq + V, Wz, reinterpret_cast<const BFloat16 *>(d_ba.data()), s);
+            dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
+                       zbig.data() + Wq + V + nv, Wz,
+                       reinterpret_cast<const BFloat16 *>(d_ba.data()) + size_t(nv) * H, s);
+        }
+        auto convw = load16("linear_attn.conv1d.weight");
+        auto dnn = load16("linear_attn.norm.weight");
+        DeviceBuffer<uint16_t> d_conv, d_dn;
+        d_conv.upload(convw);
+        d_dn.upload(dnn);
+        DeviceBuffer<float> ring(size_t(Wq) * c.conv_k), S(size_t(nv) * kd * vd), a_dt(2 * size_t(nv));
+        {
+            auto al = f.floats(p + "linear_attn.A_log");
+            auto db = f.floats(p + "linear_attn.dt_bias");
+            std::vector<float> aux(2 * size_t(nv));
+            for (size_t i = 0; i < al.size(); ++i) aux[i] = al[i];
+            for (size_t i = 0; i < db.size(); ++i) aux[nv + i] = db[i];
+            a_dt.upload(aux);
+        }
+        HIP_CHECK(hipMemsetAsync(ring.data(), 0, ring.bytes(), s));
+        HIP_CHECK(hipMemsetAsync(S.data(), 0, S.bytes(), s));
+        for (int t = 0; t < rows; ++t)
+            q_delta_step(zbig.data(), d_conv.data(), d_dn.data(), a_dt.data(), ring.data(), S.data(),
+                         d_o.data(), rows, t, Wq, V, kd, vd, c.lin_nk, nv, c.conv_k, c.eps, s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        input_t(d_o.data(), nullptr, su_o.data(), V, d_u);
+        int slices = qtip::matmul_slices(go.view(), rows);
+        static DeviceBuffer<float> part2;
+        part2.resize(size_t(slices) * rows * go.rows);
+        qtip::matmul(go.view(), lq.lut.data(), reinterpret_cast<const BFloat16 *>(d_u.data()), V, rows,
+                     part2.data(), slices, s);
+        q_sum_slices(part2.data(), slices, size_t(rows) * go.rows, d_z.data(), s);
+        q_hadamard_rows(d_z.data(), rows, H, H, false, s);
+        q_sv_add(d_z.data(), svo.data(), d_state.data(), rows, H, H, H, s);
+        HIP_CHECK(hipStreamSynchronize(s));
+
+        // ---- CPU replica
+        auto lin_ref = [](qtip::HostLinear &h, const std::vector<float> &x) {
+            return qtip::reference_forward(h, x, true);
+        };
+        std::vector<float> xs(rows * H);
+        for (size_t i = 0; i < xs.size(); ++i) xs[i] = b16(x0[i]);
+        std::vector<float> xn(rows * H);
+        for (int r = 0; r < rows; ++r) {
+            double ss = 0;
+            for (int i = 0; i < H; ++i) ss += double(xs[size_t(r) * H + i]) * xs[size_t(r) * H + i];
+            float inv = float(1.0 / std::sqrt(ss / H + c.eps));
+            for (int i = 0; i < H; ++i)
+                xn[size_t(r) * H + i] =
+                    b16(to16(xs[size_t(r) * H + i] * inv)) * (1.0f + b16(ln_in_h[size_t(i)]));
+        }
+        auto qkvf = lin_ref(hq, xn), zf = lin_ref(hz, xn);
+        // b/a
+        auto b16vec = [&](const std::string &nm) {
+            auto v = f.floats(p + nm);
+            std::vector<float> r(v.size());
+            for (size_t i = 0; i < v.size(); ++i) r[i] = v[i];
+            return r;
+        };
+        auto bw = b16vec("linear_attn.in_proj_b.weight"), aw = b16vec("linear_attn.in_proj_a.weight");
+        std::vector<float> y(rows * H, 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            static thread_local std::vector<float> qkv(Wq), zz(V), ba(2 * size_t(nv));
+            std::vector<float> ringv(size_t(Wq) * c.conv_k, 0.0f);
+            std::vector<float> Sv(size_t(nv) * kd * vd, 0.0f);
+            auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+            auto sp = [](float x) { return x > 20.0f ? x : std::log(1.0f + std::exp(x)); };
+            for (int t = 0; t <= r; ++t) {
+                (void)t;
+                break;  // placeholder: sequential state per row handled below
+            }
+            for (int t = 0; t <= r; ++t) {
+                // NOTE: this replica recomputes per row from scratch (rows share no state in the
+                // test's single-chunk semantics? they DO: one sequence). We emulate the GPU exactly:
+                // single sequence, tokens 0..rows-1, state carried across t.
+            }
+            // full sequential pass over tokens 0..r for THIS row's output is wrong; instead run one
+            // shared sequence below
+            (void)qkv;
+            (void)zz;
+            (void)ba;
+            (void)ringv;
+            (void)Sv;
+            (void)sig;
+            (void)sp;
+            (void)qkvf;
+            (void)zf;
+            (void)bw;
+            (void)aw;
+            (void)y;
+            break;
+        }
+        // shared-sequence CPU replica
+        {
+            std::vector<float> qkv(Wq), zz(V), ba(2 * size_t(nv));
+            std::vector<float> ringv(size_t(Wq) * c.conv_k, 0.0f);
+            std::vector<float> Sv(size_t(nv) * kd * vd, 0.0f);
+            auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+            auto sp = [](float x) { return x > 20.0f ? x : std::log(1.0f + std::exp(x)); };
+            std::vector<float> out(rows * V);
+            for (int t = 0; t < rows; ++t) {
+                for (int i = 0; i < Wq; ++i) qkv[size_t(i)] = qkvf[size_t(t) * Wq + i];
+                for (int i = 0; i < V; ++i) zz[size_t(i)] = zf[size_t(t) * V + i];
+                for (int i = 0; i < nv; ++i)
+                    ba[size_t(i)] = bw[size_t(i)].empty() ? 0.f : 0.f;  // replaced below
+                // b/a via dot with xn (bf16 weights)
+                for (int e = 0; e < 2 * nv; ++e) {
+                    const std::vector<float> &w = e < nv ? bw : aw;
+                    float acc = 0;
+                    for (int i = 0; i < H; ++i)
+                        acc += xn[size_t(t) * H + size_t(i)] *
+                               b16(to16(w[size_t(e % nv) * H + size_t(i)]));
+                    ba[size_t(e)] = acc;
+                }
+                for (int ch = 0; ch < Wq; ++ch) {
+                    float *rg = ringv.data() + size_t(ch) * c.conv_k;
+                    for (int j = 0; j + 1 < c.conv_k; ++j) rg[j] = rg[j + 1];
+                    rg[c.conv_k - 1] = qkv[size_t(ch)];
+                    float acc = 0;
+                    for (int j = 0; j < c.conv_k; ++j)
+                        acc += rg[j] * b16(convw[size_t(ch) * c.conv_k + size_t(j)]);
+                    qkv[size_t(ch)] = acc / (1.0f + std::exp(-acc));
+                }
+                for (int hv = 0; hv < nv; ++hv) {
+                    int kh2 = hv / (nv / c.lin_nk);
+                    float *qh = qkv.data() + size_t(kh2) * kd;
+                    float *kh_ = qkv.data() + c.key_dim() + size_t(kh2) * kd;
+                    float *vh = qkv.data() + 2 * c.key_dim() + size_t(hv) * vd;
+                    float qs = 0, ks = 0;
+                    for (int d2 = 0; d2 < kd; ++d2) {
+                        qs += qh[d2] * qh[d2];
+                        ks += kh_[d2] * kh_[d2];
+                    }
+                    float iq = 1.0f / std::sqrt(qs + 1e-6f) / std::sqrt(float(kd));
+                    float ik = 1.0f / std::sqrt(ks + 1e-6f);
+                    for (int d2 = 0; d2 < kd; ++d2) {
+                        qh[d2] *= iq;
+                        kh_[d2] *= ik;
+                    }
+                    float beta = sig(ba[size_t(hv)]);
+                    float al = f.floats(p + "linear_attn.A_log")[size_t(hv)];
+                    float dtb = f.floats(p + "linear_attn.dt_bias")[size_t(hv)];
+                    float g = -std::exp(al) * sp(ba[size_t(nv + hv)] + dtb);
+                    float decay = std::exp(g);
+                    float *Sh = Sv.data() + size_t(hv) * kd * vd;
+                    std::vector<float> kvm(vd, 0.f), dl(vd), ov(vd, 0.f), o2(vd);
+                    for (int dk = 0; dk < kd; ++dk) {
+                        float k_dk = kh_[dk];
+                        for (int dv = 0; dv < vd; ++dv) {
+                            Sh[size_t(dk) * vd + dv] *= decay;
+                            kvm[size_t(dv)] += Sh[size_t(dk) * vd + dv] * k_dk;
+                        }
+                    }
+                    for (int dv = 0; dv < vd; ++dv) {
+                        dl[size_t(dv)] = (vh[dv] - kvm[size_t(dv)]) * beta;
+                        ov[size_t(dv)] = 0;
+                    }
+                    for (int dk = 0; dk < kd; ++dk)
+                        for (int dv = 0; dv < vd; ++dv) {
+                            float sv2 = Sh[size_t(dk) * vd + dv] + kh_[dk] * dl[size_t(dv)];
+                            Sh[size_t(dk) * vd + dv] = sv2;
+                            ov[size_t(dv)] += sv2 * qh[dk];
+                        }
+                    float ss2 = 0;
+                    for (int dv = 0; dv < vd; ++dv) ss2 += ov[dv] * ov[dv];
+                    float oinv = 1.0f / std::sqrt(ss2 / vd + c.eps);
+                    for (int dv = 0; dv < vd; dv++)
+                        o2[size_t(dv)] =
+                            ov[dv] * oinv * b16(dnn[size_t(dv)]) *
+                            (zf[size_t(t) * V + size_t(hv) * vd + dv] /
+                             (1.0f + std::exp(-zf[size_t(t) * V + size_t(hv) * vd + dv])));
+                    for (int dv = 0; dv < vd; dv++) out[size_t(t) * V + size_t(hv) * vd + dv] = o2[size_t(dv)];
+                }
+            }
+            auto of2 = lin_ref(ho, out);
+            for (size_t i = 0; i < y.size(); ++i) y[i] = xs[i] + b16(to16(of2[i]));
+        }
+        auto gpu_state2 = d_state.download();
+        double maxd2 = 0, scale2 = 1e-9;
+        for (size_t i = 0; i < y.size(); ++i) {
+            double g2 = b16(gpu_state2[i]);
+            maxd2 = std::max(maxd2, std::fabs(g2 - y[i]));
+            scale2 = std::max(scale2, double(std::fabs(y[i])));
+        }
+        std::printf("layer %d (lin) post-attn: max|diff| %.5f scale %.3f rel %.2e -> %s\n", layer,
+                    maxd2, scale2, maxd2 / scale2, maxd2 / scale2 < 1.5e-1 ? "ok" : "FAIL");
+        return maxd2 / scale2 < 1.5e-1 ? 0 : 1;
     }
 
     auto gpu_state = d_state.download();
