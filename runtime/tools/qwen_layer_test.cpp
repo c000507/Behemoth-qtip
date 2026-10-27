@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
                         mx = std::max(mx, sc[size_t(i)]);
                     }
                     float sum = 0;
-                    for (int i = 0; i <= r; ++i) sum += sc[size_t(i)] = std::exp(sc[size_t(i)] - mx);
+                    for (int i = 0; i <= r; ++i) { sc[size_t(i)] = std::exp(sc[size_t(i)] - mx); sum += sc[size_t(i)]; }
                     for (int d2i = 0; d2i < hd; ++d2i) {
                         float acc = 0;
                         for (int i = 0; i <= r; ++i)
