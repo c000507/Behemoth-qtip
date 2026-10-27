@@ -303,6 +303,8 @@ __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uin
     int r = blockIdx.x % rows;
     int h = blockIdx.x / rows;
     int d = threadIdx.x;
+    if (blockIdx.x < 2 && threadIdx.x == 0)
+        printf("rope blk %d r %d h %d grid %d\n", int(blockIdx.x), r, h, int(gridDim.x));
     if (h >= nq + nkv) {
         int hv = h - nq - nkv;
         uint16_t *vv = v + long(r) * nkv * hd + long(hv) * hd;
