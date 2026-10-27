@@ -148,7 +148,7 @@ int main() {
             compare(cb[i], gb[i], .04);
         // Exercise both ownership directions, partial tiles, GQA reductions,
         // document boundaries inside key tiles, and nontrivial softmax scores.
-        for (int length : {1, 17, 33, 63, 64, 65, 129, 257}) {
+        for (int length : {1, 17, 33, 63, 64, 65, 127, 128, 129, 257}) {
             for (int group : {1, 3, 4, 12, 32}) {
                 if (group == 32 && length != 65)
                     continue;
@@ -163,8 +163,8 @@ int main() {
                     ab.positions.resize(length);
                     ab.segments.resize(length);
                     for (int t = 0; t < length; ++t) {
-                        // Include one-token docs and boundaries inside both
-                        // the 16-key wave tile and the 32-key block tile.
+                        // Include one-token docs and boundaries inside the
+                        // 16-key wave tile and the 32/64-key block tiles.
                         int start = !packed ? 0 : t < 7 ? 0 : t < 31 ? 7 : t < 32 ? 31 : t < 63 ? 32
                                                         : t < 64 ? 63 : t < 70 ? 64 : 70;
                         if (packing == 2)

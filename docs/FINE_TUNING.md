@@ -245,12 +245,13 @@ speedup estimates.
 Backward also has native BF16 WMMA kernels. dQ shares K/V staging across a GQA
 group, keeps Q/dO and its output accumulator in registers, and computes score
 and probability derivatives within each wave. dK/dV use paired waves: one owns
-dK and computes scores/dS, the other owns dV and receives a small BF16 probability
-tile through LDS. Two pairs share a 16-query Q/dO load, staged in both
-orientations directly. K/V, scores/dP, and gradient accumulators stay in registers.
-Compared with the earlier native dK/dV kernel, this halves Q/dO global loads per
-key-query pair and reduces barriers per query tile from five to three. It avoids
-the score/dP exchange and the register-mediated in-place Q/dO transpose.
+dK and computes QK scores/dS, the other owns dV and computes dP. They exchange
+FP32 dP and BF16 P through LDS. Each wave keeps one K/V operand and its gradient
+accumulator in registers. Four pairs share a 16-query Q/dO load across 64 keys,
+staged in both orientations directly. This doubles Q/dO reuse compared with
+`04a8fc9` and distributes its two score products between waves. The tradeoff is
+one additional barrier per query tile and the small FP32 dP exchange. There is
+no in-place Q/dO transpose or extra global workspace.
 
 Heads reduce in a fixed order with one writer per gradient element. Gradients
 accumulate in FP32 registers and are rounded at the existing HIP boundary. Both
@@ -267,11 +268,17 @@ QTIP_TRAIN_ATTN_BACKWARD=native build-training/qtip_attention_bench 8192 0
 QTIP_TRAIN_ATTN_PROFILE=1 build-training/qtip_attention_bench 32768 0
 ```
 
-`QTIP_TRAIN_ATTN_DKV=wave` selects the paired-wave kernel (default).
-`QTIP_TRAIN_ATTN_DKV=staged` retains the dK/dV kernel from `a067e7e`, keeping
-the same native dQ kernel. This selector only applies to native backward.
-CTest explicitly checks both native dK/dV paths against the CPU reference,
-including strided views, 16/32-key tile tails, GQA groups through 32, packed
+`QTIP_TRAIN_ATTN_DKV` only applies to native backward and keeps dQ unchanged:
+
+| Value | dK/dV implementation |
+| --- | --- |
+| `balanced` (default) | Balanced score work; four wave pairs own 64 keys |
+| `balanced32` | Same algorithm; two wave pairs own 32 keys |
+| `wave` | GPU-validated paired-wave kernel from `04a8fc9` |
+| `staged` | Native dK/dV kernel from `a067e7e` |
+
+CTest registers all four native dK/dV paths against the CPU reference,
+including strided views, 16/32/64-key tile tails, GQA groups through 32, packed
 boundaries, one-token documents, and repeat-call determinism. Run these checks
 before measuring the isolated change, then compare the steady medians and
 `dkv_ms` (stderr) for contiguous and packed sequences:
@@ -279,7 +286,7 @@ before measuring the isolated change, then compare the steady medians and
 ```sh
 cmake --build build-training -j8
 ctest --test-dir build-training --output-on-failure
-for dkv in staged wave; do
+for dkv in wave balanced32 balanced; do
   QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
     build-training/qtip_attention_bench 8192 0 8192 3 96 8 24
   QTIP_TRAIN_ATTN_BACKWARD=native QTIP_TRAIN_ATTN_DKV=$dkv QTIP_TRAIN_ATTN_PROFILE=1 \
@@ -289,15 +296,11 @@ for dkv in staged wave; do
 done
 ```
 
-ROCm 7.0 clang 20 device compilation for gfx1201 reports 215 VGPRs, zero scratch
-and zero spills, and 17,600 bytes of LDS for the paired-wave kernel. The staged
-kernel uses 159 VGPRs and 30,720 bytes of LDS with the same compiler. The CPU
-training test and a separate host WMMA-layout model passed locally; there was no
-AMD GPU in that environment, so these are **not measured GPU speedups or GPU
-correctness results**. The higher register count and different wave scheduling
-still need on-device timing. A full-layer benchmark is required to translate
-attention gains into step time; dK/dV performs four matrix products versus dQ's
-three, so equal kernel times are a target rather than a consequence of symmetry.
+The user reported all seven CTest tests passing on `04a8fc9`, no MES errors,
+and 32k layer time improving from 28.4 to 10.2 seconds. The balanced variants
+compile for gfx1201 with zero spills but still require GPU execution and timing.
+See [training attention performance](TRAINING_ATTENTION_PERF.md) for the measured
+baseline, compiler resource counts, and step-time bounds.
 
 The profile flag adds a synchronization after the two kernels. It excludes the
 softmax-correction kernel, gradient copy/rounding, and forward recomputation;
@@ -335,6 +338,7 @@ tests. `--reference` selects unrounded CPU math for numerical differentiation;
 normal CPU execution emulates BF16 boundaries.
 
 Both CPU and gfx1201 HIP builds compile and link (GPU compile checked with ROCm 7.1).
-GPU execution/gradient checks, real-layer performance, full-logit runtime
-parity, held-out quality, and the 0.5M/5M-token runs must be verified separately.
-No speed or quality result is inferred from the CPU tests.
+The user reported passing GPU execution/gradient checks and real-layer timings
+on `04a8fc9`; the new balanced dK/dV variants still need those GPU checks.
+Full-logit runtime parity, held-out quality, and the 0.5M/5M-token runs remain
+separate validation steps. No speed or quality result is inferred from CPU tests.

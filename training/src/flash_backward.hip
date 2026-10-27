@@ -298,6 +298,113 @@ __global__ __launch_bounds__(128) void dkv_wave_kernel(
                 dst.p[size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i] = out[nd][i];
     }
 }
+
+// Balance score work between the pair: the dK wave computes QK^T, the dV
+// wave computes dO*V^T. Only dP and P cross waves; each gradient still has
+// one writer and reduces query heads in a fixed order. Four pairs share
+// Q/dO loads over 64 keys, twice the reuse of dkv_wave_kernel.
+template <int KeyTiles>
+__global__ __launch_bounds__(KeyTiles * 64) void dkv_balanced_kernel(
+    View q, View k, View v, View lse, View dy, View delta, View dk, View dv, int group,
+    const int32_t *starts, const int32_t *ends) {
+    static_assert(KeyTiles == 2 || KeyTiles == 4);
+    constexpr int KeyRows = KeyTiles * 16, Threads = KeyTiles * 64;
+    constexpr int StageSize = 4 * 16 * 128;
+    // KeyRows<=64: query staging can also hold the initial K/V tile.
+    __shared__ __align__(16) uint16_t shared[StageSize], probs[KeyRows * 16];
+    // A padded 20-float row keeps both halves aligned for vector LDS access
+    // while distributing neighboring key rows across the memory banks.
+    __shared__ __align__(16) float dps[KeyRows * 20];
+    __shared__ float logs[16], corrections[16];
+    __shared__ int docs[16];
+    uint16_t *qr = shared, *dr = qr + 16 * 128, *qt = dr + 16 * 128, *dt = qt + 16 * 128;
+    int tid = threadIdx.x, wave = tid / 32, c = tid % 16, h = tid % 32 / 16;
+    int begin = blockIdx.x * KeyRows, pair = wave / 2, first = begin + pair * 16;
+    int kh = blockIdx.y, key = first + c;
+    bool live = key < q.rows, value_wave = wave & 1;
+    Reg kv[8];
+    for (int part = 0; part < 2; ++part) {
+        View src = part ? v : k;
+        for (int i = tid; i < KeyRows * 128; i += Threads) {
+            int row = i / 128, d = i % 128;
+            shared[i] = begin + row < q.rows ? bf16(get(src, begin + row, kh, d)) : 0;
+        }
+        __syncthreads();
+        if (value_wave == bool(part))
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                kv[s] = __builtin_bit_cast(
+                    Reg, *reinterpret_cast<const uint4 *>(shared + (pair * 16 + c) * 128 + kb(s, h)));
+        __syncthreads();
+    }
+    Acc out[8]{};
+    int end = ends[min(begin + KeyRows - 1, q.rows - 1)];
+    for (int head = kh * group; head < (kh + 1) * group; ++head)
+        for (int base = begin; base < end; base += 16) {
+            for (int i = tid; i < 16 * 128; i += Threads) {
+                int row = i / 128, d = i % 128;
+                uint16_t a = base + row < end ? bf16(get(q, base + row, head, d)) : 0;
+                uint16_t b = base + row < end ? bf16(get(dy, base + row, head, d)) : 0;
+                qr[at<128>(row, d)] = a;
+                dr[at<128>(row, d)] = b;
+                qt[at<16>(d, row)] = a;
+                dt[at<16>(d, row)] = b;
+            }
+            if (tid < 16) {
+                int t = base + tid;
+                logs[tid] = t < end ? lse.p[size_t(head) * lse.ld + t] : 0;
+                corrections[tid] = t < end ? delta.p[size_t(head) * delta.ld + t] : 0;
+                docs[tid] = t < end ? starts[t] : q.rows;
+            }
+            __syncthreads();
+            Acc result{};
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+                result = mma(load<128>(value_wave ? dr : qr, c, kb(s, h)), kv[s], result);
+            using HalfAcc = float __attribute__((ext_vector_type(4)));
+            float *dp_row = dps + (pair * 16 + c) * 20 + 8 * h;
+            if (value_wave) {
+                *reinterpret_cast<HalfAcc *>(dp_row) = __builtin_shufflevector(result, result, 0, 1, 2, 3);
+                *reinterpret_cast<HalfAcc *>(dp_row + 4) =
+                    __builtin_shufflevector(result, result, 4, 5, 6, 7);
+            }
+            __syncthreads();
+            Reg ds;
+            if (!value_wave) {
+                Acc dp = __builtin_shufflevector(*reinterpret_cast<const HalfAcc *>(dp_row),
+                                                *reinterpret_cast<const HalfAcc *>(dp_row + 4),
+                                                0, 1, 2, 3, 4, 5, 6, 7);
+                uint16_t pb[8], sb[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int row = 8 * h + i, t = base + row;
+                    float prob = live && t < end && key <= t && key >= docs[row]
+                                     ? __builtin_amdgcn_exp2f((result[i] * scale - logs[row]) *
+                                                              1.4426950408889634f)
+                                     : 0;
+                    pb[i] = bf16(prob);
+                    sb[i] = bf16(prob * (dp[i] - corrections[row]) * scale);
+                }
+                ds = __builtin_bit_cast(Reg, sb);
+                *reinterpret_cast<uint4 *>(probs + at<16>(pair * 16 + c, 8 * h)) =
+                    __builtin_bit_cast(uint4, pb);
+            }
+            __syncthreads();
+            Reg derivative = value_wave ? load<16>(probs, pair * 16 + c, 8 * h) : ds;
+#pragma unroll
+            for (int nd = 0; nd < 8; ++nd)
+                out[nd] = mma(load<16>(value_wave ? dt : qt, 16 * nd + c, 8 * h), derivative, out[nd]);
+            __syncthreads();
+        }
+    if (live) {
+        View dst = value_wave ? dv : dk;
+#pragma unroll
+        for (int nd = 0; nd < 8; ++nd)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                dst.p[size_t(key) * dst.ld + kh * 128 + 16 * nd + 8 * h + i] = out[nd][i];
+    }
+}
 } // namespace
 
 void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View dk, View dv, View delta,
@@ -307,9 +414,9 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
             "QTIP_TRAIN_ATTN_PROFILE must be 0 or 1");
     bool profile = setting && std::string(setting) == "1";
     const char *dkv_setting = std::getenv("QTIP_TRAIN_ATTN_DKV");
-    bool staged = dkv_setting && std::string(dkv_setting) == "staged";
-    require(!dkv_setting || staged || std::string(dkv_setting) == "wave",
-            "QTIP_TRAIN_ATTN_DKV must be wave or staged");
+    std::string dkv = dkv_setting ? dkv_setting : "balanced";
+    require(dkv == "balanced" || dkv == "balanced32" || dkv == "wave" || dkv == "staged",
+            "QTIP_TRAIN_ATTN_DKV must be balanced, balanced32, wave or staged");
     struct Events {
         hipEvent_t begin{}, middle{}, end{};
         ~Events() {
@@ -331,11 +438,17 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
                                                                           starts);
     if (profile)
         HIP_CHECK(hipEventRecord(e.middle, stream));
-    if (staged)
+    if (dkv == "staged")
         dkv_staged_kernel<<<dim3((q.rows + 15) / 16, kh), 128, 0, stream>>>(
             q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
-    else
+    else if (dkv == "wave")
         dkv_wave_kernel<<<dim3((q.rows + 31) / 32, kh), 128, 0, stream>>>(
+            q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
+    else if (dkv == "balanced32")
+        dkv_balanced_kernel<2><<<dim3((q.rows + 31) / 32, kh), 128, 0, stream>>>(
+            q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
+    else
+        dkv_balanced_kernel<4><<<dim3((q.rows + 63) / 64, kh), 256, 0, stream>>>(
             q, k, v, lse, dy, delta, dk, dv, h / kh, starts, ends);
     if (profile) {
         HIP_CHECK(hipEventRecord(e.end, stream));
@@ -349,7 +462,7 @@ void flash_back_native(View q, View k, View v, View lse, View dy, View dq, View 
                            {"seqlen", q.rows},
                            {"heads", h},
                            {"kv_heads", kh},
-                           {"dkv_kernel", staged ? "staged" : "wave"},
+                           {"dkv_kernel", dkv},
                            {"dq_ms", qms},
                            {"dkv_ms", kvms}})
                          .dump()
