@@ -1,0 +1,38 @@
+[0m
+> build · glm-5.3
+[0m
+[0m→ [0mRead .opencode_task_qwen35.md
+[0m
+[0m# [0mTodos
+[•] Explore repo + nmoe reference
+[ ] Design note docs/QWEN35.md
+[ ] Generic config + weight loader + Qwen3.5 parsing, tests
+[ ] CPU reference forward Qwen3.5
+[ ] Quantizer DeltaNet+gated attn+MoE, quantize 0.8B, ppl check
+[ ] Runtime DeltaNet decode/prefill, gated attn, MoE, parity
+[ ] Trainer support (optional)
+[ ] Report docs/QWEN35_STATUS.md + push
+[0m
+Task big: Qwen3.5 arch support in quantizer/runtime/trainer. Start explore repo + nmoe reference.
+[0m→ [0mRead .
+[0m
+[0m$ [0mgit log --oneline -5 && git status --short && git branch -a
+d74a21b Add optional 128-key attention backward and record balanced GPU results
+5ee3d77 Balance dK/dV score work and reuse queries across 64 keys
+04a8fc9 Optimize native attention dK/dV with paired waves
+a067e7e Use native WMMA attention backward and profile gradient kernels
+265b904 Use native register-resident GQA training forward and steady-state benchmarks
+  main
+* qwen35
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main
+[0m
+[0m→ [0mRead README.md
+[0m→ [0mRead docs/PLAN.md
+Now nmoe reference.
+[93m[1m! [0mpermission requested: external_directory (/home/slave02/Development/investigate_ftllm/nmoe/*); auto-rejecting
+[93m[1m! [0mpermission requested: external_directory (/home/slave02/Development/investigate_ftllm/nmoe/*); auto-rejecting
+[0m✗ [0mRead /home/slave02/Development/investigate_ftllm/nmoe/ARCHITECTURE.md failed
+[91m[1mError: [0mThe user rejected permission to use this specific tool call.
+[0m✗ [0mRead /home/slave02/Development/investigate_ftllm/nmoe/README.md failed[90m [limit=100][0m
+[91m[1mError: [0mThe user rejected permission to use this specific tool call.

@@ -44,7 +44,8 @@ class QwenLayerRunner {
   DBuf<uint16_t> x_, h_, act_;
   DBuf<float> qkv_, y_, gu_;
   DBuf<uint16_t> Qp_, Kp_, Vp_, G_, attn_, o_;  // full: Qp/G/attn; linear: o_ (out_proj input)
-  DBuf<float> S_, P_, O_;                       // attention scratch
+  DBuf<float> S_, O_;                           // attention scratch
+  DBuf<uint16_t> P_;
   DBuf<float> dn_S_, dn_ring_;                  // delta state [seqs][nv][kd*vd], [seqs][conv_dim][K]
   HBuf<uint16_t> pin_;
 };
