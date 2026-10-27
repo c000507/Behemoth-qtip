@@ -615,6 +615,8 @@ int main(int argc, char **argv) {
                 }
             }
             std::printf("delta out cpu[:6]: %.4f %.4f %.4f %.4f\n", out[0], out[1], out[2], out[3]);
+            std::printf("t0: zf[:3] %.4f %.4f | ba[:4] %.4f %.4f %.4f %.4f\n", zf[0], zf[1], ba[0],
+                        ba[1], ba[2], ba[3]);
             auto of2 = lin_ref(ho, out);
             for (size_t i = 0; i < y.size(); ++i) y[i] = xs[i] + b16(to16(of2[i]));
         }
