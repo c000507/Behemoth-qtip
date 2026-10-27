@@ -183,15 +183,32 @@ std::shared_ptr<QwenLayer> read_qwen_layer(const SafeTensorsReader& st, const Qw
       st.read_into(pre + "linear_attn.conv1d.weight", L->conv_w.data(), L->conv_w.size() * 2);
     }
     const TensorInfo& al = st.info(pre + "linear_attn.A_log");
-    QCHECK(al.dtype == "F32" && al.numel() == cfg.lin_nv, "unexpected A_log");
+    QCHECK((al.dtype == "F32" || al.dtype == "BF16") && al.numel() == cfg.lin_nv, "unexpected A_log");
     L->a_log.resize(size_t(al.numel()));
-    st.read_into(pre + "linear_attn.A_log", L->a_log.data(), L->a_log.size() * 4);
+    if (al.dtype == "F32") st.read_into(pre + "linear_attn.A_log", L->a_log.data(), L->a_log.size() * 4);
+    else {
+      std::vector<uint16_t> b(size_t(al.numel()));
+      st.read_into(pre + "linear_attn.A_log", b.data(), b.size() * 2);
+      for (size_t i = 0; i < b.size(); ++i) L->a_log[i] = bf16_to_f32(b[i]);
+    }
     const TensorInfo& db = st.info(pre + "linear_attn.dt_bias");
-    QCHECK(db.dtype == "F32" && db.numel() == cfg.lin_nv, "unexpected dt_bias");
+    QCHECK((db.dtype == "F32" || db.dtype == "BF16") && db.numel() == cfg.lin_nv, "unexpected dt_bias");
     L->dt_bias.resize(size_t(db.numel()));
-    st.read_into(pre + "linear_attn.dt_bias", L->dt_bias.data(), L->dt_bias.size() * 4);
-    L->dn_norm.resize(size_t(cfg.lin_vd));
-    st.read_into(pre + "linear_attn.norm.weight", L->dn_norm.data(), L->dn_norm.size() * 2);
+    if (db.dtype == "F32") st.read_into(pre + "linear_attn.dt_bias", L->dt_bias.data(), L->dt_bias.size() * 4);
+    else {
+      std::vector<uint16_t> b(size_t(db.numel()));
+      st.read_into(pre + "linear_attn.dt_bias", b.data(), b.size() * 2);
+      for (size_t i = 0; i < b.size(); ++i) L->dt_bias[i] = bf16_to_f32(b[i]);
+    }
+    const TensorInfo& dn = st.info(pre + "linear_attn.norm.weight");
+    QCHECK(dn.dtype == "BF16" || dn.dtype == "F32", "unexpected linear_attn.norm dtype");
+    L->dn_norm.resize(size_t(dn.numel()));
+    if (dn.dtype == "BF16") st.read_into(pre + "linear_attn.norm.weight", L->dn_norm.data(), L->dn_norm.size() * 2);
+    else {
+      std::vector<float> f(size_t(dn.numel()));
+      st.read_into(pre + "linear_attn.norm.weight", f.data(), f.size() * 4);
+      for (size_t i = 0; i < f.size(); ++i) L->dn_norm[i] = f32_to_bf16(f[i]);
+    }
   }
   if (L->moe) {
     read_w16(st, pre + "mlp.gate.weight", L->w_router);
