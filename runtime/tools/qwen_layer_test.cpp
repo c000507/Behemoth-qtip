@@ -578,6 +578,9 @@ int main(int argc, char **argv) {
                     float ss2 = 0;
                     for (int dv2 = 0; dv2 < vd; ++dv2) ss2 += ov[dv2] * ov[dv2];
                     const float oinv = 1.0f / std::sqrt(ss2 / vd + c.eps);
+                    if (t < 1 && hv < 2)
+                        std::printf("t%d hv%d: |ov| %.5g oinv %.3g beta %.3f decay %.4f dl0 %.4f vh0 %.4f k0 %.4f q0 %.4f\n",
+                                    t, hv, std::sqrt(ss2), oinv, beta, decay, dl[0], vh[0], kh_[0], qh[0]);
                     const uint16_t *nw = dnn.data();
                     for (int dv2 = 0; dv2 < vd; ++dv2) {
                         float z = zz[size_t(hv) * vd + dv2];
