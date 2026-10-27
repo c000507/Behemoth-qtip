@@ -231,7 +231,7 @@ static void test_qwen_config() {
     const char* cfg = R"({
       "model_type": "qwen3_5_moe",
       "text_config": {
-        "hidden_size": 3072, "num_hidden_layers": 48, "vocab_size": 248320,
+        "hidden_size": 3072, "num_hidden_layers": 4, "vocab_size": 248320,
         "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 256,
         "linear_num_key_heads": 16, "linear_key_head_dim": 128,
         "linear_num_value_heads": 64, "linear_value_head_dim": 128,
