@@ -432,7 +432,7 @@ static void test_qwen_layer(const std::string& model_dir, int dev) {
       Rng r(1234 + L);
       std::string embed_name;
       for (auto& kv : st.tensors())
-        if (kv.first.size() > 18 && kv.first.substr(kv.first.size() - 18) == "embed_tokens.weight") embed_name = kv.first;
+        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight") embed_name = kv.first;
       const TensorInfo& e = st.info(embed_name);
       std::vector<uint16_t> emb_row(size_t(e.shape[1]));
       st.read_into(embed_name, emb_row.data(), emb_row.size() * 2);  // token 0 embedding
