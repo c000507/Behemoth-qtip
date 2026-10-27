@@ -1,6 +1,7 @@
 #include "behemoth/gpu.hpp"
 #include "device_numeric.hpp"
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <rocwmma/rocwmma.hpp>
@@ -651,8 +652,12 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_v1_kernel(Meta m,
 //  - the dot-product index order (d for S^T, key for O^T) is permuted so that a lane's two
 //    consecutive instructions read one contiguous 16-byte chunk.
 // The accumulator O^T (lane: query column, 8 d rows per fragment) is rescaled per lane.
-// Per key tile and wave: 32 WMMA, 8 + 16 operand LDS loads, ~300 VALU (v1: 32 WMMA, ~170 LDS
-// loads of which 128 single bytes, ~900 VALU, 96 lane permutes).
+// Round 6 (PERF_ROUND6_REPORT.md): LDS-only barriers (the K/V register prefetch stays in
+// flight), select-only V transposition (no dynamic register indexing / BF16 scratch), log2-unit
+// softmax on raw v_exp_f32, reciprocal + packed FP8 conversion of P, unmasked fast path for
+// fully visible key tiles, O^T accumulated by the WMMA itself (in P-scale units), and 64-key
+// staged tiles (two 32-key sub-tiles per barrier pair) for FP8.
+// Per 32-key sub-tile and wave: 32 WMMA, 8 + 16 operand LDS loads, ~250 VALU.
 template <bool BF16> struct Mma;
 template <> struct Mma<false> {
     using reg = int __attribute__((ext_vector_type(2))); // 8 fp8
@@ -672,6 +677,24 @@ template <> struct Mma<true> {
 __device__ __forceinline__ int kbase(int s, int h) {
     return 32 * (s >> 1) + 16 * h + 8 * (s & 1);
 }
+// Workgroup barrier ordering LDS only: __syncthreads() also waits for outstanding global loads,
+// which would drain the K/V register prefetch of the next tile at every barrier.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+// x[(j - r) & 3] for j = 0..3 (rotation by a per-lane r in 0..3) with selects only.
+template <class T> __device__ __forceinline__ void rotate4(const T (&x)[4], int r, T (&y)[4]) {
+    T t[4];
+    const bool r1 = r & 1, r2 = r & 2;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        t[j] = r1 ? x[(j + 3) & 3] : x[j];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        y[j] = r2 ? t[(j + 2) & 3] : t[j];
+}
 template <bool BF16>
 __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, AttentionDeviceView a,
                                                                       float *partial, int parts,
@@ -684,11 +707,14 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
     constexpr int VROW = 32 * EB + 8; // Vt row bytes (padded: conflict-free dword stores)
     constexpr int k_bytes = 32 * KROW, v_bytes = 128 * VROW;
     constexpr int stage_tiles = 6 / EB, stage_bytes = stage_tiles * 16 * 128 * EB; // 12 KB
-    constexpr int loop_bytes = k_bytes + v_bytes + 2 * 32 * 4;
+    constexpr int SUB = BF16 ? 1 : 2;
+    static_assert(SUB == 1 || SUB == 2, "key tile 32 or 64");
+    constexpr int loop_bytes = SUB * (k_bytes + v_bytes + 2 * 32 * 4);
     constexpr int shared_bytes = stage_bytes > loop_bytes ? stage_bytes : loop_bytes;
     __shared__ __attribute__((aligned(16))) unsigned char shared[shared_bytes];
-    unsigned char *kt = shared, *vt = shared + k_bytes;
-    float *ks = reinterpret_cast<float *>(shared + k_bytes + v_bytes), *vs = ks + 32;
+    // sub-tile j: K at kt0 + j k_bytes, Vt at vt0 + j v_bytes, scales ks0/vs0 + 32 j
+    unsigned char *const kt0 = shared, *const vt0 = shared + SUB * k_bytes;
+    float *const ks0 = reinterpret_cast<float *>(shared + SUB * (k_bytes + v_bytes)), *const vs0 = ks0 + 32 * SUB;
     const int tid = int(threadIdx.x), wave = tid >> 5, lane = tid & 31, req = int(blockIdx.x),
               kh = int(blockIdx.y), part = int(blockIdx.z) % parts, tile = int(blockIdx.z) / parts;
     const int first = m.offsets[req] + tile * 16, stop = m.offsets[req + 1], head = kh * 12 + wave;
@@ -698,8 +724,11 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
     const int g = first + c;
     const bool live = g < stop;
     const float qscale = BF16 || !live ? 1.f : a.q_scale[size_t(g) * size_t(m.qh) + size_t(head)];
+    // scores in log2 units: exp(x) = exp2(x * log2 e); mx is converted back at the output
+    const float score_scale = qscale * (0.08838834764831845f * 1.4426950408889634f);
     const int pos = live ? m.pos[g] : -1;
     float mx = -INFINITY, den = 0;
+    float ps_acc = 1.f; // acc holds O^T / ps_acc (the WMMA accumulates in P-scale units)
     // Q (B operand of S^T): staged through LDS in rounds, then kept in registers.
     Reg qreg[8];
     for (int round = 0; round < prefill_waves; round += stage_tiles) {
@@ -739,17 +768,22 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
             acc[n][i] = 0.f;
     const int begin = partition_keys ? part * partition_keys : 0;
     const int end = partition_keys ? min(m.len[req], begin + partition_keys) : m.len[req];
-    int tile_last = -1;
-    for (int gg = first; gg < min(stop, first + 16); ++gg)
+    int tile_last = -1, tile_first = INT_MAX;
+    for (int gg = first; gg < min(stop, first + 16); ++gg) {
         tile_last = max(tile_last, m.pos[gg]);
+        tile_first = min(tile_first, m.pos[gg]);
+    }
     const int limit = min(end, tile_last + 1);
     // K/V tile staging: waves 0..7 own d chunk 16*wave..+16 of key `lane` (16-byte loads, one
     // tile ahead in registers); waves 8, 9 the K and V scales.
-    uint4 kreg{}, vreg{};
+    uint4 kregs[SUB]{}, vregs[SUB]{};
     float sreg = 1;
-    auto fetch = [&](int base) {
+    auto fetch = [&](int base0) {
         if (tid < 256) {
-            const int t = base + lane, d = wave * 16;
+#pragma unroll
+          for (int j = 0; j < SUB; ++j) {
+            uint4 &kreg = kregs[j], &vreg = vregs[j];
+            const int t = base0 + 32 * j + lane, d = wave * 16;
             const bool valid = t < limit;
             const int page = valid ? m.table[req * m.stride + t / 16] : 0;
             const size_t loc = (size_t(page) * size_t(m.kh) + size_t(kh)) * 16 + size_t(t % 16);
@@ -760,16 +794,22 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                 kreg = uint4{0, 0, 0, 0};
                 vreg = uint4{0, 0, 0, 0};
             }
-        } else if (tid < 320) {
-            const int t = base + lane;
+          }
+        } else if (tid < 256 + 64 * SUB) {
+            // wave 8 + 2 j: K scales of sub-tile j, wave 9 + 2 j: V scales
+            const int t = base0 + 32 * ((wave - 8) >> 1) + lane;
             const bool valid = t < limit;
             const int page = valid ? m.table[req * m.stride + t / 16] : 0;
             const size_t loc = (size_t(page) * size_t(m.kh) + size_t(kh)) * 16 + size_t(t % 16);
-            sreg = valid ? (tid < 288 ? a.k_scale[loc] : a.v_scale[loc]) : 1.f;
+            sreg = valid ? ((wave & 1) == 0 ? a.k_scale[loc] : a.v_scale[loc]) : 1.f;
         }
     };
     auto store = [&] {
         if (tid < 256) {
+#pragma unroll
+          for (int j = 0; j < SUB; ++j) {
+            const uint4 &kreg = kregs[j], &vreg = vregs[j];
+            unsigned char *const kt = kt0 + j * k_bytes, *const vt = vt0 + j * v_bytes;
             const int key = lane, c16 = wave; // d = 16 * c16 .. + 16
             if constexpr (BF16) {
                 const uint8_t *kb = reinterpret_cast<const uint8_t *>(&kreg);
@@ -795,16 +835,27 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                 for (int j = 0; j < 4; ++j)
                     own[j] = *reinterpret_cast<const uint2 *>(vw + 4 * j);
                 uint2 got[4]; // got[r'] = key (q4 + r')'s d group r
-                got[r] = own[r];
+                {
+                    uint32_t ox[4], oy[4], gx[4], gy[4];
 #pragma unroll
-                for (int kk = 1; kk < 4; ++kk) {
-                    const int src = (r + kk) & 3, sel = (r - kk) & 3;
-                    const uint2 val = sel == 0 ? own[0] : sel == 1 ? own[1] : sel == 2 ? own[2] : own[3];
-                    const uint2 y = make_uint2(__shfl(val.x, q4 + src), __shfl(val.y, q4 + src));
-                    if (src == 0) got[0] = y;
-                    else if (src == 1) got[1] = y;
-                    else if (src == 2) got[2] = y;
-                    else got[3] = y;
+                    for (int j = 0; j < 4; ++j) {
+                        ox[j] = own[j].x;
+                        oy[j] = own[j].y;
+                    }
+                    uint32_t sx[4], sy[4], rx[4], ry[4];
+                    const uint32_t mx_[4] = {ox[0], ox[3], ox[2], ox[1]}, my_[4] = {oy[0], oy[3], oy[2], oy[1]};
+                    rotate4(mx_, r, sx);
+                    rotate4(my_, r, sy);
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        rx[kk] = kk ? uint32_t(__shfl(int(sx[kk]), q4 + ((r + kk) & 3))) : sx[0];
+                        ry[kk] = kk ? uint32_t(__shfl(int(sy[kk]), q4 + ((r + kk) & 3))) : sy[0];
+                    }
+                    rotate4(rx, r, gx);
+                    rotate4(ry, r, gy);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        got[j] = make_uint2(gx[j], gy[j]);
                 }
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -822,17 +873,16 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                 const int r = lane & 3, q4 = lane & ~3;
                 const uint32_t own[4] = {vreg.x, vreg.y, vreg.z, vreg.w}; // d groups 0..3
                 uint32_t got[4]; // got[r'] = key (q4 + r')'s d group r
-                got[r] = own[r];
+                // send own[(r - kk) & 3] to lane q4 + ((r + kk) & 3); receive from that lane
+                // into got[(r + kk) & 3]: two select rotations instead of dynamic indexing
+                // send[kk] = own[(r - kk) & 3] = rotation of {own[0], own[3], own[2], own[1]}
+                uint32_t send[4], recv[4];
+                const uint32_t mirror[4] = {own[0], own[3], own[2], own[1]};
+                rotate4(mirror, r, send);
 #pragma unroll
-                for (int kk = 1; kk < 4; ++kk) {
-                    const int src = (r + kk) & 3, sel = (r - kk) & 3;
-                    const uint32_t val = sel == 0 ? own[0] : sel == 1 ? own[1] : sel == 2 ? own[2] : own[3];
-                    const uint32_t y = __shfl(val, q4 + src);
-                    if (src == 0) got[0] = y;
-                    else if (src == 1) got[1] = y;
-                    else if (src == 2) got[2] = y;
-                    else got[3] = y;
-                }
+                for (int kk = 0; kk < 4; ++kk)
+                    recv[kk] = kk ? uint32_t(__shfl(int(send[kk]), q4 + ((r + kk) & 3))) : send[0];
+                rotate4(recv, r, got); // got[j] = recv[(j - r) & 3]
                 // byte i of got[0..3] -> dword (key q4+0 .. q4+3) for d = 16 c16 + 4 r + i
                 const uint32_t lo01 = __builtin_amdgcn_perm(got[1], got[0], 0x05040100U),
                                hi01 = __builtin_amdgcn_perm(got[1], got[0], 0x07060302U),
@@ -849,19 +899,26 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                 *reinterpret_cast<uint32_t *>(vrow + 2 * VROW) = o2;
                 *reinterpret_cast<uint32_t *>(vrow + 3 * VROW) = o3;
             }
-        } else if (tid < 288) {
-            ks[lane] = sreg;
-        } else if (tid < 320) {
-            vs[lane] = sreg;
+          }
+        } else if (tid < 256 + 64 * SUB) {
+            const int j = (wave - 8) >> 1;
+            ((wave & 1) == 0 ? ks0 : vs0)[32 * j + lane] = sreg;
         }
     };
     if (begin < limit)
         fetch(begin);
-    for (int base = begin; base < limit; base += 32) {
+    for (int base0 = begin; base0 < limit; base0 += 32 * SUB) {
         store();
-        if (base + 32 < limit)
-            fetch(base + 32);
-        __syncthreads();
+        if (base0 + 32 * SUB < limit)
+            fetch(base0 + 32 * SUB);
+        lds_barrier();
+#pragma unroll
+      for (int j = 0; j < SUB; ++j) {
+        const int base = base0 + 32 * j;
+        if (base >= limit)
+            break;
+        const unsigned char *const kt = kt0 + j * k_bytes, *const vt = vt0 + j * v_bytes;
+        const float *const ks = ks0 + 32 * j, *const vs = vs0 + 32 * j;
         // S^T tiles n = 0, 1: row 8h+i of tile n is key 16h + 8n + i; A operand row c is key
         // key(n, c) = 16 (c/8) + 8n + c%8.
         f32x8_t sc[2];
@@ -898,18 +955,30 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                          k1 = *reinterpret_cast<const float4 *>(ks + 16 * h + 8 * n + 4);
             kscale[n][0] = k0.x; kscale[n][1] = k0.y; kscale[n][2] = k0.z; kscale[n][3] = k0.w;
             kscale[n][4] = k1.x; kscale[n][5] = k1.y; kscale[n][6] = k1.z; kscale[n][7] = k1.w;
+            if (base + 32 <= limit && base + 31 <= tile_first) {
+                // block-uniform: every key of the tile is visible to every query of the tile
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float s = sc[n][i] * score_scale * kscale[n][i];
+                    sc[n][i] = s;
+                    tile_max = fmaxf(tile_max, s);
+                }
+            } else {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int t = base + 16 * h + 8 * n + i;
                 const bool keep = t < limit && t <= pos;
-                const float s = keep ? sc[n][i] * qscale * kscale[n][i] * 0.08838834764831845f : -INFINITY;
+                const float s = keep ? sc[n][i] * score_scale * kscale[n][i] : -INFINITY;
                 sc[n][i] = s;
                 tile_max = fmaxf(tile_max, s);
+            }
             }
         }
         tile_max = fmaxf(tile_max, __shfl_xor(tile_max, 16));
         const float next = fmaxf(mx, tile_max);
-        const float alpha = isfinite(mx) ? expf(mx - next) : 0;
+        // raw v_exp_f32: exp2(-inf) = 0; an all-masked row so far keeps next = -inf
+        const float alpha = mx == next ? 1.f : __builtin_amdgcn_exp2f(mx - next);
+        const float shift = isfinite(next) ? next : 0.f;
         float sum = 0, weighted_max = 0;
         float pv[2][8];
 #pragma unroll
@@ -919,7 +988,7 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
             const float vsc[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float probability = isfinite(sc[n][i]) ? expf(sc[n][i] - next) : 0;
+                const float probability = __builtin_amdgcn_exp2f(sc[n][i] - shift);
                 sum += probability;
                 pv[n][i] = probability * vsc[i];
                 weighted_max = fmaxf(weighted_max, pv[n][i]);
@@ -927,12 +996,37 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
         }
         sum += __shfl_xor(sum, 16);
         weighted_max = fmaxf(weighted_max, __shfl_xor(weighted_max, 16));
-        const float pscale = BF16 ? 1.f : device::scale(weighted_max);
+        // device::scale without the IEEE division (the P operand is FP8 anyway)
+        float pscale = BF16 || weighted_max == 0 ? 1.f : fmaxf(weighted_max * (1.f / 448.f), 0x1p-126f);
+        float rescale = alpha;
+        if constexpr (!BF16) {
+            const float carry = alpha * ps_acc; // current accumulator unit relative to this tile
+            // bounded growth of acc / pscale: contributions below 2^-24 of the carried scale
+            // are quantized relative to it
+            pscale = fmaxf(pscale, carry * 0x1p-24f);
+            rescale = carry * __builtin_amdgcn_rcpf(pscale);
+            if (carry == pscale)
+                rescale = 1.f;
+            ps_acc = pscale;
+        }
         den = den * alpha + sum;
         mx = next;
         // P^T as the B operand of O^T = Vt . P^T: instruction kk covers keys 16h + 8kk + e,
         // i.e. tile n = kk of this lane.
         Reg preg[2];
+        if constexpr (!BF16) {
+            // finite non-negative inputs <= ~448: hardware packed conversion, no NaN/inf policy
+            const float inv = __builtin_amdgcn_rcpf(pscale);
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                int w0 = 0, w1 = 0;
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[n][0] * inv, pv[n][1] * inv, w0, false);
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[n][2] * inv, pv[n][3] * inv, w0, true);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[n][4] * inv, pv[n][5] * inv, w1, false);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[n][6] * inv, pv[n][7] * inv, w1, true);
+                preg[n] = __builtin_bit_cast(Reg, make_int2(w0, w1));
+            }
+        } else
 #pragma unroll
         for (int n = 0; n < 2; ++n) {
             Raw pr[8];
@@ -942,13 +1036,17 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
             preg[n] = __builtin_bit_cast(Reg, pr);
         }
         // O^T: 8 d tiles; lane (h, c): column = query c, rows d = 16 nd + 8h + i.
+        // wave-uniform skip: no lane's unit changed
+        const bool scale_acc = __builtin_amdgcn_ballot_w32(rescale != 1.f) != 0;
 #pragma unroll
         for (int nd = 0; nd < 8; ++nd) {
             const unsigned char *vrow = vt + (16 * nd + c) * VROW;
             f32x8_t o;
+            o = acc[nd];
+            if (scale_acc)
 #pragma unroll
-            for (int i = 0; i < 8; ++i)
-                o[i] = 0.f;
+                for (int i = 0; i < 8; ++i)
+                    o[i] *= rescale;
 #pragma unroll
             for (int kk = 0; kk < 2; ++kk) {
                 Reg vr;
@@ -960,11 +1058,10 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                     vr = __builtin_bit_cast(Reg, *reinterpret_cast<const uint2 *>(vrow + 16 * h + 8 * kk));
                 o = M::mma(vr, preg[kk], o);
             }
-#pragma unroll
-            for (int i = 0; i < 8; ++i)
-                acc[nd][i] = acc[nd][i] * alpha + o[i] * pscale;
+            acc[nd] = o;
         }
-        __syncthreads();
+      }
+        lds_barrier();
     }
     if (!live)
         return;
@@ -977,10 +1074,11 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
             uint16_t ob[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                ob[i] = device::bf16(den > 0 ? acc[nd][i] / den : 0);
+                ob[i] = device::bf16(den > 0 ? acc[nd][i] * ps_acc / den : 0);
             (void)inv;
             *reinterpret_cast<uint4 *>(o + 16 * nd + 8 * h) = *reinterpret_cast<const uint4 *>(ob);
         }
+        mx *= 0.6931471805599453f; // back to natural-log units
         if (h == 0) {
             if (a.maximum)
                 a.maximum[row] = mx;
@@ -988,13 +1086,14 @@ __global__ __launch_bounds__(prefill_threads) void gqa_prefill_kernel(Meta m, At
                 a.denominator[row] = den;
         }
     } else {
+        mx *= 0.6931471805599453f;
         float *dst = partial + (row * size_t(parts) + size_t(part)) * 130;
 #pragma unroll
         for (int nd = 0; nd < 8; ++nd)
 #pragma unroll
             for (int i = 0; i < 8; i += 2)
                 *reinterpret_cast<float2 *>(dst + 2 + 16 * nd + 8 * h + i) =
-                    make_float2(acc[nd][i], acc[nd][i + 1]);
+                    make_float2(acc[nd][i] * ps_acc, acc[nd][i + 1] * ps_acc);
         if (h == 0) {
             dst[0] = mx;
             dst[1] = den;
