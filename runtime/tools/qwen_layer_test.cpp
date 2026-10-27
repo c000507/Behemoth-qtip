@@ -169,6 +169,17 @@ int main(int argc, char **argv) {
                     t[size_t(i)] = double(v * (1.0f + b16(ln_in_h[size_t(i)])) * hq.su[size_t(i)]);
                 }
                 qtip::hadamard(t.data(), H, true);
+                if (r == 0) {
+                    std::printf("u gpu[:8]: ");
+                    for (int i = 0; i < 8; ++i) std::printf("%.4f ", double(b16(ug[size_t(i)])));
+                    std::printf("\nu cpu[:8]: ");
+                    for (int i = 0; i < 8; ++i) std::printf("%.4f ", t[size_t(i)]);
+                    std::printf("\nu gpu[1016:1024]: ");
+                    for (int i = 1016; i < 1024; ++i) std::printf("%.4f ", double(b16(ug[size_t(i)])));
+                    std::printf("\nu cpu[1016:1024]: ");
+                    for (int i = 1016; i < 1024; ++i) std::printf("%.4f ", t[size_t(i)]);
+                    std::printf("\n");
+                }
                 for (int i = 0; i < H; ++i)
                     du = std::max(du, double(std::fabs(double(b16(ug[size_t(r) * H + size_t(i)])) - t[size_t(i)])));
             }
