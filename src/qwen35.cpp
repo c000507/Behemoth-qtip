@@ -492,7 +492,7 @@ void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, 
 void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
                       const std::vector<std::shared_ptr<QwenLayer>>& layers, const QwenCpuRefs& refs,
                       const int32_t* tokens, int T, float* logits, int nthreads, int capture_layer,
-                      std::vector<float>* captured) {
+                      std::vector<float>* captured, std::vector<float>* all_layers) {
   static std::string prefix;
   if (prefix.empty()) prefix = detect_prefix(st);
   const int H = cfg.hidden, hd = cfg.hd, nq = cfg.nq, nkv = cfg.nkv, gq = nq / nkv;
@@ -753,6 +753,7 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
       captured->assign(x.begin(), x.end());
       capture_layer = -1;
     }
+    if (all_layers) all_layers->insert(all_layers->end(), x.begin(), x.end());
   }
   // final norm + lm_head
   std::vector<float> xf(size_t(T) * H);

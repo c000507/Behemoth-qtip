@@ -1,5 +1,6 @@
 // CPU fp32 reference forward for a dense Qwen3.5 checkpoint; prints logits (optionally saves .bin).
-// usage: qwen35_ref <model_dir> [tokens_file: int32 raw] [T] [logits_out.bin]
+// usage: qwen35_ref <model_dir> [tokens_file: int32 raw] [T] [logits_out.bin] [layers_out.bin]
+// layers_out.bin: fp32 [layers][T][hidden] residual after each layer (parity debugging).
 // Without a tokens file, tokenizes nothing: uses the ids from tools/qwen35_hf_ref.py's prompt baked in.
 #include <cstdio>
 #include <cstdlib>
@@ -37,9 +38,10 @@ int main(int argc, char** argv) {
   }
   std::vector<std::shared_ptr<QwenLayer>> layers;
   for (int L = 0; L < cfg.layers; ++L) layers.push_back(read_qwen_layer(st, cfg, L));
-  std::vector<float> logits(size_t(T) * cfg.vocab);
+  std::vector<float> logits(size_t(T) * cfg.vocab), all_layers;
   double t0 = now_s();
-  qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, toks.data(), T, logits.data(), 64);
+  qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, toks.data(), T, logits.data(), 64, -1, nullptr,
+                   argc >= 6 ? &all_layers : nullptr);
   std::printf("forward: %d tokens in %.1fs (%.0f tok/s)\n", T, now_s() - t0, T / (now_s() - t0));
   for (int t = 0; t < T; ++t) {
     int am = 0;
@@ -50,6 +52,10 @@ int main(int argc, char** argv) {
   if (argc >= 5) {
     std::ofstream f(argv[4], std::ios::binary);
     f.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
+  }
+  if (argc >= 6) {
+    std::ofstream f(argv[5], std::ios::binary);
+    f.write(reinterpret_cast<const char*>(all_layers.data()), std::streamsize(all_layers.size() * 4));
   }
   return 0;
 }

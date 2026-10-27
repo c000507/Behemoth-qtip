@@ -111,6 +111,7 @@ void qwen_cpu_layer(const QwenConfig& cfg, const QwenLayer& l, float* x, int T, 
 void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
                       const std::vector<std::shared_ptr<QwenLayer>>& layers, const QwenCpuRefs& refs,
                       const int32_t* tokens, int T, float* logits, int nthreads = 32,
-                      int capture_layer = -1, std::vector<float>* captured = nullptr);
+                      int capture_layer = -1, std::vector<float>* captured = nullptr,
+                      std::vector<float>* all_layers = nullptr);  // [layers][T][hidden] residuals
 
 }  // namespace qtip
