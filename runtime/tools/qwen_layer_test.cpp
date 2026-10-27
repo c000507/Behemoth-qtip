@@ -168,8 +168,9 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < H; ++i) ss += double(xs2[size_t(r) * H + i]) * xs2[size_t(r) * H + i];
                 float inv = float(1.0 / std::sqrt(ss / H + c.eps));
                 for (int i = 0; i < H; ++i) {
-                    float v = b16(to16(xs2[size_t(r) * H + i] * inv));
-                    if (!std::getenv("NONORM")) v *= (1.0f + b16(ln_in_h[size_t(i)]));
+                    float v;
+                    if (std::getenv("NONORM")) v = xs2[size_t(r) * H + i];
+                    else v = b16(to16(xs2[size_t(r) * H + i] * inv)) * (1.0f + b16(ln_in_h[size_t(i)]));
                     t[size_t(i)] = double(v * hq.su[size_t(i)]);
                 }
                 qtip::hadamard(t.data(), H, true);
