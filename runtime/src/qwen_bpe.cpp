@@ -37,7 +37,7 @@ const std::map<std::string, unsigned char> &unicode_to_bytes() {
     static std::map<std::string, unsigned char> m = [] {
         std::map<std::string, unsigned char> r;
         const auto &bm = bytes_to_unicode();
-        for (int b = 0; b < 256; ++b) r[bm[size_t(b)]] = unsigned char(b);
+        for (int b = 0; b < 256; ++b) r[bm[size_t(b)]] = static_cast<unsigned char>(b);
         return r;
     }();
     return m;
