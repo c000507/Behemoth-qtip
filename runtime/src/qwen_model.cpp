@@ -339,14 +339,13 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
         up16(w.ln_in, "input_layernorm.weight");
         up16(w.ln_post, "post_attention_layernorm.weight");
     }
-    std::string embed_name = "model.embed_tokens.weight", norm_name = "model.norm.weight";
-    for (auto &kv : ck.index) {
-        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight")
-            embed_name = kv.first;
-        if (kv.first.size() > 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
-            kv.first.find("layers.") == std::string::npos)
-            norm_name = kv.first;
-    }
+    std::string embed_name, norm_name;
+    for (std::string nm : {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"})
+        if (ck.index.count(nm)) embed_name = nm;
+    for (std::string nm : {"model.language_model.norm.weight", "model.norm.weight"})
+        if (ck.index.count(nm)) norm_name = nm;
+    if (embed_name.empty() || norm_name.empty())
+        throw std::runtime_error("cannot find embed_tokens / final norm in the checkpoint index");
     embed.upload(bf16_raw(ck, embed_name));
     final_norm.upload(bf16_raw(ck, norm_name));
     if (!cfg.tied) {

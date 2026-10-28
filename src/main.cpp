@@ -1159,14 +1159,25 @@ void Pipeline::assemble() {
   if (!fs::exists(ef)) {
     SafeTensorsWriter w;
     if (qwen_) {
-      std::string norm_name = "model.norm.weight", embed_name = "model.embed_tokens.weight";
-      for (auto& kv : st_.tensors()) {
-        if (kv.first.size() >= 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
-            kv.first.find("layers.") == std::string::npos)
-          norm_name = kv.first;
-        if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight")
-          embed_name = kv.first;
+      // explicit candidates first: a plain suffix scan also matches mtp.norm.weight /
+      // model.visual.merger.norm.weight and the last match would win with the WRONG tensor
+      std::string norm_name, embed_name;
+      for (std::string nm : {"model.language_model.norm.weight", "model.norm.weight"})
+        if (st_.has(nm)) norm_name = nm;
+      for (std::string nm : {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"})
+        if (st_.has(nm)) embed_name = nm;
+      if (norm_name.empty() || embed_name.empty()) {
+        for (auto& kv : st_.tensors()) {
+          if (kv.first.find("mtp.") == 0 || kv.first.find("model.visual.") == 0) continue;
+          if (kv.first.size() >= 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
+              kv.first.find("layers.") == std::string::npos && norm_name.empty())
+            norm_name = kv.first;
+          if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight" &&
+              embed_name.empty())
+            embed_name = kv.first;
+        }
       }
+      QCHECK(!norm_name.empty() && !embed_name.empty(), "cannot find final norm / embeddings");
       for (std::string nm : {embed_name, norm_name}) {
         const TensorInfo& t = st_.info(nm);
         std::vector<uint8_t> v = st_.read(nm);
