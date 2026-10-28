@@ -316,8 +316,39 @@ class Replica {
     std::vector<float> values();
     std::vector<float> grad_values();
 };
-void save_checkpoint(const fs::path &, Replica &, const Progress &, const json &signature);
-Progress load_checkpoint(const fs::path &, const std::vector<std::unique_ptr<Replica>> &, const json &);
+// Host side of the optimizer. Wscale is trained in log space relative to its
+// initial value, Wscale = Wscale0 * exp(d) with d = 0 at start: dL/dd =
+// Wscale * dL/dWscale = sum(dL/dW * W) over the matrix, so the gradient no longer
+// carries the 1/Wscale factor and one Adam step changes Wscale by a relative,
+// not absolute, amount. Device parameter slots always hold the effective
+// Wscale (kernels and export read it unchanged); d and its Adam moments are kept
+// here, in FP32, with the same Adam constants as the device. Every other
+// parameter uses device AdamW.
+class Optimizer {
+    const Model &model_;
+    const Options &options_;
+    std::vector<Param> device_params_;
+
+  public:
+    std::vector<size_t> scales;       // parameter indices of the Wscale scalars
+    std::vector<float> initial, ratio, first, second; // Wscale0, d and its Adam moments
+    Optimizer(const Model &, const Options &);
+    float effective(size_t i) const; // Wscale0 * exp(d), as stored on the device
+    // In place: dL/dWscale -> dL/dd for the Wscale slots of a summed gradient.
+    void to_log_scale(std::span<float> gradient) const;
+    // Clip in place; returns the scale applied to each group.
+    std::array<float, group_count> clip(std::span<float> gradient, const GradientStats &) const;
+    // Adam update of every replica with an already clipped gradient (step is 1-based).
+    void step(const std::vector<Replica *> &, std::span<const float> gradient, uint64_t step, float rate);
+    // Upload the effective Wscale values into a replica's parameter slots.
+    void publish(Replica &) const;
+};
+inline constexpr int checkpoint_format = 4;
+void save_checkpoint(const fs::path &, Replica &, const Optimizer &, const Progress &, const json &signature);
+// Accepts the current format and converts format 3 (raw Wscale) checkpoints whose
+// remaining signature matches.
+Progress load_checkpoint(const fs::path &, const std::vector<std::unique_ptr<Replica>> &, Optimizer &,
+                         const json &signature);
 int train(const Options &);
 void write_tiny_model(const fs::path &, int layers = 2);
 void write_tiny_data(const fs::path &, int sequences = 3);

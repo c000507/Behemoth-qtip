@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <numeric>
+#include <set>
 #include <unistd.h>
 
 namespace qat {
@@ -15,7 +16,8 @@ json Options::signature(const Model &m, const Dataset &d) const {
     json schema = json::array();
     for (auto &p : m.params)
         schema.push_back({p.name, p.offset, p.size, p.norm});
-    return {{"format", 3},
+    return {{"format", checkpoint_format},
+            {"wscale_param", "log_ratio"},
             {"model", m.identity},
             {"data", d.identity},
             {"schema", schema},
@@ -120,7 +122,8 @@ double Replica::run(const Batch &b, const Options &o, size_t denominator, bool b
     op.synchronize();
     return loss;
 }
-void save_checkpoint(const fs::path &root, Replica &r, const Progress &p, const json &signature) {
+void save_checkpoint(const fs::path &root, Replica &r, const Optimizer &opt, const Progress &p,
+                     const json &signature) {
     fs::create_directories(root);
     // Keep one snapshot: the previous one is removed only after the new one is published.
     std::string previous;
@@ -132,16 +135,30 @@ void save_checkpoint(const fs::path &root, Replica &r, const Progress &p, const 
     fs::create_directory(temp);
     try {
         qtip::SafeTensorsWriter writer;
-        auto save = [&](const char *name, Mat m) {
-            std::vector<float> v(m.size());
-            r.ops->download(m, v);
+        std::vector<std::vector<float>> keep;
+        auto save = [&](const char *name, std::vector<float> v) {
             for (float x : v)
                 require(std::isfinite(x), "nonfinite checkpoint");
-            writer.add(name, "F32", {int64_t(v.size())}, v.data(), v.size() * 4);
+            keep.push_back(std::move(v));
+            writer.add(name, "F32", {int64_t(keep.back().size())}, keep.back().data(), keep.back().size() * 4);
         };
-        save("parameters", r.parameters);
-        save("adam_m", r.first);
-        save("adam_v", r.second);
+        auto device = [&](Mat m) {
+            std::vector<float> v(m.size());
+            r.ops->download(m, v);
+            return v;
+        };
+        // Wscale slots: parameters hold the effective Wscale; the Adam moments are
+        // those of the log ratio d, which is stored exactly in wscale_log_ratio.
+        auto first = device(r.first), second = device(r.second);
+        for (size_t i = 0; i < opt.scales.size(); ++i) {
+            auto offset = r.model.params[opt.scales[i]].offset;
+            first[offset] = opt.first[i];
+            second[offset] = opt.second[i];
+        }
+        save("parameters", device(r.parameters));
+        save("adam_m", std::move(first));
+        save("adam_v", std::move(second));
+        save("wscale_log_ratio", opt.ratio);
         auto state = temp / "state.safetensors";
         writer.write(state.string());
         int fd = open(state.c_str(), O_RDONLY);
@@ -170,7 +187,7 @@ void save_checkpoint(const fs::path &root, Replica &r, const Progress &p, const 
     }
 }
 Progress load_checkpoint(const fs::path &input, const std::vector<std::unique_ptr<Replica>> &replicas,
-                         const json &signature) {
+                         Optimizer &opt, const json &signature) {
     require(input.extension() != ".pt",
             "Python .pt checkpoints are unsupported. Start from an exported model or a native checkpoint.");
     auto root = input;
@@ -184,24 +201,71 @@ Progress load_checkpoint(const fs::path &input, const std::vector<std::unique_pt
         root /= name;
     }
     auto meta = read_json(root / "metadata.json");
-    require(meta.at("signature") == signature, "checkpoint model/data/schedule/backend differs");
+    const auto &saved = meta.at("signature");
+    int format = saved.value("format", 0);
+    require(format == 3 || format == checkpoint_format,
+            "unsupported checkpoint format " + std::to_string(format) + " (expected 3 or " +
+                std::to_string(checkpoint_format) + ")");
+    if (format == 3) {
+        // Format 3 trained raw Wscale. Everything it recorded must still match.
+        static const std::set<std::string> v3 = {"format", "model",     "data",   "schema", "devices",
+                                                 "rounding", "rows",    "loss_rows", "lr", "norm_lr",
+                                                 "decay",  "clip",      "warmup", "max_tokens", "backend"};
+        json legacy = json::object();
+        for (auto &[key, value] : signature.items())
+            if (v3.contains(key))
+                legacy[key] = value;
+        legacy["format"] = 3;
+        require(saved == legacy, "checkpoint model/data/schedule/backend differs");
+    } else
+        require(saved == signature, "checkpoint model/data/schedule/backend/optimizer differs");
     require(sha256(root / "state.safetensors") == meta.at("state_sha256").get<std::string>(),
             "checkpoint checksum mismatch");
     behemoth::SafeTensorFile f(root / "state.safetensors");
-    for (auto name : {"parameters", "adam_m", "adam_v"}) {
+    auto read = [&](const char *name, size_t size) {
         auto v = f.floats(name);
-        require(f.dtype(name) == "F32" && v.size() == replicas.front()->parameters.size(),
-                "checkpoint tensor mismatch");
+        require(f.dtype(name) == "F32" && v.size() == size, std::string("checkpoint tensor mismatch: ") + name);
         std::vector<float> data(v.size());
         for (size_t i = 0; i < v.size(); ++i) {
             data[i] = v[i];
             require(std::isfinite(data[i]), "nonfinite checkpoint state");
         }
-        for (auto &r : replicas)
-            r->ops->upload(std::string(name) == "parameters" ? r->parameters
-                           : std::string(name) == "adam_m"   ? r->first
-                                                             : r->second,
-                           data);
+        return data;
+    };
+    size_t n = replicas.front()->parameters.size();
+    auto parameters = read("parameters", n), first = read("adam_m", n), second = read("adam_v", n);
+    const auto &params = replicas.front()->model.params;
+    if (format == 3) {
+        // d = log(Wscale / Wscale0). With g_d = Wscale * g_Wscale, the raw moments
+        // map to first-order as m_d = Wscale * m, v_d = Wscale^2 * v.
+        for (size_t i = 0; i < opt.scales.size(); ++i) {
+            auto offset = params[opt.scales[i]].offset;
+            float w = parameters[offset];
+            require(w > 0, "format 3 checkpoint has a non-positive Wscale; cannot convert to log scale");
+            opt.ratio[i] = float(std::log(double(w) / opt.initial[i]));
+            opt.first[i] = float(double(first[offset]) * w);
+            opt.second[i] = float(double(second[offset]) * w * w);
+            first[offset] = second[offset] = 0;
+        }
+        std::cerr << "converted format 3 checkpoint " << root
+                  << ": Wscale continues as a log ratio to its initial value with transformed Adam moments. "
+                     "The other moments were accumulated under the old gradient scaling.\n";
+    } else {
+        auto ratio = read("wscale_log_ratio", opt.scales.size());
+        for (size_t i = 0; i < opt.scales.size(); ++i) {
+            auto offset = params[opt.scales[i]].offset;
+            opt.ratio[i] = ratio[i];
+            opt.first[i] = first[offset];
+            opt.second[i] = second[offset];
+            require(std::abs(parameters[offset] - opt.effective(i)) <= 1e-6f * opt.effective(i),
+                    "checkpoint Wscale does not match its log ratio");
+        }
+    }
+    for (auto &r : replicas) {
+        r->ops->upload(r->parameters, parameters);
+        r->ops->upload(r->first, first);
+        r->ops->upload(r->second, second);
+        opt.publish(*r);
     }
     return {meta.at("step"), meta.at("position"), meta.at("tokens"), meta.at("supervised")};
 }
@@ -232,9 +296,13 @@ int train(const Options &o) {
         replicas.push_back(std::make_unique<Replica>(m, device, int(d.length), o.arena_bytes, o.rounding));
     }
     auto signature = o.signature(m, d);
+    Optimizer optimizer(m, o);
+    std::vector<Replica *> all;
+    for (auto &r : replicas)
+        all.push_back(r.get());
     Progress p;
     if (!o.resume.empty())
-        p = load_checkpoint(o.resume, replicas, signature);
+        p = load_checkpoint(o.resume, replicas, optimizer, signature);
     require(p.position <= count, "checkpoint position outside training budget");
     if (o.eval) {
         double loss = 0;
@@ -279,11 +347,10 @@ int train(const Options &o) {
             for (size_t j = 0; j < g.size(); ++j)
                 gradient[j] += g[j];
         }
+        optimizer.to_log_scale(gradient);
         auto stats = gradient_stats(m.params, gradient);
         double norm = stats.norm;
-        float factor = o.clip > 0 ? float(std::min(1., double(o.clip) / (norm + 1e-6))) : 1.f;
-        for (float &x : gradient)
-            x *= factor;
+        auto factors = optimizer.clip(gradient, stats);
         float rate =
             p.step < o.warmup
                 ? float(double(p.step + 1) / o.warmup)
@@ -295,12 +362,7 @@ int train(const Options &o) {
         p.position += active;
         p.tokens += used;
         p.supervised += targets;
-        for (auto &r : replicas) {
-            r->ops->upload(r->gradients, gradient);
-            r->ops->adam(r->parameters, r->gradients, r->first, r->second, m.params, p.step, o.lr * rate,
-                         o.norm_lr * rate, o.decay, 0);
-            r->ops->synchronize();
-        }
+        optimizer.step(all, gradient, p.step, rate);
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         json record = {{"step", p.step},
                        {"position", p.position},
@@ -312,11 +374,15 @@ int train(const Options &o) {
                        {"tokens_per_second", used / seconds},
                        {"device_peak_bytes", replicas[0]->ops->peak_bytes()}};
         record.update(stats.describe(m.params));
+        json clipped = json::object();
+        for (int g = 0; g < group_count; ++g)
+            clipped[group_name(Group(g))] = factors[g];
+        record["clip_scale"] = clipped;
         std::cout << record.dump() << std::endl;
         if (o.checkpoint_every && p.step % o.checkpoint_every == 0)
-            save_checkpoint(o.work, *replicas[0], p, signature);
+            save_checkpoint(o.work, *replicas[0], optimizer, p, signature);
     }
-    save_checkpoint(o.work, *replicas[0], p, signature);
+    save_checkpoint(o.work, *replicas[0], optimizer, p, signature);
     if (!o.output.empty())
         m.export_model(o.output, replicas[0]->values());
     return 0;

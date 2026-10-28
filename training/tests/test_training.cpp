@@ -239,6 +239,39 @@ int main(int argc, char **argv) {
             close((hi - lo) / (2 * eps * b.targets()), analytic[j], 8e-5, .035);
         }
         r.ops->upload(r.parameters, params);
+        {
+            // Wscale is trained as d = log(Wscale / Wscale0): check dL/dd against
+            // finite differences in d, away from d = 0 so the chain rule must use
+            // the current (not initial) Wscale.
+            Optimizer fd(m, opt);
+            for (size_t i = 0; i < fd.scales.size(); ++i)
+                fd.ratio[i] = .2f * float(int(i % 3) - 1);
+            fd.publish(r);
+            auto shifted = r.values();
+            r.run(b, opt, b.targets(), true);
+            auto g = r.grad_values();
+            fd.to_log_scale(g);
+            size_t checked = 0;
+            for (size_t i = 0; i < fd.scales.size(); ++i) {
+                size_t j = m.params[fd.scales[i]].offset;
+                require(shifted[j] == fd.effective(i), "published Wscale differs from Wscale0 * exp(d)");
+                auto pert = shifted;
+                float d = fd.ratio[i];
+                fd.ratio[i] = d + eps;
+                pert[j] = fd.effective(i);
+                r.ops->upload(r.parameters, pert);
+                double hi = r.run(b, opt, 1, false);
+                fd.ratio[i] = d - eps;
+                pert[j] = fd.effective(i);
+                r.ops->upload(r.parameters, pert);
+                double lo = r.run(b, opt, 1, false);
+                fd.ratio[i] = d;
+                close((hi - lo) / (2 * eps * b.targets()), g[j], 8e-5, .035);
+                checked += std::abs(g[j]) > 1e-3;
+            }
+            require(checked * 2 > fd.scales.size(), "degenerate Wscale gradient check");
+            r.ops->upload(r.parameters, params);
+        }
         // Input adjoint through masked attention and chunked MLP recomputation.
         auto input = r.ops->embedding(r.embedding, b), upstream = r.ops->alloc(5, 64);
         std::vector<float> seed(upstream.size());
@@ -277,14 +310,63 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < ga.size(); ++i)
             close(ga[i] + gb[i], (local_a[i] * b.targets() + local_b[i] * short_batch.targets()) / total,
                   1e-7, 1e-4);
+        {
+            // An untrained export reproduces the source model: SU/norms bit-exact,
+            // SV = (SV / rms) * rms within FP32 rounding.
+            Replica fresh(m, -1, 5, 0, false);
+            m.export_model(root / "export-initial", fresh.values());
+            Model same(root / "export-initial");
+            for (size_t l = 0; l < m.layers.size(); ++l)
+                for (int i = 0; i < 7; ++i) {
+                    auto &a = m.layers[l].linear[i], &e = same.layers[l].linear[i];
+                    require(a.su == e.su, "untrained SU export changed");
+                    for (size_t j = 0; j < a.sv.size(); ++j)
+                        close(a.sv[j], e.sv[j], 0, 1e-6);
+                }
+            require(same.initial.size() == m.initial.size(), "untrained export layout");
+            for (auto &p : m.params)
+                if (p.norm)
+                    for (size_t j = p.offset; j < p.offset + p.size; ++j)
+                        require(same.initial[j] == m.initial[j], "untrained norm export changed");
+        }
+        auto fit = opt;
+        fit.lr = .025f;
+        fit.norm_lr = .01f;
+        fit.decay = 0;
+        fit.clip = 1;
+        Optimizer fitter(m, fit);
         for (int step = 1; step <= 80; ++step) {
-            r.run(b, opt, b.targets(), true);
-            r.ops->adam(r.parameters, r.gradients, r.first, r.second, m.params, step, .025, .01, 0, 1);
+            r.run(b, fit, b.targets(), true);
+            auto g = r.grad_values();
+            fitter.to_log_scale(g);
+            fitter.clip(g, gradient_stats(m.params, g));
+            fitter.step({&r}, g, step, 1);
         }
         double fitted = r.run(b, opt, 1, false) / b.targets();
         require(fitted < base * .45, "tiny overfit did not converge");
-        m.export_model(root / "export", r.values());
+        double moved = 0;
+        for (float d : fitter.ratio)
+            moved = std::max(moved, double(std::abs(d)));
+        require(moved > 1e-3, "Wscale did not train");
+        auto trained = r.values();
+        m.export_model(root / "export", trained);
         Model exported(root / "export");
+        for (size_t i = 0; i < fitter.scales.size(); ++i) {
+            // Export folds the effective Wscale into FP32 SV exactly as before.
+            auto &scale = m.params[fitter.scales[i]];
+            require(trained[scale.offset] == fitter.effective(i), "device Wscale differs from optimizer");
+            auto &sv = m.params[fitter.scales[i] - 1];
+            require(sv.group == Group::sv && sv.name.substr(0, sv.name.size() - 2) ==
+                                                 scale.name.substr(0, scale.name.size() - 6),
+                    "SV/Wscale pairing");
+            auto layer = std::stoi(scale.name.substr(13));
+            int linear = int(std::find_if(linears.begin(), linears.end(),
+                                          [&](auto &n) { return scale.name.find(n) != std::string::npos; }) -
+                             linears.begin());
+            auto &e = exported.layers[layer].linear[linear].sv;
+            for (size_t j = 0; j < sv.size; ++j)
+                require(e[j] == trained[sv.offset + j] * fitter.effective(i), "exported SV is not SV * Wscale");
+        }
         for (auto &it : m.index["weight_map"].items()) {
             std::string name = it.key();
             if (name.ends_with(".SU") || name.ends_with(".SV") || name.ends_with("layernorm.weight") ||
@@ -333,21 +415,100 @@ int main(int argc, char **argv) {
             return std::make_unique<behemoth::SafeTensorFile>(p / n / "state.safetensors");
         };
         auto a = state(opt.work), e = state(partial.work);
-        for (auto n : {"parameters", "adam_m", "adam_v"}) {
+        for (auto n : {"parameters", "adam_m", "adam_v", "wscale_log_ratio"}) {
             auto av = a->bytes(n), ev = e->bytes(n);
             require(std::equal(av.begin(), av.end(), ev.begin(), ev.end()), "resume is not bit exact");
         }
         auto sig = opt.signature(m, data);
         std::vector<std::unique_ptr<Replica>> rs;
         rs.push_back(std::make_unique<Replica>(m, -1, 5, 0, false));
-        sig["lr"] = .02;
-        bool rejected = false;
-        try {
-            load_checkpoint(partial.work, rs, sig);
-        } catch (...) {
-            rejected = true;
+        auto rejects = [&](const fs::path &path, const json &signature, const std::string &expect) {
+            Optimizer scratch(m, opt);
+            try {
+                load_checkpoint(path, rs, scratch, signature);
+            } catch (const std::exception &error) {
+                require(std::string(error.what()).find(expect) != std::string::npos,
+                        std::string("unexpected rejection: ") + error.what());
+                return;
+            }
+            throw std::runtime_error("checkpoint accepted: expected " + expect);
+        };
+        auto changed = sig;
+        changed["lr"] = .02;
+        rejects(partial.work, changed, "differs");
+        {
+            // Format 3 (raw Wscale) conversion: build a v3 snapshot from a step-1
+            // v4 snapshot by mapping the log-ratio state back to raw Wscale moments.
+            auto v3src = opt;
+            v3src.work = root / "v3src";
+            v3src.stop_after = 1;
+            train(v3src);
+            auto name = read_json(v3src.work / "latest.json")["path"].get<std::string>();
+            auto src = v3src.work / name;
+            behemoth::SafeTensorFile f(src / "state.safetensors");
+            auto vec = [&](const char *n) {
+                auto v = f.floats(n);
+                std::vector<float> out(v.size());
+                for (size_t i = 0; i < out.size(); ++i)
+                    out[i] = v[i];
+                return out;
+            };
+            auto P = vec("parameters"), M = vec("adam_m"), V = vec("adam_v"), D = vec("wscale_log_ratio");
+            auto M0 = M, V0 = V;
+            Optimizer ref(m, opt);
+            for (size_t i = 0; i < ref.scales.size(); ++i) {
+                auto off = m.params[ref.scales[i]].offset;
+                float w = P[off];
+                M[off] = float(double(M[off]) / w);
+                V[off] = float(double(V[off]) / (double(w) * w));
+            }
+            auto v3 = root / "v3";
+            fs::create_directories(v3);
+            qtip::SafeTensorsWriter w;
+            w.add("parameters", "F32", {int64_t(P.size())}, P.data(), P.size() * 4);
+            w.add("adam_m", "F32", {int64_t(M.size())}, M.data(), M.size() * 4);
+            w.add("adam_v", "F32", {int64_t(V.size())}, V.data(), V.size() * 4);
+            w.write((v3 / "state.safetensors").string());
+            auto meta = read_json(src / "metadata.json");
+            for (auto key : {"wscale_param", "clip_mode", "group_clip", "wscale_lr"})
+                meta["signature"].erase(key);
+            meta["signature"]["format"] = 3;
+            meta["state_sha256"] = sha256(v3 / "state.safetensors");
+            durable_json(v3 / "metadata.json", meta);
+            Optimizer converted(m, opt);
+            load_checkpoint(v3, rs, converted, sig);
+            auto Q = rs[0]->values();
+            std::vector<float> cm(Q.size()), cv(Q.size());
+            rs[0]->ops->download(rs[0]->first, cm);
+            for (size_t i = 0; i < converted.scales.size(); ++i) {
+                auto off = m.params[converted.scales[i]].offset;
+                close(converted.ratio[i], D[i], 1e-6, 1e-5);
+                close(converted.first[i], M0[off], 1e-12, 1e-5);
+                close(converted.second[i], V0[off], 1e-15, 1e-5);
+                close(Q[off], P[off], 0, 1e-6);
+                Q[off] = P[off];
+                require(cm[off] == 0, "converted Wscale moment left in device slot");
+            }
+            require(Q == P, "converted parameters changed");
+            // Training continues from the converted snapshot and lands next to the
+            // uninterrupted run.
+            auto cont = opt;
+            cont.work = root / "v3work";
+            cont.resume = v3;
+            train(cont);
+            auto x = state(opt.work), y = state(cont.work);
+            auto xp = x->floats("parameters"), yp = y->floats("parameters");
+            for (size_t i = 0; i < xp.size(); ++i)
+                close(xp[i], yp[i], 1e-6, 1e-3);
+            auto bad = meta;
+            bad["signature"]["lr"] = .02;
+            durable_json(v3 / "metadata.json", bad);
+            rejects(v3, sig, "differs");
+            bad = meta;
+            bad["signature"]["format"] = 2;
+            durable_json(v3 / "metadata.json", bad);
+            rejects(v3, sig, "unsupported checkpoint format 2");
         }
-        require(rejected, "changed schedule accepted");
         auto unsupervised = opt;
         unsupervised.data = root / "no-targets";
         unsupervised.work = root / "skipped";

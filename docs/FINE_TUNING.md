@@ -91,7 +91,8 @@ Training stops at the smaller of one dataset traversal and the token budget
 rounded down to whole packed sequences, including a partial final GPU batch.
 
 Trainable parameters: relaxed SU tied across q/k/v and gate/up, separate SU for
-o/down, per-linear relaxed SV and scalar Wscale, and RMSNorm weights. Trellis,
+o/down, per-linear relaxed SV and scalar Wscale, and RMSNorm weights. The
+loaded SV is split into unit-RMS SV and Wscale = RMS(SV). Trellis,
 LUT, embedding, and lm_head stay frozen. Forward uses BF16 effective SU/norms,
 BF16 decoded weights and GEMM operands, FP32 accumulation, BF16 gate/up rotated
 outputs, and BF16 activation/residual boundaries. Backward uses explicit
@@ -112,8 +113,37 @@ At 24,576 tokens, activation checkpoints require about 53 GB of pinned host RAM
 per GPU, in addition to packed weights. Arena exhaustion reports a clear error.
 Actual peak memory and throughput must be measured on the target machine.
 
-Checkpoints are native format v3: `state.safetensors` (FP32 parameters and Adam
-moments), checksummed `metadata.json`, and an atomic `latest.json`. State files
+### Wscale parameterisation
+
+Wscale is trained as a log ratio to its initial value, `Wscale = Wscale0 * exp(d)`
+with `d = 0` at the start. Raw Wscale values are about 0.0015 and
+`dL/dWscale = sum(dL/dW * W) / Wscale`. Raw training therefore produced gradients
+of 40-140 in every step, all of the global norm. Adam then moved Wscale by about
+the absolute LR, 1e-4, per step. That is about 7% of the scale per step. At step
+30 of the 32k GM-CoT run, Wscale had moved by -41% to +45% (mean |log ratio| 0.08).
+The optimizer now updates `d`, with `dL/dd = Wscale * dL/dWscale = sum(dL/dW * W)`.
+The `1/Wscale` factor is gone, and an Adam step of size `lr` changes Wscale by
+the relative factor `exp(lr)`. The log form was chosen over `Wscale0 * (1 + d)`
+because Wscale stays positive, the gradient is exactly `sum(dL/dW * W)` at every
+step, and up/down changes are symmetric. With `d = 0` the starting Wscale is
+exactly Wscale0, so an untrained export is unchanged.
+
+Kernels and export are unchanged: the device parameter slot always holds the
+effective Wscale, and export still folds it into FP32 SV. `d` and its Adam moments
+are host FP32 state (616 scalars for Behemoth), updated with the device AdamW
+constants and no decay. The effective values are uploaded after each step. In the
+step log the `wscale` gradient norm, and therefore `grad_norm`, is in `d` units.
+These values are not comparable with logs from format 3 runs.
+
+Checkpoints are native format v4: `state.safetensors` (FP32 parameters and Adam
+moments; Wscale slots hold the effective Wscale and the Adam moments of `d`, plus
+`wscale_log_ratio` with exact `d`), checksummed `metadata.json`, and an atomic
+`latest.json`. Format 3 checkpoints (raw Wscale) are converted on `--resume` if
+every field they recorded still matches. The conversion sets `d = log(Wscale/Wscale0)`
+and maps Wscale moments to first order (`m_d = Wscale * m`, `v_d = Wscale^2 * v`).
+It prints a notice, because the other parameters' moments were accumulated under
+the old, globally clipped gradient scaling. Other formats are refused with
+`unsupported checkpoint format`. State files
 and directories are synced before publishing the latest pointer. Resume checks
 model shards, dataset identity, parameter layout, device count, backend and
 schedule. GPU atomic reductions can introduce small floating-point differences
