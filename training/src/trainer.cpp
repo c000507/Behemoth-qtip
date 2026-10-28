@@ -40,7 +40,7 @@ json Options::signature(const Model &m, const Dataset &d) const {
             {"max_tokens", max_tokens},
             {"backend", devices.front() < 0 ? "cpu" : "hip"}};
 }
-Replica::Replica(const Model &m, int device, int seqlen, size_t arena, bool rounding)
+Replica::Replica(const Model &m, int device, int seqlen, size_t arena, bool rounding, bool checkpoints)
     : model(m), ops(device < 0 ? cpu_ops(rounding) : hip_ops(device, arena)) {
     require(m.initial.size() <= INT32_MAX, "too many trainable parameters");
     int n = int(m.initial.size());
@@ -51,7 +51,7 @@ Replica::Replica(const Model &m, int device, int seqlen, size_t arena, bool roun
     ops->upload(parameters, m.initial);
     embedding = ops->frozen(m.embedding, m.config.vocab, m.config.n);
     head = ops->frozen(m.head, m.config.vocab, m.config.n);
-    ops->configure_streaming(m, seqlen);
+    ops->configure_streaming(m, seqlen, checkpoints);
 }
 std::vector<float> Replica::values() {
     std::vector<float> v(parameters.size());

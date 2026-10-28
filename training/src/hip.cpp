@@ -323,7 +323,9 @@ struct Hip final : Ops {
     std::vector<Weight> decode(const LayerData &layer) override {
         require(active_slot >= 0, "decode outside acquired layer slot");
         auto &s = slots[active_slot];
-        auto cb = behemoth::qtip::make_codebook(layer.linear[0].tlut);
+        auto first = std::find_if(layer.linear.begin(), layer.linear.end(), [](const auto &w) { return !w.is_fp8(); });
+        behemoth::qtip::Codebook cb{};
+        if (first != layer.linear.end()) cb = behemoth::qtip::make_codebook(first->tlut);
         auto lut = arena->alloc(sizeof(cb.bf16x2));
         HIP_CHECK(hipStreamSynchronize(stream));
         std::memcpy(stage->p, cb.bf16x2.data(), sizeof(cb.bf16x2));
@@ -333,6 +335,12 @@ struct Hip final : Ops {
         for (size_t i = 0; i < layer.linear.size(); ++i) {
             auto &w = layer.linear[i];
             auto p = arena->alloc(size_t(w.out) * w.in * 2);
+            if (w.is_fp8()) {
+                gpu::fp8_decode(static_cast<const uint8_t *>(s.codes.get()) + 2 * s.offsets[i],
+                                static_cast<uint16_t *>(p.get()), w.fp8.size(), stream);
+                result.push_back({p, p.get(), w.out, w.in, true, false});
+                continue;
+            }
             behemoth::qtip::decode_dense(
                 {static_cast<const uint16_t *>(s.codes.get()) + s.offsets[i], w.in, w.out},
                 static_cast<const uint32_t *>(lut.get()), static_cast<behemoth::BFloat16 *>(p.get()), stream);
@@ -620,6 +628,26 @@ struct Hip final : Ops {
                         stream);
         return {dq, dk, dv};
     }
+    double mse(Mat a, Mat b, std::span<const int32_t> segments, Mat gradient = {}) override {
+        require(a.rows == b.rows && a.cols == b.cols && segments.size() == size_t(a.rows), "reconstruction loss shape");
+        if (gradient.p)
+            require(!gradient.half && gradient.rows == a.rows && gradient.cols == a.cols, "reconstruction gradient shape");
+        size_t valid = 0;
+        for (int id : segments) if (id >= 0) ++valid;
+        require(valid > 0, "reconstruction batch has no valid tokens");
+        upload_int(labels, segments);
+        auto loss = alloc(a.rows, 1);
+        gpu::mse(gpu::view(a), gpu::view(b), static_cast<const int32_t *>(labels.get()), loss.p,
+                 gpu::view(gradient), float(double(valid) * a.cols), stream);
+        std::vector<float> values(a.rows);
+        download(loss, values);
+        double total = 0;
+        for (float v : values) {
+            require(std::isfinite(v), "nonfinite reconstruction loss");
+            total += v;
+        }
+        return total;
+    }
     double cross_entropy(Mat x, std::span<const int32_t> l, float den, bool back) override {
         for (int label : l)
             require(label == -100 || (label >= 0 && label < x.cols), "target outside vocabulary");
@@ -648,31 +676,33 @@ struct Hip final : Ops {
         HIP_CHECK(hipStreamSynchronize(stream));
         HIP_CHECK(hipGetLastError());
     }
-    void configure_streaming(const Model &m, int length) override {
+    void configure_streaming(const Model &m, int length, bool keep_checkpoints = true) override {
         enter();
         require(m.config.dim == 128, "HIP backend requires head_dim=128");
         for (auto &layer : m.layers)
             for (auto &w : layer.linear)
                 for (int n : {w.in, w.out})
-                    require(n == 1024 || n == 12288 || n == 28672, "unsupported HIP Hadamard dimension");
+                    require(w.is_fp8() || n == 1024 || n == 12288 || n == 28672, "unsupported HIP Hadamard dimension");
         model = &m;
         seqlen = length;
         size_t packed = 0;
         for (auto &layer : m.layers) {
             size_t bytes = 0;
             for (auto &w : layer.linear) {
-                registrations.push_back(pin(w.trellis.data(), w.trellis.size() * 2));
-                bytes += w.trellis.size() * 2;
+                const void *p = w.is_fp8() ? static_cast<const void *>(w.fp8.data()) : w.trellis.data();
+                size_t n = w.is_fp8() ? w.fp8.size() : w.trellis.size() * 2;
+                registrations.push_back(pin(p, n));
+                bytes += n;
             }
             packed = std::max(packed, bytes);
         }
         for (auto &s : slots) {
             s.codes = arena->alloc(packed);
-            s.cp = arena->alloc(size_t(length) * m.config.n * 2);
+            if (keep_checkpoints) s.cp = arena->alloc(size_t(length) * m.config.n * 2);
         }
-        for (int l = 0; l < m.config.layers; ++l)
+        for (int l = 0; keep_checkpoints && l < m.config.layers; ++l)
             checkpoints.push_back(std::make_unique<Pinned>(size_t(length) * m.config.n * 2));
-        std::cerr << "GPU " << device << ": pinned " << size_t(length) * m.config.n * 2 * m.config.layers
+        std::cerr << "GPU " << device << ": pinned " << size_t(length) * m.config.n * 2 * checkpoints.size()
                   << " activation checkpoint bytes\n";
     }
     void prefetch(int l, int slot, bool back) override {
@@ -682,9 +712,11 @@ struct Hip final : Ops {
         size_t offset = 0;
         for (auto &w : model->layers[l].linear) {
             s.offsets.push_back(offset);
-            HIP_CHECK(hipMemcpyAsync(static_cast<uint16_t *>(s.codes.get()) + offset, w.trellis.data(),
-                                     w.trellis.size() * 2, hipMemcpyHostToDevice, copy_stream));
-            offset += w.trellis.size();
+            const void *p = w.is_fp8() ? static_cast<const void *>(w.fp8.data()) : w.trellis.data();
+            size_t bytes = w.is_fp8() ? w.fp8.size() : w.trellis.size() * 2;
+            HIP_CHECK(hipMemcpyAsync(static_cast<uint16_t *>(s.codes.get()) + offset, p,
+                                     bytes, hipMemcpyHostToDevice, copy_stream));
+            offset += bytes / 2;
         }
         if (back) {
             HIP_CHECK(hipStreamWaitEvent(copy_stream, s.offloaded, 0));
@@ -703,6 +735,7 @@ struct Hip final : Ops {
         active_slot = -1;
     }
     Mat checkpoint(int l, Mat x, bool save) override {
+        require(!checkpoints.empty(), "activation checkpoints were disabled for this replica");
         auto &s = slots[l % 2];
         if (save) {
             HIP_CHECK(hipStreamWaitEvent(stream, s.offloaded, 0));

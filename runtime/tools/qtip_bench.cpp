@@ -64,12 +64,13 @@ int main(int argc, char **argv) {
             std::array<qtip::GpuLinear, copies_n> w;
         };
         std::vector<Shape> shapes(4);
-        shapes[0].name = "qkv";
+        shapes[0].name = k.is_fp8() ? "q (FP8 K/V separate)" : "qkv";
         shapes[1].name = "o";
         shapes[2].name = "gate_up";
         shapes[3].name = "down";
         for (int c = 0; c < copies_n; ++c) {
-            shapes[0].w[size_t(c)].upload({q.block_rows(0, 192), k.block_rows(0, 16), v.block_rows(0, 16)}, 12288);
+            if (k.is_fp8()) shapes[0].w[size_t(c)].upload({q.block_rows(0, 192)}, 12288);
+            else shapes[0].w[size_t(c)].upload({q.block_rows(0, 192), k.block_rows(0, 16), v.block_rows(0, 16)}, 12288);
             shapes[1].w[size_t(c)].upload({o.block_rows(0, 192)}, 12288);
             shapes[2].w[size_t(c)].upload({g.block_rows(0, 448), u.block_rows(0, 448)}, 12288);
             shapes[3].w[size_t(c)].upload({d.block_rows(0, 192)}, 28672);

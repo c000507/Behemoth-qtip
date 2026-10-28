@@ -631,14 +631,15 @@ template <class T>
 __global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows, int rank,
                                                          const float *sv_q, const float *sv_k,
                                                          const float *sv_v, uint16_t *q, uint16_t *k,
-                                                         uint16_t *v) {
+                                                         uint16_t *v, bool q_only) {
     __shared__ float scratch[1024];
     const int b = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
-    const size_t part = size_t(rows) * 7168;
+    const int width = q_only ? 6144 : 7168;
+    const size_t part = size_t(rows) * size_t(width);
     float x[4];
     if (b < 6) {
         const int k2 = 6 * rank + b;
-        Source s{all, 6144, part, 7168, 0};
+        Source s{all, 6144, part, width, 0};
         mix<12, false, T>(s, row, k2, x);
         fwht1024(x, scratch);
         const float scale = rsqrtf(12288.f);
@@ -649,6 +650,7 @@ __global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows,
             dst[i] = device::bf16(x[i] * scale * sv_q[e + i]);
         return;
     }
+    if (q_only) return;
     const bool is_k = b == 6;
     Source s{all, 512, part, 7168, is_k ? 6144 : 6656};
     mix<1, false, T>(s, row, 0, x);
@@ -847,13 +849,14 @@ template <class T>
 __global__ __launch_bounds__(256) void output_qkv_rows_kernel(const T *all, int rows, int rank,
                                                               const float *sv_q, const float *sv_k,
                                                               const float *sv_v, uint16_t *q,
-                                                              uint16_t *k, uint16_t *v) {
+                                                              uint16_t *k, uint16_t *v, bool q_only) {
     __shared__ float scratch[1024];
     const int row = int(blockIdx.x), j = 4 * int(threadIdx.x);
-    const size_t part = size_t(rows) * 7168;
+    const int width = q_only ? 6144 : 7168;
+    const size_t part = size_t(rows) * size_t(width);
     {
         float t[12][4];
-        load_row<T, 12>(Source{all, 6144, part, 7168, 0}, row, t);
+        load_row<T, 12>(Source{all, 6144, part, width, 0}, row, t);
         const float scale = rsqrtf(12288.f);
         for (int b = 0; b < 6; ++b) {
             const int k2 = 6 * rank + b;
@@ -867,6 +870,7 @@ __global__ __launch_bounds__(256) void output_qkv_rows_kernel(const T *all, int 
                 dst[i] = device::bf16(x[i] * scale * sv_q[e + i]);
         }
     }
+    if (q_only) return;
     for (int b = 6; b < 8; ++b) {
         const bool is_k = b == 6;
         float x[4];
@@ -1245,18 +1249,18 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
 }
 template <class T>
 void output_qkv_impl(const T *all, int rows, int rank, const float *sv_q, const float *sv_k,
-                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t stream) {
+                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t stream, bool q_only) {
     upload_tables();
     if (row_transforms(rows)) {
         output_qkv_rows_kernel<<<rows, 256, 0, stream>>>(
             all, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
-            reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v));
+            reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v), q_only);
         HIP_CHECK(hipGetLastError());
         return;
     }
-    output_qkv_kernel<<<dim3(8, unsigned(rows)), 256, 0, stream>>>(
+    output_qkv_kernel<<<dim3(q_only ? 6 : 8, unsigned(rows)), 256, 0, stream>>>(
         all, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
-        reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v));
+        reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v), q_only);
     HIP_CHECK(hipGetLastError());
 }
 template <class T>
@@ -1299,12 +1303,12 @@ void output_residual_input_impl(const T *all, int rows, const float *sv, BFloat1
     HIP_CHECK(hipGetLastError());
 }
 void output_qkv(const float *all, int rows, int rank, const float *sq, const float *sk,
-                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s) {
-    output_qkv_impl(all, rows, rank, sq, sk, sv, q, k, v, s);
+                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s, bool q_only) {
+    output_qkv_impl(all, rows, rank, sq, sk, sv, q, k, v, s, q_only);
 }
 void output_qkv(const BFloat16 *all, int rows, int rank, const float *sq, const float *sk,
-                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s) {
-    output_qkv_impl(reinterpret_cast<const uint16_t *>(all), rows, rank, sq, sk, sv, q, k, v, s);
+                const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s, bool q_only) {
+    output_qkv_impl(reinterpret_cast<const uint16_t *>(all), rows, rank, sq, sk, sv, q, k, v, s, q_only);
 }
 void output_residual(const float *all, int rows, const float *sv, BFloat16 *state, hipStream_t s) {
     output_residual_impl(all, rows, sv, state, s);

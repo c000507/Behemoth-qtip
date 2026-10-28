@@ -111,6 +111,7 @@ Config::Config(const json &c)
     for (auto key : {"rope_scaling", "sliding_window", "attention_bias", "mlp_bias"})
         require(!c.contains(key) || c[key].is_null() || c[key] == false || c[key] == 0,
                 std::string("unsupported ") + key);
+    if (!c.contains("quip_params")) return; // Source teacher; Model validates every FP8 tensor.
     const auto &q = c.at("quip_params");
     require(q.at("L") == 16 && q.at("K") == 2 && q.at("V") == 2 && q.at("tlut_bits") == 9 &&
                 q.at("decode_mode") == "quantlut_sym" && q.at("td_x") == 16 && q.at("td_y") == 16,
@@ -131,9 +132,13 @@ size_t Model::add_param(const std::string &name, std::span<const float> value, b
     initial.insert(initial.end(), value.begin(), value.end());
     return id;
 }
-Model::Model(const fs::path &root)
+Model::Model(const fs::path &root, bool allow_fp8_source)
     : path(fs::canonical(root)), config_json(read_json(path / "config.json")),
       index(read_json(path / "model.safetensors.index.json")), config(config_json) {
+    fp8_source = !config_json.contains("quip_params");
+    require(!fp8_source || allow_fp8_source, "FP8 source models are only accepted as reconstruction teachers");
+    const auto kv_format = config_json.value("qtip_quant", json::object()).value("kv_format", std::string("qtip"));
+    require(kv_format == "qtip" || kv_format == "fp8", "unsupported K/V format");
     for (auto &v : index.at("weight_map").items()) {
         std::string key = v.value();
         require(fs::path(key).filename() == key, "unsafe shard path");
@@ -159,6 +164,15 @@ Model::Model(const fs::path &root)
             auto [m, n] = shapes[i];
             require(m % 32 == 0 && n % 32 == 0, "QTIP dimensions need multiples of 32");
             auto base = prefix + linears[i] + ".";
+            if (fp8_source || (kv_format == "fp8" && (i == 1 || i == 2))) {
+                for (const auto *suffix : {"trellis", "SU", "SV", "tlut", "rcp", "tp_rank"})
+                    require(!index.at("weight_map").contains(base + suffix), "ambiguous FP8/QTIP projection: " + base);
+                auto w = behemoth::qtip::load_fp8_linear(file(base + "weight"), file(base + "weight_scale"), l, linears[i]);
+                require(w.in == n && w.out == m, "FP8 weight geometry mismatch");
+                layer.linear.push_back(std::move(w));
+                continue;
+            }
+            require(!index.at("weight_map").contains(base + "weight"), "undeclared FP8 projection");
             behemoth::qtip::HostLinear w;
             w.in = n;
             w.out = m;
@@ -234,7 +248,7 @@ Model::Model(const fs::path &root)
     head = frozen("lm_head.weight");
     identity = model_identity(path);
 }
-void Model::export_model(const fs::path &dest, std::span<const float> values) const {
+void Model::export_model(const fs::path &dest, std::span<const float> values, const json &reconstruction) const {
     require(values.size() == initial.size(), "export parameter size mismatch");
     auto out = fs::absolute(dest).lexically_normal();
     require(!fs::exists(out), "export destination exists");
@@ -251,6 +265,7 @@ void Model::export_model(const fs::path &dest, std::span<const float> values) co
         for (int l = 0; l < config.layers; ++l) {
             auto prefix = "model.layers." + std::to_string(l) + ".";
             for (int i = 0; i < 7; ++i) {
+                if (layers[l].linear[i].is_fp8()) continue; // Frozen FP8 bytes/scales are copied verbatim.
                 const auto &a = params[layers[l].params.at(su_name(i))];
                 replacement[prefix + linears[i] + ".SU"] = {values.begin() + a.offset,
                                                             values.begin() + a.offset + a.size};
@@ -308,6 +323,11 @@ void Model::export_model(const fs::path &dest, std::span<const float> values) co
                 require(fd >= 0 && ::fsync(fd) == 0, "export sidecar fsync");
                 ::close(fd);
             }
+        if (!reconstruction.empty()) {
+            auto config = config_json;
+            config["qtip_reconstruction"] = reconstruction;
+            durable_json(fs::path(tmp) / "config.json", config);
+        }
         sync_directory(tmp);
         fs::rename(tmp, out);
         sync_directory(out.parent_path());

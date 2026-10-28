@@ -808,6 +808,21 @@ void test_real(const fs::path &layer_file, const fs::path &refvec) {
     const int layer = std::stoi(stem.substr(stem.size() - 5));
     for (const std::string name : {"self_attn.q_proj", "self_attn.k_proj", "mlp.down_proj"}) {
         auto l = qtip::load_linear(file, layer, name);
+        if (l.is_fp8()) {
+            qtip::GpuFp8Linear weight;
+            weight.upload(l, 0, l.out);
+            std::vector<BFloat16> input(size_t(3) * l.in, BFloat16(.125f));
+            DeviceBuffer<BFloat16> x, y(size_t(3) * l.out);
+            x.upload(input);
+            qtip::fp8_linear(weight, x.data(), l.in, 3, y.data(), l.out, nullptr);
+            auto actual = y.download();
+            auto reference = qtip::reference_forward(l, std::vector<float>(input.size(), .125f), true);
+            bool pass = true;
+            for (size_t j = 0; j < actual.size(); ++j)
+                pass &= std::abs(float(actual[j]) - reference[j]) <= .001f + .01f * std::abs(reference[j]);
+            check(pass, "source FP8 projection: " + name);
+            continue;
+        }
         auto cb = qtip::make_codebook(l.tlut);
         const auto base = refvec / ("L" + std::to_string(layer) + "_" + name);
         if (fs::exists(fs::path(base.string() + ".rows.json"))) {

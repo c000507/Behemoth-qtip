@@ -483,12 +483,14 @@ class GpuTimes {
 // an all-gather of rotated outputs (or of the head-sharded attention output), and the Hadamard
 // transforms run on full vectors on both ranks.
 struct QtipLayer {
+    bool fp8_kv = false;
+    qtip::GpuFp8Linear fp8_k, fp8_v;
     qtip::GpuLinear qkv, o, gate_up, down;
     qtip::GpuCodebook lut;
     DeviceBuffer<float> su_qkv, su_o, su_gate_up, su_down;
     DeviceBuffer<float> sv_q, sv_k, sv_v, sv_o, sv_gate, sv_up, sv_down;
     size_t bytes() const {
-        return qkv.bytes() + o.bytes() + gate_up.bytes() + down.bytes();
+        return qkv.bytes() + o.bytes() + gate_up.bytes() + down.bytes() + fp8_k.bytes() + fp8_v.bytes();
     }
 };
 struct Layer {
@@ -641,19 +643,24 @@ struct Shard {
                    gate = lin("mlp.gate_proj"), up = lin("mlp.up_proj"), down = lin("mlp.down_proj");
         // The stacked q/k/v and gate/up matmuls share one rotated input: the checkpoint must use
         // one SU per Hessian group (qtip_quant does) and one tlut per layer.
-        if (q.su != k.su || q.su != v.su || gate.su != up.su)
+        w.fp8_kv = checkpoint.config.fp8_kv;
+        if ((!w.fp8_kv && (q.su != k.su || q.su != v.su)) || gate.su != up.su)
             throw std::invalid_argument("QTIP layer " + std::to_string(i) +
                                         ": q/k/v or gate/up do not share SU");
         for (const auto *x : {&k, &v, &o, &gate, &up, &down})
-            if (x->tlut != q.tlut)
+            if (!x->is_fp8() && x->tlut != q.tlut)
                 throw std::invalid_argument("QTIP layer " + std::to_string(i) +
                                             ": linears use different tluts");
         w.lut.upload(qtip::make_codebook(q.tlut));
         // Rank r owns rotated output rows [r*m/2, (r+1)*m/2) of every linear (whole 32-row
         // block-rows: q/o/down 192, k/v 16, gate/up 448 per rank).
-        w.qkv.upload({q.block_rows(rank * 192, 192), k.block_rows(rank * 16, 16),
-                      v.block_rows(rank * 16, 16)},
-                     12288);
+        if (w.fp8_kv) {
+            w.qkv.upload({q.block_rows(rank * 192, 192)}, 12288);
+            w.fp8_k.upload(k, rank * 512, 512);
+            w.fp8_v.upload(v, rank * 512, 512);
+        } else
+            w.qkv.upload({q.block_rows(rank * 192, 192), k.block_rows(rank * 16, 16),
+                          v.block_rows(rank * 16, 16)}, 12288);
         w.o.upload({o.block_rows(rank * 192, 192)}, 12288);
         w.gate_up.upload({gate.block_rows(rank * 448, 448), up.block_rows(rank * 448, 448)}, 12288);
         w.down.upload({down.block_rows(rank * 192, 192)}, 28672);
@@ -675,7 +682,7 @@ struct Shard {
             throw std::invalid_argument("Invalid block norm shape");
         if (i % 8 == 0)
             std::cerr << "rank " << rank << ": loaded QTIP block " << i << "/88 ("
-                      << double(w.bytes()) / 1e6 << " MB trellis)\n";
+                      << double(w.bytes()) / 1e6 << " MB weights)\n";
     }
     ~Shard() {
         (void)hipSetDevice(device);
@@ -798,6 +805,7 @@ struct Shard {
             // sampled rows (at most sample_capacity per step, Scheduler::max_requests).
             const size_t n = std::max<size_t>(sample_capacity, 1);
             state.resize(rows * 12288);
+            if (!layers.empty() && layers.front().qtip.fp8_kv) norm.resize(rows * 12288);
             q.resize(rows * 6144);
             k.resize(rows * 512);
             v.resize(rows * 512);
@@ -1316,11 +1324,18 @@ struct Shard {
         measure(mb, "elementwise_ms", [&] {
             if (mb.bf16_projection)
                 qtip::output_qkv(reinterpret_cast<const BFloat16 *>(all), rows, rank,
-                                 w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km, vm, mb.s);
+                                 w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km, vm, mb.s, w.fp8_kv);
             else
                 qtip::output_qkv(all, rows, rank, w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km,
-                                 vm, mb.s);
+                                 vm, mb.s, w.fp8_kv);
         });
+        if (w.fp8_kv)
+            measure(mb, "fp8_kv_projections_ms", [&] {
+                auto *xn = norm.data() + size_t(mb.r0) * 12288;
+                rms_norm(st, l.input_norm.data(), xn, rows, 12288, 1e-5f, mb.s);
+                qtip::fp8_linear(w.fp8_k, xn, 12288, rows, km, 512, mb.s);
+                qtip::fp8_linear(w.fp8_v, xn, 12288, rows, vm, 512, mb.s);
+            });
         // Attention writes this rank's heads straight into its half of the exchange block.
         auto *attention_out = reinterpret_cast<BFloat16 *>(all) + size_t(rank) * size_t(rows) * 6144;
         measure(mb, "attention_and_cache_ms", [&] {

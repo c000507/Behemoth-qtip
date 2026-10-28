@@ -13,7 +13,7 @@ using namespace qat;
 namespace {
 // One-layer model with HIP-supported widths (hidden = intermediate = 1024,
 // eight 128-wide heads) for whole-layer CPU/GPU gradient comparisons.
-void write_layer_model(const fs::path &p) {
+void write_layer_model(const fs::path &p, int format) {
     fs::create_directories(p);
     const int n = 1024, inter = 1024, vocab = 64;
     json c = {{"hidden_size", n},
@@ -34,10 +34,13 @@ void write_layer_model(const fs::path &p) {
                 {"decode_mode", "quantlut_sym"},
                 {"td_x", 16},
                 {"td_y", 16}}}};
+    if (format == 1) c["qtip_quant"]["kv_format"] = "fp8";
+    if (format == 2) c.erase("quip_params");
     durable_json(p / "config.json", c);
     qtip::SafeTensorsWriter w;
     json index = {{"weight_map", json::object()}};
     std::deque<std::vector<uint16_t>> keep16; // stable references
+    std::deque<std::vector<uint8_t>> keep8;
     std::deque<std::vector<float>> keep32;
     auto add = [&](std::string name, std::string type, std::vector<int64_t> shape, const void *data,
                    size_t bytes) {
@@ -60,6 +63,14 @@ void write_layer_model(const fs::path &p) {
     for (int i = 0; i < 7; ++i) {
         int out = i == 4 || i == 5 ? inter : n, in = i == 6 ? inter : n;
         std::string b = prefix + linears[i] + ".";
+        if (format == 2 || (format == 1 && (i == 1 || i == 2))) {
+            auto &fp8 = keep8.emplace_back(size_t(out) * in);
+            for (auto &x : fp8) x = behemoth::encode_e4m3(8.f * normal(rng));
+            auto &scales = keep32.emplace_back(out, .0025f);
+            add(b + "weight", "F8_E4M3", {out, in}, fp8.data(), fp8.size());
+            add(b + "weight_scale", "F32", {out}, scales.data(), scales.size() * 4);
+            continue;
+        }
         auto &codes = keep16.emplace_back(size_t(out) * in / 8);
         for (auto &x : codes)
             x = uint16_t(rng());
@@ -89,15 +100,15 @@ void write_layer_model(const fs::path &p) {
 }
 // Full forward/backward of a one-layer model on CPU (BF16-boundary emulation)
 // and GPU in both activation storage modes. Exercises every fused path.
-void layer_check() {
+void layer_check(int format) {
     fs::path root = fs::temp_directory_path() / ("qtip-gpu-layer-" + std::to_string(getpid()));
     fs::create_directories(root);
     struct Cleanup {
         fs::path p;
         ~Cleanup() { fs::remove_all(p); }
     } cleanup{root};
-    write_layer_model(root / "model");
-    Model m(root / "model");
+    write_layer_model(root / "model", format);
+    Model m(root / "model", format == 2);
     const int T = 40;
     Batch b;
     for (int t = 0; t < T; ++t) {
@@ -134,7 +145,7 @@ void layer_check() {
                 kinds[kind].second += double(cg[i]) * cg[i];
             }
         }
-        json report = {{"storage", storage}, {"cpu_loss", cl / denominator}, {"gpu_loss", gl / denominator}};
+        json report = {{"format", format}, {"storage", storage}, {"cpu_loss", cl / denominator}, {"gpu_loss", gl / denominator}};
         for (auto &[kind, e] : kinds) {
             double rel = std::sqrt(e.first / std::max(e.second, 1e-30));
             report[kind + "_rel_error"] = rel;
@@ -300,6 +311,16 @@ int main() {
         auto [q, gq] = pair(T, 1024, .1);
         auto [k, gk] = pair(T, 256, .4);
         auto [v, gv] = pair(T, 256, .9);
+        {
+            auto [target, gpu_target] = pair(T, 1024, .7);
+            auto gradient = cpu->alloc(T, 1024), gpu_gradient = gpu->alloc(T, 1024);
+            std::vector<int32_t> segments(T, 0);
+            segments.back() = -1;
+            double reference = cpu->mse(q, target, segments, gradient);
+            double actual = gpu->mse(gq, gpu_target, segments, gpu_gradient);
+            require(std::abs(reference - actual) < 1e-7, "GPU reconstruction MSE mismatch");
+            compare(gradient, gpu_gradient, .002);
+        }
         auto ca = cpu->attention(q, k, v, c, b), ga = gpu->attention(gq, gk, gv, c, b);
         compare(ca.out, ga.out, .012);
         compare(ca.lse, ga.lse, .001);
@@ -379,8 +400,8 @@ int main() {
         double cl = cpu->cross_entropy(cx, labels, T, true), gl = gpu->cross_entropy(gx, labels, T, true);
         require(std::abs(cl - gl) < .001, "GPU CE loss");
         compare(cx, gx, .003);
-        layer_check();
-        std::cout << "native GPU primitives, packed GQA attention gradients and fused layers passed\n";
+        for (int format : {0, 1, 2}) layer_check(format);
+        std::cout << "native GPU primitives, packed GQA gradients, QTIP, mixed and FP8 teacher layers passed\n";
         return 0;
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

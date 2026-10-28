@@ -19,6 +19,7 @@ struct FloatTensorView {
 enum class Quantization { Aqlm, Qtip };
 struct ModelConfig {
     Quantization quantization = Quantization::Aqlm;
+    bool fp8_kv = false; // Mixed QTIP checkpoint: original E4M3 K/V projections.
     int layers = 88, hidden = 12288, intermediate = 28672, q_heads = 96, kv_heads = 8, dim = 128,
         vocab = 32768;
     int max_context = 131072;
@@ -38,6 +39,7 @@ class SafeTensorFile {
     SafeTensorFile &operator=(const SafeTensorFile &) = delete;
     std::vector<size_t> shape(const std::string &) const;
     std::string dtype(const std::string &) const;
+    bool contains(const std::string &name) const { return header_.contains(name); }
     std::span<const std::byte> bytes(const std::string &) const;
     float value(const std::string &, size_t index) const;
     uint16_t code(const std::string &, size_t index) const;
@@ -63,6 +65,7 @@ class Checkpoint {
     ModelConfig config;
     explicit Checkpoint(std::filesystem::path);
     const SafeTensorFile &tensor(const std::string &) const;
+    bool has_tensor(const std::string &name) const { return index_.contains(name); }
     std::vector<BFloat16> bf16(const std::string &) const;
     HostProjection projection(int layer, const std::string &name, int rank,
                               bool column_parallel) const;

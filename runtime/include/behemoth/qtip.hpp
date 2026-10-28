@@ -46,6 +46,11 @@ struct HostLinear {
     std::vector<uint16_t> trellis; // kernel layout, (out/16)*(in/16)*32 words
     std::vector<float> su, sv;     // SU [in] (+-1), SV [out] (sign * Wscale)
     std::vector<uint16_t> tlut;    // F16 raw [512][2]
+    // Original, unrotated E4M3 weights and per-output-channel scales. Mutually
+    // exclusive with trellis/SU/SV/tlut; FP8 projections stay frozen in QAT.
+    std::vector<uint8_t> fp8;
+    std::vector<float> fp8_scale;
+    bool is_fp8() const { return !fp8.empty(); }
     // Kernel-layout word c (0..31) of tile (tile_row, tile_col):
     // trellis[(((i0*(in/32) + j0)*32 + c)*2 + j1)*2 + i1], tile_row = 2*i0+i1, tile_col = 2*j0+j1.
     uint16_t word(int tile_row, int tile_col, int c) const {
@@ -76,6 +81,8 @@ std::vector<float> reference_forward(const HostLinear &, std::span<const float> 
 HostLinear load_linear(const Checkpoint &, int layer, const std::string &name);
 // The same from one layer file (model-layer-XXXXX.safetensors) without an assembled checkpoint.
 HostLinear load_linear(const SafeTensorFile &, int layer, const std::string &name);
+HostLinear load_fp8_linear(const SafeTensorFile &, int layer, const std::string &name);
+HostLinear load_fp8_linear(const SafeTensorFile &weight, const SafeTensorFile &scale, int layer, const std::string &name);
 // Reference transformer block of a QTIP checkpoint for one token at position zero (same
 // semantics/rounding as reference_block for AQLM: bf16 norms, residual and projection outputs,
 // FP8 attention reference), using decoded weights. Slow (decodes the full layer on the CPU).

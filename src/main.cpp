@@ -44,6 +44,7 @@ struct Options {
   int batch_rows = 4096;
   int backlog = 2;
   bool keep_hessians = false;
+  bool fp8_kv = true;
   uint64_t seed = 0;
   std::string dump_acts;  // write the first sequence of GPU 0 after every chain layer (bf16)
   QuantOpts q;
@@ -63,6 +64,7 @@ static void usage() {
       "  --hess-dir DIR       Hessian files (default <work>/hess)\n"
       "  --backlog N          max layers with collected-but-unquantized Hessians (default 2, ~5.1 GB each)\n"
       "  --keep-hessians      do not delete Hessians after a layer is quantized\n"
+      "  --kv-format fp8|qtip K/V weight format (default fp8; qtip restores legacy all-2-bit)\n"
       "  --vit-batch N        trellises per Viterbi launch (default 1024; 260 KB scratch each)\n"
       "  --sigma-reg X        Hessian damping (default 1e-2)   --scale-override X (default 0.9)\n"
       "  --ldl-threads N      CPU threads per fp64 LDL (default 16)\n"
@@ -90,6 +92,11 @@ static Options parse(int argc, char** argv) {
     else if (a == "--batch-rows") o.batch_rows = std::stoi(next());
     else if (a == "--backlog") o.backlog = std::stoi(next());
     else if (a == "--keep-hessians") o.keep_hessians = true;
+    else if (a == "--kv-format") {
+      auto value = next();
+      QCHECK(value == "fp8" || value == "qtip", "--kv-format must be fp8 or qtip");
+      o.fp8_kv = value == "fp8";
+    }
     else if (a == "--vit-batch") o.q.vit_batch = std::stoi(next());
     else if (a == "--sigma-reg") o.q.sigma_reg = std::stod(next());
     else if (a == "--scale-override") o.q.scale_override = std::stod(next());
@@ -189,6 +196,9 @@ void Pipeline::load_progress() {
     progress_["layers"] = json::object();
     progress_["hessians"] = json::array();
   }
+  QCHECK(progress_.value("kv_format", std::string("qtip")) == (o_.fp8_kv ? "fp8" : "qtip") ||
+             progress_["layers"].empty(), "work directory has a different K/V format; set --kv-format to match or use a new --work directory");
+  progress_["kv_format"] = o_.fp8_kv ? "fp8" : "qtip";
   for (auto& kv : progress_["layers"].items())
     if (kv.value().value("status", "") == "done" && fs::exists(layer_path(std::stoi(kv.key()))))
       done_.insert(std::stoi(kv.key()));
@@ -359,6 +369,7 @@ void Pipeline::quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, in
     std::vector<int> lins;
   };
   std::vector<Grp> groups = {{0, {LQ, LK, LV}}, {1, {LO}}, {2, {LGate, LUp}}, {3, {LDown}}};
+  if (o_.fp8_kv) groups[0].lins = {LQ};
   std::vector<LinearOut> outs(kNumLin);
   json jl = json::object();
   // rotate all four Hessians on the GPU first, then factorise them on the CPU in a side thread (fp64 LDL of
@@ -427,8 +438,15 @@ void Pipeline::quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, in
   std::string pre = "model.layers." + std::to_string(L) + ".";
   const Codebook& cb = codebook();
   for (int li = 0; li < kNumLin; ++li) {
-    const LinearOut& r = outs[size_t(li)];
     std::string b = pre + kLinName[li] + ".";
+    if (o_.fp8_kv && (li == LK || li == LV)) {
+      w.add(b + "weight", "F8_E4M3", {LH->out_dim[li], LH->in_dim[li]},
+            LH->w[li].data(), LH->w[li].size());
+      w.add(b + "weight_scale", "BF16", {LH->out_dim[li]}, LH->sc[li].data(), LH->sc[li].size() * 2);
+      jl[kLinName[li]] = {{"format", "fp8"}, {"source_preserved", true}};
+      continue;
+    }
+    const LinearOut& r = outs[size_t(li)];
     w.add(b + "trellis", "I16", {long(r.m / 16) * (r.n / 16), kWordsPerTrellis}, r.trellis.data(),
           r.trellis.size() * 2);
     w.add(b + "SU", "BF16", {r.n}, r.su_bf16.data(), r.su_bf16.size() * 2);
@@ -631,7 +649,7 @@ void Pipeline::assemble() {
                       {"skip_list", nullptr}};
   c["qtip_quant"] = {{"sigma_reg", o_.q.sigma_reg}, {"scale_override", o_.q.scale_override},
                      {"ntok", o_.ntok},             {"seq_len", o_.seq_len},
-                     {"shared_su_per_hessian_group", true}};
+                     {"shared_su_per_hessian_group", true}, {"kv_format", o_.fp8_kv ? "fp8" : "qtip"}};
   {
     std::ofstream f(o_.out + "/config.json");
     f << c.dump(2);
@@ -666,7 +684,7 @@ void Pipeline::assemble() {
     std::ofstream f(o_.out + "/model.safetensors.index.json");
     f << idx.dump(2);
   }
-  for (std::string fn : {"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
+  for (std::string fn : {"tokenizer.model", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
                          "generation_config.json"}) {
     fs::path src = fs::path(o_.model) / fn;
     if (fs::exists(src)) fs::copy_file(src, fs::path(o_.out) / fn, fs::copy_options::overwrite_existing);

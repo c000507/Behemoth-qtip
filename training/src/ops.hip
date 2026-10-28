@@ -2,6 +2,13 @@
 #include <cmath>
 namespace qat::gpu {
 using behemoth::device::bf16;
+__global__ void fp8_decode_kernel(const uint8_t *x, uint16_t *y, size_t n) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = bf16(behemoth::device::fp8(x[i]));
+}
+void fp8_decode(const uint8_t *x, uint16_t *y, size_t n, hipStream_t stream) {
+    fp8_decode_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, y, n);
+}
 __device__ float f16(uint16_t x) { return __uint_as_float(uint32_t(x) << 16); }
 __device__ float read(View a, int r, int c) { return load(a, r, c); }
 __device__ float sum(float x) {
@@ -20,6 +27,20 @@ __device__ float sum(float x) {
         s[0] = x;
     __syncthreads();
     return s[0];
+}
+__global__ void mse_kernel(View a, View b, const int32_t *segments, float *loss, View gradient, float denominator) {
+    int row = blockIdx.x;
+    float ss = 0;
+    for (int c = threadIdx.x; c < a.cols; c += blockDim.x) {
+        float d = segments[row] >= 0 ? load(a, row, c) - load(b, row, c) : 0;
+        ss = fmaf(d, d, ss);
+        if (gradient.p) store(gradient, size_t(row) * gradient.ld + c, 2 * d / denominator);
+    }
+    ss = sum(ss);
+    if (threadIdx.x == 0) loss[row] = ss / denominator;
+}
+void mse(View a, View b, const int32_t *segments, float *loss, View gradient, float denominator, hipStream_t stream) {
+    mse_kernel<<<a.rows, 256, 0, stream>>>(a, b, segments, loss, gradient, denominator);
 }
 __global__ void bin(View d, View a, View b, int mode, bool round) {
     size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;

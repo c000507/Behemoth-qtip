@@ -1,5 +1,9 @@
 # Native QTIP fine-tuning
 
+For source-preserving FP8 K/V projections and a block-output teacher objective,
+see [mixed precision and reconstruction](MIXED_FP8_RECONSTRUCTION.md). The native
+trainer accepts these mixed checkpoints; FP8 K/V weights and scales stay frozen.
+
 The fine-tuner and data preparer are standalone C++20/HIP executables. Build,
 prepare, train, resume, evaluate, export, benchmark, and runtime-trace checking
 require **no Python, PyTorch, Triton, libtorch, or Python bindings**. The former

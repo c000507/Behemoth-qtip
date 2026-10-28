@@ -2,7 +2,9 @@
 
 namespace qat {
 Layer::Layer(Ops &o, const Model &m, int layer, Mat p, Mat g)
-    : o_(o), m_(m), data_(m.layers.at(layer)), parameters_(p), gradients_(g), weights_(o.decode(data_)) {}
+    : o_(o), m_(m), data_(m.layers.at(layer)), parameters_(p), gradients_(g), weights_(o.decode(data_)) {
+    for (const auto &w : data_.linear) mixed_ |= w.is_fp8();
+}
 Mat Layer::parameter(const std::string &name) const {
     const auto &p = m_.params.at(data_.params.at(name));
     return parameters_.col(int(p.offset), int(p.offset + p.size));
@@ -11,8 +13,9 @@ Mat Layer::gradient(const std::string &name) const {
     const auto &p = m_.params.at(data_.params.at(name));
     return gradients_.col(int(p.offset), int(p.offset + p.size));
 }
-// Parameters are fixed for the lifetime of a Layer (one pass), so the BF16
-// effective SU/norm vectors are rounded once and reused by every MLP chunk.
+// Parameters are fixed within a pass, so the BF16 effective SU/norm vectors
+// are rounded once and reused by every MLP chunk. Reconstruction clears this
+// cache after each parameter update.
 // SV vectors are copied once into separately aligned storage for vector loads.
 Mat Layer::effective(const std::string &name, bool rounded) const {
     auto key = (rounded ? "r:" : "c:") + name;
@@ -105,6 +108,7 @@ Mat Layer::mlp(Mat h, MlpSave *save, Mat dst) {
     return out;
 }
 Mat Layer::forward(Mat x, const Batch &b, int chunk) {
+    if (mixed_) return mixed_forward(x, b, chunk);
     auto h = attention_half(x, b, nullptr), out = o_.act(x.rows, x.cols);
     for (int start = 0; start < x.rows; start += chunk) {
         int end = std::min(start + chunk, x.rows);
@@ -113,6 +117,7 @@ Mat Layer::forward(Mat x, const Batch &b, int chunk) {
     return out;
 }
 Mat Layer::backward(Mat x, Mat dy, const Batch &b, int chunk) {
+    if (mixed_) return mixed_backward(x, dy, b, chunk);
     AttnSave saved;
     auto h = attention_half(x, b, &saved);
     // The residual-stream gradient stays FP32: it accumulates every chunk.
@@ -156,6 +161,111 @@ Mat Layer::backward(Mat x, Mat dy, const Batch &b, int chunk) {
     d.clear();
     saved.qkv.clear();
     o_.rms_backward_su(x, saved.norm, effective(norm1), effective(su_name(0)), dxsu, gradient(norm1), dh);
+    return dh;
+}
+Mat Layer::fp8_scale(int i) const {
+    auto key = "fp8:" + std::to_string(i);
+    if (!effective_.contains(key)) {
+        auto scale = o_.alloc(1, data_.linear[i].out);
+        o_.upload(scale, data_.linear[i].fp8_scale);
+        effective_[key] = scale;
+    }
+    return effective_.at(key);
+}
+Mat Layer::mixed_projection(Mat x, int i, LinearSave *save, Mat residual, Mat dst) {
+    const auto &w = data_.linear[i];
+    if (!w.is_fp8()) return projection(x, i, save, residual, dst);
+    auto z = o_.mm(x, weights_[i]);
+    auto scale = fp8_scale(i);
+    auto y = o_.act(z.rows, z.cols);
+    o_.mul(y, z, scale);
+    o_.round(y);
+    if (residual.p) {
+        auto result = dst.p ? dst : o_.act(y.rows, y.cols);
+        o_.add(result, residual, y, true);
+        y = result;
+    } else if (dst.p) {
+        o_.copy(dst, y);
+        y = dst;
+    }
+    if (save) *save = {x, {}, i};
+    return y;
+}
+Mat Layer::mixed_projection_backward(const LinearSave &s, Mat dy) {
+    const auto &w = data_.linear[s.index];
+    if (w.is_fp8()) {
+        auto scale = fp8_scale(s.index), scaled = o_.alloc(dy.rows, dy.cols);
+        o_.mul(scaled, dy, scale);
+        return o_.mm(scaled, weights_[s.index], true);
+    }
+    auto dxsu = projections_backward(&s, 1, &dy, false).c;
+    auto dx = o_.alloc(dxsu.rows, dxsu.cols);
+    o_.mul(dx, dxsu, effective(su_name(s.index)));
+    return dx;
+}
+// The generic path preserves the source FP8 weights' original orientation.
+// QTIP-only layers keep their existing fused fast path above.
+Mat Layer::mixed_forward(Mat x, const Batch &b, int chunk) {
+    auto n = o_.rms(x, effective(norm1), m_.config.eps);
+    auto q = o_.rope(mixed_projection(n.y, 0), m_.config.heads, m_.config, b);
+    auto k = o_.rope(mixed_projection(n.y, 1), m_.config.kv, m_.config, b);
+    auto v = mixed_projection(n.y, 2);
+    auto a = o_.attention(q, k, v, m_.config, b);
+    auto h = mixed_projection(a.out, 3, nullptr, x);
+    a = {};
+    q = {}; k = {}; v = {}; n = {};
+    auto out = o_.act(x.rows, x.cols);
+    for (int lo = 0; lo < x.rows; lo += chunk) {
+        int end = std::min(lo + chunk, x.rows);
+        auto rows = h.row(lo, end);
+        auto mn = o_.rms(rows, effective(norm2), m_.config.eps);
+        auto gate = mixed_projection(mn.y, 4), up = mixed_projection(mn.y, 5);
+        auto product = o_.swiglu(gate, up);
+        mixed_projection(product, 6, nullptr, rows, out.row(lo, end));
+    }
+    return out;
+}
+Mat Layer::mixed_backward(Mat x, Mat dy, const Batch &b, int chunk) {
+    auto n = o_.rms(x, effective(norm1), m_.config.eps);
+    LinearSave qkv[3], os;
+    auto q = o_.rope(mixed_projection(n.y, 0, qkv), m_.config.heads, m_.config, b);
+    auto k = o_.rope(mixed_projection(n.y, 1, qkv + 1), m_.config.kv, m_.config, b);
+    auto v = mixed_projection(n.y, 2, qkv + 2);
+    auto a = o_.attention(q, k, v, m_.config, b);
+    auto h = mixed_projection(a.out, 3, &os, x);
+    auto dh = o_.alloc(dy.rows, dy.cols);
+    o_.copy(dh, dy);
+    for (int lo = 0; lo < x.rows; lo += chunk) {
+        int end = std::min(lo + chunk, x.rows);
+        auto rows = h.row(lo, end);
+        auto mn = o_.rms(rows, effective(norm2), m_.config.eps);
+        LinearSave gs, us, ds;
+        auto gate = mixed_projection(mn.y, 4, &gs), up = mixed_projection(mn.y, 5, &us);
+        auto product = o_.swiglu(gate, up);
+        (void)mixed_projection(product, 6, &ds, rows);
+        auto dp = mixed_projection_backward(ds, dy.row(lo, end));
+        auto [dg, du] = o_.swiglu_backward(gate, up, dp);
+        auto gn = mixed_projection_backward(gs, dg), un = mixed_projection_backward(us, du);
+        o_.add(gn, gn, un);
+        auto part = o_.rms_backward(rows, mn, effective(norm2), gn, gradient(norm2));
+        o_.add(dh.row(lo, end), dh.row(lo, end), part);
+    }
+    h = {};
+    auto da = mixed_projection_backward(os, dh);
+    os = {};
+    auto gradients = o_.attention_backward(a, da, m_.config, b);
+    a = {}; q = {}; k = {}; v = {}; da = {};
+    gradients[0] = o_.rope(gradients[0], m_.config.heads, m_.config, b, true);
+    gradients[1] = o_.rope(gradients[1], m_.config.kv, m_.config, b, true);
+    auto dn = mixed_projection_backward(qkv[0], gradients[0]);
+    qkv[0] = {}; gradients[0] = {};
+    for (int i = 1; i < 3; ++i) {
+        auto part = mixed_projection_backward(qkv[i], gradients[i]);
+        o_.add(dn, dn, part);
+        qkv[i] = {}; gradients[i] = {};
+    }
+    auto dx = o_.rms_backward(x, n, effective(norm1), dn, gradient(norm1));
+    o_.add(dh, dh, dx);
     return dh;
 }
 } // namespace qat

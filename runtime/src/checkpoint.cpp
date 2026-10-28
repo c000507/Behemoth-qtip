@@ -90,6 +90,10 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
             throw std::invalid_argument("Unsupported QTIP format (needs HYB L16 K2 V2 tlut_bits 9 "
                                         "quantlut_sym 16x16, no TP split, no skip list)");
         c.quantization = Quantization::Qtip;
+        const auto format = j.value("qtip_quant", nlohmann::json::object()).value("kv_format", std::string("qtip"));
+        if (format != "qtip" && format != "fp8")
+            throw std::invalid_argument("qtip_quant.kv_format must be qtip or fp8");
+        c.fp8_kv = format == "fp8";
     } else {
         auto q = j.at("quantization_config");
         if (q.at("quant_method") != "aqlm" || q.at("in_group_size") != 8 ||
@@ -166,6 +170,7 @@ std::span<const std::byte> SafeTensorFile::bytes(const std::string &name) const 
         throw std::runtime_error("Tensor offsets out of bounds");
     std::string d = dtype(name);
     size_t width = d == "F32" ? 4
+                   : d == "F8_E4M3" ? 1
                    : (d == "F16" || d == "BF16" || d == "I16") ? 2
                    : d == "I64" ? 8 // QTIP rcp / tp_rank scalars
                                 : 0;

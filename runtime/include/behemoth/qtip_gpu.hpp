@@ -8,6 +8,25 @@
 #include <memory>
 
 namespace behemoth::qtip {
+// Unrotated E4M3 weights, column-parallel output shard. Activations stay BF16
+// and accumulation stays FP32; no activation FP8 quantization is introduced.
+struct GpuFp8Linear {
+    DeviceBuffer<uint8_t> weight;
+    DeviceBuffer<float> scale;
+    int in = 0, rows = 0;
+    void upload(const HostLinear &w, int row0, int count) {
+        if (!w.is_fp8() || row0 < 0 || count <= 0 || row0 + count > w.out ||
+            w.fp8.size() != size_t(w.in) * size_t(w.out) || w.fp8_scale.size() != size_t(w.out))
+            throw std::invalid_argument("Invalid FP8 shard");
+        in = w.in;
+        rows = count;
+        weight.upload(std::span(w.fp8).subspan(size_t(row0) * size_t(in), size_t(count) * size_t(in)));
+        scale.upload(std::span(w.fp8_scale).subspan(size_t(row0), size_t(count)));
+    }
+    size_t bytes() const { return weight.bytes() + scale.bytes(); }
+};
+void fp8_linear(const GpuFp8Linear &, const BFloat16 *x, int ldx, int rows,
+                BFloat16 *y, int ldy, hipStream_t);
 // Non-owning view for externally managed/double-buffered device storage.
 struct LinearView {
     const uint16_t *trellis = nullptr;
@@ -87,11 +106,11 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
 // per rank), writes this rank's q heads [rows][6144], k/v heads [rows][512] as bf16 of
 // SV (.) hadU(z).
 void output_qkv(const float *all, int rows, int rank, const float *sv_q, const float *sv_k,
-                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t);
+                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t, bool q_only = false);
 // Prefill-only BF16 rotated-output payload (same rank-blocked element layout).
 // Equivalent to the FP32 epilogue with every input explicitly rounded to BF16.
 void output_qkv(const BFloat16 *all, int rows, int rank, const float *sv_q, const float *sv_k,
-                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t);
+                const float *sv_v, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t, bool q_only = false);
 // o/down epilogue: all = gathered [2][rows][6144] fp32 rotated outputs; state[rows][12288] =
 // bf16(state + bf16(SV (.) hadU(z))).
 void output_residual(const float *all, int rows, const float *sv, BFloat16 *state, hipStream_t);

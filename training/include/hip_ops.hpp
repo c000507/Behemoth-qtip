@@ -12,6 +12,8 @@ inline View view(Mat m) { return {m.p, m.rows, m.cols, m.ld, m.half ? 1 : 0}; }
 void binary(View, View, View, int, bool, hipStream_t);
 void cast(View, uint16_t *, bool, hipStream_t);
 void rounded(View, hipStream_t);
+void fp8_decode(const uint8_t *, uint16_t *, size_t, hipStream_t);
+void mse(View, View, const int32_t *, float *, View, float, hipStream_t);
 void scalar_reduce(View, View, View, hipStream_t);
 inline constexpr int reduction_rows = 256;
 void column_reduce(View, View, View, View, View, hipStream_t);

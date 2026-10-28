@@ -131,6 +131,22 @@ std::vector<float> reference_forward(const HostLinear &l, std::span<const float>
     if (x.size() % size_t(l.in))
         throw std::invalid_argument("QTIP reference input shape");
     const size_t rows = x.size() / size_t(l.in);
+    if (l.is_fp8()) {
+        if (l.fp8.size() != size_t(l.in) * size_t(l.out) || l.fp8_scale.size() != size_t(l.out))
+            throw std::invalid_argument("Invalid FP8 reference weight");
+        std::vector<float> y(rows * size_t(l.out));
+        for (size_t r = 0; r < rows; ++r)
+            for (int o = 0; o < l.out; ++o) {
+                double sum = 0;
+                for (int i = 0; i < l.in; ++i) {
+                    float v = x[r * size_t(l.in) + size_t(i)];
+                    if (device_rounding) v = float(BFloat16(v));
+                    sum += double(v) * decode_e4m3(l.fp8[size_t(o) * size_t(l.in) + size_t(i)]);
+                }
+                y[r * size_t(l.out) + size_t(o)] = float(sum) * l.fp8_scale[size_t(o)];
+            }
+        return y;
+    }
     const Codebook cb = make_codebook(l.tlut);
     std::vector<double> u(rows * size_t(l.in));
     for (size_t r = 0; r < rows; ++r) {
@@ -177,11 +193,27 @@ std::vector<float> reference_forward(const HostLinear &l, std::span<const float>
 HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::string &name) {
     if (layer < 0 || layer >= checkpoint.config.layers)
         throw std::invalid_argument("Invalid QTIP layer");
+    const auto base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    const bool fp8 = checkpoint.config.fp8_kv && (name == "self_attn.k_proj" || name == "self_attn.v_proj");
+    if (fp8) {
+        for (const auto *suffix : {"trellis", "SU", "SV", "tlut", "rcp", "tp_rank"})
+            if (checkpoint.has_tensor(base + suffix))
+                throw std::invalid_argument("Mixed checkpoint has both FP8 and QTIP K/V: " + base);
+        auto w = load_fp8_linear(checkpoint.tensor(base + "weight"), checkpoint.tensor(base + "weight_scale"), layer, name);
+        if (w.in != 12288 || w.out != 1024)
+            throw std::invalid_argument("Invalid FP8 K/V geometry: " + base);
+        return w;
+    }
+    if (checkpoint.has_tensor(base + "weight"))
+        throw std::invalid_argument("FP8 projection requires qtip_quant.kv_format=fp8: " + base);
     return load_linear(
         checkpoint.tensor("model.layers." + std::to_string(layer) + "." + name + ".trellis"), layer,
         name);
 }
 HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string &name) {
+    const auto prefix = "model.layers." + std::to_string(layer) + "." + name + ".";
+    if (file.contains(prefix + "weight"))
+        return load_fp8_linear(file, layer, name);
     int in = 12288, out = 12288;
     if (name == "self_attn.k_proj" || name == "self_attn.v_proj")
         out = 1024;
@@ -239,6 +271,40 @@ HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string 
             throw std::invalid_argument("QTIP rcp != 0 (TP-split checkpoints are not supported)");
     }
     return l;
+}
+HostLinear load_fp8_linear(const SafeTensorFile &file, int layer, const std::string &name) {
+    return load_fp8_linear(file, file, layer, name);
+}
+HostLinear load_fp8_linear(const SafeTensorFile &file, const SafeTensorFile &scale_file, int layer, const std::string &name) {
+    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    auto shape = file.shape(base + "weight");
+    if (file.dtype(base + "weight") != "F8_E4M3" || shape.size() != 2 || !shape[0] || !shape[1] ||
+        shape[0] > size_t(INT32_MAX) || shape[1] > size_t(INT32_MAX) ||
+        file.contains(base + "trellis") || file.contains(base + "SU") || file.contains(base + "SV") ||
+        file.contains(base + "tlut") || file.contains(base + "rcp") || file.contains(base + "tp_rank"))
+        throw std::invalid_argument("Invalid or ambiguous FP8 projection: " + base);
+    HostLinear w;
+    w.out = int(shape[0]);
+    w.in = int(shape[1]);
+    auto raw = file.bytes(base + "weight");
+    w.fp8.resize(raw.size());
+    std::memcpy(w.fp8.data(), raw.data(), raw.size());
+    const auto dtype = scale_file.dtype(base + "weight_scale");
+    if (dtype != "BF16" && dtype != "F32")
+        throw std::invalid_argument("FP8 scales must be BF16 or FP32: " + base);
+    auto scales = scale_file.floats(base + "weight_scale");
+    if (scales.size() != size_t(w.out))
+        throw std::invalid_argument("Invalid FP8 per-output scale: " + base);
+    w.fp8_scale.resize(scales.size());
+    for (size_t i = 0; i < scales.size(); ++i) {
+        w.fp8_scale[i] = scales[i];
+        if (!std::isfinite(scales[i]) || scales[i] < 0)
+            throw std::invalid_argument("Nonfinite or negative FP8 scale: " + base);
+    }
+    for (uint8_t x : w.fp8)
+        if (!std::isfinite(decode_e4m3(x)))
+            throw std::invalid_argument("Nonfinite FP8 weight: " + base);
+    return w;
 }
 namespace {
 std::vector<BFloat16> norm_ref(std::span<const BFloat16> x, const std::vector<BFloat16> &weights) {

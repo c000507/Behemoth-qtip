@@ -21,7 +21,8 @@ Pipeline:
    - Each GPU owns half of the sequences and runs its own layer chain. The two partial Hessians are summed on the
      host.
    - Activations stay in host RAM (bf16, about 98 GB for 4.19M tokens).
-3. **Quantization**: one Hessian group at a time (q+k+v, o, gate+up, down).
+3. **Quantization**: one Hessian group at a time (q, o, gate+up, down), preserving source FP8 K/V by default
+   (`--kv-format qtip` quantizes q+k+v for the legacy format).
    - **RHT**: random sign vectors SU/SV, then the reference's Hadamard factorisation `hadK ⊗ H_{2^p}` on both
      sides (12288 = 12·1024, 28672 = 28·1024, 1024 = 2^10).
    - **Damping**: `regularize_H` (σ = 1e-2 · mean diag).
@@ -71,6 +72,12 @@ runtime/build-rocm/behemoth_server --model /mnt/nvme/qtip_quant/Behemoth-R1-123B
 The model directory needs `tokenizer.model` next to `tokenizer.json` (copy it from the source model if
 `qtip_quant --mode assemble` did not). Single-request decode is ~44 ms/token short context (~52 ms at 16k) on
 2x R9700, against ~69-74 ms/token for the AQLM 1x16 model.
+
+Fresh quantization keeps the source FP8 K/V projection weights while keeping
+the other projections in QTIP 2-bit (`--kv-format qtip` selects legacy all-2-bit).
+`qtip_fp8_kv` upgrades an existing checkpoint;
+`qtip_reconstruct` performs sequential teacher-guided block fitting. See
+[FP8 K/V and block reconstruction](docs/MIXED_FP8_RECONSTRUCTION.md).
 
 QTIP prefill and scheduling options (`runtime/PREFILL_SCHED_REPORT.md`):
 

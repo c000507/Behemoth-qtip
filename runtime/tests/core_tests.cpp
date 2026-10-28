@@ -3,6 +3,7 @@
 #include "behemoth/prefix_cache.hpp"
 #include "behemoth/prefill.hpp"
 #include "behemoth/protocol.hpp"
+#include "behemoth/qtip.hpp"
 #include "behemoth/sampling.hpp"
 #include "behemoth/sorted_layout.hpp"
 #include "behemoth/tuning.hpp"
@@ -812,6 +813,70 @@ static void checkpoint_tests() {
     CHECK(std::abs(y[0] - 16) < 1e-4);
     CHECK(std::abs(y[1] - 24) < 1e-4);
 }
+static void fp8_checkpoint_tests() {
+    namespace fs = std::filesystem;
+    using json = nlohmann::json;
+    const auto root = fs::temp_directory_path() / ("behemoth-fp8-" + std::to_string(getpid()));
+    fs::create_directory(root);
+    struct Cleanup { fs::path path; ~Cleanup() { fs::remove_all(path); } } cleanup{root};
+    auto write_json = [&](const char *name, const json &j) { std::ofstream(root / name) << j; };
+    const std::string base = "model.layers.0.self_attn.k_proj.";
+    const size_t count = size_t(1024) * 12288;
+    auto tensor = [&](const char *file, const std::string &name, const char *dtype,
+                      const json &shape, const void *data, size_t bytes) {
+        auto header = json({{name, {{"dtype", dtype}, {"shape", shape}, {"data_offsets", {0, bytes}}}}}).dump();
+        uint64_t n = header.size();
+        std::ofstream out(root / file, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(&n), 8);
+        out.write(header.data(), std::streamsize(header.size()));
+        out.write(static_cast<const char *>(data), std::streamsize(bytes));
+    };
+    std::vector<uint8_t> raw(count, encode_e4m3(1));
+    std::vector<float> scales(1024, 2.f);
+    tensor("weights.safetensors", base + "weight", "F8_E4M3", {1024, 12288}, raw.data(), raw.size());
+    tensor("scales.safetensors", base + "weight_scale", "F32", {1024}, scales.data(), scales.size() * 4);
+    json index = {{"weight_map", {{base + "weight", "weights.safetensors"},
+                                  {base + "weight_scale", "scales.safetensors"}}}};
+    json config = {{"hidden_size", 12288}, {"intermediate_size", 28672}, {"num_hidden_layers", 88},
+        {"num_attention_heads", 96}, {"num_key_value_heads", 8}, {"head_dim", 128}, {"vocab_size", 32768},
+        {"model_type", "llama"}, {"hidden_act", "silu"}, {"tie_word_embeddings", false},
+        {"max_position_embeddings", 131072}, {"rms_norm_eps", 1e-5f}, {"rope_theta", 1000000.f},
+        {"quip_params", {{"codebook", "bitshift"}, {"L", 16}, {"K", 2}, {"V", 2}, {"tlut_bits", 9},
+                         {"decode_mode", "quantlut_sym"}, {"td_x", 16}, {"td_y", 16}}},
+        {"qtip_quant", {{"kv_format", "fp8"}}}};
+    write_json("config.json", config);
+    write_json("model.safetensors.index.json", index);
+    {
+        Checkpoint checkpoint(root);
+        CHECK(checkpoint.config.fp8_kv);
+        auto w = qtip::load_linear(checkpoint, 0, "self_attn.k_proj");
+        CHECK(w.is_fp8() && w.in == 12288 && w.out == 1024);
+        CHECK(w.fp8 == raw && w.fp8_scale == scales && w.trellis.empty());
+        auto y = qtip::reference_forward(w, std::vector<float>(12288, .5f), true);
+        CHECK(y.size() == 1024 && std::all_of(y.begin(), y.end(), [](float v) { return v == 12288.f; }));
+    }
+    config["qtip_quant"].erase("kv_format");
+    write_json("config.json", config);
+    rejects([&] { Checkpoint checkpoint(root); (void)qtip::load_linear(checkpoint, 0, "self_attn.k_proj"); });
+    config["qtip_quant"]["kv_format"] = "invalid";
+    write_json("config.json", config);
+    rejects([&] { Checkpoint checkpoint(root); });
+    config["qtip_quant"]["kv_format"] = "fp8";
+    write_json("config.json", config);
+    index["weight_map"][base + "SU"] = "scales.safetensors";
+    write_json("model.safetensors.index.json", index);
+    rejects([&] { Checkpoint checkpoint(root); (void)qtip::load_linear(checkpoint, 0, "self_attn.k_proj"); });
+    index["weight_map"].erase(base + "SU");
+    write_json("model.safetensors.index.json", index);
+    scales[0] = -1.f;
+    tensor("scales.safetensors", base + "weight_scale", "F32", {1024}, scales.data(), scales.size() * 4);
+    rejects([&] { Checkpoint checkpoint(root); (void)qtip::load_linear(checkpoint, 0, "self_attn.k_proj"); });
+    scales[0] = 2.f;
+    tensor("scales.safetensors", base + "weight_scale", "F32", {1024}, scales.data(), scales.size() * 4);
+    raw[0] = 127; // E4M3 NaN.
+    tensor("weights.safetensors", base + "weight", "F8_E4M3", {1024, 12288}, raw.data(), raw.size());
+    rejects([&] { Checkpoint checkpoint(root); (void)qtip::load_linear(checkpoint, 0, "self_attn.k_proj"); });
+}
 int main() {
     try {
         CHECK(qtip_fp32_exchange_bytes == 147456);
@@ -833,7 +898,8 @@ int main() {
                   {"sampling", sampling_tests},
                   {"sampler_equivalence", sampler_equivalence_tests},
                   {"tuning", tuning_tests},
-                 {"checkpoint", checkpoint_tests}}) {
+                 {"checkpoint", checkpoint_tests},
+                 {"fp8_checkpoint", fp8_checkpoint_tests}}) {
             fn();
             std::cout << "PASS " << name << '\n';
         }

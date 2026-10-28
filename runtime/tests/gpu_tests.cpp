@@ -1,5 +1,6 @@
 #include "behemoth/gpu.hpp"
 #include "behemoth/model.hpp"
+#include "behemoth/qtip_gpu.hpp"
 #include "fixtures.hpp"
 #include <iostream>
 #include <sstream>
@@ -8,6 +9,90 @@ using namespace behemoth;
 static void check(bool condition, const char *what) {
     if (!condition)
         throw std::runtime_error(what);
+}
+static void fp8_weights(hipStream_t stream) {
+    for (int n : {32, 128, 256})
+        for (int out : {32, 96})
+            for (int rows : {1, 3, 5, 17, 33}) {
+                qtip::HostLinear host;
+                host.in = n; host.out = out;
+                host.fp8.resize(size_t(n) * out);
+                host.fp8_scale.resize(out);
+                for (size_t i = 0; i < host.fp8.size(); ++i)
+                    host.fp8[i] = encode_e4m3(float(std::sin(double(i) * .17) * 12));
+                for (int i = 0; i < out; ++i) host.fp8_scale[i] = i == 0 ? 0 : .01f * (1 + i % 3);
+                qtip::GpuFp8Linear weight; weight.upload(host, 0, out);
+                const int ldx = n + 16, ldy = out + 16;
+                std::vector<BFloat16> x(size_t(rows) * ldx), y(size_t(rows) * ldy + 32, BFloat16(-19));
+                std::vector<float> dense(size_t(rows) * n);
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < n; ++c) {
+                        x[size_t(r) * ldx + c] = BFloat16(float(std::cos(double(r * n + c) * .23)));
+                        dense[size_t(r) * n + c] = float(x[size_t(r) * ldx + c]);
+                    }
+                DeviceBuffer<BFloat16> dx, dy; dx.upload(x); dy.upload(y);
+                qtip::fp8_linear(weight, dx.data(), ldx, rows, dy.data() + 16, ldy, stream);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                auto got = dy.download();
+                auto ref = qtip::reference_forward(host, dense, true);
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < ldy; ++c) {
+                        float value = float(got[16 + size_t(r) * ldy + c]);
+                        if (c >= out) check(value == -19, "FP8 projection overwrote row padding");
+                        else {
+                            float expected = float(BFloat16(ref[size_t(r) * out + c]));
+                            check(std::abs(value - expected) <= .001f + .01f * std::abs(expected), "W8A16 projection mismatch");
+                        }
+                    }
+                for (int i = 0; i < 16; ++i)
+                    check(float(got[i]) == -19 && float(got[got.size() - 1 - i]) == -19, "FP8 projection output guard");
+            }
+    const int saved = qtip::row_transform_threshold();
+    for (int threshold : {0, 1}) {
+        qtip::set_row_transform_threshold(threshold);
+        for (int rows : {1, 17}) {
+            std::vector<float> legacy(size_t(rows) * 2 * 7168), only_q(size_t(rows) * 2 * 6144);
+            for (int rank = 0; rank < 2; ++rank)
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < 6144; ++c) {
+                        float value = float(std::sin(double((rank * rows + r) * 6144 + c) * .013));
+                        legacy[(size_t(rank) * rows + r) * 7168 + c] = value;
+                        only_q[(size_t(rank) * rows + r) * 6144 + c] = value;
+                    }
+            DeviceBuffer<float> a, b, sq, sk;
+            a.upload(legacy); b.upload(only_q);
+            std::vector<BFloat16> legacy_bf16(legacy.size()), only_bf16(only_q.size());
+            for (size_t i = 0; i < legacy.size(); ++i) legacy_bf16[i] = BFloat16(legacy[i]);
+            for (size_t i = 0; i < only_q.size(); ++i) only_bf16[i] = BFloat16(only_q[i]);
+            DeviceBuffer<BFloat16> ab, bb;
+            ab.upload(legacy_bf16); bb.upload(only_bf16);
+            sq.upload(std::vector<float>(12288, 1)); sk.upload(std::vector<float>(1024, 1));
+            DeviceBuffer<BFloat16> qa(size_t(rows) * 6144), qb(size_t(rows) * 6144), k, v;
+            k.upload(std::vector<BFloat16>(size_t(rows) * 512, BFloat16(-19)));
+            v.upload(std::vector<BFloat16>(size_t(rows) * 512, BFloat16(-19)));
+            for (int rank = 0; rank < 2; ++rank) {
+                qtip::output_qkv(a.data(), rows, rank, sq.data(), sk.data(), sk.data(), qa.data(), k.data(), v.data(), stream);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                auto expected = qa.download();
+                k.upload(std::vector<BFloat16>(size_t(rows) * 512, BFloat16(-19)));
+                v.upload(std::vector<BFloat16>(size_t(rows) * 512, BFloat16(-19)));
+                qtip::output_qkv(b.data(), rows, rank, sq.data(), sk.data(), sk.data(), qb.data(), k.data(), v.data(), stream, true);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                auto actual = qb.download();
+                for (size_t i = 0; i < expected.size(); ++i) check(expected[i].bits == actual[i].bits, "Q-only TP epilogue changed Q");
+                for (auto value : k.download()) check(float(value) == -19, "Q-only epilogue wrote K");
+                for (auto value : v.download()) check(float(value) == -19, "Q-only epilogue wrote V");
+                qtip::output_qkv(ab.data(), rows, rank, sq.data(), sk.data(), sk.data(), qa.data(), k.data(), v.data(), stream);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                expected = qa.download();
+                qtip::output_qkv(bb.data(), rows, rank, sq.data(), sk.data(), sk.data(), qb.data(), k.data(), v.data(), stream, true);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                actual = qb.download();
+                for (size_t i = 0; i < expected.size(); ++i) check(expected[i].bits == actual[i].bits, "BF16 Q-only TP epilogue changed Q");
+            }
+        }
+    }
+    qtip::set_row_transform_threshold(saved);
 }
 static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
                      bool known = false) {
@@ -427,6 +512,7 @@ int main(int argc, char **argv) {
             append(stream);
             projection_selection(stream);
             projections(stream);
+            fp8_weights(stream);
             for (int seed : {7, 19, 103})
                 for (int len : {1, 15, 16, 17, 31, 32, 33, 127, 129, 1025}) {
                     auto f = test::fixture({len}, {{len - 1}}, seed);

@@ -5,6 +5,30 @@
 #include <numeric>
 
 namespace qat {
+double Ops::mse(Mat prediction, Mat target, std::span<const int32_t> segments, Mat gradient) {
+    require(prediction.rows == target.rows && prediction.cols == target.cols &&
+                segments.size() == size_t(prediction.rows), "block reconstruction loss shape");
+    size_t valid = 0;
+    for (int id : segments) if (id >= 0) ++valid;
+    require(valid > 0, "block reconstruction batch has no valid tokens");
+    if (gradient.p)
+        require(gradient.rows == prediction.rows && gradient.cols == prediction.cols && !gradient.half,
+                "block reconstruction gradient shape/storage");
+    std::vector<float> a(prediction.size()), b(target.size()), g(gradient.p ? prediction.size() : 0);
+    download(prediction, a);
+    download(target, b);
+    double total = 0, denominator = double(valid) * prediction.cols;
+    for (int r = 0; r < prediction.rows; ++r)
+        for (int c = 0; c < prediction.cols; ++c) {
+            size_t i = size_t(r) * prediction.cols + c;
+            double d = segments[r] >= 0 ? double(a[i]) - b[i] : 0;
+            require(std::isfinite(d), "nonfinite block reconstruction output");
+            total += d * d;
+            if (gradient.p) g[i] = float(2 * d / denominator);
+        }
+    if (gradient.p) upload(gradient, g);
+    return total / denominator;
+}
 namespace {
 struct Cpu final : Ops {
     std::vector<Mat> checkpoints;
@@ -132,6 +156,12 @@ struct Cpu final : Ops {
         std::vector<Weight> w;
         for (auto &lin : l.linear) {
             auto a = alloc(lin.out, lin.in);
+            if (lin.is_fp8()) {
+                for (size_t i = 0; i < lin.fp8.size(); ++i)
+                    a.p[i] = behemoth::decode_e4m3(lin.fp8[i]);
+                w.push_back({a.owner, a.p, lin.out, lin.in, false, false});
+                continue;
+            }
             auto cb = behemoth::qtip::make_codebook(lin.tlut);
             if (rounding)
                 behemoth::qtip::decode_rows_bf16(lin, cb, 0, lin.out, a.p);
@@ -323,7 +353,7 @@ struct Cpu final : Ops {
                 p.p[i] -= rate * (m.p[i] / b1) / (std::sqrt(v.p[i] / b2) + 1e-8f);
             }
     }
-    void configure_streaming(const Model &m, int) override { checkpoints.resize(m.layers.size()); }
+    void configure_streaming(const Model &m, int, bool keep = true) override { checkpoints.resize(keep ? m.layers.size() : 0); }
     Mat checkpoint(int layer, Mat x, bool save) override {
         if (save) {
             if (!checkpoints.at(layer).p)

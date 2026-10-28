@@ -30,6 +30,7 @@ inline const std::vector<std::string> linears = {"self_attn.q_proj", "self_attn.
                                                  "mlp.down_proj"};
 inline const std::string norm1 = "input_layernorm.weight", norm2 = "post_attention_layernorm.weight";
 std::string su_name(int linear);
+void replace_kv_fp8(const fs::path &model, const fs::path &source, const fs::path &output);
 // Optimizer parameter groups. Every trainable tensor belongs to exactly one.
 enum class Group : int { su, sv, wscale, norm };
 inline constexpr int group_count = 4;
@@ -67,10 +68,11 @@ class Model {
     std::vector<float> initial;
     size_t final_norm = 0;
     std::vector<uint16_t> embedding, head;
-    explicit Model(const fs::path &);
+    bool fp8_source = false;
+    explicit Model(const fs::path &, bool allow_fp8_source = false);
     const behemoth::SafeTensorFile &file(const std::string &) const;
     size_t add_param(const std::string &, std::span<const float>, bool norm = false);
-    void export_model(const fs::path &, std::span<const float>) const;
+    void export_model(const fs::path &, std::span<const float>, const json &reconstruction = json::object()) const;
 };
 struct Batch {
     std::vector<int32_t> tokens, labels, segments, positions, starts, ends;
@@ -239,11 +241,14 @@ struct Ops {
     virtual std::vector<Mat> attention_backward(const Attention &, Mat dy, const Config &, const Batch &) = 0;
     virtual double cross_entropy(Mat logits, std::span<const int32_t> labels, float normalizer,
                                  bool backward) = 0;
+    // Mean squared block-output error over nonpadding tokens. Optional FP32
+    // gradient receives 2*(prediction-target)/valid_elements, zero at padding.
+    virtual double mse(Mat, Mat, std::span<const int32_t>, Mat gradient = {});
     virtual void adam(Mat p, Mat g, Mat m, Mat v, const std::vector<Param> &, uint64_t step, float lr,
                       float norm_lr, float decay, float clip) = 0;
     virtual void synchronize() {}
     // Prefetch callbacks borrow immutable, pinned model storage. CPU uses no-ops.
-    virtual void configure_streaming(const Model &, int) {}
+    virtual void configure_streaming(const Model &, int, bool checkpoints = true) { (void)checkpoints; }
     virtual void prefetch(int, int, bool) {}
     virtual Mat checkpoint(int, Mat, bool save) = 0;
     virtual void acquire(int) {}
@@ -263,9 +268,15 @@ class Layer {
     Mat parameters_, gradients_;
     std::vector<Weight> weights_;
     mutable std::map<std::string, Mat> effective_;
+    bool mixed_ = false;
+    Mat mixed_projection(Mat, int, LinearSave * = nullptr, Mat residual = {}, Mat dst = {});
+    Mat mixed_projection_backward(const LinearSave &, Mat);
+    Mat mixed_forward(Mat, const Batch &, int);
+    Mat mixed_backward(Mat, Mat, const Batch &, int);
     Mat parameter(const std::string &) const;
     Mat gradient(const std::string &) const;
     Mat effective(const std::string &, bool rounded = true) const;
+    Mat fp8_scale(int) const;
     std::vector<Mat> epilogues(std::vector<Mat> z, int first, LinearSave *saves, Mat input, Mat residual = {},
                                Mat dst = {});
     Mat projection(Mat, int, LinearSave *save = nullptr, Mat residual = {}, Mat dst = {});
@@ -289,6 +300,7 @@ class Layer {
 
   public:
     Layer(Ops &, const Model &, int layer, Mat parameters, Mat gradients);
+    void refresh_parameters() { effective_.clear(); }
     Mat forward(Mat, const Batch &, int chunk);
     Mat backward(Mat x, Mat dy, const Batch &, int chunk);
 };
@@ -318,7 +330,7 @@ class Replica {
     std::unique_ptr<Ops> ops;
     Mat parameters, gradients, first, second;
     Weight head, embedding;
-    Replica(const Model &, int device, int seqlen, size_t arena, bool rounding);
+    Replica(const Model &, int device, int seqlen, size_t arena, bool rounding, bool checkpoints = true);
     double run(const Batch &, const Options &, size_t denominator, bool backward);
     std::vector<float> values();
     std::vector<float> grad_values();
@@ -357,6 +369,15 @@ void save_checkpoint(const fs::path &, Replica &, const Optimizer &, const Progr
 Progress load_checkpoint(const fs::path &, const std::vector<std::unique_ptr<Replica>> &, Optimizer &,
                          const json &signature);
 int train(const Options &);
+struct ReconstructionOptions {
+    fs::path model, teacher, data, validation_data, work, output;
+    int device = 0, teacher_device = 1, samples = 4, validation_samples = 1;
+    int steps = 64, eval_every = 8, rows = 1024, layer_begin = 0, layer_end = -1;
+    float lr = 1e-4f, norm_lr = 1e-5f, clip = 1;
+    size_t arena_bytes = size_t(24e9), teacher_arena_bytes = size_t(12e9);
+    bool resume = false;
+};
+int reconstruct(const ReconstructionOptions &);
 void write_tiny_model(const fs::path &, int layers = 2);
 void write_tiny_data(const fs::path &, int sequences = 3);
 } // namespace qat
