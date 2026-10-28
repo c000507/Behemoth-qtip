@@ -46,6 +46,7 @@ struct Options {
   int batch_rows = 4096;
   int backlog = 2;
   bool keep_hessians = false;
+  int moe_min_tok = 64;  // starved-expert fallback: experts with fewer routed calibration tokens use the pooled Hessian
   uint64_t seed = 0;
   std::string dump_acts;  // write the first sequence of GPU 0 after every chain layer (bf16)
   QuantOpts q;
@@ -70,7 +71,9 @@ static void usage() {
       "  --ldl-threads N      CPU threads per fp64 LDL (default 16)\n"
       "  --dump-dir DIR       write W / reconstructed hatW (fp32) per linear for validation\n"
       "  --seed N             sign-vector seed (default 0)\n"
-      "  --dump-acts DIR      debug: dump sequence 0 (GPU 0) activations after each chain layer\n");
+      "  --dump-acts DIR      debug: dump sequence 0 (GPU 0) activations after each chain layer\n"
+      "  --moe-min-tok N      MoE: experts with < N routed calibration tokens fall back to the pooled\n"
+      "                       Hessian (default 64)");
 }
 
 static Options parse(int argc, char** argv) {
@@ -99,6 +102,7 @@ static Options parse(int argc, char** argv) {
     else if (a == "--dump-dir") o.q.dump_dir = next();
     else if (a == "--seed") o.seed = std::stoull(next());
     else if (a == "--dump-acts") o.dump_acts = next();
+    else if (a == "--moe-min-tok") o.moe_min_tok = std::stoi(next());
     else if (a == "--layers") {
       std::string v = next();
       auto c = v.find(':');
@@ -138,6 +142,8 @@ struct LayerState {
   enum St { kNone, kPartial, kReady, kQuantizing, kDone } st = kNone;
   std::vector<std::vector<float>> H;  // combined (normalised) Hessians in RAM when kReady (may be empty: on disk)
   std::vector<std::vector<float>> partial;
+  // MoE: [0,E) = per-expert sum of routing-weight^2, [E,2E) = per-expert routed token counts
+  std::vector<float> moe_stats, moe_stats_partial;
   long partial_count = 0;
   int partial_parts = 0;
 };
@@ -184,7 +190,7 @@ class Pipeline {
   void quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, int L);
   void quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L);
   void deposit_partial(int L, HessAcc& acc, LayerRunner& R);
-  void deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R);
+  void deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R, MoeHessAcc* moe);
   int layers_total() const { return qwen_ ? qcfg_.layers : cfg_.layers; }
 
   Options o_;
@@ -272,6 +278,59 @@ static std::vector<std::vector<float>> read_hess(const std::string& path) {
     QCHECK(f.good(), "short read " + path);
   }
   return H;
+}
+
+// --- MoE Hessian file: qkv/o/gateup/down (pooled, shared expert) + per-expert gateup/down + stats.
+// Layout of the returned vector: [0,4) as dense, [4+2e] expert e gateup, [5+2e] expert e down.
+// stats (out-param): [0,E) sum of routing-weight^2, [E,2E) routed token counts (both still summed).
+static std::vector<std::vector<float>> read_hess_moe(const std::string& path, std::vector<float>& stats,
+                                                     int& experts) {
+  std::ifstream f(path, std::ios::binary);
+  QCHECK(f, "cannot open " + path);
+  uint64_t hl = 0;
+  f.read(reinterpret_cast<char*>(&hl), 8);
+  std::string hs(hl, '\0');
+  f.read(hs.data(), std::streamsize(hl));
+  json h = json::parse(hs);
+  QCHECK(h.contains("__metadata__") && h["__metadata__"].value("format", "") == "moe",
+         "not a MoE Hessian file: " + path);
+  experts = std::stoi(h["__metadata__"].at("experts").get<std::string>());
+  auto read_t = [&](const std::string& name) {
+    auto& t = h.at(name);
+    auto off = t["data_offsets"].get<std::vector<uint64_t>>();
+    std::vector<float> v((off[1] - off[0]) / 4);
+    f.seekg(std::streamoff(8 + hl + off[0]));
+    f.read(reinterpret_cast<char*>(v.data()), std::streamsize(off[1] - off[0]));
+    QCHECK(f.good(), "short read " + path + " tensor " + name);
+    return v;
+  };
+  std::vector<std::vector<float>> H(4 + size_t(2 * experts));
+  for (int i = 0; i < 4; ++i) H[size_t(i)] = read_t(kHessName[i]);
+  stats = read_t("stats");
+  for (int e = 0; e < experts; ++e) {
+    H[size_t(4 + 2 * e)] = read_t("e" + std::to_string(e) + ".gateup");
+    H[size_t(5 + 2 * e)] = read_t("e" + std::to_string(e) + ".down");
+  }
+  return H;
+}
+
+static void write_hess_moe(const std::string& path, const std::vector<std::vector<float>>& H,
+                           const std::vector<float>& stats, const int dims[4], int moe_inter, int experts,
+                           long count) {
+  SafeTensorsWriter w;
+  for (int i = 0; i < 4; ++i)
+    w.add(kHessName[i], "F32", {dims[i], dims[i]}, H[size_t(i)].data(), H[size_t(i)].size() * 4);
+  w.add("stats", "F32", {long(stats.size())}, stats.data(), stats.size() * 4);
+  for (int e = 0; e < experts; ++e) {
+    w.add("e" + std::to_string(e) + ".gateup", "F32", {dims[2], dims[2]}, H[size_t(4 + 2 * e)].data(),
+          H[size_t(4 + 2 * e)].size() * 4);
+    w.add("e" + std::to_string(e) + ".down", "F32", {moe_inter, moe_inter}, H[size_t(5 + 2 * e)].data(),
+          H[size_t(5 + 2 * e)].size() * 4);
+  }
+  w.write(path, {{"format", "moe"},
+                 {"count", std::to_string(count)},
+                 {"normalised", "1"},
+                 {"experts", std::to_string(experts)}});
 }
 
 void Pipeline::deposit_partial(int L, HessAcc& acc, LayerRunner& R) {
@@ -380,19 +439,33 @@ void Pipeline::chain_step_qwen(int wi, QwenLayerRunner& R, int L, bool collect) 
   R.upload(*QL);
   double t_up = now_s() - t0;
   HessAcc* acc = nullptr;
+  MoeHessAcc* moe = nullptr;
   static thread_local std::unique_ptr<HessAcc> tacc;
+  static thread_local std::unique_ptr<MoeHessAcc> tmoe;
   if (collect) {
-    if (!tacc) {
+    const bool moe_layer = QL->moe;
+    const int dim1 = qcfg_.is_full(L) ? qcfg_.nq * qcfg_.hd : qcfg_.value_dim();
+    const int dim3 = moe_layer ? qcfg_.shared_inter : qcfg_.inter;
+    if (!tacc || tacc->dim[1] != dim1 || tacc->dim[3] != dim3 || (moe_layer && !tmoe) ||
+        (!moe_layer && tmoe)) {
       tacc = std::make_unique<HessAcc>();
-      R.alloc_hess(*tacc, qcfg_.is_full(L));
+      R.alloc_hess(*tacc, qcfg_.is_full(L), moe_layer);
+      tmoe.reset();
+      if (moe_layer) {
+        tmoe = std::make_unique<MoeHessAcc>();
+        R.alloc_moe_hess(*tmoe);
+      }
     } else {
       R.zero_hess(*tacc);
+      if (tmoe) R.zero_moe_hess(*tmoe);
     }
     acc = tacc.get();
+    moe = tmoe.get();
   }
+  QCHECK(!QL->moe || moe, "MoE layer without a MoE Hessian accumulator");
   R.gemm_flops = 0;
   t0 = now_s();
-  R.forward(act_[size_t(wi)].get(), act_nseq_[size_t(wi)], acc);
+  R.forward(act_[size_t(wi)].get(), act_nseq_[size_t(wi)], acc, moe);
   double t_fwd = now_s() - t0;
   long ntok = act_nseq_[size_t(wi)] * o_.seq_len;
   logf("gpu%d qwen layer %d %s: %ld tokens in %.1fs (%.0f tok/s, %.1f TFLOPS), weights read %.1fs upload %.1fs",
@@ -404,34 +477,59 @@ void Pipeline::chain_step_qwen(int wi, QwenLayerRunner& R, int L, bool collect) 
     f.write(reinterpret_cast<const char*>(act_[0].get()),
             std::streamsize(size_t(o_.seq_len) * qcfg_.hidden * 2));
   }
-  if (collect) deposit_partial_qwen(L, *acc, R);
+  if (collect) deposit_partial_qwen(L, *acc, R, moe);
 }
 
-void Pipeline::deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R) {
+void Pipeline::deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R, MoeHessAcc* moe) {
   R.symmetrize_hess(acc);
-  std::vector<std::vector<float>> part(4);
+  const int E = moe ? qcfg_.n_experts : 0;
+  if (moe) R.symmetrize_moe_hess(*moe);
+  std::vector<std::vector<float>> part(4 + size_t(2 * E));
   for (int i = 0; i < 4; ++i) {
     part[size_t(i)].resize(size_t(acc.dim[i]) * acc.dim[i]);
     d2h_staged(part[size_t(i)].data(), acc.h[i], part[size_t(i)].size() * 4, R.stream());
   }
+  std::vector<float> stats;
+  if (moe) {
+    for (int e = 0; e < E; ++e) {
+      auto& g = part[size_t(4 + 2 * e)];
+      g.resize(size_t(qcfg_.hidden) * qcfg_.hidden);
+      d2h_staged(g.data(), moe->gate[size_t(e)], g.size() * 4, R.stream());
+      auto& d = part[size_t(5 + 2 * e)];
+      d.resize(size_t(qcfg_.moe_inter) * qcfg_.moe_inter);
+      d2h_staged(d.data(), moe->down[size_t(e)], d.size() * 4, R.stream());
+    }
+    stats.resize(size_t(2 * E));
+    d2h_staged(stats.data(), moe->wsum, size_t(E) * 4, R.stream());
+    HIP_CHECK(hipStreamSynchronize(R.stream()));
+    std::vector<int> cnt_h{size_t(E)};  // tiny copy after the sync: plain pageable memcpy is safe
+    HIP_CHECK(hipMemcpy(cnt_h.data(), moe->cnt, size_t(E) * 4, hipMemcpyDeviceToHost));
+    for (int e = 0; e < E; ++e) stats[size_t(E + e)] = float(cnt_h[size_t(e)]);
+  }
   long cnt = acc.count;
   bool complete = false;
   std::vector<std::vector<float>> mine;
+  std::vector<float> my_stats;
   long total = 0;
   {
     std::lock_guard<std::mutex> lk(mu_);
     LayerState& S = layers_[L];
     if (S.partial.empty()) {
       S.partial = std::move(part);
+      S.moe_stats_partial = std::move(stats);
       S.partial_count = cnt;
     } else {
-      for (int i = 0; i < 4; ++i) {
-        float* a = S.partial[size_t(i)].data();
-        const float* b = part[size_t(i)].data();
-        long n = long(S.partial[size_t(i)].size());
+      QCHECK(S.partial.size() == part.size(), "partial Hessian count mismatch (dense vs MoE?)");
+      for (size_t i = 0; i < S.partial.size(); ++i) {
+        float* a = S.partial[i].data();
+        const float* b = part[i].data();
+        long n = long(S.partial[i].size());
+        QCHECK(n == long(part[i].size()), "partial Hessian size mismatch");
 #pragma omp parallel for schedule(static) num_threads(16)
         for (long k = 0; k < n; ++k) a[k] += b[k];
       }
+      for (size_t i = 0; i < S.moe_stats_partial.size() && i < stats.size(); ++i)
+        S.moe_stats_partial[i] += stats[i];
       S.partial_count += cnt;
     }
     S.partial_parts++;
@@ -439,21 +537,38 @@ void Pipeline::deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R) {
     if (S.partial_parts == int(o_.gpus.size())) {
       complete = true;
       mine = std::move(S.partial);
+      my_stats = std::move(S.moe_stats_partial);
       total = S.partial_count;
       S.partial.clear();
+      S.moe_stats_partial.clear();
     }
   }
   if (!complete) return;
+  // normalise: attn groups + pooled (shared expert) by the token count; each expert by its own
+  // routing-weight mass (sum of w^2), so every Hessian is an average xx^T under its own distribution
   double inv = 1.0 / double(total);
-  for (auto& v : mine) {
-    long n = long(v.size());
-    float* a = v.data();
+  for (size_t i = 0; i < mine.size(); ++i) {
+    double s = inv;
+    if (E && i >= 4) {
+      int e = int((i - 4) / 2);
+      double ws = my_stats[size_t(e)];
+      s = ws > 0 ? 1.0 / ws : 0.0;
+    }
+    long n = long(mine[i].size());
+    float* a = mine[i].data();
+    float f = float(s);
 #pragma omp parallel for schedule(static) num_threads(16)
-    for (long k = 0; k < n; ++k) a[k] = float(a[k] * inv);
+    for (long k = 0; k < n; ++k) a[k] *= f;
   }
   double t0 = now_s();
-  write_hess(hess_path(L), mine, acc.dim, total);
-  logf("qwen layer %d: Hessians complete (%ld tokens), saved in %.1fs", L, total, now_s() - t0);
+  if (E) {
+    int moe_dims[4] = {acc.dim[0], acc.dim[1], acc.dim[2], acc.dim[3]};
+    write_hess_moe(hess_path(L), mine, my_stats, moe_dims, qcfg_.moe_inter, E, total);
+  } else {
+    write_hess(hess_path(L), mine, acc.dim, total);
+  }
+  logf("qwen layer %d: Hessians complete (%ld tokens%s), saved in %.1fs", L, total, E ? ", MoE" : "",
+       now_s() - t0);
   {
     std::lock_guard<std::mutex> lk(mu_);
     LayerState& S = layers_[L];
@@ -461,6 +576,7 @@ void Pipeline::deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R) {
       S.st = LayerState::kDone;
     } else {
       S.H = std::move(mine);
+      S.moe_stats = std::move(my_stats);
       S.st = LayerState::kReady;
     }
     hess_on_disk_.insert(L);
@@ -604,23 +720,38 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     std::lock_guard<std::mutex> lk(mu_);
     H = std::move(layers_[L].H);
   }
-  if (H.empty()) H = read_hess(hess_path(L));
   auto QL = qcache_->get(L);
-  QCHECK(!QL->moe, "layer " + std::to_string(L) + ": MoE quantization not implemented yet (Qwen3.5 dense only)");
+  const bool is_moe = QL->moe;
+  std::vector<float> moe_stats;
+  if (H.empty()) {
+    if (is_moe) {
+      int E = 0;
+      H = read_hess_moe(hess_path(L), moe_stats, E);
+      QCHECK(E == qcfg_.n_experts, "MoE Hessian expert count mismatch");
+      std::lock_guard<std::mutex> lk(mu_);
+      layers_[L].moe_stats = moe_stats;
+    } else {
+      H = read_hess(hess_path(L));
+    }
+  } else if (is_moe) {
+    std::lock_guard<std::mutex> lk(mu_);
+    moe_stats = layers_[L].moe_stats;
+    QCHECK(moe_stats.size() == size_t(2 * qcfg_.n_experts), "missing MoE Hessian stats");
+  }
   int dev = 0;
   HIP_CHECK(hipGetDevice(&dev));
   const bool full = qcfg_.is_full(L);
   const int Hid = qcfg_.hidden;
   // linear index space of this layer type -> output tensor name, host fp32 weight and dims
   struct QLin {
-    const char* name;
+    std::string name;
     int m = 0, n = 0;
     std::vector<float> w;  // fp32 rows of this linear [m][n]
   };
   std::vector<QLin> lins;
-  auto add_lin = [&](const char* name, int m, int n, std::vector<float> w) {
+  auto add_lin = [&](std::string name, int m, int n, std::vector<float> w) {
     QLin q;
-    q.name = name, q.m = m, q.n = n, q.w = std::move(w);
+    q.name = std::move(name), q.m = m, q.n = n, q.w = std::move(w);
     lins.push_back(std::move(q));
   };
   if (full) {
@@ -629,44 +760,75 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     add_lin("self_attn.k_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_k));
     add_lin("self_attn.v_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_v));
     add_lin("self_attn.o_proj", Hid, A, bf16_to_f32_vec(QL->w_o));
-    add_lin("mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate));
-    add_lin("mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up));
-    add_lin("mlp.down_proj", Hid, qcfg_.inter, bf16_to_f32_vec(QL->w_down));
   } else {
     const long nv = qcfg_.lin_nv, V = qcfg_.value_dim();
     add_lin("linear_attn.in_proj_qkv", qcfg_.conv_dim(), Hid, bf16_to_f32_vec(QL->w_in_qkv));
     add_lin("linear_attn.in_proj_z", int(V), Hid, bf16_to_f32_vec(QL->w_in_z));
     add_lin("linear_attn.out_proj", Hid, int(V), bf16_to_f32_vec(QL->w_out));
+  }
+  if (is_moe) {
+    const int E = qcfg_.n_experts, F = qcfg_.moe_inter, S = qcfg_.shared_inter;
+    for (int e = 0; e < E; ++e) {
+      std::string ep = "mlp.experts." + std::to_string(e) + ".";
+      add_lin(ep + "gate_proj", F, Hid, bf16_to_f32_vec(QL->w_exp_gate[size_t(e)]));
+      add_lin(ep + "up_proj", F, Hid, bf16_to_f32_vec(QL->w_exp_up[size_t(e)]));
+      add_lin(ep + "down_proj", Hid, F, bf16_to_f32_vec(QL->w_exp_down[size_t(e)]));
+    }
+    add_lin("mlp.shared_expert.gate_proj", S, Hid, bf16_to_f32_vec(QL->w_sh_gate));
+    add_lin("mlp.shared_expert.up_proj", S, Hid, bf16_to_f32_vec(QL->w_sh_up));
+    add_lin("mlp.shared_expert.down_proj", Hid, S, bf16_to_f32_vec(QL->w_sh_down));
+  } else {
     add_lin("mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate));
     add_lin("mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up));
     add_lin("mlp.down_proj", Hid, qcfg_.inter, bf16_to_f32_vec(QL->w_down));
   }
+  // groups: (Hessian matrix index in H, n, lins). MoE Hessian layout: [0,4) dense slots
+  // (2/3 = pooled, shared expert), [4+2e] expert gateup, [5+2e] expert down.
   struct Grp {
     int hess;
+    int n;
     std::vector<int> lins;
+    std::string tag;  // log/seed tag
   };
-  std::vector<Grp> groups = full ? std::vector<Grp>{{0, {0, 1, 2}}, {1, {3}}, {2, {4, 5}}, {3, {6}}}
-                                 : std::vector<Grp>{{0, {0, 1}}, {1, {2}}, {2, {3, 4}}, {3, {5}}};
+  std::vector<Grp> groups;
+  if (full)
+    groups.push_back({0, Hid, {0, 1, 2}, "qkv"});
+  else
+    groups.push_back({0, Hid, {0, 1}, "qkv"});
+  groups.push_back({1, full ? qcfg_.nq * qcfg_.hd : qcfg_.value_dim(), {full ? 3 : 2}, "o"});
+  if (is_moe) {
+    const int E = qcfg_.n_experts, F = qcfg_.moe_inter, S = qcfg_.shared_inter;
+    int base = full ? 4 : 3;
+    for (int e = 0; e < E; ++e) {
+      int g0 = base + 3 * e;
+      // starved experts (< moe_min_tok routed calibration tokens) use the pooled Hessian
+      bool starved = moe_stats[size_t(E + e)] < float(o_.moe_min_tok);
+      groups.push_back({starved ? 2 : 4 + 2 * e, Hid, {g0, g0 + 1}, "e" + std::to_string(e) + (starved ? "g*" : "g")});
+      groups.push_back({starved ? 3 : 5 + 2 * e, starved ? S : F, {g0 + 2}, "e" + std::to_string(e) + (starved ? "d*" : "d")});
+    }
+    groups.push_back({2, Hid, {base + 3 * E, base + 3 * E + 1}, "sg"});
+    groups.push_back({3, S, {base + 3 * E + 2}, "sd"});
+  } else {
+    groups.push_back({2, Hid, {full ? 4 : 3, full ? 5 : 4}, "gateup"});
+    groups.push_back({3, qcfg_.inter, {full ? 6 : 5}, "down"});
+  }
   std::vector<LinearOut> outs(lins.size());
   json jl = json::object();
+  int n_starved = 0;
   std::vector<HessPrep> preps(groups.size());
   for (size_t gi = 0; gi < groups.size(); ++gi) {
     const Grp& G = groups[gi];
-    int n = qcfg_.hidden;
-    if (G.hess == 1) n = full ? qcfg_.nq * qcfg_.hd : qcfg_.value_dim();
-    else if (G.hess == 3) n = qcfg_.inter;
-    QCHECK(long(H[size_t(G.hess)].size()) == long(n) * n, "Hessian size mismatch");
-    uint64_t seed = (o_.seed * 1000003ull + uint64_t(L)) * 16 + uint64_t(G.hess);
+    int n = G.n;
+    QCHECK(long(H[size_t(G.hess)].size()) == long(n) * n, "Hessian size mismatch (group " + G.tag + ")");
+    uint64_t seed = (o_.seed * 1000003ull + uint64_t(L)) * 16 + uint64_t(G.hess) + 1009ull * uint64_t(gi);
     rotate_hessian(s, H[size_t(G.hess)].data(), n, seed, o_.q, preps[gi]);
-    H[size_t(G.hess)].clear();
-    H[size_t(G.hess)].shrink_to_fit();
   }
   std::mutex lmu;
   std::condition_variable lcv;
   int ldl_done = 0;
   std::thread ldl_th([&] {
     for (size_t gi = 0; gi < groups.size(); ++gi) {
-      ldl_hessian(preps[gi], o_.q.ldl_threads, "L" + std::to_string(L) + "_" + kHessName[groups[gi].hess]);
+      ldl_hessian(preps[gi], o_.q.ldl_threads, "L" + std::to_string(L) + "_" + groups[gi].tag);
       std::lock_guard<std::mutex> lk(lmu);
       ldl_done = int(gi) + 1;
       lcv.notify_all();
@@ -690,19 +852,39 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     auto res = quantize_group(s, g, ins, preps[gi], o_.q, &tm, "L" + std::to_string(L));
     preps[gi].HRr.clear();
     preps[gi].HRr.shrink_to_fit();
-    logf("gpu%d qwen layer %d group %s: total %.1fs (load %.1f rht %.1f ldl_cpu %.1f ldlq %.1f [viterbi %.1f] "
-         "proxy %.1f pack %.1f)",
-         dev, L, kHessName[G.hess], tm.total, tm.load, tm.rht, tm.ldl_cpu, tm.ldlq, tm.viterbi, tm.proxy, tm.pack);
+    bool expert_grp = G.tag.size() > 1 && (G.tag[0] == 'e') && G.tag[1] >= '0' && G.tag[1] <= '9';
+    if (expert_grp) {
+      if (G.tag.find("g*") != std::string::npos) n_starved++;
+      // keep the JSON log small: one summary line per expert group, not into progress json
+      logf("  qwen layer %d %-6s %5d x %5d  %.1fs  proxy %.6f", L, G.tag.c_str(), res[0].m, res[0].n,
+           res[0].seconds, res[0].proxy);
+    } else {
+      logf("gpu%d qwen layer %d group %s: total %.1fs (load %.1f rht %.1f ldl_cpu %.1f ldlq %.1f [viterbi %.1f] "
+           "proxy %.1f pack %.1f)",
+           dev, L, G.tag.c_str(), tm.total, tm.load, tm.rht, tm.ldl_cpu, tm.ldlq, tm.viterbi, tm.proxy, tm.pack);
+    }
     for (size_t k = 0; k < res.size(); ++k) {
       const LinearOut& r = res[k];
-      logf("  qwen layer %d %-24s %5d x %5d  %.1fs  proxy %.6f  proxy_rot_reg %.6f  Wscale %.6g", L, r.name.c_str(),
-           r.m, r.n, r.seconds, r.proxy, r.proxy_rot_reg, r.wscale);
-      jl[r.name] = {{"m", r.m}, {"n", r.n}, {"seconds", r.seconds}, {"proxy", r.proxy},
-                    {"proxy_rot_reg", r.proxy_rot_reg}, {"wscale", r.wscale}};
+      if (!expert_grp) {
+        logf("  qwen layer %d %-24s %5d x %5d  %.1fs  proxy %.6f  proxy_rot_reg %.6f  Wscale %.6g", L,
+             r.name.c_str(), r.m, r.n, r.seconds, r.proxy, r.proxy_rot_reg, r.wscale);
+        jl[r.name] = {{"m", r.m}, {"n", r.n}, {"seconds", r.seconds}, {"proxy", r.proxy},
+                      {"proxy_rot_reg", r.proxy_rot_reg}, {"wscale", r.wscale}};
+      }
       outs[size_t(G.lins[k])] = res[k];
     }
   }
   ldl_th.join();
+  if (is_moe) {
+    double px = 0;
+    int np = 0;
+    for (auto& o : outs)
+      if (o.proxy >= 0) px += o.proxy, np++;
+    jl["experts"] = {{"n", qcfg_.n_experts}, {"starved_pooled", n_starved},
+                     {"mean_proxy", np ? px / np : 0.0}};
+    logf("qwen layer %d: %d experts (%d starved -> pooled Hessian), mean proxy %.6f", L, qcfg_.n_experts,
+         n_starved, np ? px / np : 0.0);
+  }
   // ---- write layer file: QTIP tensors with the original HF names + unquantised small tensors
   SafeTensorsWriter w;
   std::string pre = "model.layers." + std::to_string(L) + ".";
@@ -739,6 +921,16 @@ void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
     w.add(pre + "linear_attn.A_log", "F32", {qcfg_.lin_nv}, QL->a_log.data(), QL->a_log.size() * 4);
     w.add(pre + "linear_attn.dt_bias", "F32", {qcfg_.lin_nv}, QL->dt_bias.data(), QL->dt_bias.size() * 4);
     w.add(pre + "linear_attn.norm.weight", "BF16", {qcfg_.lin_vd}, QL->dn_norm.data(), QL->dn_norm.size() * 2);
+  }
+  if (is_moe) {  // router + shared-expert gate stay unquantised (bf16/f32 verbatim)
+    w.add(pre + "mlp.gate.weight", "BF16", {qcfg_.n_experts, qcfg_.hidden}, QL->w_router.data(),
+          QL->w_router.size() * 2);
+    if (!QL->w_router_bias.empty())
+      w.add(pre + "mlp.gate.e_score_correction_bias", "F32", {qcfg_.n_experts}, QL->w_router_bias.data(),
+            QL->w_router_bias.size() * 4);
+    if (qcfg_.shared_gate)
+      w.add(pre + "mlp.shared_expert_gate.weight", "BF16", {1, qcfg_.hidden}, QL->w_sh_gate_w.data(),
+            QL->w_sh_gate_w.size() * 2);
   }
   size_t bytes = w.write(layer_path(L));
   double secs = now_s() - t_layer;

@@ -1,8 +1,9 @@
 #pragma once
-// Qwen3.5 single-GPU QTIP inference model (hybrid Gated DeltaNet / gated full attention, dense MLP).
-// Correctness-first runtime for eval (greedy / perplexity): recurrent per-token delta-rule prefill,
-// bf16 KV cache attention on full-attention layers, trellis GEMV decode + dense GEMM prefill per
-// linear. MoE checkpoints are rejected with a clear error until implemented.
+// Qwen3.5 single-GPU QTIP inference model (hybrid Gated DeltaNet / gated full attention, dense or
+// MoE MLP). Correctness-first runtime for eval (greedy / perplexity): recurrent per-token
+// delta-rule prefill, bf16 KV cache attention on full-attention layers, trellis GEMV decode +
+// dense GEMM prefill per linear. Linears load either QTIP trellis tensors or plain bf16 weights
+// (unquantized checkpoints), enabling bf16-vs-quantized comparison of the same code path.
 #include "qtip_gpu.hpp"
 #include <filesystem>
 #include <memory>
@@ -18,7 +19,8 @@ struct QwenRuntimeConfig {
     bool attn_output_gate = true;
     int lin_nk = 0, lin_kd = 0, lin_nv = 0, lin_vd = 0, conv_k = 0;
     bool tied = true;
-    int num_experts = 0;
+    int num_experts = 0, topk = 0, moe_inter = 0, shared_inter = 0;
+    bool shared_gate = true;
     std::vector<unsigned char> full_attn;  // per layer
     int max_context = 8192;
     int key_dim() const { return lin_nk * lin_kd; }

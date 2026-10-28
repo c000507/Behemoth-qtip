@@ -660,7 +660,26 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
     }
 #pragma omp parallel for num_threads(nthreads)
     for (long i = 0; i < long(T) * H; ++i) x[size_t(i)] += y[size_t(i)];
+    if (std::getenv("QWEN_DBG_NORM")) {
+      double ss = 0;
+      for (int i = 0; i < H; ++i) ss += double(x[i]) * x[i];
+      std::fprintf(stderr, "L%d %s post-attn rms %.4f\n", L, l.full ? "full" : "lin", std::sqrt(ss / H));
+    }
     // MLP (dense or MoE)
+    if (std::getenv("QWEN_DBG_NORM")) {
+      double wmin = 1e30, wmax = -1e30;
+      for (int i = 0; i < H; ++i) {
+        float wv = bf16_to_f32(l.ln_post[size_t(i)]);
+        wmin = std::min(wmin, double(wv));
+        wmax = std::max(wmax, double(wv));
+      }
+      std::fprintf(stderr, "  mlp entry x rms %.4f ln_post [%.3f, %.3f]\n", [&] {
+        double ss = 0;
+        for (int i = 0; i < H; ++i) ss += double(x[i]) * x[i];
+        return std::sqrt(ss / H);
+      }(),
+                   wmin, wmax);
+    }
     std::memcpy(xn.data(), x.data(), size_t(T) * H * 4);
 #pragma omp parallel for num_threads(nthreads)
     for (int t = 0; t < T; ++t) zc_norm_inplace(xn.data() + size_t(t) * H, l.ln_post.data(), H, cfg.eps);
@@ -676,8 +695,14 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
       mm_bf16w(y.data(), act.data(), l.w_down.data(), T, H, cfg.inter, nthreads);
     } else {
       std::vector<float> rlog(cfg.n_experts);
+      const bool dbg = std::getenv("QWEN_DBG_NORM") != nullptr;
       for (int t = 0; t < T; ++t) {
         const float* xt = xn.data() + size_t(t) * H;
+        if (dbg && t == 0) {
+          double ss = 0;
+          for (int i = 0; i < H; ++i) ss += double(xt[i]) * xt[i];
+          std::fprintf(stderr, "  moe xn rms %.4f\n", std::sqrt(ss / H));
+        }
         mm_bf16w(rlog.data(), xt, l.w_router.data(), 1, cfg.n_experts, H, 1);
         // softmax -> top-k (deterministic: highest logit, ties by lower index) -> renormalise
         float mx = -INFINITY;
@@ -697,6 +722,9 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
         }
         float wsum = 0;
         for (int j = 0; j < cfg.topk; ++j) wsum += wts[j];
+        if (dbg && t == 0)
+          std::fprintf(stderr, "  moe route ids %d/%d w %.4f/%.4f (wsum %.4f) rlog0 %.3f rlog1 %.3f\n",
+                       ids[0], ids[1], wts[0] / wsum, wts[1] / wsum, wsum, rlog[0], rlog[1]);
         std::vector<float> yr(H, 0.0f), h(cfg.moe_inter);
         for (int j = 0; j < cfg.topk; ++j) {
           const int e = ids[j];
@@ -719,6 +747,11 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
           }
         }
         // shared expert, sigmoid-gated
+        if (dbg && t == 0) {
+          double ss = 0;
+          for (int i = 0; i < H; ++i) ss += double(yr[i]) * yr[i];
+          std::fprintf(stderr, "  moe routed yr rms %.4f\n", std::sqrt(ss / H));
+        }
         if (cfg.shared_gate) {
           float sg = 0;
           for (int d = 0; d < H; ++d) sg += xt[d] * bf16_to_f32(l.w_sh_gate_w[size_t(d)]);
@@ -756,10 +789,24 @@ void qwen_cpu_forward(const QwenConfig& cfg, const SafeTensorsReader& st,
           }
         }
         std::memcpy(y.data() + size_t(t) * H, yr.data(), H * 4);
+        if (dbg && t == 0) {
+          double ss = 0;
+          bool fin = true;
+          for (int i = 0; i < H; ++i) {
+            ss += double(yr[i]) * yr[i];
+            fin = fin && std::isfinite(yr[i]);
+          }
+          std::fprintf(stderr, "  moe yr rms %.4f finite %d\n", std::sqrt(ss / H), int(fin));
+        }
       }
     }
 #pragma omp parallel for num_threads(nthreads)
     for (long i = 0; i < long(T) * H; ++i) x[size_t(i)] += y[size_t(i)];
+    if (std::getenv("QWEN_DBG_NORM")) {
+      double ss = 0;
+      for (int i = 0; i < H; ++i) ss += double(x[i]) * x[i];
+      std::fprintf(stderr, "L%d mlp rms %.4f\n", L, std::sqrt(ss / H));
+    }
     if (capture_layer == L && captured) {
       captured->assign(x.begin(), x.end());
       capture_layer = -1;

@@ -186,9 +186,14 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipStreamSynchronize(s));
         auto out4 = ao4.download();
         // expected: scores all equal (q=k=1 vectors scaled) => p uniform over [0..t] => mean of v
-        std::printf("crafted attn out r0 [0:4]: %.4f %.4f (want ~1.0..1.75 mean of v) r2: %.4f %.4f\n",
-                    b16x(out4[0]), b16x(out4[1]), b16x[size_t>(2) * nq * hd], 0.0f);
-        (void)0;
+        auto b16v = [](uint16_t h) {
+            uint32_t u = uint32_t(h) << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+        };
+        std::printf("crafted attn out r0 [0:4]: %.4f %.4f (want ~1.0..1.75 mean of v) r2: %.4f\n",
+                    b16v(out4[0]), b16v(out4[1]), b16v(out4[size_t(2) * nq * hd]));
     }
     return 0;
 }

@@ -32,4 +32,28 @@ void k_q_delta_step(const float* qkvz, const uint16_t* conv_w, const uint16_t* d
 // fill with 1.0 (scale vectors for the fp8-oriented kernels when weights are unquantised)
 void k_q_ones(float* x, long n, hipStream_t s);
 
+// ------------------------------------------------------------------ MoE routing (softmax top-k renorm)
+// rlog: fp32 [rows][E] router logits. One block per row, thread 0 does the deterministic selection
+// (softmax -> top-k, ties to the lowest index -> renormalise), matching the CPU reference.
+// wts: fp32 [rows][k]; ids: i32 [rows][k]; cnt: i32 [E] += 1 per routed (row, expert);
+// wsum: fp32 [E] += w^2 per routed pair (Hessian weight mass). cnt/wsum must be pre-zeroed.
+void k_q_route(const float* rlog, int rows, int E, int k, float* wts, int* ids, int* cnt, float* wsum,
+               hipStream_t s);
+// base: i32 [E] = exclusive scan of cnt (single block; E <= 4096)
+void k_q_scan(const int* cnt, int* base, int E, hipStream_t s);
+// Second pass of the routing: re-runs the same deterministic selection and places each (row, e, w)
+// pair into the compact slot range [base[e], base[e]+cnt[e]) using atomicAdd on run (pre-zeroed).
+// slot_tok: i32 [rows*k]; slot_w: fp32 [rows*k].
+void k_q_route_fill(const float* rlog, int rows, int E, int k, const int* base, int* run, int* slot_tok,
+                    float* slot_w, hipStream_t s);
+// dst[i][c] = scale ? bf16(scale[i] * src[slot_tok[i]][c]) : src[slot_tok[i]][c]; i < nslots, c < n.
+// src rows have stride n. scale may be null.
+void k_q_moe_gather(const uint16_t* src, long rows, int n, const int* slot_tok, const float* scale,
+                    uint16_t* dst, int nslots, hipStream_t s);
+// y[tok[i]][c] += w[i] * out[i][c]; y fp32 [rows][n], out fp32 [nslots][n], tok = slot_tok[i].
+void k_q_moe_scatter_add(float* y, const float* out, const int* slot_tok, const float* slot_w, int nslots,
+                         int rows, int n, hipStream_t s);
+// y[r][c] += sigmoid(sg[r]) * out[r][c] (sg null: plain add); y fp32 [rows][n], out fp32 [rows][n].
+void k_q_sigmoid_scale_add(float* y, const float* out, const float* sg, int rows, int n, hipStream_t s);
+
 }  // namespace qtip

@@ -477,4 +477,150 @@ void q_delta_step(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_
     HIP_CHECK(hipGetLastError());
 }
 
+// ------------------------------------------------------------------ MoE routing (softmax top-k renorm)
+// Deterministic selection matching the CPU reference: softmax -> top-k (ties to the lowest index)
+// -> renormalise. One block per row; thread 0 selects.
+__global__ void q_moe_route_kernel(const float *rlog, int rows, int E, int k, float *wts, int *ids,
+                                   int *cnt) {
+    extern __shared__ float p[];
+    const float *lg = rlog + long(blockIdx.x) * E;
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int e = 0; e < E; ++e) mx = fmaxf(mx, lg[e]);
+        float sum = 0;
+        for (int e = 0; e < E; ++e) sum += p[e] = __expf(lg[e] - mx);
+        float inv = 1.0f / sum;
+        for (int j = 0; j < k; ++j) {
+            float best = -1.0f;
+            int bi = 0;
+            for (int e = 0; e < E; ++e)
+                if (p[e] > best) best = p[e], bi = e;
+            wts[long(blockIdx.x) * k + j] = best * inv;
+            ids[long(blockIdx.x) * k + j] = bi;
+            p[bi] = -1.0f;
+        }
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < k; j += blockDim.x) atomicAdd(&cnt[ids[long(blockIdx.x) * k + j]], 1);
+}
+void q_moe_route(const float *rlog, int rows, int E, int k, float *wts, int *ids, int *cnt,
+                 hipStream_t s) {
+    if (E > 4096 || k > 64) throw std::runtime_error("moe route supports E <= 4096, k <= 64");
+    q_moe_route_kernel<<<unsigned(rows), 256, size_t(E) * 4, s>>>(rlog, rows, E, k, wts, ids, cnt);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_scan_kernel(const int *cnt, int *base, int E) {
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < E; ++e) {
+            base[e] = acc;
+            acc += cnt[e];
+        }
+    }
+}
+void q_moe_scan(const int *cnt, int *base, int E, hipStream_t s) {
+    q_moe_scan_kernel<<<1, 32, 0, s>>>(cnt, base, E);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_route_fill_kernel(const float *rlog, int rows, int E, int k, const int *base,
+                                        int *run, int *slot_tok, float *slot_w) {
+    extern __shared__ float p[];
+    const float *lg = rlog + long(blockIdx.x) * E;
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int e = 0; e < E; ++e) mx = fmaxf(mx, lg[e]);
+        float sum = 0;
+        for (int e = 0; e < E; ++e) sum += p[e] = __expf(lg[e] - mx);
+        float inv = 1.0f / sum;
+        for (int j = 0; j < k; ++j) {
+            float best = -1.0f;
+            int bi = 0;
+            for (int e = 0; e < E; ++e)
+                if (p[e] > best) best = p[e], bi = e;
+            int slot = base[bi] + atomicAdd(&run[bi], 1);
+            slot_tok[slot] = int(blockIdx.x);
+            slot_w[slot] = best * inv;
+            p[bi] = -1.0f;
+        }
+    }
+}
+void q_moe_route_fill(const float *rlog, int rows, int E, int k, const int *base, int *run, int *slot_tok,
+                      float *slot_w, hipStream_t s) {
+    q_moe_route_fill_kernel<<<unsigned(rows), 256, size_t(E) * 4, s>>>(rlog, rows, E, k, base, run,
+                                                                       slot_tok, slot_w);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_gather_kernel(const uint16_t *src, int n, const int *slot_tok, uint16_t *dst,
+                                    long total) {
+    long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int c = int(idx % n);
+    int i = int(idx / n);
+    dst[idx] = src[long(slot_tok[i]) * n + c];
+}
+void q_moe_gather(const uint16_t *src, int n, const int *slot_tok, uint16_t *dst, int nslots,
+                  hipStream_t s) {
+    q_moe_gather_kernel<<<nblocks(long(nslots) * n, 256), 256, 0, s>>>(src, n, slot_tok, dst,
+                                                                        long(nslots) * n);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_scatter_sv_add_kernel(float *y, const float *z, const float *sv,
+                                            const int *slot_tok, const float *slot_w, int nslots,
+                                            int n) {
+    long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= long(nslots) * n) return;
+    int c = int(idx % n);
+    int i = int(idx / n);
+    atomicAdd(&y[long(slot_tok[i]) * n + c], slot_w[i] * z[idx] * sv[c]);
+}
+void q_moe_scatter_sv_add(float *y, const float *z, const float *sv, const int *slot_tok,
+                          const float *slot_w, int nslots, int n, hipStream_t s) {
+    q_moe_scatter_sv_add_kernel<<<nblocks(long(nslots) * n, 256), 256, 0, s>>>(
+        y, z, sv, slot_tok, slot_w, nslots, n);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_residual_add_kernel(uint16_t *state, const float *y, long total, int n) {
+    long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    state[idx] = f2bf(bf2f(state[idx]) + y[idx]);
+}
+void q_moe_residual_add(uint16_t *state, const float *y, long rows, int n, hipStream_t s) {
+    q_moe_residual_add_kernel<<<nblocks(rows * n, 256), 256, 0, s>>>(state, y, rows * n, n);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_scatter_f32_kernel(float *dst, int ldd, int col0, const float *src, int lds, long rows,
+                                     int cols) {
+    long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int c = int(idx % cols);
+    int r = int(idx / cols);
+    dst[long(r) * ldd + col0 + c] = src[long(r) * lds + c];
+}
+void q_scatter_f32(float *dst, int ldd, int col0, const float *src, int lds, long rows, int cols,
+                   hipStream_t s) {
+    q_scatter_f32_kernel<<<nblocks(rows * cols, 256), 256, 0, s>>>(dst, ldd, col0, src, lds, rows, cols);
+    HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_sv_add_gated_kernel(const float *z, const float *sv, const float *sg,
+                                          uint16_t *state, long rows, int n) {
+    long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= rows * n) return;
+    int r = int(idx / n);
+    int c = int(idx % n);
+    float g = sg ? (1.0f / (1.0f + __expf(-sg[r]))) : 1.0f;
+    state[idx] = f2bf(bf2f(state[idx]) + g * z[idx] * sv[c]);
+}
+void q_moe_sv_add_gated(const float *z, const float *sv, const float *sg, uint16_t *state, long rows,
+                        int n, hipStream_t s) {
+    q_moe_sv_add_gated_kernel<<<nblocks(rows * n, 256), 256, 0, s>>>(z, sv, sg, state, rows, n);
+    HIP_CHECK(hipGetLastError());
+}
+
 }  // namespace behemoth

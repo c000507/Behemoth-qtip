@@ -16,7 +16,6 @@ int main(int argc, char** argv) {
   QCHECK(argc >= 2, "usage: qwen35_ref <model_dir> [tokens_file] [T] [logits_out.bin]");
   std::string dir = argv[1];
   QwenConfig cfg = load_qwen_config(dir);
-  QCHECK(!cfg.moe(), "MoE checkpoints not supported by the CPU reference yet");
   SafeTensorsReader st(dir);
   std::vector<int32_t> toks;
   int T = 16;

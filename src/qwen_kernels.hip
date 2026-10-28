@@ -221,4 +221,125 @@ void k_q_delta_step(const float* qkvz, const uint16_t* conv_w, const uint16_t* d
   HIP_CHECK(hipGetLastError());
 }
 
+// ------------------------------------------------------------------ MoE routing + gather/scatter
+// Deterministic softmax -> top-k (ties to the lowest index) -> renormalise, one block per row.
+__global__ void q_route_kernel(const float* rlog, int rows, int E, int k, float* wts, int* ids, int* cnt,
+                               float* wsum) {
+  extern __shared__ float p[];  // E probs
+  const float* lg = rlog + long(blockIdx.x) * E;
+  if (threadIdx.x == 0) {
+    float mx = -INFINITY;
+    for (int e = 0; e < E; ++e) mx = fmaxf(mx, lg[e]);
+    float sum = 0;
+    for (int e = 0; e < E; ++e) sum += p[e] = __expf(lg[e] - mx);
+    float inv = 1.0f / sum;
+    for (int j = 0; j < k; ++j) {
+      float best = -1.0f;
+      int bi = 0;
+      for (int e = 0; e < E; ++e)
+        if (p[e] > best) best = p[e], bi = e;
+      float w = best * inv;
+      wts[long(blockIdx.x) * k + j] = w;
+      ids[long(blockIdx.x) * k + j] = bi;
+      atomicAdd(&wsum[bi], w * w);
+      p[bi] = -1.0f;
+    }
+  }
+  __syncthreads();
+  for (int j = threadIdx.x; j < k; j += blockDim.x) atomicAdd(&cnt[ids[long(blockIdx.x) * k + j]], 1);
+}
+void k_q_route(const float* rlog, int rows, int E, int k, float* wts, int* ids, int* cnt, float* wsum,
+               hipStream_t s) {
+  QCHECK(E <= 4096 && k <= 64, "router kernel supports E <= 4096, k <= 64");
+  q_route_kernel<<<unsigned(rows), 256, size_t(E) * 4, s>>>(rlog, rows, E, k, wts, ids, cnt, wsum);
+  HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_scan_kernel(const int* cnt, int* base, int E) {
+  if (threadIdx.x == 0) {
+    int acc = 0;
+    for (int e = 0; e < E; ++e) {
+      base[e] = acc;
+      acc += cnt[e];
+    }
+  }
+}
+void k_q_scan(const int* cnt, int* base, int E, hipStream_t s) {
+  q_scan_kernel<<<1, 32, 0, s>>>(cnt, base, E);
+  HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_route_fill_kernel(const float* rlog, int rows, int E, int k, const int* base, int* run,
+                                    int* slot_tok, float* slot_w) {
+  extern __shared__ float p[];
+  const float* lg = rlog + long(blockIdx.x) * E;
+  if (threadIdx.x == 0) {
+    float mx = -INFINITY;
+    for (int e = 0; e < E; ++e) mx = fmaxf(mx, lg[e]);
+    float sum = 0;
+    for (int e = 0; e < E; ++e) sum += p[e] = __expf(lg[e] - mx);
+    float inv = 1.0f / sum;
+    for (int j = 0; j < k; ++j) {
+      float best = -1.0f;
+      int bi = 0;
+      for (int e = 0; e < E; ++e)
+        if (p[e] > best) best = p[e], bi = e;
+      float w = best * inv;
+      int slot = base[bi] + atomicAdd(&run[bi], 1);
+      slot_tok[slot] = int(blockIdx.x);
+      slot_w[slot] = w;
+      p[bi] = -1.0f;
+    }
+  }
+}
+void k_q_route_fill(const float* rlog, int rows, int E, int k, const int* base, int* run, int* slot_tok,
+                    float* slot_w, hipStream_t s) {
+  q_route_fill_kernel<<<unsigned(rows), 256, size_t(E) * 4, s>>>(rlog, rows, E, k, base, run, slot_tok, slot_w);
+  HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_gather_kernel(const uint16_t* src, long rows, int n, const int* slot_tok,
+                                    const float* scale, uint16_t* dst, int nslots) {
+  long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= long(nslots) * n) return;
+  int c = int(idx % n);
+  int i = int(idx / n);
+  float v = bf2f(src[long(slot_tok[i]) * n + c]);
+  if (scale) v *= scale[i];
+  dst[idx] = f2bf(v);
+}
+void k_q_moe_gather(const uint16_t* src, long rows, int n, const int* slot_tok, const float* scale,
+                    uint16_t* dst, int nslots, hipStream_t s) {
+  q_moe_gather_kernel<<<nblocks(long(nslots) * n, 256), 256, 0, s>>>(src, rows, n, slot_tok, scale, dst,
+                                                                     nslots);
+  HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_moe_scatter_add_kernel(float* y, const float* out, const int* slot_tok, const float* slot_w,
+                                         int nslots, int n) {
+  long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= long(nslots) * n) return;
+  int c = int(idx % n);
+  int i = int(idx / n);
+  atomicAdd(&y[long(slot_tok[i]) * n + c], slot_w[i] * out[idx]);
+}
+void k_q_moe_scatter_add(float* y, const float* out, const int* slot_tok, const float* slot_w, int nslots,
+                         int rows, int n, hipStream_t s) {
+  q_moe_scatter_add_kernel<<<nblocks(long(nslots) * n, 256), 256, 0, s>>>(y, out, slot_tok, slot_w, nslots,
+                                                                          n);
+  HIP_CHECK(hipGetLastError());
+}
+
+__global__ void q_sigmoid_scale_add_kernel(float* y, const float* out, const float* sg, int rows, int n) {
+  long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= long(rows) * n) return;
+  int r = int(idx / n);
+  float w = sg ? (1.0f / (1.0f + __expf(-sg[r]))) : 1.0f;
+  y[idx] += w * out[idx];
+}
+void k_q_sigmoid_scale_add(float* y, const float* out, const float* sg, int rows, int n, hipStream_t s) {
+  q_sigmoid_scale_add_kernel<<<nblocks(long(rows) * n, 256), 256, 0, s>>>(y, out, sg, rows, n);
+  HIP_CHECK(hipGetLastError());
+}
+
 }  // namespace qtip

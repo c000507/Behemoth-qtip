@@ -103,6 +103,9 @@ Config::Config(const json &c)
       kv(c.at("num_key_value_heads")), dim(c.value("head_dim", n / std::max(heads, 1))),
       vocab(c.at("vocab_size")), layers(c.at("num_hidden_layers")), eps(c.value("rms_norm_eps", 1e-5f)),
       theta(c.value("rope_theta", 1e6f)) {
+    std::string mt = c.value("model_type", std::string("llama"));
+    require(mt == "llama" || mt == "mistral",
+            "Qwen3.5 ('" + mt + "') is not supported in the trainer yet (Behemoth/Mistral only)");
     require(n > 0 && inter > 0 && heads > 0 && kv > 0 && heads % kv == 0 && dim > 0 && dim % 2 == 0 &&
                 vocab > 1 && layers > 0,
             "invalid model geometry");
@@ -134,6 +137,11 @@ size_t Model::add_param(const std::string &name, std::span<const float> value, b
 Model::Model(const fs::path &root)
     : path(fs::canonical(root)), config_json(read_json(path / "config.json")),
       index(read_json(path / "model.safetensors.index.json")), config(config_json) {
+    {  // reject Qwen3.5 (and any other non-Mistral arch) up front with a clear message
+        std::string mt = config_json.value("model_type", std::string("llama"));
+        if (mt != "llama" && mt != "mistral")
+            require(false, "Qwen3.5 ('" + mt + "') is not supported in the trainer yet (Behemoth/Mistral only)");
+    }
     for (auto &v : index.at("weight_map").items()) {
         std::string key = v.value();
         require(fs::path(key).filename() == key, "unsafe shard path");
