@@ -45,6 +45,14 @@ Branch `qwen35`. Reference implementation: `nmoe` (read-only). Test model: Qwen3
 
 - CPU bf16 ppl (dense 0.8B, our reference forward, 512-token windows, 4088 predictions):
   **5.7415** (`qwen35_ref ... --ppl`).
+- **Quantized-reference ppl (0.8B QTIP-2bit, `qwen_qt_ref --ppl`, double-precision trellis decode):
+  9.3136** over 3584 predictions of the same corpus — the first 0.8B quantization used only 202k
+  calibration tokens; re-quantization with 4M tokens pending GPU. This separates quantization
+  quality from runtime correctness: the GPU runtime should MATCH ~9.31 on the old checkpoint.
+- Bug found on the way: the embed/norm tensor scan (assemble + runtime loader) picked
+  `mtp.norm.weight` over `model.language_model.norm.weight` (last-match-wins) — every earlier
+  runtime eval applied the WRONG final norm. Fixed (explicit candidates); 0.8B model-embed
+  regenerated.
 - Tiny MoE (`~/qwen_tiny_moe` on .229, seed 777): CPU-ref logits `/tmp/tiny_logits.bin` (16 tokens,
   max|diff| vs HF 1.5e-5), argmax `386 1919 1389 457 75 561 165 926 1058 1413 718 772 186 642 666 884`;
   CPU-ref ppl over 1022 predictions of `/tmp/tiny_ppl.bin`: **3437.42** (random weights).
@@ -52,11 +60,15 @@ Branch `qwen35`. Reference implementation: `nmoe` (read-only). Test model: Qwen3
 
 ## Pending / open issues
 
-1. **GPU slots**: a 123B fine-tune owned both GPUs during this session. Blocked on: GPU parity test
-   (`QWEN35_MODEL=... qtip_tests_gpu`), 0.8B + tiny-MoE Hessian collection/quantization, runtime
-   ppl/greedy validation, and the layer-6 DeltaNet runtime bug (runtime vs CPU-ref diverges around
-   layer 6, "L 6 mean 0.0907 n>0.1: 917 of 4096"; layer 3 full-attn matches at rel 5.8e-3 — see the
-   `qwen_micro`/`qwen_layer_test` bisect trail and QWEN_DUMP_LAYERS tooling).
+1. **GPU slots**: a 123B fine-tune owned both GPUs until ~18:00. Queued (in order):
+   (a) runtime ppl/greedy of the existing 0.8B QTIP checkpoint with the fixed final norm vs the
+   quantized reference (expect ≈ 9.31) — validates/clears the suspected "layer-6 DeltaNet runtime
+   bug" (evidence now points at quantization drift + the final-norm bug, not the delta kernels:
+   the layer test showed layer-0 delta out rel 3.2e-3 after the host-pointer fixes);
+   (b) re-quantize 0.8B with 4M calibration tokens (`/tmp/qwen_calib.i32`, 2048x2048);
+   (c) qtref + runtime ppl of the new checkpoint vs the 5.7415 bf16 baseline;
+   (d) tiny-MoE Hessian collection + quantize + GPU-runtime vs CPU-ref parity (bf16 and quantized);
+   (e) `qtip_tests_gpu` parity suite.
 2. **122B-A10B**: full plan (memory/time/disk) in docs/QWEN35.md; FP8 block-scale reading
    implemented; run NOT executed per task instructions.
 3. Runtime is single-GPU / single-sequence (eval); no scheduler/server integration, prefix cache
