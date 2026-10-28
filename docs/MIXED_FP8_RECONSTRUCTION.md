@@ -88,8 +88,9 @@ build-training/qtip_prepare --data rp.jsonl --tokenizer /models/behemoth-qtip-fp
 
 Use the same `--split-metadata FILE` for both when retaining an existing holdout.
 The reconstruction path uses the trainer's bounded-memory attention and honors
-these masks. This does not retrofit long-context tiling or metadata masks into
-the older Hessian collector in `src/model.cpp`.
+these masks. The quantizer's Hessian collector also uses bounded-memory tiled
+attention, but still treats each raw token row as one causal document and does
+not read the preparer's document/position metadata.
 
 ## Fit blocks against the source FP8 teacher
 

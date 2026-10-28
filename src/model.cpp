@@ -123,7 +123,9 @@ LayerRunner::LayerRunner(int device, const ModelConfig& cfg, int max_rows, int s
   gemm_ = std::make_unique<Gemm>(s_);
   const long H = cfg.hidden, F = cfg.inter, R = max_rows;
   const long nqkv = long(cfg.nq + 2 * cfg.nkv) * cfg.hd;
-  QCHECK(R % T_ == 0, "max_rows must be a multiple of the sequence length");
+  QCHECK(T_ > 0 && R > 0 && R % T_ == 0, "max_rows must be a positive multiple of the sequence length");
+  QCHECK(cfg.hd > 0 && cfg.hd <= 256 && cfg.hd % 2 == 0 && cfg.nq > 0 && cfg.nkv > 0 && cfg.nq % cfg.nkv == 0,
+         "invalid attention geometry (head_dim must be even and <=256)");
   wqkv_.alloc(size_t(nqkv) * H);
   wo_.alloc(size_t(H) * cfg.nq * cfg.hd);
   wgu_.alloc(size_t(2 * F) * H);
@@ -142,13 +144,9 @@ LayerRunner::LayerRunner(int device, const ModelConfig& cfg, int max_rows, int s
   qkv_.alloc(size_t(R) * nqkv);
   y_.alloc(size_t(R) * H);
   gu_.alloc(size_t(R) * 2 * F);
-  const int gq = cfg.nq / cfg.nkv;
   Qp_.alloc(size_t(cfg.nq) * T_ * cfg.hd);
   Kp_.alloc(size_t(cfg.nkv) * T_ * cfg.hd);
   Vp_.alloc(size_t(cfg.nkv) * T_ * cfg.hd);
-  S_.alloc(size_t(gq) * T_ * T_);
-  P_.alloc(size_t(gq) * T_ * T_);
-  O_.alloc(size_t(gq) * T_ * cfg.hd);
   pin_.alloc(size_t(R) * H);
 }
 LayerRunner::~LayerRunner() { (void)hipStreamDestroy(s_); }
@@ -218,7 +216,7 @@ void LayerRunner::forward(uint16_t* host_x, long nseq, HessAcc* acc) {
 
 void LayerRunner::forward_batch(long R, HessAcc* acc) {
   const int H = cfg_.hidden, F = cfg_.inter, hd = cfg_.hd, nq = cfg_.nq, nkv = cfg_.nkv, T = T_;
-  const int gq = nq / nkv, nqkv = (nq + 2 * nkv) * hd, A = nq * hd;
+  const int nqkv = (nq + 2 * nkv) * hd, A = nq * hd;
   Gemm& g = *gemm_;
   auto hess = [&](int which, const uint16_t* X, int n) {
     if (!acc) return;
@@ -240,21 +238,11 @@ void LayerRunner::forward_batch(long R, HessAcc* acc) {
   k_rmsnorm(x_, ln_in_, h_, R, H, cfg_.eps, s_);
   hess(0, h_, H);
   proj(h_, H, wqkv_, nqkv, qkv_);
-  const float sm_scale = 1.0f / std::sqrt(float(hd));
   for (long sq = 0; sq < R / T; ++sq) {
     k_qkv_rope(qkv_ + sq * T * long(nqkv), sqkv_, Qp_, Kp_, Vp_, T, nq, nkv, hd, cfg_.theta, s_);
-    for (int kv = 0; kv < nkv; ++kv) {
-      const uint16_t* K = Kp_ + long(kv) * T * hd;
-      const uint16_t* V = Vp_ + long(kv) * T * hd;
-      const uint16_t* Q = Qp_ + long(kv) * gq * T * hd;
-      // S row-major (gq*T x T) = Q K^T ; col-major S_cm (T x gq*T) = K_cm^T (T x hd) Q_cm (hd x gq*T)
-      g.run(true, false, T, gq * T, hd, K, hd, Q, hd, S_, T, OutT::F32, 1.f, 0.f);
-      k_causal_softmax(S_, P_, gq, T, sm_scale, s_);
-      // O row-major (gq*T x hd) = P V ; col-major O_cm (hd x gq*T) = V_cm (hd x T) P_cm (T x gq*T)
-      g.run(false, false, hd, gq * T, T, V, hd, P_, T, O_, hd, OutT::F32, 1.f, 0.f);
-      k_heads_to_tokens(O_, attn_ + sq * T * long(A), gq, T, hd, kv * gq, A, s_);
-      gemm_flops += 4.0 * gq * T * double(T) * hd;
-    }
+    k_tiled_attention(Qp_, Kp_, Vp_, attn_ + sq * T * long(A), T, nq, nkv, hd, s_);
+    // Causal useful work; the final 16-query tile also computes masked entries.
+    gemm_flops += 2.0 * nq * hd * T * double(T + 1);
   }
   hess(1, attn_, A);
   proj(attn_, A, wo_, H, y_);

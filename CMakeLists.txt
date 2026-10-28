@@ -22,7 +22,7 @@ target_compile_options(qtip_core PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall -Wext
 target_link_libraries(qtip_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 
 # GPU kernels + hipBLASLt wrapper + quantizer + model forward
-add_library(qtip_gpu STATIC src/kernels.hip src/viterbi.hip src/gemm.cpp src/staging.cpp src/quantizer.cpp src/model.cpp)
+add_library(qtip_gpu STATIC src/kernels.hip src/attention.hip src/viterbi.hip src/gemm.cpp src/staging.cpp src/quantizer.cpp src/model.cpp)
 target_include_directories(qtip_gpu PUBLIC src third_party)
 target_link_libraries(qtip_gpu PUBLIC qtip_core hip::host roc::hipblaslt)
 target_compile_options(qtip_gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -O3>
@@ -36,7 +36,11 @@ add_executable(qtip_tests_cpu tests/test_cpu.cpp)
 target_link_libraries(qtip_tests_cpu PRIVATE qtip_core)
 add_executable(qtip_tests_gpu tests/test_gpu.cpp)
 target_link_libraries(qtip_tests_gpu PRIVATE qtip_gpu)
+add_executable(qtip_attention_tests tests/test_attention.cpp)
+target_link_libraries(qtip_attention_tests PRIVATE qtip_gpu)
 
 enable_testing()
 add_test(NAME cpu COMMAND qtip_tests_cpu ${CMAKE_SOURCE_DIR}/tests/refvec)
 add_test(NAME gpu COMMAND qtip_tests_gpu)
+add_test(NAME gpu_attention COMMAND qtip_attention_tests)
+set_tests_properties(gpu_attention PROPERTIES SKIP_RETURN_CODE 77)

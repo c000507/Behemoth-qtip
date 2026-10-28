@@ -16,6 +16,8 @@ Pipeline:
    choice as the original quantbench calibration mix.
 2. **Hessian collection**: the original FP8 model is run in bf16 layer by layer. FP8 weights are used exactly, and
    the per-channel scale is applied in fp32 to the GEMM output.
+   - Causal GQA attention uses native WMMA query/key tiles and online softmax, with no full sequence-length-squared
+     score/probability buffers. Q/K/V and attention outputs remain BF16; softmax and accumulation are FP32.
    - `H = XᵀX/N` is accumulated for the inputs of q/k/v (shared), o, gate/up (shared) and down.
    - Accumulation is bf16-input, fp32-accumulate (hipBLASLt).
    - Each GPU owns half of the sequences and runs its own layer chain. The two partial Hessians are summed on the
@@ -152,7 +154,7 @@ Flags (`--help`):
 | `--tokens FILE`, `--ntok N`, `--seq-len N` | –, 4194304, 2048 | calibration tokens (raw int32 [nseq][seq_len]) |
 | `--layers A:B` | all | layer range [A, B) |
 | `--gpus 0,1` | 0,1 | HIP devices |
-| `--batch-rows N` | 4096 | tokens per forward batch |
+| `--batch-rows N` | 4096 | tokens per forward batch, rounded up to whole sequences (at least `--seq-len`) |
 | `--hess-dir DIR` | `<work>/hess` | Hessian files `layer<L>.safetensors` (F32 qkv/o/gateup/down, normalised by token count) |
 | `--backlog N` | 2 | max layers with collected but unquantized Hessians (5.1 GB RAM + disk each) |
 | `--keep-hessians` | off | do not delete a layer's Hessians after it is quantized |
@@ -162,6 +164,27 @@ Flags (`--help`):
 | `--dump-dir DIR` | – | write W and the reconstructed weight per linear (fp32), for validation |
 | `--dump-acts DIR` | – | debug: activations of sequence 0 after each layer |
 | `--seed N` | 0 | sign-vector seed |
+
+Attention is tiled automatically, including for 32k calibration sequences. For
+example, add `--seq-len 32768` when the token file contains 32k rows. The default
+batch then becomes one full 32k sequence. This removes 72 GiB of score/probability
+workspace per GPU at 32k for Behemoth, plus the old intermediate attention output.
+Q/K/V, model activations, decoded source weights and Hessians still need memory.
+The quantizer continues to treat each raw token row as one causal document with
+positions starting at zero; it does not consume the preparer's document masks.
+
+Numerical/causal checks and an optional full-shape benchmark:
+
+```sh
+ctest --test-dir build -R gpu_attention --output-on-failure
+./build/qtip_attention_tests --device 0 --bench 32768
+```
+
+The tests cover FP64 attention agreement, comparison with the previous
+GEMM/softmax path, GQA/head layouts, partial tiles, output guards and future-token
+isolation. The benchmark checks uniform attention against prefix means and
+reports attention-only time. Local validation compiled the HIP kernels for
+gfx1201 and checked host code; GPU execution and timings require GPU hardware.
 
 ### Resume
 

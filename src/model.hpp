@@ -96,8 +96,8 @@ class LayerRunner {
   DBuf<float> sqkv_, so_, sgu_, sd_;
   DBuf<uint8_t> stage8_;
   // activations
-  DBuf<uint16_t> x_, h_, attn_, act_, Qp_, Kp_, Vp_, P_;
-  DBuf<float> qkv_, y_, gu_, S_, O_;
+  DBuf<uint16_t> x_, h_, attn_, act_, Qp_, Kp_, Vp_;
+  DBuf<float> qkv_, y_, gu_;
   HBuf<uint16_t> pin_;
 };
 

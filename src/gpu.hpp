@@ -138,6 +138,11 @@ void k_rmsnorm(const uint16_t* x, const uint16_t* w, uint16_t* out, long rows, i
 // Vp[8][T][128] bf16 (per-sequence; T tokens; positions 0..T-1)
 void k_qkv_rope(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t* Kp, uint16_t* Vp, int T,
                 int nq, int nkv, int hd, float theta, hipStream_t s);
+// Causal GQA attention: Q[nq][T][hd], K/V[nkv][T][hd] -> out[T][nq*hd].
+// BF16 operands/output, FP32 scores/online softmax/accumulation, hd<=256.
+// No global score/probability workspace. All T tokens form one causal document.
+void k_tiled_attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out,
+                        int T, int nq, int nkv, int hd, hipStream_t s);
 // causal softmax on S [rows = nh*T][T] fp32 (row r -> token r % T), scale; writes P bf16 (zeros above diagonal)
 void k_causal_softmax(const float* S, uint16_t* P, int nh, int T, float scale, hipStream_t s);
 // O [nh][T][hd] fp32 -> out [T][(h0+h)*hd] bf16 with row stride ld

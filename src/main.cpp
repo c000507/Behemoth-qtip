@@ -60,7 +60,7 @@ static void usage() {
       "  --seq-len N          sequence length of the token file (default 2048)\n"
       "  --layers A:B         layer range [A, B) (default all)\n"
       "  --gpus 0,1           HIP devices (each GPU owns a token half and runs its own layer chain)\n"
-      "  --batch-rows N       tokens per forward batch (default 4096)\n"
+      "  --batch-rows N       tokens per forward batch (default 4096, rounded up to whole sequences)\n"
       "  --hess-dir DIR       Hessian files (default <work>/hess)\n"
       "  --backlog N          max layers with collected-but-unquantized Hessians (default 2, ~5.1 GB each)\n"
       "  --keep-hessians      do not delete Hessians after a layer is quantized\n"
@@ -124,6 +124,10 @@ static Options parse(int argc, char** argv) {
     }
   }
   QCHECK(!o.out.empty() && !o.work.empty(), "--out and --work are required");
+  QCHECK(o.seq_len > 0 && o.batch_rows > 0, "--seq-len and --batch-rows must be positive");
+  long batch = ((long(o.batch_rows) + o.seq_len - 1) / o.seq_len) * o.seq_len;
+  QCHECK(batch <= INT32_MAX, "forward batch is too large");
+  o.batch_rows = int(batch);
   if (o.hess_dir.empty()) o.hess_dir = o.work + "/hess";
   return o;
 }
