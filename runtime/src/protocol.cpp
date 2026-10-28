@@ -1,6 +1,8 @@
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
 
+#include <random>
+
 namespace behemoth {
 ChatRequest parse_chat(const nlohmann::json &j) {
     if (!j.is_object())
@@ -49,7 +51,10 @@ ChatRequest parse_chat(const nlohmann::json &j) {
     r.sampling.temperature = j.value("temperature", 0.f);
     r.sampling.top_k = j.value("top_k", 0);
     r.sampling.top_p = j.value("top_p", 1.f);
-    r.sampling.seed = j.value("seed", uint64_t(0));
+    // Without an explicit seed every request draws a fresh one; a fixed default made
+    // regenerations of the same prompt return the identical sample.
+    r.sampling.seed = j.contains("seed") ? j.at("seed").get<uint64_t>()
+                                         : (uint64_t(std::random_device{}()) << 32) ^ std::random_device{}();
     validate_sampling(r.sampling);
     if (j.contains("stop")) {
         if (j.at("stop").is_string())
