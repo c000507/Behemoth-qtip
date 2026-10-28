@@ -127,7 +127,7 @@ size_t Model::add_param(const std::string &name, std::span<const float> value, b
             "nonfinite " + name);
     // The native row transforms load sign/norm vectors in aligned groups of four.
     initial.resize((initial.size() + 3) / 4 * 4, 0.f);
-    params.push_back({name, initial.size(), value.size(), norm});
+    params.push_back({name, initial.size(), value.size(), norm, group_of(name, norm)});
     initial.insert(initial.end(), value.begin(), value.end());
     return id;
 }

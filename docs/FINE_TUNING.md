@@ -139,6 +139,12 @@ build-training/qtip_bench /mnt/nvme/models/Behemoth-R1-123B-v2-QTIP-2bit-gmcot 0
 
 The benchmark reports decode, forward, backward seconds and peak arena bytes.
 Training emits JSON loss, gradient norm, LR, step time and packed tokens/second.
+Each step record also has `grad_norms` (pre-clip L2 norm of the `su`, `sv`,
+`wscale` and `norm` parameter groups; their root-sum-square is `grad_norm`) and
+`grad_top`, the three largest tensors by pre-clip gradient norm with `name`,
+`group`, `layer` (null for the final norm) and `linear` (module path, e.g.
+`self_attn.q_proj` or `input_layernorm`). They come from the same host pass that
+computes the global norm. To follow one group: `jq -c '[.step, .grad_norms]' LOG`.
 With repeats greater than one, the layer is decoded once and run repeatedly with
 unchanged inputs/parameters and cleared gradients. Each iteration prints timings;
 the final report gives medians excluding the first iteration. This separates

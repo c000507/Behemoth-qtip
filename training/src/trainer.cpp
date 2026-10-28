@@ -279,12 +279,8 @@ int train(const Options &o) {
             for (size_t j = 0; j < g.size(); ++j)
                 gradient[j] += g[j];
         }
-        double ss = 0;
-        for (float x : gradient) {
-            require(std::isfinite(x), "nonfinite gradient; checkpoint unchanged");
-            ss += double(x) * x;
-        }
-        double norm = std::sqrt(ss);
+        auto stats = gradient_stats(m.params, gradient);
+        double norm = stats.norm;
         float factor = o.clip > 0 ? float(std::min(1., double(o.clip) / (norm + 1e-6))) : 1.f;
         for (float &x : gradient)
             x *= factor;
@@ -306,17 +302,17 @@ int train(const Options &o) {
             r->ops->synchronize();
         }
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::cout << json({{"step", p.step},
-                           {"position", p.position},
-                           {"tokens", p.tokens},
-                           {"loss", loss / targets},
-                           {"grad_norm", norm},
-                           {"lr", o.lr * rate},
-                           {"seconds", seconds},
-                           {"tokens_per_second", used / seconds},
-                           {"device_peak_bytes", replicas[0]->ops->peak_bytes()}})
-                         .dump()
-                  << std::endl;
+        json record = {{"step", p.step},
+                       {"position", p.position},
+                       {"tokens", p.tokens},
+                       {"loss", loss / targets},
+                       {"grad_norm", norm},
+                       {"lr", o.lr * rate},
+                       {"seconds", seconds},
+                       {"tokens_per_second", used / seconds},
+                       {"device_peak_bytes", replicas[0]->ops->peak_bytes()}};
+        record.update(stats.describe(m.params));
+        std::cout << record.dump() << std::endl;
         if (o.checkpoint_every && p.step % o.checkpoint_every == 0)
             save_checkpoint(o.work, *replicas[0], p, signature);
     }

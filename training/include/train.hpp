@@ -1,5 +1,6 @@
 #pragma once
 #include "behemoth/qtip.hpp"
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -29,11 +30,26 @@ inline const std::vector<std::string> linears = {"self_attn.q_proj", "self_attn.
                                                  "mlp.down_proj"};
 inline const std::string norm1 = "input_layernorm.weight", norm2 = "post_attention_layernorm.weight";
 std::string su_name(int linear);
+// Optimizer parameter groups. Every trainable tensor belongs to exactly one.
+enum class Group : int { su, sv, wscale, norm };
+inline constexpr int group_count = 4;
+const char *group_name(Group);
+Group group_of(const std::string &name, bool norm);
 struct Param {
     std::string name;
     size_t offset, size;
     bool norm;
+    Group group = Group::su;
 };
+// One pass over a summed parameter gradient: global, per-group and per-tensor
+// L2 norms (FP64 accumulation). Rejects nonfinite gradients.
+struct GradientStats {
+    double norm = 0;
+    std::array<double, group_count> group{};
+    std::vector<std::pair<double, size_t>> top; // (tensor norm, parameter index), largest first
+    json describe(const std::vector<Param> &) const;
+};
+GradientStats gradient_stats(const std::vector<Param> &, std::span<const float> gradient, size_t top = 3);
 struct LayerData {
     std::vector<behemoth::qtip::HostLinear> linear;
     std::map<std::string, size_t> params;

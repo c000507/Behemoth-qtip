@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <unistd.h>
 using namespace qat;
 namespace qat {
@@ -128,6 +129,53 @@ int main(int argc, char **argv) {
         Dataset data(root / "data");
         auto b = data.get(0);
         require(b.labels == std::vector<int32_t>({4, 5, -100, 7, -100}), "shifted assistant/boundary mask");
+        {
+            // Per-group/per-tensor norms: every tensor gets a distinct known norm.
+            std::vector<float> g(m.initial.size(), 0.f);
+            std::array<double, group_count> expect{};
+            double total = 0;
+            for (size_t k = 0; k < m.params.size(); ++k) {
+                auto &p = m.params[k];
+                double norm = .01 * double(k + 1);
+                float each = float(norm / std::sqrt(double(p.size)));
+                double ss = 0;
+                for (size_t i = 0; i < p.size; ++i) {
+                    g[p.offset + i] = (i % 2 ? -1 : 1) * each;
+                    ss += double(each) * each;
+                }
+                expect[int(p.group)] += ss;
+                total += ss;
+            }
+            auto stats = gradient_stats(m.params, g);
+            close(stats.norm, std::sqrt(total), 1e-9, 1e-9);
+            for (int i = 0; i < group_count; ++i)
+                close(stats.group[i], std::sqrt(expect[i]), 1e-9, 1e-9);
+            require(stats.top.size() == 3 && stats.top[0].second == m.params.size() - 1 &&
+                        stats.top[1].second == m.params.size() - 2 && stats.top[2].second == m.params.size() - 3,
+                    "top tensors not ordered by norm");
+            auto d = stats.describe(m.params);
+            require(d["grad_top"][0]["name"] == "model.norm.weight" && d["grad_top"][0]["layer"].is_null() &&
+                        d["grad_top"][0]["group"] == "norm",
+                    "final norm description");
+            require(d["grad_top"][1]["layer"] == 1 && d["grad_top"][1]["linear"] == "post_attention_layernorm",
+                    "layer/linear description");
+            for (auto k : {"su", "sv", "wscale", "norm"})
+                require(d["grad_norms"].contains(k), std::string("missing group norm ") + k);
+            int counts[group_count] = {};
+            for (auto &p : m.params)
+                ++counts[int(p.group)];
+            require(counts[int(Group::su)] == 2 * 4 && counts[int(Group::sv)] == 2 * 7 &&
+                        counts[int(Group::wscale)] == 2 * 7 && counts[int(Group::norm)] == 2 * 2 + 1,
+                    "parameter group assignment");
+            g[m.params[3].offset] = std::nanf("");
+            bool rejected = false;
+            try {
+                gradient_stats(m.params, g);
+            } catch (...) {
+                rejected = true;
+            }
+            require(rejected, "nonfinite gradient accepted");
+        }
         auto o = cpu_ops();
         auto x = o->alloc(3, 96);
         std::vector<float> v(x.size());
@@ -246,7 +294,33 @@ int main(int argc, char **argv) {
             require(std::equal(a.begin(), a.end(), e.begin(), e.end()), "frozen tensor changed: " + name);
         }
         require(exported.layers[0].linear[0].su == exported.layers[0].linear[1].su, "tied SU export");
-        train(opt);
+        {
+            std::ostringstream log;
+            auto *previous = std::cout.rdbuf(log.rdbuf());
+            try {
+                train(opt);
+            } catch (...) {
+                std::cout.rdbuf(previous);
+                throw;
+            }
+            std::cout.rdbuf(previous);
+            std::istringstream lines(log.str());
+            std::string line;
+            int steps = 0;
+            while (std::getline(lines, line)) {
+                auto j = json::parse(line);
+                if (!j.contains("step"))
+                    continue;
+                ++steps;
+                double ss = 0;
+                for (auto k : {"su", "sv", "wscale", "norm"})
+                    ss += std::pow(j["grad_norms"][k].get<double>(), 2);
+                close(std::sqrt(ss), j["grad_norm"].get<double>(), 1e-9, 1e-6);
+                require(j["grad_top"].size() == 3 && j["grad_top"][0]["norm"] >= j["grad_top"][1]["norm"],
+                        "step record top tensors");
+            }
+            require(steps == 3, "step records missing");
+        }
         auto partial = opt;
         partial.work = root / "resume";
         partial.stop_after = 1;

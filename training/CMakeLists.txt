@@ -8,7 +8,7 @@ get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
 find_package(OpenMP COMPONENTS CXX)
-add_library(qtip_train_core src/io.cpp src/cpu.cpp src/layer.cpp src/trainer.cpp
+add_library(qtip_train_core src/io.cpp src/cpu.cpp src/layer.cpp src/trainer.cpp src/optimizer.cpp
   ${REPO}/runtime/src/qtip.cpp ${REPO}/runtime/src/checkpoint.cpp
   ${REPO}/runtime/src/attention.cpp ${REPO}/runtime/src/sorted_layout.cpp
   ${REPO}/src/safetensors.cpp)
