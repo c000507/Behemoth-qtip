@@ -122,7 +122,9 @@ std::vector<float> bf16_to_f32_vec(const std::vector<uint16_t>& v) {
   return o;
 }
 
-// Read a 2-D weight [out][in] into bf16 (fp8+scale checkpoints are dequantised on read).
+// Read a 2-D weight [out][in] into bf16 (fp8+scale checkpoints are dequantised on read). Two FP8
+// layouts: per-row `weight_scale` [out] (bf16) and 128x128 block `weight_scale_inv`
+// [out/128][in/128] (bf16, the Qwen3.5-122B-A10B-FP8 layout); scale_inv multiplies on dequant.
 static void read_w16(const SafeTensorsReader& st, const std::string& name, std::vector<uint16_t>& out) {
   const TensorInfo& w = st.info(name);
   QCHECK(w.shape.size() == 2, "unexpected shape for " + name);
@@ -132,12 +134,32 @@ static void read_w16(const SafeTensorsReader& st, const std::string& name, std::
   } else if (w.dtype == "F8_E4M3") {
     std::vector<uint8_t> fp8(w.bytes());
     st.read_into(name, fp8.data(), fp8.size());
-    const TensorInfo& si = st.info(name + ".weight_scale");
-    std::vector<uint16_t> sc(size_t(si.numel()));
-    QCHECK(si.dtype == "BF16" && int64_t(sc.size()) == w.shape[0], "unexpected weight_scale for " + name);
-    st.read_into(name + ".weight_scale", sc.data(), sc.size() * 2);
     out.resize(size_t(w.numel()));
-    for (size_t i = 0; i < out.size(); ++i) out[i] = f32_to_bf16(fp8e4m3_to_f32(fp8[i]) * bf16_to_f32(sc[i / size_t(w.shape[1])]));
+    const long rows = w.shape[0], cols = w.shape[1];
+    if (st.has(name + ".weight_scale")) {  // per-row scales
+      const TensorInfo& si = st.info(name + ".weight_scale");
+      std::vector<uint16_t> sc(size_t(si.numel()));
+      QCHECK(si.dtype == "BF16" && long(sc.size()) == rows, "unexpected weight_scale for " + name);
+      st.read_into(name + ".weight_scale", sc.data(), sc.size() * 2);
+      for (long r = 0; r < rows; ++r) {
+        float s = bf16_to_f32(sc[size_t(r)]);
+        for (long c = 0; c < cols; ++c) out[size_t(r * cols + c)] = f32_to_bf16(fp8e4m3_to_f32(fp8[size_t(r * cols + c)]) * s);
+      }
+    } else if (st.has(name + ".weight_scale_inv")) {  // 128x128 block scales
+      const TensorInfo& si = st.info(name + ".weight_scale_inv");
+      QCHECK(si.dtype == "BF16" && si.shape.size() == 2 && si.shape[0] == (rows + 127) / 128 &&
+                 si.shape[1] == (cols + 127) / 128,
+             "unexpected weight_scale_inv for " + name);
+      std::vector<uint16_t> sc(size_t(si.numel()));
+      st.read_into(name + ".weight_scale_inv", sc.data(), sc.size() * 2);
+      for (long r = 0; r < rows; ++r)
+        for (long c = 0; c < cols; ++c) {
+          float s = bf16_to_f32(sc[size_t(r / 128) * si.shape[1] + c / 128]);
+          out[size_t(r * cols + c)] = f32_to_bf16(fp8e4m3_to_f32(fp8[size_t(r * cols + c)]) * s);
+        }
+    } else {
+      QCHECK(false, "FP8 tensor " + name + " without weight_scale/weight_scale_inv");
+    }
   } else {
     QCHECK(false, "unsupported dtype " + w.dtype + " for " + name);
   }

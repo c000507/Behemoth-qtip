@@ -141,3 +141,66 @@ are done and stable.
   2-bit HYB degradation similar to Behemoth numbers in QTIP_QUANT_REPORT.md.
 - Runtime: greedy short prompts vs CPU reference tokens; ppl parity quantized runtime vs quantizer-side
   proxy; MoE variant config-only smoke (clear error until implemented).
+
+## MoE implementation (done)
+
+- Routing (quantizer kernels `k_q_route*` / runtime `q_moe_route*`): softmax → top-k (deterministic,
+  ties to the lowest index) → renormalise, one block per token; a second pass + single-block scan
+  builds compact per-expert token lists (atomicAdd; Hessian GEMMs are order-independent).
+  Matches the CPU reference and nmoe `k_router_topk` bit-for-bit in the selection rule.
+- **Per-expert Hessians**: each routed expert accumulates `Σ_t w_t² x_t x_tᵀ` for gateup and the
+  same-weighted activation Hessian for down, where `w_t` is the renormalised routing weight. Rationale:
+  the expert's contribution to the residual is `w · E(x)`, so a weight perturbation ΔW costs
+  `w·ΔW·x` — the Hessian is the input covariance under the w²-weighted routing distribution.
+  Each expert is normalised by its own `Σ w²` (an average xxᵀ, scale independent of routing mass).
+- **Starved experts** (< `--moe-min-tok` (default 64) routed calibration tokens) fall back to the
+  pooled all-token Hessian (= the shared expert's), which is the natural flatter input distribution;
+  QTIP degrades gracefully on it. The fallback is logged and counted in `quant_log.jsonl`
+  (`experts.starved_pooled`).
+- Shared expert uses the pooled (unweighted) Hessians — HessAcc slots 2/3; routed experts live in
+  `MoeHessAcc` (gate/down per expert + per-expert `Σw²` and token counts). Hessian file: safetensors
+  with `qkv`/`o`/`gateup`/`down` (pooled), `stats` F32 [2E] and `e{i}.gateup`/`e{i}.down`,
+  metadata `format=moe`.
+- Quantized output: `mlp.experts.{e}.{gate,up,down}_proj` and `mlp.shared_expert.*` as QTIP;
+  `mlp.gate.weight` (router), `mlp.gate.e_score_correction_bias`, `mlp.shared_expert_gate.weight`
+  stay unquantised (copied verbatim). The softmax router ignores `e_score_correction_bias`
+  (matches nmoe: the bias only affects sigmoid/noaux_tc routers), it is stored for completeness.
+- Runtime `moe_block`: router bf16 GEMM → routing kernels → per expert gather + (trellis
+  transform→GEMV→hadU→SV or plain bf16 GEMM) → weighted scatter-add into an fp32 accumulator;
+  shared expert with `sigmoid(shared_expert_gate)`; state += accumulator. Untied `lm_head.weight`
+  supported. Linears load either QTIP trellis or plain bf16 weights (unquantized checkpoints run
+  the identical surrounding code — bf16-vs-quantized comparison).
+
+## Qwen3.5-122B-A10B plan (not executed)
+
+Checkpoint facts (read from `/mnt/evo/Qwen3.5-122B-A10B-FP8`, config + tensor headers):
+text model H=3072, 48 layers (36 linear / 12 full), full attention nq32/nkv2/hd256 (A=8192),
+DeltaNet nk16/kd128, nv64/vd128 (key 2048, value 8192, conv 12288), vocab 248320,
+`tie_word_embeddings=false`, MoE per layer: 256 experts top-8, moe_inter 1024, shared_inter 1024,
+sigmoid-gated shared expert, softmax router (no `scoring_func` override). FP8-E4M3 weights with
+**128×128 block scales** `weight_scale_inv` BF16 [out/128][in/128] (e.g. [8,24] next to [1024,3072]);
+`read_w16` dequantises both layouts (per-row `weight_scale` and block `weight_scale_inv`, scale
+multiplies on dequant — transformers FP8 convention). Router/conv/A_log/dt_bias/gates are BF16 in
+the checkpoint (`modules_to_not_convert`).
+
+Memory/time (2× R9700 32 GB, 377 GB host RAM, ~27 GB free on /mnt/nvme):
+
+| item | size |
+|---|---|
+| per-expert Hessians (F32, GPU + hess file) | 256×(3072²+1024²)×4 ≈ **10.7 GB/layer** |
+| expert weights bf16 on GPU (collection) | 256×3×1024×3072×2 ≈ 4.8 GB/layer |
+| MoE collection peak per GPU | ≈ 17 GB (Hessians + weights + activations) ✓ |
+| host peak at deposit | partials 2×10.7 + combined 10.7 + writer copy 10.7 ≈ 43 GB ✓ |
+| hess disk peak | backlog × 10.7 GB → run with **`--backlog 1`**, delete after quantize ✓ |
+| quantized weights (2-bit, all linears) | ≈ 30 GB + embed/lm_head bf16 3.05 GB ≈ **33 GB total** |
+
+- Collection: 4M calibration tokens ≈ 38 PFLOP forward + ~equal Hessian GEMM work → ~10–20 min GPU
+  total across both GPUs (experts see topk-8 × the tokens, all GEMM-bound).
+- Quantize: 2 attn groups + 512 expert groups + 2 shared groups per layer; fp64 LDL (3072²/1024²)
+  ~3–6 s each → **~40–60 min per layer** (GPU Viterbi + CPU LDL overlap), 48 layers ≈ 1.5–2 days on
+  two GPUs in parallel. The per-expert groups are embarrassingly parallel if more CPUs help.
+- Runtime: 33 GB of weights does not leave KV room on one 32 GB GPU → serve with TP=2 (experts
+  sharded 128/128, router replicated; see TP plan above); single-GPU eval works with small context
+  and lm_head streaming. Untied lm_head is a bf16 GEMM (`lm_head.weight` stays bf16).
+- Do NOT write outputs to /mnt/nvme beyond the hess backlog: quantized model ≈ 33 GB — target a
+  different disk.

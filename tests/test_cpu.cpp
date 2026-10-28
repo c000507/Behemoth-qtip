@@ -1,7 +1,9 @@
 // CPU unit tests vs committed vectors from the unmodified upstream QTIP reference.
 // usage: qtip_tests_cpu <refvec_dir>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -257,6 +259,48 @@ static void test_qwen_config() {
   EXPECT(!is_qwen35_dir(dir), "llama not qwen");
 }
 
+// Tiny synthetic qwen3_5_moe checkpoint end-to-end CPU forward (qwen_make_tiny_moe output).
+// Skipped unless QWEN_TINY_MOE points at the checkpoint dir.
+static void test_qwen_tiny_moe() {
+  const char* dp = std::getenv("QWEN_TINY_MOE");
+  if (!dp) {
+    std::printf("[qwen35] tiny moe forward (skipped; set QWEN_TINY_MOE=<dir>)\n");
+    return;
+  }
+  std::printf("[qwen35] tiny moe forward\n");
+  QwenConfig cfg = load_qwen_config(dp);
+  EXPECT(cfg.moe() && cfg.n_experts > 0 && cfg.topk >= 2, "moe config");
+  SafeTensorsReader st(dp);
+  std::vector<std::shared_ptr<QwenLayer>> layers;
+  for (int L = 0; L < cfg.layers; ++L) layers.push_back(read_qwen_layer(st, cfg, L));
+  std::vector<int32_t> toks{1, 1500, 42, 999, 2047 % cfg.vocab, 3, 777, 512};
+  std::vector<float> logits(size_t(toks.size()) * cfg.vocab);
+  qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, toks.data(), int(toks.size()), logits.data(), 8);
+  bool fin = true;
+  int nmax = 0;
+  std::vector<int> seen;
+  for (int t = 0; t < int(toks.size()); ++t) {
+    int am = 0;
+    for (long v = 1; v < cfg.vocab; ++v) {
+      float x = logits[size_t(t) * cfg.vocab + v];
+      fin = fin && std::isfinite(x);
+      if (x > logits[size_t(t) * cfg.vocab + am]) am = int(v);
+    }
+    if (std::find(seen.begin(), seen.end(), am) == seen.end()) seen.push_back(am);
+    nmax++;
+  }
+  EXPECT(fin, "logits finite");
+  EXPECT(!seen.empty(), "argmax computed");
+  std::printf("  argmax (first 8):");
+  for (int t = 0; t < int(toks.size()); ++t) {
+    int am = 0;
+    for (long v = 1; v < cfg.vocab; ++v)
+      if (logits[size_t(t) * cfg.vocab + v] > logits[size_t(t) * cfg.vocab + am]) am = int(v);
+    std::printf(" %d", am);
+  }
+  std::printf("\n");
+}
+
 int main(int argc, char** argv) {
   if (argc >= 4 && std::string(argv[1]) == "--chol") {
     chol_bench(std::atoi(argv[2]), std::atoi(argv[3]));
@@ -270,6 +314,7 @@ int main(int argc, char** argv) {
   test_packing();
   test_ldl();
   test_qwen_config();
+  test_qwen_tiny_moe();
   std::printf(g_fail ? "CPU TESTS FAILED (%d)\n" : "ALL CPU TESTS PASSED\n", g_fail);
   return g_fail ? 1 : 0;
 }
