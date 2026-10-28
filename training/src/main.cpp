@@ -26,7 +26,12 @@ qtip_finetune --model MODEL --data PACKED --work CHECKPOINTS [options]
   --warmup-steps N       Warmup steps (10)
   --lr X --norm-lr X    Parameter / norm learning rates (1e-4 / 1e-5)
   --norm-decay X        Norm-only AdamW decay (.01)
-  --clip X              Global gradient norm clip (1)
+  --wscale-lr X         Wscale log-ratio learning rate (default: --lr)
+  --clip X              Gradient norm clip (1): global limit, or default group limit
+  --clip-mode M         group (default): clip su/sv/wscale/norm groups separately;
+                        global: one norm over all parameters
+  --clip-su X --clip-sv X --clip-wscale X --clip-norm X
+                        Per-group max norm in group mode (default --clip; 0 off)
   --checkpoint-every N  Checkpoint interval (10, 0 disables periodic)
   --stop-after-steps N  Stop after absolute step N; checkpoint for resume
   --arena-gb X          Fixed GPU allocation budget (24 decimal GB)
@@ -102,6 +107,21 @@ qtip_finetune --model MODEL --data PACKED --work CHECKPOINTS [options]
                 o.decay = real();
             else if (a == "--clip")
                 o.clip = real();
+            else if (a == "--wscale-lr") {
+                o.wscale_lr = real();
+                qat::require(o.wscale_lr > 0, "--wscale-lr must be positive");
+            } else if (a == "--clip-mode") {
+                qat::require(v == "group" || v == "global", "--clip-mode must be group or global");
+                o.clip_mode = v == "group" ? qat::Options::ClipMode::group : qat::Options::ClipMode::global;
+            } else if (a == "--clip-su" || a == "--clip-sv" || a == "--clip-wscale" || a == "--clip-norm") {
+                auto x = real();
+                qat::require(x >= 0, a + " must be non-negative");
+                auto g = a == "--clip-su"   ? qat::Group::su
+                         : a == "--clip-sv" ? qat::Group::sv
+                         : a == "--clip-wscale" ? qat::Group::wscale
+                                                : qat::Group::norm;
+                o.group_clip[int(g)] = x;
+            }
             else if (a == "--arena-gb") {
                 double gb = real();
                 qat::require(gb > 0 && gb <= 1024, "arena GB out of range");

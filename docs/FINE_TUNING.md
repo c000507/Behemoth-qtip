@@ -97,8 +97,8 @@ LUT, embedding, and lm_head stay frozen. Forward uses BF16 effective SU/norms,
 BF16 decoded weights and GEMM operands, FP32 accumulation, BF16 gate/up rotated
 outputs, and BF16 activation/residual boundaries. Backward uses explicit
 straight-through adjoints and recomputation. AdamW keeps FP32 master parameters
-and moments, lower norm LR, norm-only decay, global clipping, and warmup followed
-by cosine decay. Loss uses assistant targets and one global supervised-token
+and moments, lower norm LR, norm-only decay, per-group clipping (below), and
+warmup followed by cosine decay. Loss uses assistant targets and one global supervised-token
 denominator across all active GPUs. Idle replicas receive the same update on a
 partial final step.
 
@@ -112,6 +112,34 @@ squared tensor. Transfers use registered weights or reusable pinned staging.
 At 24,576 tokens, activation checkpoints require about 53 GB of pinned host RAM
 per GPU, in addition to packed weights. Arena exhaustion reports a clear error.
 Actual peak memory and throughput must be measured on the target machine.
+
+### Gradient clipping and per-group learning rates
+
+`--clip-mode group` (default) clips the `su`, `sv`, `wscale` and `norm` groups
+separately. Each group is scaled to at most its max norm: `--clip-su`, `--clip-sv`,
+`--clip-wscale` and `--clip-norm`, default `--clip` (1), with 0 disabling that group.
+`--clip-mode global` restores one clip over all parameters at `--clip`. Per-group
+limits are rejected in that mode. A spike in one group (for example q/k Wscale)
+no longer scales down every other group's update that step. Each step record
+reports the scale applied to each group in `clip_scale` (1 = not clipped).
+
+The default of 1 for every group is based on the step-30 checkpoint of the 32k run,
+which still used raw Wscale. Its Adam second moments put about 100% of the
+clipped squared norm in Wscale. That means `clip=1` scaled SU/SV/norm gradients down
+by the whole 40-140x in every step. Rescaling those moments by a typical global
+norm of ~60 estimates unclipped group norms of ~0.03 (SU), ~0.08 (SV) and ~0.09
+(norm). Wscale in `d` units is ~60 * 0.0018, about 0.1. A limit of 1 should
+therefore leave ordinary steps unclipped and still cap spikes of 10x or more.
+At the step-21 spike (13,112), the Wscale group would be about 23 in `d` units.
+These are estimates from optimizer state, not measured group norms: check
+`grad_norms` and `clip_scale` in the first steps of a run.
+
+`--wscale-lr` sets the Wscale log-ratio LR and defaults to `--lr`. In `d` units an
+Adam step of `lr` is a relative Wscale change of about `lr`. SV (unit RMS) and SU
+(about ±1) take the same relative steps at `--lr`, so equal LRs give every
+non-norm group the same relative speed. Raw Wscale moved about lr/0.0015, about
+600 times faster. RMSNorm keeps `--norm-lr`. Clip mode, resolved group limits and
+`wscale_lr` are in the checkpoint signature, so resume requires the same values.
 
 ### Wscale parameterisation
 
@@ -174,7 +202,8 @@ Each step record also has `grad_norms` (pre-clip L2 norm of the `su`, `sv`,
 `grad_top`, the three largest tensors by pre-clip gradient norm with `name`,
 `group`, `layer` (null for the final norm) and `linear` (module path, e.g.
 `self_attn.q_proj` or `input_layernorm`). They come from the same host pass that
-computes the global norm. To follow one group: `jq -c '[.step, .grad_norms]' LOG`.
+computes the global norm. `clip_scale` gives the per-group clip factor and
+`wscale_lr` the scheduled Wscale LR. To follow one group: `jq -c '[.step, .grad_norms]' LOG`.
 With repeats greater than one, the layer is decoded once and run repeatedly with
 unchanged inputs/parameters and cleared gradients. Each iteration prints timings;
 the final report gives medians excluding the first iteration. This separates
@@ -388,6 +417,11 @@ The native CPU suite checks parameter gradients through a complete two-layer
 transformer against finite differences, document/assistant masks, generalized
 Hadamard inversion, single-batch overfitting, immutable export tensors, tied SU,
 bit-exact interrupted/resumed CPU training, and checkpoint identity rejection.
+The optimizer tests cover finite differences of the Wscale log ratio away from
+`d = 0`, untrained-export identity, SV x Wscale export folding, format 3
+conversion and continued training, format/optimizer-signature rejection,
+per-group and global clipping, per-group first-step LRs, and the per-group
+gradient log. A single-batch overfit runs through the same host optimizer.
 Native SentencePiece tests cover chat boundaries, assistant EOS, Unicode,
 reasoning, packing, padding and continued positions. No Python is used by these
 tests. `--reference` selects unrounded CPU math for numerical differentiation;

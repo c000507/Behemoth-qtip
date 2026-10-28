@@ -298,6 +298,13 @@ struct Options {
     uint64_t max_tokens = 500000, warmup = 10, checkpoint_every = 10, stop_after = 0;
     int rows = 1024, loss_rows = 128;
     float lr = 1e-4f, norm_lr = 1e-5f, decay = .01f, clip = 1;
+    // global: one L2 clip over all parameters. group: each group is clipped to its
+    // own max norm (group_clip, negative = --clip; 0 disables that group).
+    enum class ClipMode { global, group } clip_mode = ClipMode::group;
+    std::array<float, group_count> group_clip{-1, -1, -1, -1};
+    float wscale_lr = -1; // log-ratio Wscale LR; negative = lr
+    float max_norm(Group g) const { return group_clip[int(g)] < 0 ? clip : group_clip[int(g)]; }
+    float scale_lr() const { return wscale_lr < 0 ? lr : wscale_lr; }
     size_t arena_bytes = size_t(24) * 1000 * 1000 * 1000;
     bool eval = false, rounding = true;
     json signature(const Model &, const Dataset &) const;

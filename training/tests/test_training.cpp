@@ -176,6 +176,65 @@ int main(int argc, char **argv) {
             }
             require(rejected, "nonfinite gradient accepted");
         }
+        {
+            // Group clipping limits each group independently; global mode scales all.
+            std::vector<float> g(m.initial.size(), 0.f);
+            for (auto &p : m.params)
+                for (size_t j = 0; j < p.size; ++j)
+                    g[p.offset + j] = p.group == Group::wscale ? 100.f : .001f;
+            auto before = gradient_stats(m.params, g);
+            Options go;
+            Optimizer grouped(m, go);
+            auto gg = g;
+            auto f = grouped.clip(gg, before);
+            auto after = gradient_stats(m.params, gg);
+            close(after.group[int(Group::wscale)], 1, 1e-5, 1e-5);
+            for (auto k : {Group::su, Group::sv, Group::norm}) {
+                require(f[int(k)] == 1.f, "unclipped group scaled");
+                close(after.group[int(k)], before.group[int(k)], 0, 1e-12);
+            }
+            go.group_clip[int(Group::wscale)] = 0;
+            go.group_clip[int(Group::sv)] = 1e-4f;
+            gg = g;
+            f = grouped.clip(gg, before);
+            after = gradient_stats(m.params, gg);
+            require(f[int(Group::wscale)] == 1.f, "disabled group clip applied");
+            double sv = before.group[int(Group::sv)];
+            close(after.group[int(Group::sv)], 1e-4 * sv / (sv + 1e-6), 1e-12, 1e-5);
+            Options gl;
+            gl.clip_mode = Options::ClipMode::global;
+            Optimizer global(m, gl);
+            gg = g;
+            f = global.clip(gg, before);
+            close(gradient_stats(m.params, gg).norm, 1, 1e-5, 1e-5);
+            for (int i = 0; i < group_count; ++i)
+                require(f[i] == f[0] && f[0] < 1, "global clip must scale every group equally");
+            // Per-group LR: the first Adam step moves each parameter by its LR.
+            Options lo;
+            lo.lr = .01f;
+            lo.norm_lr = .002f;
+            lo.wscale_lr = .003f;
+            lo.decay = 0;
+            Replica fresh(m, -1, 5, 0, false);
+            Optimizer stepper(m, lo);
+            std::vector<float> ones(m.initial.size(), 0.f);
+            for (auto &p : m.params)
+                std::fill_n(ones.begin() + p.offset, p.size, .5f);
+            stepper.step({&fresh}, ones, 1, 1.f);
+            auto moved = fresh.values();
+            for (size_t k = 0; k < m.params.size(); ++k) {
+                auto &p = m.params[k];
+                for (size_t j = p.offset; j < p.offset + p.size; ++j) {
+                    double delta = moved[j] - m.initial[j];
+                    if (p.group == Group::wscale)
+                        close(delta / m.initial[j], std::expm1(-.003), 1e-6, 1e-3);
+                    else
+                        close(delta, p.norm ? -.002 : -.01, 1e-6, 1e-3);
+                }
+            }
+            for (float d : stepper.ratio)
+                close(d, -.003, 1e-7, 1e-4);
+        }
         auto o = cpu_ops();
         auto x = o->alloc(3, 96);
         std::vector<float> v(x.size());
@@ -436,6 +495,11 @@ int main(int argc, char **argv) {
         auto changed = sig;
         changed["lr"] = .02;
         rejects(partial.work, changed, "differs");
+        for (auto [key, value] : {std::pair<const char *, json>{"clip_mode", "global"}, {"wscale_lr", 1e-3}}) {
+            changed = sig;
+            changed[key] = value;
+            rejects(partial.work, changed, "differs");
+        }
         {
             // Format 3 (raw Wscale) conversion: build a v3 snapshot from a step-1
             // v4 snapshot by mapping the log-ratio state back to raw Wscale moments.

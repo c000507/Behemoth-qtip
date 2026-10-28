@@ -29,6 +29,13 @@ json Options::signature(const Model &m, const Dataset &d) const {
             {"norm_lr", norm_lr},
             {"decay", decay},
             {"clip", clip},
+            {"clip_mode", clip_mode == ClipMode::global ? "global" : "group"},
+            {"group_clip",
+             {{"su", max_norm(Group::su)},
+              {"sv", max_norm(Group::sv)},
+              {"wscale", max_norm(Group::wscale)},
+              {"norm", max_norm(Group::norm)}}},
+            {"wscale_lr", scale_lr()},
             {"warmup", warmup},
             {"max_tokens", max_tokens},
             {"backend", devices.front() < 0 ? "cpu" : "hip"}};
@@ -274,7 +281,13 @@ int train(const Options &o) {
     require(o.rows > 0 && o.loss_rows > 0 && o.max_tokens > 0 && !o.devices.empty(),
             "invalid training options");
     require(o.devices.front() < 0 || o.rounding, "--reference is a CPU verification option");
-    require(o.lr > 0 && o.norm_lr > 0 && o.decay >= 0 && o.clip >= 0, "invalid optimizer settings");
+    require(o.lr > 0 && o.norm_lr > 0 && o.decay >= 0 && o.clip >= 0 && o.scale_lr() > 0,
+            "invalid optimizer settings");
+    for (int g = 0; g < group_count; ++g)
+        require(std::isfinite(o.max_norm(Group(g))) && o.max_norm(Group(g)) >= 0, "invalid group clip");
+    require(o.clip_mode == Options::ClipMode::group ||
+                std::all_of(o.group_clip.begin(), o.group_clip.end(), [](float c) { return c < 0; }),
+            "per-group clip limits need --clip-mode group");
     require(o.eval || !o.work.empty(), "--work required for training");
     if (o.devices.front() < 0)
         require(o.devices.size() == 1 && Config(read_json(o.model / "config.json")).n <= 1024,
@@ -370,6 +383,7 @@ int train(const Options &o) {
                        {"loss", loss / targets},
                        {"grad_norm", norm},
                        {"lr", o.lr * rate},
+                       {"wscale_lr", o.scale_lr() * rate},
                        {"seconds", seconds},
                        {"tokens_per_second", used / seconds},
                        {"device_peak_bytes", replicas[0]->ops->peak_bytes()}};

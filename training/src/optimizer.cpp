@@ -101,12 +101,22 @@ void Optimizer::to_log_scale(std::span<float> g) const {
     }
 }
 std::array<float, group_count> Optimizer::clip(std::span<float> g, const GradientStats &s) const {
+    auto limit = [](double max, double norm) { return max > 0 ? float(std::min(1., max / (norm + 1e-6))) : 1.f; };
     std::array<float, group_count> factor;
-    float global = options_.clip > 0 ? float(std::min(1., double(options_.clip) / (s.norm + 1e-6))) : 1.f;
-    factor.fill(global);
-    if (global != 1.f)
-        for (float &x : g)
-            x *= global;
+    if (options_.clip_mode == Options::ClipMode::global) {
+        float global = limit(options_.clip, s.norm);
+        factor.fill(global);
+        if (global != 1.f)
+            for (float &x : g)
+                x *= global;
+        return factor;
+    }
+    for (int i = 0; i < group_count; ++i)
+        factor[i] = limit(options_.max_norm(Group(i)), s.group[i]);
+    for (const auto &p : model_.params)
+        if (float f = factor[int(p.group)]; f != 1.f)
+            for (size_t i = p.offset; i < p.offset + p.size; ++i)
+                g[i] *= f;
     return factor;
 }
 void Optimizer::step(const std::vector<Replica *> &replicas, std::span<const float> g, uint64_t step,
@@ -114,7 +124,7 @@ void Optimizer::step(const std::vector<Replica *> &replicas, std::span<const flo
     require(step > 0, "optimizer steps are 1-based");
     // Same constants and FP32 operation order as the device AdamW (no decay on Wscale).
     float b1 = 1 - std::pow(.9f, float(step)), b2 = 1 - std::pow(.999f, float(step));
-    float lr = options_.lr * rate;
+    float lr = options_.scale_lr() * rate;
     for (size_t i = 0; i < scales.size(); ++i) {
         float gg = g[model_.params[scales[i]].offset];
         first[i] = .9f * first[i] + .1f * gg;
