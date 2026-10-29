@@ -8,6 +8,10 @@
 #include <csignal>
 #include <ctime>
 #include <deque>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -31,6 +35,8 @@ class Session : public std::enable_shared_from_this<Session> {
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
          closed_ = false, first_piece_ = true, include_usage_ = false;
     std::string output_;
+    std::string diagnostic_dir_;
+    json diagnostic_;
     TextStream text_;
     std::deque<std::string> queue_;
     size_t queued_ = 0;
@@ -128,6 +134,24 @@ class Session : public std::enable_shared_from_this<Session> {
     void finish(const GenerationEvent &event, const std::string &reason) {
         if (finished_ || closed_)
             return;
+        if (!diagnostic_dir_.empty()) {
+            try {
+                namespace fs = std::filesystem;
+                fs::create_directories(diagnostic_dir_);
+                auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+                auto path = fs::path(diagnostic_dir_) / (completion_id() + "-" + std::to_string(stamp) + ".json");
+                auto temp = fs::path(path.string() + ".tmp");
+                diagnostic_["finish_reason"] = reason;
+                diagnostic_["completion_tokens"] = event.completion_tokens;
+                diagnostic_["attention_qp"] = std::getenv("BEHEMOTH_ATTN_QP") ? std::getenv("BEHEMOTH_ATTN_QP") : "fp8";
+                diagnostic_["attention_legacy"] = std::getenv("BEHEMOTH_ATTN_LEGACY") ? std::getenv("BEHEMOTH_ATTN_LEGACY") : "0";
+                std::ofstream out(temp);
+                out << diagnostic_.dump() << '\n'; out.close();
+                if (!out) throw std::runtime_error("capture write failed");
+                fs::rename(temp, path);
+                std::cerr << "Diagnostic capture: " << path << '\n';
+            } catch (const std::exception &e) { std::cerr << "Diagnostic capture failed: " << e.what() << '\n'; }
+        }
         emit(text_.append("", true));
         finished_ = true;
         if (streaming_) {
@@ -171,6 +195,7 @@ class Session : public std::enable_shared_from_this<Session> {
             return;
         }
         if (event.token >= 0) {
+            if (!diagnostic_dir_.empty()) diagnostic_["tokens"].push_back(event.token);
             emit(text_.append(tokenizer_.piece(event.token, first_piece_)));
             if (text_.stopped()) {
                 engine_.cancel(id_);
@@ -219,6 +244,14 @@ class Session : public std::enable_shared_from_this<Session> {
             }
             auto request = parse_chat(json::parse(req.body()));
             auto prompt = tokenizer_.encode(request.rendered);
+            if (const char *directory = std::getenv("BEHEMOTH_DIAGNOSTIC_DIR"); directory && *directory) {
+                diagnostic_dir_ = directory;
+                diagnostic_ = {{"tokens", prompt}, {"prompt_tokens", prompt.size()},
+                    {"rendered_prompt", request.rendered}, {"request", json::parse(req.body())},
+                    {"sampling", {{"seed", request.sampling.seed}, {"temperature", request.sampling.temperature},
+                                  {"top_k", request.sampling.top_k}, {"top_p", request.sampling.top_p}}},
+                    {"producer", "behemoth_server exact delivered token IDs"}};
+            }
             streaming_ = request.stream;
             include_usage_ = request.include_usage;
             text_ = TextStream(request.stops);

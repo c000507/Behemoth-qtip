@@ -8,7 +8,7 @@ get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
 find_package(OpenMP COMPONENTS CXX)
-add_library(qtip_train_core src/io.cpp src/cpu.cpp src/layer.cpp src/trainer.cpp src/optimizer.cpp src/mixed.cpp src/reconstruct.cpp
+add_library(qtip_train_core src/io.cpp src/cpu.cpp src/layer.cpp src/trainer.cpp src/optimizer.cpp src/mixed.cpp src/reconstruct.cpp src/diagnose.cpp
   ${REPO}/runtime/src/qtip.cpp ${REPO}/runtime/src/checkpoint.cpp
   ${REPO}/runtime/src/attention.cpp ${REPO}/runtime/src/sorted_layout.cpp
   ${REPO}/src/safetensors.cpp)
@@ -50,6 +50,8 @@ add_executable(qtip_reconstruct src/reconstruct_main.cpp)
 target_link_libraries(qtip_reconstruct PRIVATE qtip_train_core)
 add_executable(qtip_check src/check.cpp)
 target_link_libraries(qtip_check PRIVATE qtip_train_core)
+add_executable(qtip_diagnose src/diagnose_main.cpp)
+target_link_libraries(qtip_diagnose PRIVATE qtip_train_core)
 add_executable(qtip_bench src/bench.cpp)
 target_link_libraries(qtip_bench PRIVATE qtip_train_core)
 add_executable(qtip_gradcheck src/gradcheck.cpp)

@@ -1,4 +1,5 @@
 #include "train.hpp"
+#include "diagnose.hpp"
 #include "safetensors.hpp"
 #include <algorithm>
 #include <cmath>
@@ -118,6 +119,39 @@ int main() {
                   !mixed.layers[l].params.contains("self_attn.v_proj.SV"), "FP8 K/V must stay frozen");
         }
         Dataset dataset(root / "data");
+        {
+            json request = {{"tokens", dataset.get(0).tokens}, {"logit_positions", {1, 2, 3}},
+                            {"activation_positions", {2}}, {"focus_tokens", {5}}};
+            auto student_trace = diagnostic_trace(mixed.path, request, -1, size_t(1e9), 3);
+            auto teacher_trace = diagnostic_trace(teacher.path, request, -1, size_t(1e9), 3);
+            auto identity = diagnostic_compare(student_trace, student_trace);
+            check(identity["mean_kl_reference_to_candidate"] == 0 && identity["argmax_disagreements"] == 0,
+                  "identical diagnostic traces disagree");
+            auto comparison = diagnostic_compare(teacher_trace, student_trace);
+            check(comparison["positions"].size() == 3 && comparison["layers"].size() == 2 &&
+                  comparison["positions"][0]["reference_actual_next"]["token"] == request["tokens"][2],
+                  "teacher diagnostic replay alignment or layer comparison failed");
+            auto changed = student_trace;
+            changed["tokens"][0] = 99;
+            rejects([&] { diagnostic_compare(teacher_trace, changed); });
+            json uniform = {{"tokens", {0, 1}}, {"logit_positions", {0}}, {"logits", {{0.f, 0.f}}}};
+            auto shifted = uniform; shifted["logits"] = {{1000.f, 1000.f}};
+            auto metric = diagnostic_compare(uniform, shifted);
+            check(metric["mean_kl_reference_to_candidate"] == 0 &&
+                  std::abs(metric["positions"][0]["reference_entropy"].get<double>() - std::log(2.)) < 1e-12 &&
+                  metric["positions"][0]["reference_actual_next"]["rank"] == 1,
+                  "diagnostic softmax stability/entropy/rank failed");
+            shifted["logits"] = {{0.f, float(std::log(3.))}};
+            metric = diagnostic_compare(uniform, shifted);
+            check(std::abs(metric["mean_kl_reference_to_candidate"].get<double>() - .5 * std::log(4./3.)) < 1e-7,
+                  "diagnostic KL differs from analytical answer");
+            std::vector<int> repeated{1};
+            for (int copy = 0; copy < 2; ++copy) for (int i = 0; i < 40; ++i) repeated.push_back(i + 2);
+            auto prepared = diagnostic_request({{"tokens", repeated}, {"prompt_tokens", 1}});
+            check(prepared["repeat_start"] == 41 && prepared["previous_match"] == 1 &&
+                  prepared["activation_positions"][0] == 40, "repeat onset detection failed");
+            rejects([&] { diagnostic_request({{"tokens", {1,2,3}}, {"prompt_tokens", 1}}); });
+        }
         finite_difference(mixed, dataset.get(0));
         auto ops = cpu_ops();
         auto a = ops->alloc(2, 3), b = ops->alloc(2, 3, true), g = ops->alloc(2, 3);

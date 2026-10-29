@@ -81,6 +81,10 @@ the other projections in QTIP 2-bit (`--kv-format qtip` selects legacy all-2-bit
 `qtip_reconstruct` performs sequential teacher-guided block fitting. See
 [FP8 K/V and block reconstruction](docs/MIXED_FP8_RECONSTRUCTION.md).
 
+For repeated paragraphs or reasoning loops, `qtip_diagnose` captures/replays exact
+tokens and compares source/student probabilities and block outputs; see
+[repetition diagnosis](docs/REPETITION_DIAGNOSIS.md).
+
 QTIP prefill and scheduling options (`runtime/PREFILL_SCHED_REPORT.md`):
 
 | flag / env | default | meaning |
