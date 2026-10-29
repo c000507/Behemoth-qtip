@@ -47,6 +47,38 @@ static void fp8_weights(hipStream_t stream) {
                 for (int i = 0; i < 16; ++i)
                     check(float(got[i]) == -19 && float(got[got.size() - 1 - i]) == -19, "FP8 projection output guard");
             }
+    // Production K/V geometry and both TP shards. Each output selects a
+    // different input channel, giving an exact oracle independent of GEMM.
+    {
+        qtip::HostLinear host;
+        host.in = 12288; host.out = 1024;
+        host.fp8.assign(size_t(host.in) * host.out, 0);
+        host.fp8_scale.resize(host.out);
+        for (int o = 0; o < host.out; ++o) {
+            host.fp8[size_t(o) * host.in + (o * 17) % host.in] = encode_e4m3(o % 2 ? -1.f : 1.f);
+            host.fp8_scale[o] = float(1 + o % 7) / 8;
+        }
+        for (int rows : {1, 5, 17}) {
+            std::vector<BFloat16> x(size_t(rows) * host.in);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = BFloat16(float(int(i % 61) - 30) / 16);
+            DeviceBuffer<BFloat16> input, output(size_t(rows) * 512);
+            input.upload(x);
+            for (int rank = 0; rank < 2; ++rank) {
+                qtip::GpuFp8Linear weights;
+                weights.upload(host, rank * 512, 512);
+                qtip::fp8_linear(weights, input.data(), host.in, rows, output.data(), 512, stream);
+                HIP_CHECK(hipStreamSynchronize(stream));
+                auto got = output.download();
+                for (int r = 0; r < rows; ++r)
+                    for (int c = 0; c < 512; ++c) {
+                        int o = rank * 512 + c;
+                        BFloat16 expected(float(x[size_t(r) * host.in + (o * 17) % host.in]) *
+                                          (o % 2 ? -1.f : 1.f) * host.fp8_scale[o]);
+                        check(got[size_t(r) * 512 + c].bits == expected.bits, "production FP8 K/V shard projection mismatch");
+                    }
+            }
+        }
+    }
     const int saved = qtip::row_transform_threshold();
     for (int threshold : {0, 1}) {
         qtip::set_row_transform_threshold(threshold);
@@ -94,7 +126,7 @@ static void fp8_weights(hipStream_t stream) {
     }
     qtip::set_row_transform_threshold(saved);
 }
-static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
+static std::vector<float> run_case(const test::Fixture &f, int partition, hipStream_t stream,
                      bool known = false) {
     const auto &l = f.layout;
     const auto &a = f.data;
@@ -154,6 +186,7 @@ static void run_case(const test::Fixture &f, int partition, hipStream_t stream,
         check(actual[i].bits == guarded[i].bits &&
                   actual[actual.size() - 1 - i].bits == guarded.back().bits,
               "Attention wrote outside output");
+    return values;
 }
 // BF16 Q/P mode: unquantised queries alongside the FP8 copy (which stays valid).
 static test::Fixture with_bf16_queries(test::Fixture f, int seed) {
@@ -163,6 +196,77 @@ static test::Fixture with_bf16_queries(test::Fixture f, int seed) {
     for (auto &x : f.data.q_bf16)
         x = BFloat16(normal(rng));
     return f;
+}
+// Independent invariants in addition to the scalar implementation comparison.
+static void attention_audit(hipStream_t stream) {
+    for (int heads : {48, 96}) {
+        std::vector<int> positions(65);
+        std::iota(positions.begin(), positions.end(), 0);
+        auto routing = test::fixture({97, 81}, {positions, {0, 15, 16, 31, 32, 64}}, 91, heads);
+        std::fill(routing.data.q.begin(), routing.data.q.end(), 0);
+        // Distinct powers of two identify each request and KV head without
+        // depending on reference_attention's GQA or page-index calculations.
+        for (int r = 0; r < 2; ++r)
+            for (int t = 0; t < routing.layout.lengths[r]; ++t)
+                for (int h = 0; h < heads / 12; ++h) {
+                    int page = routing.layout.page_table[r * routing.layout.table_stride + t / 16];
+                    size_t loc = (size_t(page) * (heads / 12) + h) * 16 + t % 16;
+                    routing.data.v_scale[loc] = std::ldexp(1.f, r * 8 + h - 8);
+                    for (int d = 0; d < 128; ++d)
+                        routing.data.v[loc * 128 + d] = encode_e4m3(d % 2 ? -1.f : 1.f);
+                }
+        for (bool bf16 : {false, true}) {
+            if (bf16) routing.data.q_bf16.assign(routing.data.q.size(), BFloat16(0));
+            for (int partition : {0, 32, 64}) {
+                auto got = run_case(routing, partition, stream);
+                for (int r = 0; r < 2; ++r)
+                    for (int q = routing.layout.query_offsets[r]; q < routing.layout.query_offsets[r + 1]; ++q)
+                        for (int h = 0; h < heads; ++h)
+                            for (int d = 0; d < 128; ++d) {
+                                float expected = std::ldexp(d % 2 ? -1.f : 1.f, r * 8 + h / 12 - 8);
+                                check(std::abs(got[(size_t(q) * heads + h) * 128 + d] - expected) <= .008f * std::abs(expected),
+                                      "GQA head/request/page routing invariant failed");
+                            }
+            }
+        }
+    }
+    std::vector<int> positions(65);
+    std::iota(positions.begin(), positions.end(), 0);
+    for (bool bf16 : {false, true}) {
+        auto f = test::fixture({97}, {positions}, 47);
+        if (bf16) f = with_bf16_queries(std::move(f), 47);
+        for (int partition : {0, 32}) {
+            auto full = run_case(f, partition, stream);
+            for (int t : {0, 15, 16, 31, 32, 64}) {
+                auto one = f;
+                one.layout.positions = {t};
+                one.layout.query_offsets = {0, 1};
+                const size_t row = size_t(t) * 48;
+                one.data.q = {f.data.q.begin() + row * 128, f.data.q.begin() + (row + 48) * 128};
+                one.data.q_scale = {f.data.q_scale.begin() + row, f.data.q_scale.begin() + row + 48};
+                if (bf16) one.data.q_bf16 = {f.data.q_bf16.begin() + row * 128, f.data.q_bf16.begin() + (row + 48) * 128};
+                auto decoded = run_case(one, partition, stream);
+                std::vector<float> expected(full.begin() + row * 128, full.begin() + (row + 48) * 128);
+                check(compare_attention(decoded, expected).pass, "prefill/decode attention disagreement");
+            }
+            auto poisoned = f;
+            for (int t = 33; t < 97; ++t)
+                for (int h = 0; h < 4; ++h) {
+                    int page = f.layout.page_table[t / 16];
+                    size_t loc = (size_t(page) * 4 + h) * 16 + t % 16;
+                    poisoned.data.k_scale[loc] = 10;
+                    poisoned.data.v_scale[loc] = 10;
+                    for (int d = 0; d < 128; ++d) {
+                        poisoned.data.k[loc * 128 + d] = encode_e4m3(7);
+                        poisoned.data.v[loc * 128 + d] = encode_e4m3(-7);
+                    }
+                }
+            auto changed = run_case(poisoned, partition, stream);
+            check(std::equal(full.begin(), full.begin() + 33 * 48 * 128, changed.begin()),
+                  "future K/V changed earlier attention outputs");
+        }
+    }
+    std::cout << "PASS GQA routing, full prefill tiles, prefill/decode equivalence and causal isolation\n";
 }
 // Long single-query contexts (decode) through every partition the model can
 // pick: unsplit, the forced 32/1024-key splits and the automatic block-filling
@@ -508,6 +612,14 @@ int main(int argc, char **argv) {
         hipStream_t stream{};
         HIP_CHECK(hipStreamCreate(&stream));
         try {
+            if (argc > 1 && std::string(argv[1]) == "--attention-audit") {
+                fp8_weights(stream);
+                append(stream);
+                attention_audit(stream);
+                long_contexts(stream);
+                HIP_CHECK(hipStreamDestroy(stream));
+                return 0;
+            }
             conversion(stream);
             append(stream);
             projection_selection(stream);
