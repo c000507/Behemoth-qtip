@@ -43,8 +43,9 @@ Branch `qwen35`. Reference implementation: `nmoe` (read-only). Test model: Qwen3
 
 ### Baselines recorded
 
-- CPU bf16 ppl (dense 0.8B, our reference forward, 512-token windows, 4088 predictions):
-  **5.7415** (`qwen35_ref ... --ppl`).
+- CPU bf16 ppl (dense 0.8B, our reference forward, 512-token windows): **6.2137** over 4088
+  predictions of `/tmp/qwen_eval.i32` (re-measured on the current eval file; the older 5.7415 was a
+  slightly different eval set).
 - **Quantized-reference ppl (0.8B QTIP-2bit, `qwen_qt_ref --ppl`, double-precision trellis decode):
   9.3136** over 3584 predictions of the same corpus — the first 0.8B quantization used only 202k
   calibration tokens; re-quantization with 4M tokens pending GPU. This separates quantization
@@ -60,13 +61,17 @@ Branch `qwen35`. Reference implementation: `nmoe` (read-only). Test model: Qwen3
 
 ## Pending / open issues
 
-1. **GPU slots**: a 123B fine-tune owned both GPUs until ~18:00. Queued (in order):
+1. **GPU slots**: since the 123B finetune ended, the other agent has saturated both GPUs
+   continuously (behemoth_server, 123B qtip_quant, behemoth_eval, qtip_reconstruct; a 2 h
+   gap-watcher found no idle window). All GPU validation is scripted and ready in
+   `tools/qwen35_gpu_validate.sh` (steps 1-6, one GPU process at a time; also
+   `/tmp/qwen35_gap_run.sh <cmd>` on .229 waits for an amd-smi gap and runs it). Queued:
    (a) runtime ppl/greedy of the existing 0.8B QTIP checkpoint with the fixed final norm vs the
    quantized reference (expect ≈ 9.31) — validates/clears the suspected "layer-6 DeltaNet runtime
    bug" (evidence now points at quantization drift + the final-norm bug, not the delta kernels:
    the layer test showed layer-0 delta out rel 3.2e-3 after the host-pointer fixes);
-   (b) re-quantize 0.8B with 4M calibration tokens (`/tmp/qwen_calib.i32`, 2048x2048);
-   (c) qtref + runtime ppl of the new checkpoint vs the 5.7415 bf16 baseline;
+   (b) re-quantize 0.8B with 4M calibration tokens (`/tmp/qwen_calib.i32`, 2048x2048 on .229);
+   (c) qtref + runtime ppl of the new checkpoint vs the 6.2137 bf16 baseline (same eval file);
    (d) tiny-MoE Hessian collection + quantize + GPU-runtime vs CPU-ref parity (bf16 and quantized);
    (e) `qtip_tests_gpu` parity suite.
 2. **122B-A10B**: full plan (memory/time/disk) in docs/QWEN35.md; FP8 block-scale reading
