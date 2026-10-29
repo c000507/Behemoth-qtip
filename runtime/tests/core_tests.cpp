@@ -532,6 +532,69 @@ static void scheduler_restore_tests() {
     auto rb = s.schedule();
     CHECK(rb.requests.size() == 1 && rb.requests[0].id == r && asked == 3 && s.preemptions() == 0);
 }
+static void reasoning_tests() {
+    struct Example { std::string input, content, reasoning; };
+    const std::vector<Example> cases = {
+        {"plain answer", "plain answer", ""},
+        {"<think>plan</think>answer", "answer", "plan"},
+        {"<think>first</think>answer<think>again</think>tail", "answertail", "firstagain"},
+        {"prefix<think>a<think>b</think>c</think>suffix", "prefixsuffix", "abc"},
+        {"<think></think>done", "done", ""},
+        {"<think>unfinished", "", "unfinished"},
+        {"answer<think>reopened", "answer", "reopened"},
+        {"<think>unfinished </thi", "", "unfinished </thi"},
+        {"literal <thi", "literal <thi", ""},
+        {"stray </think> tag", "stray </think> tag", ""},
+        {"&lt;think&gt;quoted", "&lt;think&gt;quoted", ""},
+        {"<think>\xe2\x82\xac</think>\xf0\x9f\x98\x80", "\xf0\x9f\x98\x80", "\xe2\x82\xac"},
+    };
+    for (const auto &c : cases) {
+        // Every possible two-piece boundary, including inside either marker.
+        for (size_t split = 0; split <= c.input.size(); ++split) {
+            ReasoningStream stream;
+            std::string content, reasoning;
+            auto consume = [&](const auto &parts) {
+                for (const auto &part : parts) (part.reasoning ? reasoning : content) += part.text;
+            };
+            consume(stream.append(std::string_view(c.input).substr(0, split)));
+            consume(stream.append(std::string_view(c.input).substr(split)));
+            consume(stream.append("", true));
+            CHECK(content == c.content && reasoning == c.reasoning);
+            CHECK(stream.append("ignored after finish", true).empty());
+        }
+        // Same production order: UTF-8/stop handling, then reasoning routing.
+        TextStream text;
+        ReasoningStream stream;
+        std::string content, reasoning;
+        auto consume = [&](const auto &parts) {
+            for (const auto &part : parts) (part.reasoning ? reasoning : content) += part.text;
+        };
+        for (char ch : c.input) consume(stream.append(text.append(std::string_view(&ch, 1))));
+        consume(stream.append(text.append("", true), true));
+        CHECK(content == c.content && reasoning == c.reasoning);
+    }
+    ReasoningStream ordered;
+    auto parts = ordered.append("a<think>b</think>c<think>d</think>e", true);
+    CHECK(parts.size() == 5);
+    for (size_t i = 0; i < parts.size(); ++i) {
+        CHECK(parts[i].reasoning == bool(i % 2));
+        CHECK(parts[i].text == std::string(1, char('a' + i)));
+    }
+    for (bool inside : {false, true}) {
+        TextStream text({"STOP"});
+        ReasoningStream reasoning;
+        std::string answer, thoughts;
+        auto consume = [&](const auto &parts) {
+            for (const auto &p : parts) (p.reasoning ? thoughts : answer) += p.text;
+        };
+        consume(reasoning.append(text.append(inside ? "<think>plan ST" : "<think>plan</think>answer ST")));
+        consume(reasoning.append(text.append("OP trailing text")));
+        CHECK(text.stopped());
+        consume(reasoning.append(text.append("", true), true));
+        CHECK(thoughts == (inside ? "plan " : "plan"));
+        CHECK(answer == (inside ? "" : "answer "));
+    }
+}
 static void sampling_tests() {
     std::thread::id worker_id;
     {
@@ -896,6 +959,7 @@ int main() {
                  {"prefix_cache", prefix_cache_tests},
                  {"scheduler_restore", scheduler_restore_tests},
                   {"sampling", sampling_tests},
+                 {"reasoning", reasoning_tests},
                   {"sampler_equivalence", sampler_equivalence_tests},
                   {"tuning", tuning_tests},
                  {"checkpoint", checkpoint_tests},

@@ -154,6 +154,30 @@ are rejected. The exact checkpoint chat template and legacy SentencePiece behavi
 are implemented in C++. Streaming handles partial stop strings, incomplete UTF-8,
 disconnect cancellation, and bounded network write queues.
 
+Generated `<think>...</think>` blocks are returned in `reasoning_content`;
+answer text is returned in `content`. This is enabled automatically. Nonstreaming
+responses place both strings in `choices[0].message`, for example:
+
+```json
+{"role":"assistant","content":"The answer.","reasoning_content":"The model's generated reasoning."}
+```
+
+Streaming responses send `delta.reasoning_content` for reasoning text and
+`delta.content` for answer text, in generation order. Every explicit think block
+is routed this way, including blocks reopened after answer text. Multiple blocks
+are concatenated within each field without adding separators; their generated
+whitespace is preserved. Delimiter tags are removed. An unfinished open block
+remains reasoning through the output limit. Nested think tags are tracked, and
+tags split across tokens/chunks are buffered until recognized. Partial unmatched
+tags at the end are preserved as literal text in the current field. Unmarked
+text remains content; a stray closing tag outside a block remains literal.
+The server does not infer reasoning from untagged prose. Stop strings apply to
+the generated text before this split, including reasoning. Requests continue to
+use message `content`; historical `reasoning_content` is not inserted into prompts.
+
+When `BEHEMOTH_DIAGNOSTIC_DIR` is set, captures include both output fields as
+well as the original token sequence, which retains all generated delimiters.
+
 ```sh
 curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \

@@ -13,4 +13,17 @@ struct ChatRequest {
     std::vector<std::string> stops;
 };
 ChatRequest parse_chat(const nlohmann::json &);
+struct ReasoningPart {
+    bool reasoning = false;
+    std::string text;
+};
+// Consumes decoded/UTF-8-safe TextStream output. Explicit think tags route
+// generated text; unmarked output remains answer content.
+class ReasoningStream {
+    std::string pending_;
+    size_t depth_ = 0;
+    bool finished_ = false;
+  public:
+    std::vector<ReasoningPart> append(std::string_view text, bool finish = false);
+};
 } // namespace behemoth

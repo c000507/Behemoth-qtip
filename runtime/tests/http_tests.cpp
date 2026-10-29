@@ -70,6 +70,7 @@ int main(int argc, char **argv) {
         check(ordinary.status == 200, "Nonstreaming generation failed");
         auto body = json::parse(ordinary.body);
         auto text = body.at("choices")[0].at("message").at("content").get<std::string>();
+        auto reasoning = body.at("choices")[0].at("message").at("reasoning_content").get<std::string>();
         check(body.at("usage").at("completion_tokens").get<int>() <= 2,
               "Output-token limit violated");
         auto tuning_reply = call("/metrics/tuning");
@@ -92,7 +93,7 @@ int main(int argc, char **argv) {
         check(streamed.status == 200, "Streaming generation failed");
         size_t begin = 0;
         bool done = false;
-        std::string assembled;
+        std::string assembled, assembled_reasoning;
         while (begin < streamed.body.size()) {
             size_t end = streamed.body.find("\n\n", begin);
             check(end != std::string::npos, "Incomplete SSE event");
@@ -111,9 +112,12 @@ int main(int argc, char **argv) {
             auto delta = event.at("choices")[0].at("delta");
             if (delta.contains("content"))
                 assembled += delta.at("content").get<std::string>();
+            if (delta.contains("reasoning_content"))
+                assembled_reasoning += delta.at("reasoning_content").get<std::string>();
         }
         check(done, "Missing DONE event");
         check(assembled == text, "Seeded streaming/nonstreaming output differs");
+        check(assembled_reasoning == reasoning, "Seeded streaming/nonstreaming reasoning differs");
         request["stream"] = false;
         std::vector<std::future<Reply>> concurrent;
         for (int i = 0; i < 4; ++i)

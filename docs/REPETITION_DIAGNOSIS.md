@@ -17,6 +17,9 @@ prompt, original request, resolved sampling settings/seed, exact prompt token ID
 delivered by the engine, before stop-string/display filtering. All requests in
 that server process are captured while this variable is set. Unset it to stop
 capturing. Cancelled/disconnected/error requests do not currently produce files.
+Captures also contain separate `content` and `reasoning_content` strings, matching
+the server response's think-tag routing. The raw token IDs retain the tags and
+their original ordering, including repeated reasoning blocks.
 
 Run your repeating conversation. The server logs the capture filename. This
 preserves token boundaries and includes tokens whose decoded text may be hidden.

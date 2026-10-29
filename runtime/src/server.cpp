@@ -34,7 +34,8 @@ class Session : public std::enable_shared_from_this<Session> {
     std::time_t created_ = std::time(nullptr);
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
          closed_ = false, first_piece_ = true, include_usage_ = false;
-    std::string output_;
+    std::string output_, reasoning_output_;
+    ReasoningStream reasoning_;
     std::string diagnostic_dir_;
     json diagnostic_;
     TextStream text_;
@@ -120,10 +121,12 @@ class Session : public std::enable_shared_from_this<Session> {
         queue_.push_back(std::move(wire));
         write_next();
     }
-    void emit(const std::string &text) {
-        output_ += text;
-        if (streaming_ && !text.empty())
-            enqueue("data: " + chunk({{"content", text}}).dump() + "\n\n");
+    void emit(const std::string &text, bool finish = false) {
+        for (const auto &part : reasoning_.append(text, finish)) {
+            (part.reasoning ? reasoning_output_ : output_) += part.text;
+            if (streaming_)
+                enqueue("data: " + chunk({{part.reasoning ? "reasoning_content" : "content", part.text}}).dump() + "\n\n");
+        }
     }
     static json usage(const GenerationEvent &event) {
         return {{"prompt_tokens", event.prompt_tokens},
@@ -134,6 +137,7 @@ class Session : public std::enable_shared_from_this<Session> {
     void finish(const GenerationEvent &event, const std::string &reason) {
         if (finished_ || closed_)
             return;
+        emit(text_.append("", true), true);
         if (!diagnostic_dir_.empty()) {
             try {
                 namespace fs = std::filesystem;
@@ -143,6 +147,8 @@ class Session : public std::enable_shared_from_this<Session> {
                 auto temp = fs::path(path.string() + ".tmp");
                 diagnostic_["finish_reason"] = reason;
                 diagnostic_["completion_tokens"] = event.completion_tokens;
+                diagnostic_["content"] = output_;
+                diagnostic_["reasoning_content"] = reasoning_output_;
                 diagnostic_["attention_qp"] = std::getenv("BEHEMOTH_ATTN_QP") ? std::getenv("BEHEMOTH_ATTN_QP") : "fp8";
                 diagnostic_["attention_legacy"] = std::getenv("BEHEMOTH_ATTN_LEGACY") ? std::getenv("BEHEMOTH_ATTN_LEGACY") : "0";
                 std::ofstream out(temp);
@@ -152,7 +158,6 @@ class Session : public std::enable_shared_from_this<Session> {
                 std::cerr << "Diagnostic capture: " << path << '\n';
             } catch (const std::exception &e) { std::cerr << "Diagnostic capture failed: " << e.what() << '\n'; }
         }
-        emit(text_.append("", true));
         finished_ = true;
         if (streaming_) {
             enqueue("data: " + chunk(json::object(), reason).dump() + "\n\n");
@@ -176,7 +181,8 @@ class Session : public std::enable_shared_from_this<Session> {
                      {"model", model_id},
                      {"choices",
                       {{{"index", 0},
-                        {"message", {{"role", "assistant"}, {"content", output_}}},
+                        {"message", {{"role", "assistant"}, {"content", output_},
+                                     {"reasoning_content", reasoning_output_}}},
                         {"finish_reason", reason}}}},
                      {"usage", usage(event)}});
     }
