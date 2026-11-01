@@ -49,19 +49,31 @@ __global__ __launch_bounds__(256) void fp8_gemv_rows(const uint8_t *__restrict__
 #pragma unroll
     for (int r = 0; r < R; ++r)
         acc[r] = 0.f;
-    for (int d = tid * 4; d < n; d += 1024) {
-        const uint32_t packed = *reinterpret_cast<const uint32_t *>(wf + d);
-        const float w0 = device::fp8(uint8_t(packed)), w1 = device::fp8(uint8_t(packed >> 8)),
-                    w2 = device::fp8(uint8_t(packed >> 16)), w3 = device::fp8(uint8_t(packed >> 24));
+    // 16 consecutive inputs per thread per 4096-wide step: one 128-bit weight load, two 128-bit
+    // activation loads per row.
+    for (int d = tid * 16; d < n; d += 4096) {
+        const uint4 packed = *reinterpret_cast<const uint4 *>(wf + d);
+        float wv[16];
+        const uint32_t pw[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            wv[4 * q] = device::fp8(uint8_t(pw[q]));
+            wv[4 * q + 1] = device::fp8(uint8_t(pw[q] >> 8));
+            wv[4 * q + 2] = device::fp8(uint8_t(pw[q] >> 16));
+            wv[4 * q + 3] = device::fp8(uint8_t(pw[q] >> 24));
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (r < live) {
-                const uint2 xv =
-                    *reinterpret_cast<const uint2 *>(x + size_t(row0 + r) * size_t(ldx) + d);
-                acc[r] = fmaf(device::bf16(uint16_t(xv.x)), w0, acc[r]);
-                acc[r] = fmaf(device::bf16(uint16_t(xv.x >> 16)), w1, acc[r]);
-                acc[r] = fmaf(device::bf16(uint16_t(xv.y)), w2, acc[r]);
-                acc[r] = fmaf(device::bf16(uint16_t(xv.y >> 16)), w3, acc[r]);
+                const uint4 *xp =
+                    reinterpret_cast<const uint4 *>(x + size_t(row0 + r) * size_t(ldx) + d);
+                const uint4 xa = xp[0], xb = xp[1];
+                const uint32_t px[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    acc[r] = fmaf(device::bf16(uint16_t(px[q])), wv[2 * q], acc[r]);
+                    acc[r] = fmaf(device::bf16(uint16_t(px[q] >> 16)), wv[2 * q + 1], acc[r]);
+                }
             }
         }
     }
@@ -131,9 +143,9 @@ void fp8_linear(const GpuFp8Linear &w, const BFloat16 *x, int ldx, int rows,
         throw std::invalid_argument("Invalid FP8 projection call");
     const auto *xs = reinterpret_cast<const uint16_t *>(x);
     auto *ys = reinterpret_cast<uint16_t *>(y);
-    // Row-batched GEMV: 4-wide loads need n % 4 == 0 and 8-byte aligned activation rows.
-    const bool batched = !legacy_dispatch() && rows <= 64 && w.in % 4 == 0 && ldx % 4 == 0 &&
-                         (reinterpret_cast<uintptr_t>(x) & 7) == 0;
+    // Row-batched GEMV: 128-bit loads need n % 16 == 0 and 16-byte aligned activation rows.
+    const bool batched = !legacy_dispatch() && rows <= 64 && w.in % 16 == 0 && ldx % 8 == 0 &&
+                         (reinterpret_cast<uintptr_t>(x) & 15) == 0;
     if (batched) {
         auto launch = [&](auto kernel, int r) {
             kernel<<<dim3(w.rows, (rows + r - 1) / r), 256, 0, s>>>(
