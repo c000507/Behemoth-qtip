@@ -144,7 +144,8 @@ ended at the available context limit.
 Endpoints:
 
 - `POST /v1/chat/completions`: text messages, streaming/nonstreaming, temperature
-  (default 0), top-k/top-p, seed, stop strings, and output-token limits.
+  (default 0), top-k/top-p, seed, stop strings, output-token limits, and structured
+  outputs (`response_format` json_object/json_schema, `grammar`; see below).
 - `GET /v1/models`, `GET /health`, `GET /metrics`.
 - `GET /metrics/tuning`: last-step choices and calibration samples for layer 0
   and the LM head on both ranks; `/metrics/tuning/all` includes all 88 layers.
@@ -186,6 +187,117 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 # Run while the actual GPU server is listening, in another terminal:
 cpp_runtime/build-rocm/behemoth_http_tests 127.0.0.1 8080
 ```
+
+### Structured outputs (JSON mode, JSON schema, grammars)
+
+OpenAI-compatible constrained decoding on `/v1/chat/completions`, streaming and
+nonstreaming:
+
+```sh
+# Any single JSON object
+curl http://127.0.0.1:1337/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages":[{"role":"user","content":"Describe a cat as JSON."}],
+  "max_tokens":1500, "response_format":{"type":"json_object"}}'
+
+# Output validated against a JSON Schema
+curl http://127.0.0.1:1337/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages":[{"role":"user","content":"Invent a person."}], "max_tokens":1500,
+  "response_format":{"type":"json_schema","json_schema":{"name":"person","strict":true,
+    "schema":{"type":"object","properties":{"name":{"type":"string"},
+      "age":{"type":"integer","minimum":0,"maximum":150},
+      "color":{"enum":["red","green","blue"]}},
+      "required":["name","age","color"],"additionalProperties":false}}}}'
+```
+
+- `response_format: {"type":"text"}` is the default (unconstrained).
+- `{"type":"json_object"}`: the answer is exactly one JSON object.
+- `{"type":"json_schema","json_schema":{"name":..., "schema":{...}, "strict":...}}`: the
+  answer matches the schema. `strict` is accepted and recorded; the schema is always
+  enforced exactly (there is no best-effort mode). Properties are emitted in the order
+  the request lists them.
+- Extension `"grammar": "<GBNF>"` (llama.cpp syntax, `root` rule; not with
+  `response_format`): the answer matches the grammar. Unlike JSON modes, EOS is allowed
+  (not forced) whenever the text so far is a complete match.
+- Extension `"reasoning_effort": "none"` (only with one of the above): no think block,
+  the answer starts immediately. Other `reasoning_effort` values change nothing.
+
+**Supported JSON Schema subset.** `type` (string or list), `properties`, `required`
+(names without a property schema accept any value), `additionalProperties`
+(true/false/schema; default true: extra keys after the declared ones), `items`,
+`prefixItems` (and draft-7 tuple `items`/`additionalItems`), `minItems`, `maxItems`,
+`enum`, `const`, `anyOf`, `oneOf` (treated as anyOf: exclusivity is not enforced),
+`allOf` with one schema, `$ref` to `#`, `#/$defs/...` or `#/definitions/...` (recursion
+allowed), `nullable` (OpenAPI), `minLength`/`maxLength` (codepoints; an escape counts as
+one), `format` `date`, `time`, `date-time`, `uuid` (enforced; other formats such as `email`
+or `uri` are annotations and pass through unchecked), integer
+`minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum` (exact digit-range grammars,
+draft-4 boolean exclusive form too), number bounds with integer-valued limits (bounded
+numbers are written without exponent). Annotations (`title`, `description`, `default`,
+`examples`, `$schema`, `$id`, `$comment`, `deprecated`, `readOnly`, `writeOnly`, ...)
+are ignored. Generated numbers have at most 16 integer/fraction digits and 2 exponent
+digits; whitespace inside the JSON is bounded (one space or a newline plus up to 20
+indentation columns).
+
+**Rejected with HTTP 400** (`{"error":{"message":..., "type":"invalid_request_error",
+"param":"response_format.json_schema.schema", "code":null}}`, the message names the
+keyword): `pattern`, `patternProperties`, `propertyNames`, `multipleOf`, `uniqueItems`,
+`contains`, `minProperties`/`maxProperties`, `dependent*`, `unevaluated*`, `not`,
+`if`/`then`/`else`, `allOf` with several schemas, non-local `$ref`, schema `false`,
+number bounds that are not integers, `$ref`/`anyOf`/`oneOf`/`allOf`/`enum`/`const`
+combined with other validation keywords (they would be silently dropped), unknown
+keywords, contradictory bounds, repetition bounds above 4096, nesting deeper than 64
+levels, and invalid GBNF for `grammar`.
+
+**Reasoning.** This model starts with a `<think>...</think>` block. With a constraint,
+up to 8 leading whitespace bytes are dropped, then the model may open one think
+block, which runs unconstrained (reasoning text, control tokens, nested tags) except
+that EOS is not allowed inside it and a token that closes the block must not
+continue into text the grammar rejects. After `</think>` (and up to 8 dropped
+whitespace bytes) the answer is constrained from its first byte; think tags are not
+recognized inside the answer, so `"<think>"` may appear inside a JSON string. Without a
+think block (the model answers directly, or `reasoning_effort: "none"`), the answer is
+constrained from the first token. The think block is returned in `reasoning_content`
+(`delta.reasoning_content` when streaming) and the JSON alone in `content`. JSON
+answers end with EOS as soon as the root value is complete (no trailing text), so
+`finish_reason` is `stop`. `max_tokens` counts reasoning and answer: a request that
+runs out mid-way ends with `finish_reason: "length"` and incomplete JSON, so allow
+for the think block (1000-2000 tokens). Stop strings still apply and can cut the JSON.
+
+**Decoding.** Each constrained request owns a `StructuredConstraint`
+(`include/behemoth/constraint.hpp`): a GBNF pushdown matcher over codepoints, which
+carries partial UTF-8 sequences across tokens (byte-fallback tokens, multi-byte
+characters split over pieces; overlong forms, surrogates and >U+10FFFF are rejected),
+and a byte trie over the exact streamed piece of every token (SentencePiece `▁`,
+`<0xNN>` bytes, first-piece space stripping; duplicate pieces share a node). The mask
+for a grammar state is a trie walk that prunes at the first impossible byte; it is
+cached per (grammar state, partial UTF-8) and compiled grammars with their caches are
+reused across requests with the same schema (16 grammars, LRU). Tokens spanning
+several terminals (`"}`, `":"`, `</think>\n\n{`) are checked byte by byte. In the
+engine's sampler job (per request, in parallel), greedy and in-reasoning steps first
+take the unconstrained choice and check it (about 0.3 us), masking only on rejection;
+sampled answer steps apply the mask before temperature/top-k/top-p. A step with one
+allowed token (EOS when the JSON is complete) skips sampling. Unconstrained requests
+in the same batch take the unchanged path (no per-token cost). `/metrics` reports
+`structured_output` (requests, tokens, mask fallbacks, constraint time per token).
+
+**Overhead** (CPU, `behemoth_structured_bench` on the checkpoint vocabulary, 32768
+tokens / 55,941 trie nodes, masked sampling at every step): 26-109 us per token
+averaged over 20 answers per schema with warm caches, 53-646 us per token for the
+first (cold) answer of a new schema, worst single token 4.7 ms (first mask inside a
+free string); the first answer token (exact check of all ids) costs 1.3-1.6 ms. Greedy
+steps whose choice is allowed cost ~0.3 us; reasoning tokens ~0.02 us. Decode steps
+take tens of milliseconds, so the constraint is below 1 % of decode time. Live on the
+2x R9700 server (25 constrained requests incl. cold schemas, concurrent with
+unconstrained ones): 139 us constraint time per constrained token (`/metrics`) against
+~51 ms per decoded token, i.e. ~0.3 %.
+
+Tests: `behemoth_structured_tests` (CPU: GBNF, schema compiler incl. exhaustive
+integer ranges and rejections, think splitter at every split point, token masks vs a
+per-token check over the whole vocabulary along random walks, outputs validated with an
+independent validator, UTF-8 edge cases, masked sampling, request parsing, grammar
+cache), `behemoth_structured_bench MODEL` (same exactness checks and the timings above
+on the real vocabulary). Against a live server:
+`python3 runtime/scripts/test_structured_json.py --host 127.0.0.1 --port 1337`.
 
 ### Prefix cache
 
