@@ -1,3 +1,4 @@
+#include "behemoth/constraint.hpp"
 #include "behemoth/engine.hpp"
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
@@ -24,12 +25,23 @@ using tcp = asio::ip::tcp;
 using json = nlohmann::json;
 using namespace behemoth;
 
+// Structured outputs (constraint.hpp): the vocabulary's byte pieces, built once, and
+// compiled grammars reused across requests.
+struct StructuredContext {
+    Vocabulary vocabulary;
+    GrammarCache grammars;
+    explicit StructuredContext(const Tokenizer &tokenizer) : vocabulary(vocabulary_pieces(tokenizer)) {}
+};
+
 class Session : public std::enable_shared_from_this<Session> {
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
     http::request_parser<http::string_body> parser_;
     Engine &engine_;
     const Tokenizer &tokenizer_;
+    StructuredContext &structured_;
+    bool constrained_ = false;
+    ThinkSplitter splitter_;
     uint64_t id_ = 0;
     std::time_t created_ = std::time(nullptr);
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
@@ -122,6 +134,20 @@ class Session : public std::enable_shared_from_this<Session> {
         write_next();
     }
     void emit(const std::string &text, bool finish = false) {
+        if (constrained_) {
+            // Same split as the decoding gate: one leading think block, then the answer.
+            std::string reasoning, answer;
+            splitter_.feed(text, &reasoning, &answer, finish);
+            for (auto *part : {&reasoning, &answer}) {
+                if (part->empty())
+                    continue;
+                const bool is_reasoning = part == &reasoning;
+                (is_reasoning ? reasoning_output_ : output_) += *part;
+                if (streaming_)
+                    enqueue("data: " + chunk({{is_reasoning ? "reasoning_content" : "content", *part}}).dump() + "\n\n");
+            }
+            return;
+        }
         for (const auto &part : reasoning_.append(text, finish)) {
             (part.reasoning ? reasoning_output_ : output_) += part.text;
             if (streaming_)
@@ -248,7 +274,8 @@ class Session : public std::enable_shared_from_this<Session> {
                 respond(http::status::method_not_allowed, {{"error", {{"message", "Use POST"}}}});
                 return;
             }
-            auto request = parse_chat(json::parse(req.body()));
+            const auto ordered = nlohmann::ordered_json::parse(req.body());
+            auto request = parse_chat(json::parse(req.body()), &ordered);
             auto prompt = tokenizer_.encode(request.rendered);
             if (const char *directory = std::getenv("BEHEMOTH_DIAGNOSTIC_DIR"); directory && *directory) {
                 diagnostic_dir_ = directory;
@@ -261,13 +288,34 @@ class Session : public std::enable_shared_from_this<Session> {
             streaming_ = request.stream;
             include_usage_ = request.include_usage;
             text_ = TextStream(request.stops);
+            std::shared_ptr<TokenConstraint> constraint;
+            if (request.structured.kind != StructuredOutput::None) {
+                std::unique_ptr<GrammarEngine> grammar;
+                try {
+                    grammar = structured_.grammars.acquire(request.structured.gbnf, request.structured.json);
+                } catch (const std::exception &e) {
+                    throw RequestError(std::string("Invalid grammar: ") + e.what(),
+                                       request.structured.kind == StructuredOutput::Grammar ? "grammar"
+                                                                                            : "response_format");
+                }
+                constraint = std::make_shared<StructuredConstraint>(structured_.vocabulary, std::move(grammar),
+                                                                    request.structured.allow_think,
+                                                                    &structured_.grammars);
+                constrained_ = true;
+                splitter_ = ThinkSplitter(request.structured.allow_think);
+                if (!diagnostic_dir_.empty())
+                    diagnostic_["structured"] = {{"kind", int(request.structured.kind)},
+                                                 {"allow_think", request.structured.allow_think},
+                                                 {"grammar", request.structured.gbnf}};
+            }
             std::weak_ptr<Session> weak = shared_from_this();
             id_ = engine_.submit(prompt, request.max_new, request.sampling,
                                  [weak](const GenerationEvent &event) {
                                      if (auto self = weak.lock())
                                          asio::post(self->stream_.get_executor(),
                                                     [self, event] { self->on_event(event); });
-                                 });
+                                 },
+                                 std::move(constraint));
             stream_.expires_never();
             watch_disconnect();
             if (streaming_) {
@@ -288,15 +336,20 @@ class Session : public std::enable_shared_from_this<Session> {
                                          });
                 enqueue("data: " + chunk({{"role", "assistant"}}).dump() + "\n\n");
             }
+        } catch (const RequestError &e) {
+            respond(http::status::bad_request,
+                    {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}, {"param", e.param},
+                                {"code", nullptr}}}});
         } catch (const std::exception &e) {
             respond(http::status::bad_request,
-                    {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}}}});
+                    {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}, {"param", nullptr},
+                                {"code", nullptr}}}});
         }
     }
 
   public:
-    Session(tcp::socket socket, Engine &engine, const Tokenizer &tokenizer)
-        : stream_(std::move(socket)), engine_(engine), tokenizer_(tokenizer) {
+    Session(tcp::socket socket, Engine &engine, const Tokenizer &tokenizer, StructuredContext &structured)
+        : stream_(std::move(socket)), engine_(engine), tokenizer_(tokenizer), structured_(structured) {
         parser_.body_limit(4 * 1024 * 1024);
     }
     void run() {
@@ -317,11 +370,12 @@ class Listener : public std::enable_shared_from_this<Listener> {
     tcp::acceptor acceptor_;
     Engine &engine_;
     const Tokenizer &tokenizer_;
+    StructuredContext &structured_;
 
   public:
     Listener(asio::io_context &io, tcp::endpoint endpoint, Engine &engine,
-             const Tokenizer &tokenizer)
-        : io_(io), acceptor_(io), engine_(engine), tokenizer_(tokenizer) {
+             const Tokenizer &tokenizer, StructuredContext &structured)
+        : io_(io), acceptor_(io), engine_(engine), tokenizer_(tokenizer), structured_(structured) {
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(asio::socket_base::reuse_address(true));
         acceptor_.bind(endpoint);
@@ -332,7 +386,8 @@ class Listener : public std::enable_shared_from_this<Listener> {
             asio::make_strand(io_),
             [self = shared_from_this()](beast::error_code ec, tcp::socket socket) {
                 if (!ec)
-                    std::make_shared<Session>(std::move(socket), self->engine_, self->tokenizer_)
+                    std::make_shared<Session>(std::move(socket), self->engine_, self->tokenizer_,
+                                              self->structured_)
                         ->run();
                 if (self->acceptor_.is_open())
                     self->accept();
@@ -435,10 +490,11 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("Usage: behemoth_server --model DIRECTORY [--transport "
                                         "host|rccl-shm] [--port 8080] [--threads 4]");
         Tokenizer tokenizer(options.model);
+        StructuredContext structured(tokenizer);
         Engine engine(options);
         asio::io_context io(threads);
         auto listener = std::make_shared<Listener>(
-            io, tcp::endpoint(asio::ip::make_address(host), port), engine, tokenizer);
+            io, tcp::endpoint(asio::ip::make_address(host), port), engine, tokenizer, structured);
         listener->accept();
         asio::signal_set signals(io, SIGINT, SIGTERM);
         signals.async_wait([&](beast::error_code, int) {

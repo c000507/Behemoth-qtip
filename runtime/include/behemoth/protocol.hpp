@@ -4,6 +4,21 @@
 
 namespace behemoth {
 inline constexpr const char *model_id = "cgg507/Behemoth-R1-123B-v2-aqlm";
+// 400 error that names the offending request parameter (OpenAI error "param").
+struct RequestError : std::invalid_argument {
+    std::string param;
+    RequestError(const std::string &message, std::string p)
+        : std::invalid_argument(message), param(std::move(p)) {}
+};
+// Structured output request (response_format / grammar), compiled to GBNF.
+struct StructuredOutput {
+    enum Kind { None, JsonObject, JsonSchema, Grammar } kind = None;
+    std::string gbnf;        // grammar the answer must match
+    bool json = false;       // answer is one JSON value: it ends when the value is complete
+    bool allow_think = true; // a leading <think> block may precede the answer (unconstrained)
+    std::string name;        // json_schema.name
+    bool strict = false;     // json_schema.strict (always enforced; recorded only)
+};
 struct ChatRequest {
     std::string rendered;
     SamplingOptions sampling;
@@ -11,8 +26,13 @@ struct ChatRequest {
     bool stream = false;
     bool include_usage = false; // stream_options.include_usage: final chunk carries usage
     std::vector<std::string> stops;
+    StructuredOutput structured;
 };
-ChatRequest parse_chat(const nlohmann::json &);
+// `ordered`: the same request parsed with nlohmann::ordered_json, so JSON-schema
+// properties keep their declared order (the order the model is made to emit them in).
+ChatRequest parse_chat(const nlohmann::json &, const nlohmann::ordered_json *ordered = nullptr);
+// Parses response_format / grammar / reasoning_effort into a StructuredOutput.
+StructuredOutput parse_structured(const nlohmann::ordered_json &request);
 struct ReasoningPart {
     bool reasoning = false;
     std::string text;

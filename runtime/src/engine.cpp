@@ -1,5 +1,7 @@
 #include "behemoth/engine.hpp"
 #include "behemoth/sampling.hpp"
+#include "behemoth/constraint.hpp"
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -106,6 +108,11 @@ struct Engine::Impl {
     bool stop = false, failed = false;
     std::map<uint64_t, GenerationCallback> callbacks;
     std::map<uint64_t, std::mt19937_64> rng;
+    // Structured outputs: per-request token constraints (absent for unconstrained requests,
+    // which take the unchanged sampling path).
+    std::map<uint64_t, std::shared_ptr<TokenConstraint>> constraints;
+    std::atomic<uint64_t> constraint_ns{0}, constrained_tokens{0}, constraint_fallbacks{0};
+    uint64_t constrained_requests = 0;
     std::set<uint64_t> cancellations;
     uint64_t completed = 0, tokens = 0;
     double gpu_seconds = 0;
@@ -505,6 +512,7 @@ struct Engine::Impl {
                         const uint64_t id = r.id;
                         retire(id);
                         rng.erase(id);
+                        constraints.erase(id);
                         submitted.erase(id);
                         last_token.erase(id);
                         it = callbacks.erase(it);
@@ -597,10 +605,45 @@ struct Engine::Impl {
                             const float *low = logits.data() + row * 16384,
                                         *high = logits.data() + sample_count * 16384 + row * 16384;
                             ++row;
-                            jobs.push_back([&sampled, i, sampling, generator, low, high] {
-                                sampled[i] = sample_logits(std::span<const float>(low, 16384),
-                                                           std::span<const float>(high, 16384),
-                                                           *sampling, *generator);
+                            auto found = constraints.find(request.id);
+                            if (found == constraints.end()) {
+                                jobs.push_back([&sampled, i, sampling, generator, low, high] {
+                                    sampled[i] = sample_logits(std::span<const float>(low, 16384),
+                                                               std::span<const float>(high, 16384),
+                                                               *sampling, *generator);
+                                });
+                                continue;
+                            }
+                            jobs.push_back([this, &sampled, i, sampling, generator, low, high,
+                                            constraint = found->second.get()] {
+                                const std::span<const float> lo(low, 16384), hi(high, 16384);
+                                using C = std::chrono::steady_clock;
+                                C::duration spent{};
+                                int token = -1;
+                                if (constraint->accept_first(sampling->temperature == 0)) {
+                                    token = sample_logits(lo, hi, *sampling, *generator);
+                                    auto t0 = C::now();
+                                    if (!constraint->accepts(token))
+                                        token = -1;
+                                    spent += C::now() - t0;
+                                }
+                                if (token < 0) {
+                                    auto t0 = C::now();
+                                    const auto allowed = constraint->allowed();
+                                    spent += C::now() - t0;
+                                    constraint_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                                    token = allowed.count == 1
+                                                ? allowed.single
+                                                : sample_logits(lo, hi, *sampling, *generator,
+                                                                allowed.mask->data());
+                                }
+                                auto t0 = C::now();
+                                constraint->advance(token);
+                                spent += C::now() - t0;
+                                sampled[i] = token;
+                                constraint_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count()),
+                                                        std::memory_order_relaxed);
+                                constrained_tokens.fetch_add(1, std::memory_order_relaxed);
                             });
                         }
                         samplers.run(jobs);
@@ -639,6 +682,7 @@ struct Engine::Impl {
                             retire(request.id);
                             callbacks.erase(request.id);
                             rng.erase(request.id);
+                            constraints.erase(request.id);
                             submitted.erase(request.id);
                             last_token.erase(request.id);
                         }
@@ -671,7 +715,7 @@ struct Engine::Impl {
 Engine::Engine(const RuntimeOptions &options) : impl_(std::make_unique<Impl>(options)) {}
 Engine::~Engine() = default;
 uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOptions options,
-                        GenerationCallback callback) {
+                        GenerationCallback callback, std::shared_ptr<TokenConstraint> constraint) {
     validate_sampling(options);
     if (!callback)
         throw std::invalid_argument("Missing generation callback");
@@ -689,6 +733,10 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
         }
     impl_->callbacks[id] = std::move(callback);
     impl_->rng.emplace(id, std::mt19937_64(options.seed));
+    if (constraint) {
+        impl_->constraints.emplace(id, std::move(constraint));
+        ++impl_->constrained_requests;
+    }
     impl_->submitted[id] = Impl::Clock::now();
     impl_->cv.notify_one();
     return id;
@@ -731,6 +779,15 @@ nlohmann::json Engine::metrics() const {
                         {"inter_token_p95_ms", percentile(impl_->itl, .95)},
                         {"precision", "fp8_e4m3/bf16/fp32"},
                         {"healthy", !impl_->failed && !impl_->stop}};
+    {
+        const double tokens = double(impl_->constrained_tokens.load());
+        const double ms = double(impl_->constraint_ns.load()) / 1e6;
+        m["structured_output"] = {{"requests", impl_->constrained_requests},
+                                  {"tokens", impl_->constrained_tokens.load()},
+                                  {"mask_fallbacks", impl_->constraint_fallbacks.load()},
+                                  {"constraint_ms_total", ms},
+                                  {"constraint_us_per_token", tokens ? ms * 1000 / tokens : 0.0}};
+    }
     if (const auto &c = impl_->cache) {
         const auto &s = c->stats();
         const auto &cc = impl_->cc;

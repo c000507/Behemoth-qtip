@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 namespace behemoth {
+class TokenConstraint;
 struct GenerationEvent {
     uint64_t id{};
     int token = -1;
@@ -20,7 +21,9 @@ class Engine {
   public:
     explicit Engine(const RuntimeOptions &);
     ~Engine();
-    uint64_t submit(std::span<const int>, size_t max_new, SamplingOptions, GenerationCallback);
+    // `constraint` (optional): structured-output token constraint, applied before sampling.
+    uint64_t submit(std::span<const int>, size_t max_new, SamplingOptions, GenerationCallback,
+                    std::shared_ptr<TokenConstraint> constraint = nullptr);
     void cancel(uint64_t);
     void shutdown();
     nlohmann::json metrics() const;
