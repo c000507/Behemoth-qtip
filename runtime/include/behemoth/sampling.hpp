@@ -9,8 +9,10 @@ int sample_logits(std::span<const float>, const SamplingOptions &, std::mt19937_
 // low ++ high (the two ranks' lm_head halves stay in device order; no host
 // interleave copy is needed). Produces identical tokens to the contiguous
 // form on the same logits.
+// `allowed` (optional): bitset over the 32768 ids (bit i of word i/64); masked-out ids
+// are excluded before temperature/top-k/top-p (structured outputs, constraint.hpp).
 int sample_logits(std::span<const float> low, std::span<const float> high,
-                  const SamplingOptions &, std::mt19937_64 &);
+                  const SamplingOptions &, std::mt19937_64 &, const uint64_t *allowed = nullptr);
 class TextStream {
     std::string pending_, emitted_;
     std::vector<std::string> stops_;

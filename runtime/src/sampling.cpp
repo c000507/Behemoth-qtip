@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <numeric>
 
 namespace behemoth {
@@ -98,16 +99,9 @@ void validate_sampling(const SamplingOptions &p) {
 int sample_logits(std::span<const float> logits, const SamplingOptions &p, std::mt19937_64 &rng) {
     return sample_logits(logits, {}, p, rng);
 }
-int sample_logits(std::span<const float> low, std::span<const float> high, const SamplingOptions &p,
-                  std::mt19937_64 &rng) {
-    validate_sampling(p);
-    const size_t n = low.size() + high.size();
-    if (!n)
-        throw std::invalid_argument("Empty logits");
-    auto value = [&](size_t i) -> float { return i < low.size() ? low[i] : high[i - low.size()]; };
-    for (size_t i = 0; i < n; ++i)
-        if (!std::isfinite(value(i)))
-            throw std::runtime_error("Nonfinite model logits");
+namespace {
+// Shared sampler body; `value(i)` is the logit of id i (-inf for ids a constraint masks out).
+template <class Value> int sample_values(size_t n, Value value, const SamplingOptions &p, std::mt19937_64 &rng) {
     if (p.temperature == 0) {
         size_t best = 0;
         for (size_t i = 1; i < n; ++i)
@@ -148,6 +142,40 @@ int sample_logits(std::span<const float> low, std::span<const float> high, const
     probabilities.resize(keep);
     std::discrete_distribution<size_t> dist(probabilities.begin(), probabilities.end());
     return int(order[dist(rng)]);
+}
+} // namespace
+int sample_logits(std::span<const float> low, std::span<const float> high, const SamplingOptions &p,
+                  std::mt19937_64 &rng, const uint64_t *allowed) {
+    validate_sampling(p);
+    const size_t n = low.size() + high.size();
+    if (!n)
+        throw std::invalid_argument("Empty logits");
+    auto value = [&](size_t i) -> float { return i < low.size() ? low[i] : high[i - low.size()]; };
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(value(i)))
+            throw std::runtime_error("Nonfinite model logits");
+    if (!allowed)
+        return sample_values(n, value, p, rng);
+    // Constrained: disallowed ids get -inf (zero probability, never the argmax).
+    // Temperature, top-k and top-p then act on the allowed ids only.
+    size_t first_allowed = n;
+    for (size_t i = 0; i < n && first_allowed == n; ++i)
+        if ((allowed[i >> 6] >> (i & 63)) & 1)
+            first_allowed = i;
+    if (first_allowed == n)
+        throw std::invalid_argument("Constraint allows no token");
+    auto masked = [&](size_t i) -> float {
+        return ((allowed[i >> 6] >> (i & 63)) & 1) ? value(i) : -std::numeric_limits<float>::infinity();
+    };
+    if (p.temperature == 0) { // argmax over allowed ids, lowest id on ties
+        size_t best = first_allowed;
+        for (size_t i = first_allowed + 1; i < n; ++i)
+            if (masked(i) > masked(best))
+                best = i;
+        return int(best);
+    }
+    // Masked ids contribute exp(-inf) = 0 and are never drawn.
+    return sample_values(n, masked, p, rng);
 }
 TextStream::TextStream(std::vector<std::string> stops) : stops_(std::move(stops)) {
     for (const auto &s : stops_)

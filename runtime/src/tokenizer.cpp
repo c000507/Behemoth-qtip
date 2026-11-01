@@ -93,6 +93,23 @@ std::string Tokenizer::piece(int id, bool &first) const {
         first = false;
     return p;
 }
+bool Tokenizer::is_special(int id) const {
+    auto special = impl_->special.find(id);
+    return special != impl_->special.end() && special->second;
+}
+std::vector<Vocabulary::Token> vocabulary_pieces(const Tokenizer &tokenizer) {
+    std::vector<Vocabulary::Token> tokens(vocabulary_size);
+    for (int id = 0; id < vocabulary_size; ++id) {
+        auto &t = tokens[size_t(id)];
+        t.special = tokenizer.is_special(id);
+        bool first = true;
+        t.first = tokenizer.piece(id, first);
+        t.first_after = first;
+        bool rest = false;
+        t.rest = tokenizer.piece(id, rest);
+    }
+    return tokens;
+}
 std::string Tokenizer::decode(const std::vector<int> &ids) const {
     std::string out;
     bool first = true;
