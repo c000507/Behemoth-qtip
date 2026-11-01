@@ -65,9 +65,28 @@ void topology(int device) {
     bool iommu_pt = false;
     while (cmd >> flag)
         iommu_pt |= flag == "iommu=pt" || flag == "iommu.passthrough=1";
+    // The endpoint link only reaches the card's on-board switch; the host bandwidth is set by the
+    // slowest link on the path to the root port (perf/prefill: GPU 0 here reports 32 GT/s at the
+    // endpoint while its root port trained at 8 GT/s).
+    std::string slowest = "unavailable";
+    double slowest_gts = 1e9;
+    std::error_code ec;
+    for (auto dir = std::filesystem::canonical(root, ec); !ec && dir.has_parent_path() && dir != dir.parent_path();
+         dir = dir.parent_path()) {
+        std::ifstream sf(dir / "current_link_speed"), wf(dir / "current_link_width");
+        std::string speed, width;
+        if (!std::getline(sf, speed) || !std::getline(wf, width) || speed.empty())
+            continue;
+        const double gts = std::atof(speed.c_str());
+        if (gts > 0 && gts < slowest_gts) {
+            slowest_gts = gts;
+            slowest = speed + " x" + width + " (" + dir.filename().string() + ")";
+        }
+    }
     std::cerr << "GPU " << device << " " << p.name << " arch=" << p.gcnArchName
               << " wave=" << p.warpSize << " pci=" << bus << " link=" << line("current_link_speed")
-              << " width=" << line("current_link_width") << " largest_memory_BAR=" << largest
+              << " width=" << line("current_link_width") << " slowest_upstream_link=" << slowest
+              << " largest_memory_BAR=" << largest
               << " BAR_covers_VRAM=" << (largest >= p.totalGlobalMem) << " iommu_pt=" << iommu_pt
               << " P2P=disabled; BAR/IOMMU are diagnostic only\n";
 }
@@ -532,6 +551,8 @@ struct Shard {
     // linear (pieces of <= qtip::dense_scratch_elements), hipBLASLt plans per shape.
     std::unique_ptr<qtip::DenseMatmul> qtip_dense;
     DeviceBuffer<BFloat16> qtip_dense_scratch;
+    // bf16 expansion of one layer's stacked fp8 K|V shard per micro-batch (fp8_kv_dense)
+    std::array<DeviceBuffer<BFloat16>, 4> fp8_kv_scratch; // indexed by micro-batch (max_micro_batches)
     hipStream_t copy_stream{};
     hipEvent_t copy_start{}, copy_done{};
     // Second micro-batch stream of large prefill steps (qtip_forward) and its events.
@@ -637,6 +658,15 @@ struct Shard {
             const int dense = qtip::dense_rows_threshold();
             if (dense > 0 && options.token_budget >= size_t(dense))
                 qtip_dense_scratch.resize(qtip::dense_scratch_elements);
+            // fp8 K/V expansion scratch: one per micro-batch a step of the budget can use
+            const int kv_rows = fp8_kv_dense_rows();
+            if (checkpoint.config.fp8_kv && kv_rows > 0 && options.token_budget >= size_t(kv_rows)) {
+                const char *v = std::getenv("BEHEMOTH_QTIP_MICRO_BATCHES");
+                const int requested = std::clamp(v ? std::atoi(v) : 2, 1, max_micro_batches);
+                const int count = dense > 0 && options.token_budget >= size_t(2 * dense) ? requested : 1;
+                for (int i = 0; i < count; ++i)
+                    fp8_kv_scratch[size_t(i)].resize(size_t(1024) * 12288);
+            }
         }
     }
     void load_qtip_layer(const Checkpoint &checkpoint, int i) {
@@ -1118,6 +1148,16 @@ struct Shard {
                     log << ' ' << name << "/bf16@" << n << '=' << int(tflops);
                 }
             }
+        if (w0.fp8_kv && fp8_kv_scratch[0].size() && qtip::fp8_pair_dense_eligible(w0.fp8_k, w0.fp8_v)) {
+            const int features = w0.fp8_k.rows + w0.fp8_v.rows;
+            qtip::fp8_expand_pair(w0.fp8_k, w0.fp8_v, fp8_kv_scratch[0].data(), stream);
+            for (int n : sizes) {
+                const double tflops = qtip_dense->tune(features, w0.fp8_k.in, qtip_u.data(), 12288, n,
+                                                       qtip_partial.data(), features,
+                                                       fp8_kv_scratch[0].data(), stream, candidates);
+                log << " fp8_kv@" << n << '=' << int(tflops);
+            }
+        }
         std::cerr << log.str() << '\n';
     }
     // ---------------------------------------------------------------- QTIP execution
@@ -1244,6 +1284,13 @@ struct Shard {
         static const bool on = [] {
             const char *v = std::getenv("BEHEMOTH_QTIP_BF16_DIRECT");
             return !v || std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    static bool qtip_bf16_exchange_all() {
+        static const bool on = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_BF16_EXCHANGE_ALL");
+            return v && std::atoi(v) != 0;
         }();
         return on;
     }
@@ -1430,6 +1477,36 @@ struct Shard {
         });
         return e;
     }
+    // FP8 K/V projections of steps of at least BEHEMOTH_FP8_KV_DENSE_ROWS rows (default 65:
+    // above the row-batched GEMV's range; 0 disables) as one hipBLASLt bf16 GEMM over the exact
+    // bf16 expansion of the stacked K|V shard (perf/prefill). The old path for these sizes, a
+    // 16x64-tile WMMA kernel that re-expands the fp8 weights per tile, ran at ~2.6 TFLOP/s:
+    // 1.7 s of a 2048-row step. Each micro-batch has its own expansion scratch (25 MB), so no
+    // cross-stream ordering is needed; the fp32 GEMM output reuses the micro-batch's
+    // qtip_partial region (free during step A) and is scaled/rounded once into k/v.
+    static int fp8_kv_dense_rows() {
+        static const int rows = [] {
+            const char *v = std::getenv("BEHEMOTH_FP8_KV_DENSE_ROWS");
+            return v ? std::atoi(v) : 65;
+        }();
+        return rows;
+    }
+    bool fp8_kv_dense(const QtipLayer &w, const BFloat16 *xn, const Mb &mb, BFloat16 *km, BFloat16 *vm) {
+        const int t = fp8_kv_dense_rows();
+        if (t <= 0 || mb.rows < t || !qtip_dense || size_t(mb.index) >= fp8_kv_scratch.size() ||
+            !fp8_kv_scratch[size_t(mb.index)].size() || !qtip::fp8_pair_dense_eligible(w.fp8_k, w.fp8_v))
+            return false;
+        const int features = w.fp8_k.rows + w.fp8_v.rows;
+        if (size_t(features) * size_t(w.fp8_k.in) > fp8_kv_scratch[size_t(mb.index)].size() ||
+            size_t(mb.r0) * 28672 + size_t(mb.rows) * size_t(features) > qtip_partial.size())
+            return false;
+        BFloat16 *scratch = fp8_kv_scratch[size_t(mb.index)].data();
+        float *acc = qtip_partial.data() + size_t(mb.r0) * 28672;
+        qtip::fp8_expand_pair(w.fp8_k, w.fp8_v, scratch, mb.s);
+        qtip_dense->gemm(features, w.fp8_k.in, xn, 12288, mb.rows, acc, features, scratch, mb.s);
+        qtip::fp8_scale_pair(acc, mb.rows, w.fp8_k, w.fp8_v, km, vm, 512, mb.s);
+        return true;
+    }
     // A: q/k/v input transform (norm + SU + hadUt), stacked matmul, all-gather of the rotated
     // outputs, hadU + SV for this rank's heads, rope, KV append, attention, all-gather of the
     // head-sharded attention output.
@@ -1476,6 +1553,8 @@ struct Shard {
                 if (!mb.norm_ready)
                     rms_norm(st, l.input_norm.data(), xn, rows, 12288, 1e-5f, mb.s);
                 mb.norm_ready = false;
+                if (fp8_kv_dense(w, xn, mb, km, vm))
+                    return;
                 if (!qtip::fp8_linear_pair(w.fp8_k, w.fp8_v, xn, 12288, rows, km, vm, 512, mb.s)) {
                     qtip::fp8_linear(w.fp8_k, xn, 12288, rows, km, 512, mb.s);
                     qtip::fp8_linear(w.fp8_v, xn, 12288, rows, vm, 512, mb.s);
@@ -1691,7 +1770,11 @@ struct Shard {
             m.copy_start = i ? mb_copy_start[size_t(i)] : copy_start;
             m.copy_done = i ? mb_copy_done[size_t(i)] : copy_done;
             m.overlap = count > 1;
-            m.bf16_projection = qtip_bf16_prefill_enabled(m.rows, bf16_prefill_rows, has_decode);
+            // BEHEMOTH_QTIP_BF16_EXCHANGE_ALL=1 (perf/prefill, default off): bf16 q/k/v, o and down
+            // payloads in every step, including decode-only and mixed decode/prefill steps (the
+            // PCIe bytes of those exchanges drop 144 -> 106 KB per row and layer).
+            m.bf16_projection = qtip_bf16_prefill_enabled(m.rows, bf16_prefill_rows, has_decode) ||
+                                qtip_bf16_exchange_all();
             m.meta = &metadata;
         }
         if (count > 1) {

@@ -209,7 +209,72 @@ bool legacy_dispatch() {
     }();
     return legacy;
 }
+// Prefill-sized K/V (perf/prefill): exact E4M3 -> BF16 expansion of the stacked K|V shard
+// (E4M3 values are representable in BF16), 16 weights per thread.
+__global__ __launch_bounds__(256) void fp8_expand(const uint8_t *__restrict__ w, size_t n16,
+                                                  uint16_t *__restrict__ out) {
+    const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= n16)
+        return;
+    const uint4 b = reinterpret_cast<const uint4 *>(w)[i];
+    const uint32_t words[4] = {b.x, b.y, b.z, b.w};
+    uint32_t packed[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t word = words[j / 2], shift = 16 * (j % 2);
+        const uint16_t lo = device::bf16(device::fp8(uint8_t(word >> shift)));
+        const uint16_t hi = device::bf16(device::fp8(uint8_t(word >> (shift + 8))));
+        packed[j] = uint32_t(lo) | (uint32_t(hi) << 16);
+    }
+    auto *o = reinterpret_cast<uint4 *>(out) + 2 * i;
+    o[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    o[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+}
+// y = bf16(acc * scale[feature]) for the stacked K|V GEMM output acc[rows][k_rows + v_rows]
+// (the rounding of the GEMV kernels: one per output, after the fp32 scale).
+__global__ __launch_bounds__(256) void fp8_scale_split(const float *__restrict__ acc, int rows,
+                                                       const float *__restrict__ sk, int k_rows,
+                                                       const float *__restrict__ sv, int v_rows,
+                                                       uint16_t *__restrict__ yk, uint16_t *__restrict__ yv,
+                                                       int ldy) {
+    const int features = k_rows + v_rows;
+    const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= size_t(rows) * size_t(features))
+        return;
+    const int r = int(i / size_t(features)), f = int(i % size_t(features));
+    if (f < k_rows)
+        yk[size_t(r) * ldy + f] = device::bf16(acc[i] * sk[f]);
+    else
+        yv[size_t(r) * ldy + (f - k_rows)] = device::bf16(acc[i] * sv[f - k_rows]);
+}
 } // namespace
+bool fp8_pair_dense_eligible(const GpuFp8Linear &k, const GpuFp8Linear &v) {
+    return k.in == v.in && k.in % 16 == 0 && k.rows > 0 && v.rows > 0 &&
+           k.weight.size() == size_t(k.in) * size_t(k.rows) && v.weight.size() == size_t(v.in) * size_t(v.rows) &&
+           k.scale.size() == size_t(k.rows) && v.scale.size() == size_t(v.rows);
+}
+void fp8_expand_pair(const GpuFp8Linear &k, const GpuFp8Linear &v, BFloat16 *w, hipStream_t s) {
+    if (!fp8_pair_dense_eligible(k, v))
+        throw std::invalid_argument("Invalid FP8 K/V pair expansion");
+    auto expand = [&](const GpuFp8Linear &l, BFloat16 *out) {
+        const size_t n16 = l.weight.size() / 16;
+        fp8_expand<<<unsigned((n16 + 255) / 256), 256, 0, s>>>(l.weight.data(), n16,
+                                                              reinterpret_cast<uint16_t *>(out));
+    };
+    expand(k, w);
+    expand(v, w + size_t(k.rows) * size_t(k.in));
+    HIP_CHECK(hipGetLastError());
+}
+void fp8_scale_pair(const float *acc, int rows, const GpuFp8Linear &k, const GpuFp8Linear &v,
+                    BFloat16 *yk, BFloat16 *yv, int ldy, hipStream_t s) {
+    if (rows < 1 || ldy < k.rows || ldy < v.rows)
+        throw std::invalid_argument("Invalid FP8 K/V scale call");
+    const size_t n = size_t(rows) * size_t(k.rows + v.rows);
+    fp8_scale_split<<<unsigned((n + 255) / 256), 256, 0, s>>>(
+        acc, rows, k.scale.data(), k.rows, v.scale.data(), v.rows, reinterpret_cast<uint16_t *>(yk),
+        reinterpret_cast<uint16_t *>(yv), ldy);
+    HIP_CHECK(hipGetLastError());
+}
 void fp8_linear(const GpuFp8Linear &w, const BFloat16 *x, int ldx, int rows,
                 BFloat16 *y, int ldy, hipStream_t s) {
     if (w.in <= 0 || w.rows <= 0 || rows <= 0 || ldx < w.in || ldy < w.rows ||

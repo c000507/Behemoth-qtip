@@ -32,6 +32,14 @@ void fp8_linear(const GpuFp8Linear &, const BFloat16 *x, int ldx, int rows,
 // range or BEHEMOTH_FP8_KV_PAIR=0, so the caller falls back to two fp8_linear calls.
 bool fp8_linear_pair(const GpuFp8Linear &k, const GpuFp8Linear &v, const BFloat16 *x, int ldx,
                      int rows, BFloat16 *yk, BFloat16 *yv, int ldy, hipStream_t);
+// Prefill-sized K/V through a dense BF16 GEMM (perf/prefill): fp8_expand_pair writes the exact
+// BF16 expansion of the stacked shard, w[k.rows + v.rows][in] (K rows first); after
+// acc[rows][k.rows + v.rows] = x . w^T (fp32), fp8_scale_pair stores bf16(acc * scale) into yk/yv
+// (the GEMV kernels' rounding; summation order differs).
+bool fp8_pair_dense_eligible(const GpuFp8Linear &k, const GpuFp8Linear &v);
+void fp8_expand_pair(const GpuFp8Linear &k, const GpuFp8Linear &v, BFloat16 *w, hipStream_t);
+void fp8_scale_pair(const float *acc, int rows, const GpuFp8Linear &k, const GpuFp8Linear &v,
+                    BFloat16 *yk, BFloat16 *yv, int ldy, hipStream_t);
 // Non-owning view for externally managed/double-buffered device storage.
 struct LinearView {
     const uint16_t *trellis = nullptr;

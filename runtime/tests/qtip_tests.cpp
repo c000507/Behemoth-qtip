@@ -834,6 +834,53 @@ void test_real(const fs::path &layer_file, const fs::path &refvec) {
                     pass &= std::abs(float(actual[j]) - reference[j]) <= .001f + .01f * std::abs(reference[j]);
                 check(pass, "source FP8 projection: " + name + " rows=" + std::to_string(rows));
             }
+            if (name == "self_attn.k_proj") {
+                // Prefill-sized K/V pair (perf/prefill): exact bf16 expansion + hipBLASLt GEMM +
+                // scale, rank 0's shards, against the reference and the fp8_linear kernels.
+                auto lv = qtip::load_linear(file, layer, "self_attn.v_proj");
+                qtip::GpuFp8Linear k, v;
+                k.upload(l, 0, 512);
+                v.upload(lv, 0, 512);
+                check(qtip::fp8_pair_dense_eligible(k, v), "fp8 K/V pair dense eligible");
+                qtip::DenseMatmul dense;
+                DeviceBuffer<BFloat16> wexp(size_t(1024) * l.in);
+                qtip::fp8_expand_pair(k, v, wexp.data(), nullptr);
+                for (int rows : {65, 600}) {
+                    std::vector<float> values(size_t(rows) * size_t(l.in));
+                    for (size_t j = 0; j < values.size(); ++j) {
+                        const size_t r = j / size_t(l.in), i = j % size_t(l.in);
+                        values[j] = (.125f + .03125f * float(r % 7)) * (i % 3 == 0 ? -1.f : 1.f) *
+                                    (1.f + .25f * float(i % 5));
+                    }
+                    std::vector<BFloat16> input(values.size());
+                    for (size_t j = 0; j < values.size(); ++j)
+                        input[j] = BFloat16(values[j]);
+                    DeviceBuffer<BFloat16> x, yk(size_t(rows) * 512), yv(size_t(rows) * 512),
+                        rk(size_t(rows) * 512), rv(size_t(rows) * 512);
+                    DeviceBuffer<float> acc(size_t(rows) * 1024);
+                    x.upload(input);
+                    dense.gemm(1024, l.in, x.data(), l.in, rows, acc.data(), 1024, wexp.data(), nullptr);
+                    qtip::fp8_scale_pair(acc.data(), rows, k, v, yk.data(), yv.data(), 512, nullptr);
+                    qtip::fp8_linear(k, x.data(), l.in, rows, rk.data(), 512, nullptr);
+                    qtip::fp8_linear(v, x.data(), l.in, rows, rv.data(), 512, nullptr);
+                    HIP_CHECK(hipDeviceSynchronize());
+                    const auto ak = yk.download(), av = yv.download(), bk = rk.download(), bv = rv.download();
+                    const auto refk = qtip::reference_forward(l, values, true);
+                    const auto refv = qtip::reference_forward(lv, values, true);
+                    bool pass = true;
+                    size_t ulps = 0;
+                    for (int r = 0; r < rows; ++r)
+                        for (int f = 0; f < 512; ++f) {
+                            const size_t j = size_t(r) * 512 + size_t(f), jr = size_t(r) * size_t(l.out) + size_t(f);
+                            pass &= std::abs(float(ak[j]) - refk[jr]) <= .001f + .01f * std::abs(refk[jr]);
+                            pass &= std::abs(float(av[j]) - refv[jr]) <= .001f + .01f * std::abs(refv[jr]);
+                            ulps += (ak[j].bits != bk[j].bits) + (av[j].bits != bv[j].bits);
+                        }
+                    check(pass, "dense FP8 K/V pair vs reference rows=" + std::to_string(rows));
+                    std::cout << "  dense FP8 K/V rows=" << rows << ": " << ulps << " of " << rows * 1024
+                              << " outputs differ from fp8_linear (summation order)\n";
+                }
+            }
             continue;
         }
         auto cb = qtip::make_codebook(l.tlut);
