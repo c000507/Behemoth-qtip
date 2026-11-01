@@ -811,16 +811,29 @@ void test_real(const fs::path &layer_file, const fs::path &refvec) {
         if (l.is_fp8()) {
             qtip::GpuFp8Linear weight;
             weight.upload(l, 0, l.out);
-            std::vector<BFloat16> input(size_t(3) * l.in, BFloat16(.125f));
-            DeviceBuffer<BFloat16> x, y(size_t(3) * l.out);
-            x.upload(input);
-            qtip::fp8_linear(weight, x.data(), l.in, 3, y.data(), l.out, nullptr);
-            auto actual = y.download();
-            auto reference = qtip::reference_forward(l, std::vector<float>(input.size(), .125f), true);
-            bool pass = true;
-            for (size_t j = 0; j < actual.size(); ++j)
-                pass &= std::abs(float(actual[j]) - reference[j]) <= .001f + .01f * std::abs(reference[j]);
-            check(pass, "source FP8 projection: " + name);
+            // Row-batched GEMV (rows <= 64, every R template) and the WMMA GEMM (rows > 64)
+            // against the double-precision reference, distinct activations per row.
+            for (int rows : {1, 3, 8, 17, 40, 72}) {
+                std::vector<float> values(size_t(rows) * size_t(l.in));
+                for (size_t j = 0; j < values.size(); ++j) {
+                    const size_t r = j / size_t(l.in), i = j % size_t(l.in);
+                    values[j] = (.125f + .03125f * float(r % 7)) * (i % 3 == 0 ? -1.f : 1.f) *
+                                (1.f + .25f * float(i % 5));
+                }
+                std::vector<BFloat16> input(values.size());
+                for (size_t j = 0; j < values.size(); ++j)
+                    input[j] = BFloat16(values[j]);
+                DeviceBuffer<BFloat16> x, y(size_t(rows) * l.out);
+                x.upload(input);
+                qtip::fp8_linear(weight, x.data(), l.in, rows, y.data(), l.out, nullptr);
+                HIP_CHECK(hipDeviceSynchronize());
+                auto actual = y.download();
+                auto reference = qtip::reference_forward(l, values, true);
+                bool pass = true;
+                for (size_t j = 0; j < actual.size(); ++j)
+                    pass &= std::abs(float(actual[j]) - reference[j]) <= .001f + .01f * std::abs(reference[j]);
+                check(pass, "source FP8 projection: " + name + " rows=" + std::to_string(rows));
+            }
             continue;
         }
         auto cb = qtip::make_codebook(l.tlut);
