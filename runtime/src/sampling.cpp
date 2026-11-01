@@ -4,6 +4,9 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <random>
+#include <cstdlib>
+#include <cmath>
 
 namespace behemoth {
 namespace {
@@ -108,6 +111,39 @@ template <class Value> int sample_values(size_t n, Value value, const SamplingOp
             if (value(i) > value(best))
                 best = i;
         return int(best);
+    }
+    if (p.top_k == 0 && p.top_p >= 1) {
+        // No truncation: one pass of float exp over the unsorted logits and a CDF walk, O(n)
+        // without the full-vocabulary order (perf/single-decode: the sorted path cost 2.3 ms per
+        // token standalone, ~6 ms per token in the serving loop, at batch 1 more than 10 % of a
+        // 45 ms decode step). Same distribution as the sorted path; a given seed draws
+        // differently. BEHEMOTH_SAMPLER_SORTED=1 restores the sorted path.
+        const char *sorted = std::getenv("BEHEMOTH_SAMPLER_SORTED"); // per call: tests toggle it
+        if (!(sorted && std::atoi(sorted) != 0)) {
+            float m = value(0);
+            for (size_t i = 1; i < n; ++i)
+                m = std::max(m, value(i));
+            auto &probabilities = probability_buffer;
+            probabilities.resize(n);
+            const float inv_t = 1.f / p.temperature;
+            double total = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const float e = std::exp((value(i) - m) * inv_t);
+                probabilities[i] = e;
+                total += e;
+            }
+            const double u = std::uniform_real_distribution<double>(0.0, total)(rng);
+            double cumulative = 0;
+            for (size_t i = 0; i < n; ++i) {
+                cumulative += probabilities[i];
+                if (cumulative > u)
+                    return int(i);
+            }
+            size_t last = n - 1; // rounding: the last id with non-zero probability
+            while (last > 0 && probabilities[last] == 0)
+                --last;
+            return int(last);
+        }
     }
     auto &order = order_buffer;
     order.resize(n);

@@ -10,6 +10,11 @@ static void check(bool condition, const char *what) {
     if (!condition)
         throw std::runtime_error(what);
 }
+// Exact oracle up to the sign of zero: x = 0 times a negative weight is -0 on the host but the
+// kernels' fma(0, -1, +0) is +0.
+static bool same_bf16(BFloat16 got, BFloat16 expected) {
+    return got.bits == expected.bits || (float(got) == 0.f && float(expected) == 0.f);
+}
 static void fp8_weights(hipStream_t stream) {
     for (int n : {32, 128, 256})
         for (int out : {32, 96})
@@ -58,6 +63,29 @@ static void fp8_weights(hipStream_t stream) {
             host.fp8[size_t(o) * host.in + (o * 17) % host.in] = encode_e4m3(o % 2 ? -1.f : 1.f);
             host.fp8_scale[o] = float(1 + o % 7) / 8;
         }
+        // Fused decode K/V launch (fp8_linear_pair, rows <= 4): shard 0 as K, shard 1 as V,
+        // the same exact oracle (one weight per output: no summation-order effects).
+        for (int rows : {1, 2, 3, 4}) {
+            std::vector<BFloat16> x(size_t(rows) * host.in);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = BFloat16(float(int(i % 61) - 30) / 16);
+            DeviceBuffer<BFloat16> input, yk(size_t(rows) * 512), yv(size_t(rows) * 512);
+            input.upload(x);
+            qtip::GpuFp8Linear k, v;
+            k.upload(host, 0, 512);
+            v.upload(host, 512, 512);
+            check(qtip::fp8_linear_pair(k, v, input.data(), host.in, rows, yk.data(), yv.data(), 512, stream),
+                  "fp8_linear_pair declined a decode-sized K/V pair");
+            HIP_CHECK(hipStreamSynchronize(stream));
+            auto gk = yk.download(), gv = yv.download();
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < 1024; ++c) {
+                    BFloat16 expected(float(x[size_t(r) * host.in + (c * 17) % host.in]) * (c % 2 ? -1.f : 1.f) *
+                                      host.fp8_scale[c]);
+                    const auto got = c < 512 ? gk[size_t(r) * 512 + c] : gv[size_t(r) * 512 + c - 512];
+                    check(same_bf16(got, expected), "fused FP8 K/V pair projection mismatch");
+                }
+        }
+        std::cout << "PASS fused FP8 K/V pair projection (rows 1..4)\n";
         for (int rows : {1, 5, 17}) {
             std::vector<BFloat16> x(size_t(rows) * host.in);
             for (size_t i = 0; i < x.size(); ++i) x[i] = BFloat16(float(int(i % 61) - 30) / 16);
@@ -74,7 +102,7 @@ static void fp8_weights(hipStream_t stream) {
                         int o = rank * 512 + c;
                         BFloat16 expected(float(x[size_t(r) * host.in + (o * 17) % host.in]) *
                                           (o % 2 ? -1.f : 1.f) * host.fp8_scale[o]);
-                        check(got[size_t(r) * 512 + c].bits == expected.bits, "production FP8 K/V shard projection mismatch");
+                        check(same_bf16(got[size_t(r) * 512 + c], expected), "production FP8 K/V shard projection mismatch");
                     }
             }
         }

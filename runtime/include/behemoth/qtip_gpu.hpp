@@ -27,6 +27,11 @@ struct GpuFp8Linear {
 };
 void fp8_linear(const GpuFp8Linear &, const BFloat16 *x, int ldx, int rows,
                 BFloat16 *y, int ldy, hipStream_t);
+// K and V shards (same input width) of a decode-sized step (rows <= 4) in one launch; returns
+// false (nothing launched) when the shapes or the row count are outside the fused kernel's
+// range or BEHEMOTH_FP8_KV_PAIR=0, so the caller falls back to two fp8_linear calls.
+bool fp8_linear_pair(const GpuFp8Linear &k, const GpuFp8Linear &v, const BFloat16 *x, int ldx,
+                     int rows, BFloat16 *yk, BFloat16 *yv, int ldy, hipStream_t);
 // Non-owning view for externally managed/double-buffered device storage.
 struct LinearView {
     const uint16_t *trellis = nullptr;
@@ -101,11 +106,75 @@ struct Source {
     int half = 0;
     size_t part = 0;
     int ld = 0, offset = 0;
+    // Non-null: elements with e / half == 1 come from p1 (same r * ld + offset + e % half
+    // indexing, part unused), e.g. the peer rank's half read straight from its host buffer.
+    const void *p1 = nullptr;
 };
+// ---------------------------------------------------------------- fused decode exchange
+// (perf/single-decode) Decode-sized steps (rows <= 4) skip the exchange kernels: the GEMV sums
+// its K slices per block-row as the slices finish into the rank's half of the device exchange
+// block (no reduce kernel); the epilogue kernels copy that half to the pinned host buffer and
+// release the flag (WordPublish), wait for the peer's flag, copy the peer's half into the block
+// (Peer) and then run the plain epilogue.
+struct Publish {
+    unsigned *counters = nullptr; // device, zeroed: [block_rows] slice arrivals + [block_rows] done
+    void *local = nullptr;        // this rank's half of the device exchange block
+    void *host = nullptr;         // optional pinned host mirror (device pointer; slow: fences)
+    unsigned *flag = nullptr;
+    unsigned seq = 0;
+    bool bf16 = false; // payload rounding (gate/up); else fp32
+};
+inline constexpr int publish_counter_words = 2 * 1024; // enough for 896 block-rows
+void matmul_publish(const GpuLinear &, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
+                    float *partial, int slices, const Publish &, hipStream_t,
+                    const MatmulOptions & = {});
+// Peer half of an exchange for the epilogue kernels: device pointer of the peer's host buffer and
+// the flag/sequence to wait for first (flag null: no wait, peer data ignored).
+struct Peer {
+    const void *data = nullptr; // device pointer of the peer's host buffer
+    void *dst = nullptr;        // the peer's half of the device exchange block
+    int n4 = 0;                 // uint4 count of the half
+    const unsigned *flag = nullptr;
+    unsigned seq = 0;
+    unsigned long long *barrier = nullptr; // two words (device, zeroed): arrivals, generation
+};
+// Words copied to the host buffer and flagged by an epilogue kernel before it waits (the
+// attention output, produced by the attention kernels into the device block).
+struct WordPublish {
+    const void *local = nullptr;
+    void *host = nullptr;
+    unsigned *flag = nullptr, *counter = nullptr;
+    unsigned seq = 0;
+    int n4 = 0; // uint4 count
+};
+// Epilogues that first wait for the peer's flag, copy the peer's half from its host buffer into
+// the device block (all blocks, grid-stride) and rendezvous through Peer::barrier, then run the
+// plain epilogue on `all`; per-chunk kernels only (rows < row-transform threshold), every block
+// must be co-resident (small decode grids). Results identical to the plain epilogues.
+void output_qkv(const float *all, const WordPublish &, const Peer &, int rows, int rank,
+                const float *sv_q, const float *sv_k, const float *sv_v, BFloat16 *q, BFloat16 *k,
+                BFloat16 *v, hipStream_t, bool q_only);
+// o input transform of the gathered bf16 attention output (publishes this rank's half first).
+void input_transform_o(const BFloat16 *all, const WordPublish &, const Peer &,
+                       int rows, int rank, const float *su, BFloat16 *u, int ldu, hipStream_t);
+void output_residual(const float *all, const WordPublish &, const Peer &, int rows, int rank,
+                     const float *sv, BFloat16 *state, hipStream_t);
+void output_residual_input(const float *all, const WordPublish &, const Peer &, int rows, int rank,
+                           const float *sv, BFloat16 *state, const BFloat16 *norm, float epsilon,
+                           const float *su, BFloat16 *u, int ldu, hipStream_t, BFloat16 *xn,
+                           unsigned long long *sync);
+// gate/up epilogue, a rendezvous of the row's 28 blocks (sync: one counter per row, separate
+// from the residual counters), then the down input transform of h.
+void output_gateup_down(const BFloat16 *all, const WordPublish &, const Peer &, int rows, int rank,
+                        const float *sv_gate, const float *sv_up, BFloat16 *h, const float *su_down,
+                        BFloat16 *u, int ldu, unsigned long long *sync, hipStream_t);
 // u = bf16( hadUt_n( SU (.) x' ) ), x' = bf16(x * rsqrt(mean(x^2) + eps) * w) when norm is
 // non-null (the runtime's rms_norm rounding), else x' = x. x bf16, u bf16 [rows][ldu].
-void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,
-                     int rows, BFloat16 *u, int ldu, hipStream_t);
+// With norm and xn non-null, the per-chunk kernels (rows below the row-transform threshold)
+// also write x' to xn[rows][n] (the FP8 K/V projections' input, rms_norm's rounding) and return
+// true; false means xn was not written.
+bool input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,
+                     int rows, BFloat16 *u, int ldu, hipStream_t, BFloat16 *xn = nullptr);
 // q/k/v epilogue: all = gathered [2][rows][7168] fp32 rotated outputs (q 6144 | k 512 | v 512
 // per rank), writes this rank's q heads [rows][6144], k/v heads [rows][512] as bf16 of
 // SV (.) hadU(z).
@@ -196,12 +265,13 @@ struct ResidualSync {
     int capacity = 0; // counters (rows)
 };
 inline constexpr int residual_sync_rows = 16; // env BEHEMOTH_QTIP_SYNC_ROWS (0 disables)
-void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+// xn: as input_transform (returns whether the normalised row was written).
+bool output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, hipStream_t, ResidualSync *sync = nullptr);
-void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
+                           int ldu, hipStream_t, ResidualSync *sync = nullptr, BFloat16 *xn = nullptr);
+bool output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, hipStream_t, ResidualSync *sync = nullptr);
+                           int ldu, hipStream_t, ResidualSync *sync = nullptr, BFloat16 *xn = nullptr);
 // WMMA layout probe (tests): D = A * B for one 16x16x16 bf16 tile with A/B given row-major as
 // bf16 [16][16] (A: M x K, B: K x N); returns D row-major fp32.
 void wmma_probe(const BFloat16 *a, const BFloat16 *b, float *d, hipStream_t);

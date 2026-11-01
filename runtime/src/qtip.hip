@@ -66,14 +66,73 @@ template <int C> __device__ __forceinline__ void fill_table(uint32_t *table, con
     __syncthreads();
 }
 
+// Fused decode exchange helpers (perf/single-decode, see qtip_gpu.hpp). Wait for the peer's
+// flag, copy its half into the device block (every block takes a grid-stride share: one PCIe read
+// of the half in total) and rendezvous all blocks (co-resident by construction) through the
+// barrier counter (multiples of the grid size, as the residual rendezvous).
+__device__ __forceinline__ void wait_peer(const Peer &peer) {
+    if (!peer.flag)
+        return;
+    if (threadIdx.x == 0)
+        while (__hip_atomic_load(peer.flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < peer.seq)
+            __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    const unsigned grid = gridDim.x * gridDim.y;
+    const int stride = int(grid) * int(blockDim.x);
+    const int block = int(blockIdx.y) * int(gridDim.x) + int(blockIdx.x);
+    for (int i = block * int(blockDim.x) + int(threadIdx.x); i < peer.n4; i += stride)
+        static_cast<uint4 *>(peer.dst)[i] = static_cast<const uint4 *>(peer.data)[i];
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // generation barrier: barrier[0] arrivals (reset by the last block), barrier[1] generation
+        const unsigned long long gen =
+            __hip_atomic_load(peer.barrier + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        const unsigned long long seen =
+            __hip_atomic_fetch_add(peer.barrier, 1ull, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (seen + 1 == grid) {
+            __hip_atomic_store(peer.barrier, 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_add(peer.barrier + 1, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else
+            while (__hip_atomic_load(peer.barrier + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen)
+                __builtin_amdgcn_s_sleep(1);
+    }
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+}
+// Grid-stride copy of pub.n4 uint4 to the host buffer, then the last block releases the flag.
+__device__ __forceinline__ void word_publish(const WordPublish &pub) {
+    if (!pub.host)
+        return;
+    const int stride = int(gridDim.x) * int(gridDim.y) * int(blockDim.x);
+    const int block = int(blockIdx.y) * int(gridDim.x) + int(blockIdx.x);
+    for (int i = block * int(blockDim.x) + int(threadIdx.x); i < pub.n4; i += stride)
+        static_cast<uint4 *>(pub.host)[i] = static_cast<const uint4 *>(pub.local)[i];
+    // Per-block system-scope fences (L2 writeback) serialised at ~2.5 us each (14 blocks: 37 us
+    // exchange); the host buffer is fine-grained (uncached), so an agent-scope release before the
+    // arrival counter and one system-scope release in the last block order every block's stores
+    // before the flag (perf/single-decode).
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned done =
+            __hip_atomic_fetch_add(pub.counter, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1;
+        if (done == gridDim.x * gridDim.y) {
+            __threadfence_system();
+            __hip_atomic_store(pub.flag, pub.seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            *pub.counter = 0;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- GEMV (rows 1..4)
 // One wave per (block-row of 32 outputs, K slice); lane w owns word w of each tile, i.e. states
 // 4w..4w+3: rows A = w/4 and A + 8, column pairs 2B and 8 + 2B (B = w % 4) of every tile.
-template <int R, int C, int WAVES>
+template <int R, int C, int WAVES, bool PUB>
 __global__ __launch_bounds__(WAVES * 32) void gemv_kernel(
     const uint2 *__restrict__ trellis, int block_rows, int n2, int per, int slices,
     const uint32_t *__restrict__ lut, const uint32_t *__restrict__ x, int ldx2, int rows,
-    float *__restrict__ partial, int out_rows) {
+    float *__restrict__ partial, int out_rows, Publish pub) {
     __shared__ uint32_t table[1024 * C];
     fill_table<C>(table, lut);
     // wave-uniform work indices live in SGPRs, so the loads use scalar base + 32-bit lane offsets
@@ -161,6 +220,56 @@ __global__ __launch_bounds__(WAVES * 32) void gemv_kernel(
         for (int r = 0; r < R; ++r) {
             const float v = B == 0 ? acc[r][0] : B == 1 ? acc[r][1] : B == 2 ? acc[r][2] : acc[r][3];
             partial[(size_t(s) * size_t(rows) + size_t(r)) * size_t(out_rows) + size_t(row)] = v;
+        }
+        if constexpr (PUB) {
+            // The last slice of the block-row to arrive sums the slices (slice order, as
+            // reduce_publish) for its 32 output rows and publishes them; the last block-row
+            // releases the flag. Counters return to zero for the next launch.
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            unsigned prev = 0;
+            if (lane == 0)
+                prev = __hip_atomic_fetch_add(pub.counters + br, 1u, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+            prev = __shfl(prev, 0);
+            if (prev == unsigned(slices) - 1) {
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                if (lane == 0)
+                    pub.counters[br] = 0;
+                const int orow = br * 32 + lane;
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const size_t o = size_t(r) * size_t(out_rows) + size_t(orow);
+                    float sum = partial[o];
+                    for (int k = 1; k < slices; ++k)
+                        sum += partial[size_t(k) * size_t(rows) * size_t(out_rows) + o];
+                    if (pub.bf16) {
+                        const uint16_t b = device::bf16(sum);
+                        static_cast<uint16_t *>(pub.local)[o] = b;
+                        if (pub.host)
+                            static_cast<uint16_t *>(pub.host)[o] = b;
+                    } else {
+                        static_cast<float *>(pub.local)[o] = sum;
+                        if (pub.host)
+                            static_cast<float *>(pub.host)[o] = sum;
+                    }
+                }
+                // Host publish from the GEMV (one system-scope fence per block-row) measured
+                // 128 vs 77 us per launch: the consumers publish instead (word_publish). Kept
+                // for pub.host != nullptr.
+                if (pub.host) {
+                    __threadfence_system();
+                    unsigned done = 0;
+                    if (lane == 0)
+                        done = __hip_atomic_fetch_add(pub.counters + block_rows, 1u, __ATOMIC_RELAXED,
+                                                      __HIP_MEMORY_SCOPE_AGENT);
+                    done = __shfl(done, 0);
+                    if (done == unsigned(block_rows) - 1 && lane == 0) {
+                        __threadfence_system();
+                        __hip_atomic_store(pub.flag, pub.seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                        pub.counters[block_rows] = 0;
+                    }
+                }
+            }
         }
     }
 }
@@ -373,10 +482,15 @@ __global__ void reduce_publish_kernel(const float4 *__restrict__ partial, int sl
     }
     if (!host)
         return;
-    __threadfence_system();
+    // Per-block system-scope fences (L2 writeback) serialised at ~2.5 us each (14 blocks: 37 us
+    // exchange); the host buffer is fine-grained (uncached), so an agent-scope release before the
+    // arrival counter and one system-scope release in the last block order every block's stores
+    // before the flag (perf/single-decode).
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned done = atomicAdd(counter, 1u) + 1;
+        const unsigned done =
+            __hip_atomic_fetch_add(counter, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1;
         if (done == gridDim.x) {
             __threadfence_system();
             __hip_atomic_store(flag, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -395,6 +509,28 @@ __global__ void gather_peer_kernel(const uint4 *__restrict__ peer, uint4 *__rest
         all[size_t(1 - rank) * size_t(n4) + size_t(i)] = peer[i];
 }
 
+// Sum of the slices of element i in slice order (bitwise as the sequential loop), with up to 8
+// independent loads in flight per thread: the decode-sized exchange kernels run 3-14 blocks, so
+// the L2 latency of 16 dependent-looking slice loads was most of their 15-36 us.
+__device__ __forceinline__ float4 slice_sum(const float4 *__restrict__ partial, int slices, int n4, int i) {
+    float4 s = partial[i];
+    for (int k0 = 1; k0 < slices; k0 += 8) {
+        float4 v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (k0 + j < slices)
+                v[j] = partial[size_t(k0 + j) * size_t(n4) + size_t(i)];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (k0 + j < slices) {
+                s.x += v[j].x;
+                s.y += v[j].y;
+                s.z += v[j].z;
+                s.w += v[j].w;
+            }
+    }
+    return s;
+}
 // Fused zero-copy exchange: publish (sum of slices or a copy of local words) + flag release,
 // then wait for the peer's flag and copy its half. Grid-stride with at most 64 blocks so every
 // block is resident while it spins (no deadlock against blocks that still have to publish).
@@ -412,14 +548,7 @@ __global__ __launch_bounds__(256) void exchange_kernel(const float4 *__restrict_
         if constexpr (MODE == 2) {
             static_cast<uint4 *>(host)[i] = static_cast<const uint4 *>(local)[i];
         } else {
-            float4 s = partial[i];
-            for (int k = 1; k < slices; ++k) {
-                const float4 v = partial[size_t(k) * size_t(n4) + size_t(i)];
-                s.x += v.x;
-                s.y += v.y;
-                s.z += v.z;
-                s.w += v.w;
-            }
+            const float4 s = slice_sum(partial, slices, n4, i);
             if constexpr (MODE == 1) {
                 const uint2 o = make_uint2(uint32_t(device::bf16(s.x)) | uint32_t(device::bf16(s.y)) << 16,
                                            uint32_t(device::bf16(s.z)) | uint32_t(device::bf16(s.w)) << 16);
@@ -431,10 +560,15 @@ __global__ __launch_bounds__(256) void exchange_kernel(const float4 *__restrict_
             }
         }
     }
-    __threadfence_system();
+    // Per-block system-scope fences (L2 writeback) serialised at ~2.5 us each (14 blocks: 37 us
+    // exchange); the host buffer is fine-grained (uncached), so an agent-scope release before the
+    // arrival counter and one system-scope release in the last block order every block's stores
+    // before the flag (perf/single-decode).
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned done = atomicAdd(counter, 1u) + 1;
+        const unsigned done =
+            __hip_atomic_fetch_add(counter, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1;
         if (done == gridDim.x) {
             __threadfence_system();
             __hip_atomic_store(flag, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -521,9 +655,10 @@ template <> __device__ __forceinline__ float load_elem<uint16_t>(const uint16_t 
 // Four consecutive elements e..e+3 (e % 4 == 0, never crossing `half`).
 template <class T>
 __device__ __forceinline__ void load4(const Source &s, int row, int e, float out[4]) {
-    const T *p = static_cast<const T *>(s.p);
-    const size_t i = size_t(e / s.half) * s.part + size_t(row) * size_t(s.ld) + size_t(s.offset) +
-                     size_t(e % s.half);
+    const int h = e / s.half;
+    const T *p = static_cast<const T *>(h && s.p1 ? s.p1 : s.p);
+    const size_t i = (s.p1 ? size_t(0) : size_t(h) * s.part) + size_t(row) * size_t(s.ld) +
+                     size_t(s.offset) + size_t(e % s.half);
     if constexpr (sizeof(T) == 4) {
         const float4 v = *reinterpret_cast<const float4 *>(p + i);
         out[0] = v.x;
@@ -579,7 +714,7 @@ template <int K, bool NORM>
 __device__ __forceinline__ void input_transform_chunk(const Source &src, const uint16_t *norm,
                                                       float epsilon, const float *su, uint16_t *u,
                                                       int ldu, int k2, int row, float *scratch,
-                                                      float *red) {
+                                                      float *red, uint16_t *xn = nullptr) {
     const int j = 4 * int(threadIdx.x);
     constexpr int n = K * 1024;
     // The block's mix inputs (4 positions of every chunk) are the whole row, so the rms of the
@@ -614,11 +749,19 @@ __device__ __forceinline__ void input_transform_chunk(const Source &src, const u
             w[3] = device::bf16(uint16_t(wv.y >> 16));
         }
         const float sign = K == 1 ? 1.f : float(had_sign<K>(k, k2)); // hadK^T[k2][k]
+        uint16_t xb[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float x = NORM ? device::bf16(device::bf16(t[i] * factor * w[i])) : t[i];
+            xb[i] = NORM ? device::bf16(t[i] * factor * w[i]) : uint16_t(0);
+            const float x = NORM ? device::bf16(xb[i]) : t[i];
             v[i] += sign * (sgn[i] * x);
         }
+        // The normalised row x' is also the FP8 K/V projections' input (rms_norm's rounding):
+        // chunk k2 writes elements e..e+3 of every k, i.e. the whole row across the K blocks.
+        if constexpr (NORM)
+            if (xn && k2 == 0)
+                *reinterpret_cast<uint2 *>(xn + size_t(row) * size_t(n) + size_t(e)) =
+                    make_uint2(uint32_t(xb[0]) | uint32_t(xb[1]) << 16, uint32_t(xb[2]) | uint32_t(xb[3]) << 16);
     }
     fwht1024(v, scratch);
     const float scale = rsqrtf(float(n));
@@ -631,19 +774,24 @@ __device__ __forceinline__ void input_transform_chunk(const Source &src, const u
 template <int K, bool NORM>
 __global__ __launch_bounds__(256) void input_transform_kernel(Source src, const uint16_t *norm,
                                                               float epsilon, const float *su,
-                                                              uint16_t *u, int ldu) {
+                                                              uint16_t *u, int ldu, uint16_t *xn,
+                                                              WordPublish pub, Peer wait) {
     __shared__ float scratch[1024];
     __shared__ float red[8];
+    word_publish(pub);
+    wait_peer(wait);
     input_transform_chunk<K, NORM>(src, norm, epsilon, su, u, ldu, int(blockIdx.x), int(blockIdx.y),
-                                   scratch, red);
+                                   scratch, red, xn);
 }
 // grid (8, rows): blocks 0..5 = this rank's q chunks, 6 = k, 7 = v.
 template <class T>
-__global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, int rows, int rank,
-                                                         const float *sv_q, const float *sv_k,
+__global__ __launch_bounds__(256) void output_qkv_kernel(const T *all, WordPublish pub, Peer wait, int rows,
+                                                         int rank, const float *sv_q, const float *sv_k,
                                                          const float *sv_v, uint16_t *q, uint16_t *k,
                                                          uint16_t *v, bool q_only) {
     __shared__ float scratch[1024];
+    word_publish(pub);
+    wait_peer(wait);
     const int b = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
     const int width = q_only ? 6144 : 7168;
     const size_t part = size_t(rows) * size_t(width);
@@ -695,9 +843,11 @@ __device__ __forceinline__ void output_residual_chunk(const T *all, int rows, co
 }
 // grid (12, rows)
 template <class T>
-__global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int rows,
-                                                              const float *sv, uint16_t *state) {
+__global__ __launch_bounds__(256) void output_residual_kernel(const T *all, WordPublish pub, Peer wait,
+                                                              int rows, const float *sv, uint16_t *state) {
     __shared__ float scratch[1024];
+    word_publish(pub);
+    wait_peer(wait);
     output_residual_chunk<T>(all, rows, sv, state, int(blockIdx.x), int(blockIdx.y), scratch);
 }
 // grid (12, rows): the residual epilogue of chunk k2, a rendezvous of the row's 12 blocks
@@ -707,10 +857,13 @@ __global__ __launch_bounds__(256) void output_residual_kernel(const T *all, int 
 // code: results are identical to output_residual_kernel + input_transform_kernel<12, true>.
 template <class T>
 __global__ __launch_bounds__(256) void output_residual_input_kernel(
-    const T *all, int rows, const float *sv, uint16_t *state, const uint16_t *norm, float epsilon,
-    const float *su, uint16_t *u, int ldu, unsigned long long *sync) {
+    const T *all, WordPublish pub, Peer wait, int rows, const float *sv, uint16_t *state,
+    const uint16_t *norm, float epsilon, const float *su, uint16_t *u, int ldu,
+    unsigned long long *sync, uint16_t *xn) {
     __shared__ float scratch[1024];
     __shared__ float red[8];
+    word_publish(pub);
+    wait_peer(wait);
     const int k2 = int(blockIdx.x), row = int(blockIdx.y);
     output_residual_chunk<T>(all, rows, sv, state, k2, row, scratch);
     __threadfence();
@@ -728,13 +881,22 @@ __global__ __launch_bounds__(256) void output_residual_input_kernel(
     __syncthreads();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); // every wave: fresh view of `state`
     input_transform_chunk<12, true>(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, u, ldu, k2,
-                                    row, scratch, red);
+                                    row, scratch, red, xn);
 }
 // grid (28, rows)
-__global__ __launch_bounds__(256) void output_gateup_kernel(const uint16_t *all, int rows,
-                                                            const float *sv_g, const float *sv_u,
-                                                            uint16_t *h) {
+// FUSE: then (after a rendezvous of the row's 28 blocks through sync[row], multiples of 28) the
+// down input transform of the row of h for output chunk k2: identical to output_gateup_kernel +
+// input_transform_kernel<28, false>.
+template <bool FUSE>
+__global__ __launch_bounds__(256) void output_gateup_kernel(const uint16_t *all, WordPublish pub, Peer wait,
+                                                            int rows, const float *sv_g, const float *sv_u,
+                                                            uint16_t *h, const float *su_down,
+                                                            uint16_t *ud, int ldu,
+                                                            unsigned long long *sync) {
     __shared__ float scratch[1024];
+    __shared__ float red[8];
+    word_publish(pub);
+    wait_peer(wait);
     const int k2 = int(blockIdx.x), row = int(blockIdx.y), j = 4 * int(threadIdx.x);
     const size_t part = size_t(rows) * 28672;
     float g[4], u[4];
@@ -753,6 +915,21 @@ __global__ __launch_bounds__(256) void output_gateup_kernel(const uint16_t *all,
     }
     *reinterpret_cast<uint2 *>(h + size_t(row) * 28672 + size_t(e)) =
         make_uint2(uint32_t(out[0]) | uint32_t(out[1]) << 16, uint32_t(out[2]) | uint32_t(out[3]) << 16);
+    if constexpr (FUSE) {
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned long long seen =
+                __hip_atomic_fetch_add(sync + row, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            const unsigned long long target = (seen / 28 + 1) * 28;
+            while (__hip_atomic_load(sync + row, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target)
+                __builtin_amdgcn_s_sleep(1);
+        }
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        input_transform_chunk<28, false>(Source{h, 28672, 0, 28672, 0}, nullptr, 0.f, su_down, ud, ldu,
+                                         k2, row, scratch, red);
+    }
 }
 // Tests: plain hadU / hadUt of fp32 rows. grid (K, rows)
 template <int K, bool TRANSPOSE>
@@ -1127,7 +1304,8 @@ void matmul(LinearView l, const uint32_t *lut, const BFloat16 *x, int ldx, int r
         const auto *x2 = reinterpret_cast<const uint32_t *>(x);
         const int items = block_rows * slices;
 #define GEMV_R(RR, CC)                                                                             \
-    launch(gemv_kernel<RR, CC, gemv_waves>, gemv_waves, items, x2, ldx / 2, rows, partial, l.rows)
+    launch(gemv_kernel<RR, CC, gemv_waves, false>, gemv_waves, items, x2, ldx / 2, rows, partial,  \
+           l.rows, Publish{})
 #define GEMV_C(CC)                                                                                 \
     do {                                                                                          \
         if (rows == 1)                                                                            \
@@ -1163,6 +1341,55 @@ void matmul(LinearView l, const uint32_t *lut, const BFloat16 *x, int ldx, int r
 #undef WMMA_MT
 #undef BEHEMOTH_QTIP_COPIES
 }
+void matmul_publish(const GpuLinear &l, const uint32_t *lut, const BFloat16 *x, int ldx, int rows,
+                    float *partial, int slices, const Publish &pub, hipStream_t stream,
+                    const MatmulOptions &o) {
+    if (rows < 1 || rows > 4 || l.rows % 32 || l.in % 32 || ldx % 8 || slices < 1 || !pub.counters ||
+        !pub.local || (pub.host && !pub.flag))
+        throw std::invalid_argument("QTIP publishing matmul shape");
+    const int block_rows = l.rows / 32, n2 = l.in / 32, per = (n2 + slices - 1) / slices;
+    if (2 * block_rows + 1 > publish_counter_words)
+        throw std::invalid_argument("QTIP publishing matmul: too many block-rows for the counters");
+    const int copies = o.copies ? o.copies : default_copies(false);
+    const uint2 *tr = reinterpret_cast<const uint2 *>(l.trellis.data());
+    const auto *x2 = reinterpret_cast<const uint32_t *>(x);
+    const int items = block_rows * slices;
+    auto launch = [&](auto kernel) {
+        const int threads = gemv_waves * 32;
+        const int max_blocks = multiprocessors() * occupancy(kernel, threads, 0);
+        const int blocks = std::max(1, std::min(max_blocks, (items + gemv_waves - 1) / gemv_waves));
+        kernel<<<blocks, threads, 0, stream>>>(tr, block_rows, n2, per, slices, lut, x2, ldx / 2, rows,
+                                               partial, l.rows, pub);
+        HIP_CHECK(hipGetLastError());
+    };
+#define GEMV_PUB_R(RR, CC) launch(gemv_kernel<RR, CC, gemv_waves, true>)
+#define GEMV_PUB_C(CC)                                                                             \
+    do {                                                                                          \
+        if (rows == 1)                                                                            \
+            GEMV_PUB_R(1, CC);                                                                    \
+        else if (rows == 2)                                                                       \
+            GEMV_PUB_R(2, CC);                                                                    \
+        else if (rows == 3)                                                                       \
+            GEMV_PUB_R(3, CC);                                                                    \
+        else                                                                                      \
+            GEMV_PUB_R(4, CC);                                                                    \
+    } while (0)
+    switch (copies) {
+    case 1:
+        GEMV_PUB_C(1);
+        break;
+    case 4:
+        GEMV_PUB_C(4);
+        break;
+    case 8:
+        GEMV_PUB_C(8);
+        break;
+    default:
+        GEMV_PUB_C(16);
+    }
+#undef GEMV_PUB_C
+#undef GEMV_PUB_R
+}
 nlohmann::json kernel_info() {
     nlohmann::json j;
     j["multiprocessors"] = multiprocessors();
@@ -1174,9 +1401,10 @@ nlohmann::json kernel_info() {
                    {"lds_bytes", a.sharedSizeBytes},
                    {"vgprs", a.numRegs}};
     };
-    add("gemv_r1_c16", gemv_kernel<1, 16, gemv_waves>, gemv_waves * 32);
-    add("gemv_r4_c16", gemv_kernel<4, 16, gemv_waves>, gemv_waves * 32);
-    add("gemv_r1_c8", gemv_kernel<1, 8, gemv_waves>, gemv_waves * 32);
+    add("gemv_r1_c16", gemv_kernel<1, 16, gemv_waves, false>, gemv_waves * 32);
+    add("gemv_r4_c16", gemv_kernel<4, 16, gemv_waves, false>, gemv_waves * 32);
+    add("gemv_r1_c8", gemv_kernel<1, 8, gemv_waves, false>, gemv_waves * 32);
+    add("gemv_r1_c16_publish", gemv_kernel<1, 16, gemv_waves, true>, gemv_waves * 32);
     add("wmma_mt4_c8", wmma_kernel<4, 8, wmma_waves>, wmma_waves * 32);
     add("wmma_mt4_c16", wmma_kernel<4, 16, wmma_waves>, wmma_waves * 32);
     add("wmma_mt1_c8", wmma_kernel<1, 8, wmma_waves>, wmma_waves * 32);
@@ -1247,10 +1475,11 @@ void flag_wait(const unsigned *peer_flag, unsigned seq, hipStream_t stream) {
     flag_wait_kernel<<<1, 32, 0, stream>>>(peer_flag, seq);
     HIP_CHECK(hipGetLastError());
 }
-void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,
-                     int rows, BFloat16 *u, int ldu, hipStream_t stream) {
+bool input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,
+                     int rows, BFloat16 *u, int ldu, hipStream_t stream, BFloat16 *xn) {
     upload_tables();
     auto *out = reinterpret_cast<uint16_t *>(u);
+    auto *xo = reinterpret_cast<uint16_t *>(xn);
     const auto *w = reinterpret_cast<const uint16_t *>(norm);
     if (row_transforms(rows)) {
         if (n == 12288) {
@@ -1263,19 +1492,23 @@ void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const
         } else
             throw std::invalid_argument("QTIP input transform supports 12288 (+norm) and 28672");
         HIP_CHECK(hipGetLastError());
-        return;
+        return false;
     }
     const dim3 grid(unsigned(n / 1024), unsigned(rows));
     if (n == 12288) {
         if (norm)
-            input_transform_kernel<12, true><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+            input_transform_kernel<12, true><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu, xo,
+                                                                       WordPublish{}, Peer{});
         else
-            input_transform_kernel<12, false><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+            input_transform_kernel<12, false><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu, nullptr,
+                                                                        WordPublish{}, Peer{});
     } else if (n == 28672 && !norm) {
-        input_transform_kernel<28, false><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu);
+        input_transform_kernel<28, false><<<grid, 256, 0, stream>>>(x, w, epsilon, su, out, ldu, nullptr,
+                                                                    WordPublish{}, Peer{});
     } else
         throw std::invalid_argument("QTIP input transform supports 12288 (+norm) and 28672");
     HIP_CHECK(hipGetLastError());
+    return norm && xn;
 }
 template <class T>
 void output_qkv_impl(const T *all, int rows, int rank, const float *sv_q, const float *sv_k,
@@ -1289,7 +1522,7 @@ void output_qkv_impl(const T *all, int rows, int rank, const float *sv_q, const 
         return;
     }
     output_qkv_kernel<<<dim3(q_only ? 6 : 8, unsigned(rows)), 256, 0, stream>>>(
-        all, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
+        all, WordPublish{}, Peer{}, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
         reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v), q_only);
     HIP_CHECK(hipGetLastError());
 }
@@ -1304,33 +1537,33 @@ void output_residual_impl(const T *all, int rows, const float *sv, BFloat16 *sta
         return;
     }
     output_residual_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
-        all, rows, sv, reinterpret_cast<uint16_t *>(state));
+        all, WordPublish{}, Peer{}, rows, sv, reinterpret_cast<uint16_t *>(state));
     HIP_CHECK(hipGetLastError());
 }
 template <class T>
-void output_residual_input_impl(const T *all, int rows, const float *sv, BFloat16 *state,
+bool output_residual_input_impl(const T *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float epsilon, const float *su, BFloat16 *u,
-                           int ldu, ResidualSync *sync, hipStream_t stream) {
+                           int ldu, ResidualSync *sync, hipStream_t stream, BFloat16 *xn) {
     upload_tables();
     if (!row_transforms(rows)) {
         static const int sync_rows = env_rows("BEHEMOTH_QTIP_SYNC_ROWS", residual_sync_rows);
         if (sync && sync->counters && rows <= std::min(sync->capacity, sync_rows) && sync_rows > 0) {
             output_residual_input_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
-                all, rows, sv, reinterpret_cast<uint16_t *>(state),
+                all, WordPublish{}, Peer{}, rows, sv, reinterpret_cast<uint16_t *>(state),
                 reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u),
-                ldu, sync->counters);
+                ldu, sync->counters, reinterpret_cast<uint16_t *>(xn));
             HIP_CHECK(hipGetLastError());
-            return;
+            return xn != nullptr;
         }
         output_residual_impl(all, rows, sv, state, stream);
-        input_transform(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, 12288, rows, u, ldu,
-                        stream);
-        return;
+        return input_transform(Source{state, 12288, 0, 12288, 0}, norm, epsilon, su, 12288, rows, u, ldu,
+                               stream, xn);
     }
     output_residual_rows_kernel<true><<<rows, 256, 0, stream>>>(
         all, rows, sv, reinterpret_cast<uint16_t *>(state),
         reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u), ldu);
     HIP_CHECK(hipGetLastError());
+    return false;
 }
 void output_qkv(const float *all, int rows, int rank, const float *sq, const float *sk,
                 const float *sv, BFloat16 *q, BFloat16 *k, BFloat16 *v, hipStream_t s, bool q_only) {
@@ -1346,16 +1579,16 @@ void output_residual(const float *all, int rows, const float *sv, BFloat16 *stat
 void output_residual(const BFloat16 *all, int rows, const float *sv, BFloat16 *state, hipStream_t s) {
     output_residual_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, s);
 }
-void output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
+bool output_residual_input(const float *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
-                           hipStream_t s, ResidualSync *sync) {
-    output_residual_input_impl(all, rows, sv, state, norm, eps, su, u, ldu, sync, s);
+                           hipStream_t s, ResidualSync *sync, BFloat16 *xn) {
+    return output_residual_input_impl(all, rows, sv, state, norm, eps, su, u, ldu, sync, s, xn);
 }
-void output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
+bool output_residual_input(const BFloat16 *all, int rows, const float *sv, BFloat16 *state,
                            const BFloat16 *norm, float eps, const float *su, BFloat16 *u, int ldu,
-                           hipStream_t s, ResidualSync *sync) {
-    output_residual_input_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, norm, eps,
-                               su, u, ldu, sync, s);
+                           hipStream_t s, ResidualSync *sync, BFloat16 *xn) {
+    return output_residual_input_impl(reinterpret_cast<const uint16_t *>(all), rows, sv, state, norm, eps,
+                                      su, u, ldu, sync, s, xn);
 }
 void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const float *sv_up,
                    BFloat16 *h, hipStream_t stream) {
@@ -1367,9 +1600,74 @@ void output_gateup(const BFloat16 *all, int rows, const float *sv_gate, const fl
         HIP_CHECK(hipGetLastError());
         return;
     }
-    output_gateup_kernel<<<dim3(28, unsigned(rows)), 256, 0, stream>>>(
-        reinterpret_cast<const uint16_t *>(all), rows, sv_gate, sv_up,
-        reinterpret_cast<uint16_t *>(h));
+    output_gateup_kernel<false><<<dim3(28, unsigned(rows)), 256, 0, stream>>>(
+        reinterpret_cast<const uint16_t *>(all), WordPublish{}, Peer{}, rows, sv_gate, sv_up,
+        reinterpret_cast<uint16_t *>(h), nullptr, nullptr, 0, nullptr);
+    HIP_CHECK(hipGetLastError());
+}
+// ---- fused decode exchange epilogues (peer half from its host buffer)
+namespace {
+void check_fused(int rows, const Peer &p) {
+    if (rows < 1 || rows > residual_sync_rows || row_transforms(rows))
+        throw std::invalid_argument("QTIP fused decode epilogue: decode-sized rows only");
+    if (!p.flag || !p.data || !p.dst || p.n4 <= 0 || !p.barrier)
+        throw std::invalid_argument("QTIP fused decode epilogue: incomplete peer description");
+}
+} // namespace
+void output_qkv(const float *all, const WordPublish &pub, const Peer &wait, int rows, int rank,
+                const float *sv_q, const float *sv_k, const float *sv_v, BFloat16 *q, BFloat16 *k,
+                BFloat16 *v, hipStream_t stream, bool q_only) {
+    upload_tables();
+    check_fused(rows, wait);
+    output_qkv_kernel<<<dim3(q_only ? 6 : 8, unsigned(rows)), 256, 0, stream>>>(
+        all, pub, wait, rows, rank, sv_q, sv_k, sv_v, reinterpret_cast<uint16_t *>(q),
+        reinterpret_cast<uint16_t *>(k), reinterpret_cast<uint16_t *>(v), q_only);
+    HIP_CHECK(hipGetLastError());
+}
+void input_transform_o(const BFloat16 *all, const WordPublish &pub, const Peer &wait,
+                       int rows, int rank, const float *su, BFloat16 *u, int ldu, hipStream_t stream) {
+    (void)rank;
+    upload_tables();
+    check_fused(rows, wait);
+    const Source src{all, 6144, size_t(rows) * 6144, 6144, 0};
+    input_transform_kernel<12, false><<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
+        src, nullptr, 0.f, su, reinterpret_cast<uint16_t *>(u), ldu, nullptr, pub, wait);
+    HIP_CHECK(hipGetLastError());
+}
+void output_residual(const float *all, const WordPublish &pub, const Peer &wait, int rows, int rank,
+                     const float *sv, BFloat16 *state, hipStream_t stream) {
+    (void)rank;
+    upload_tables();
+    check_fused(rows, wait);
+    output_residual_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
+        all, pub, wait, rows, sv, reinterpret_cast<uint16_t *>(state));
+    HIP_CHECK(hipGetLastError());
+}
+void output_residual_input(const float *all, const WordPublish &pub, const Peer &wait, int rows, int rank,
+                           const float *sv, BFloat16 *state, const BFloat16 *norm, float epsilon,
+                           const float *su, BFloat16 *u, int ldu, hipStream_t stream, BFloat16 *xn,
+                           unsigned long long *sync) {
+    (void)rank;
+    upload_tables();
+    check_fused(rows, wait);
+    if (!sync)
+        throw std::invalid_argument("QTIP fused residual epilogue needs the rendezvous counters");
+    output_residual_input_kernel<<<dim3(12, unsigned(rows)), 256, 0, stream>>>(
+        all, pub, wait, rows, sv, reinterpret_cast<uint16_t *>(state),
+        reinterpret_cast<const uint16_t *>(norm), epsilon, su, reinterpret_cast<uint16_t *>(u), ldu, sync,
+        reinterpret_cast<uint16_t *>(xn));
+    HIP_CHECK(hipGetLastError());
+}
+void output_gateup_down(const BFloat16 *all, const WordPublish &pub, const Peer &wait, int rows, int rank,
+                        const float *sv_gate, const float *sv_up, BFloat16 *h, const float *su_down,
+                        BFloat16 *u, int ldu, unsigned long long *sync, hipStream_t stream) {
+    (void)rank;
+    upload_tables();
+    check_fused(rows, wait);
+    if (!sync)
+        throw std::invalid_argument("QTIP fused gate/up epilogue needs the rendezvous counters");
+    output_gateup_kernel<true><<<dim3(28, unsigned(rows)), 256, 0, stream>>>(
+        reinterpret_cast<const uint16_t *>(all), pub, wait, rows, sv_gate, sv_up, reinterpret_cast<uint16_t *>(h), su_down, reinterpret_cast<uint16_t *>(u), ldu, sync);
     HIP_CHECK(hipGetLastError());
 }
 void hadamard_rows(const float *x, int n, int rows, bool transpose, float *y, hipStream_t stream) {

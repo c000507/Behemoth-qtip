@@ -526,6 +526,8 @@ struct Shard {
     // Fused decode-sized residual + input transform (qtip::ResidualSync): rank stream only.
     DeviceBuffer<unsigned long long> qtip_sync_counters;
     qtip::ResidualSync qtip_sync;
+    // Fused decode exchange (perf/single-decode): GEMV publish counters, rank stream only.
+    DeviceBuffer<unsigned> qtip_pub_counters;
     // Dense prefill path (PREFILL_SCHED_REPORT.md): one decoded-weight scratch shared by every
     // linear (pieces of <= qtip::dense_scratch_elements), hipBLASLt plans per shape.
     std::unique_ptr<qtip::DenseMatmul> qtip_dense;
@@ -828,7 +830,9 @@ struct Shard {
             qtip_partial.resize(std::max<size_t>(rows, 64) * 28672);
             qtip_sync_counters.resize(64);
             HIP_CHECK(hipMemset(qtip_sync_counters.data(), 0, qtip_sync_counters.bytes()));
-            qtip_sync = {qtip_sync_counters.data(), 64};
+            qtip_sync = {qtip_sync_counters.data(), 32}; // [32, 64): gate/up rendezvous
+            qtip_pub_counters.resize(qtip::publish_counter_words);
+            HIP_CHECK(hipMemset(qtip_pub_counters.data(), 0, qtip_pub_counters.bytes()));
             return;
         }
         state.resize(rows * 12288);
@@ -881,6 +885,7 @@ struct Shard {
     }
     void forward(const InferenceBatch &batch, ncclComm_t comm, HostTransport *transport,
                  int only_layer = -1, const std::vector<BFloat16> *injected = nullptr) {
+        const auto forward_started = std::chrono::steady_clock::now();
         HIP_CHECK(hipSetDevice(device));
         if (qtip && batch.sample_rows.size() > sample_capacity)
             throw std::invalid_argument("More sampled rows than the lm_head buffers hold");
@@ -1051,6 +1056,21 @@ struct Shard {
                                              ncclFloat, comm, stream));
             });
         }
+        static const int trace = [] {
+            const char *v = std::getenv("BEHEMOTH_LOOP_TRACE");
+            return v ? std::atoi(v) : 0;
+        }();
+        static std::atomic<int> traced{0};
+        if (traced.load() < 2 * trace) {
+            ++traced;
+            const auto enqueued = std::chrono::steady_clock::now();
+            HIP_CHECK(hipStreamSynchronize(stream));
+            const auto synced = std::chrono::steady_clock::now();
+            std::cerr << "shard-trace rank " << rank << ": enqueue "
+                      << std::chrono::duration<double, std::milli>(enqueued - forward_started).count() << " sync-wait "
+                      << std::chrono::duration<double, std::milli>(synced - enqueued).count() << " ms\n";
+            return;
+        }
         HIP_CHECK(hipStreamSynchronize(stream));
     }
     // Startup autotuning of the dense-prefill GEMMs (hipBLASLt's first heuristic choice is
@@ -1112,6 +1132,9 @@ struct Shard {
         const GpuMetadata *meta = nullptr;
         bool overlap = false; // two micro-batches in flight
         bool input_ready = false; // the previous down epilogue wrote this layer's q/k/v input
+        bool norm_ready = false;  // ... and the normalised row (FP8 K/V input) into `norm`
+        bool fused = false;       // fused decode exchange path (qtip_fused_decode)
+        HostTransport::Exchange attn_exchange{}; // attention output slot (fused path)
         bool bf16_projection = false; // q/k/v, o and down payloads for pure prefill only
     };
     template <class F> void measure(const Mb &mb, const char *name, F f) {
@@ -1335,6 +1358,78 @@ struct Shard {
             return nullptr;
         return &qtip_sync;
     }
+    // Fused decode exchange path (perf/single-decode, env BEHEMOTH_QTIP_FUSED_DECODE=1; default
+    // off): decode-sized steps of at most 4 rows on the zero-copy transport. The GEMV reduces its
+    // K slices in-kernel and the epilogue kernels publish this rank's half, wait for the peer's
+    // flag and copy the peer's half: no exchange kernels, 5 launches per layer fewer. Measured a
+    // wash against the separate exchange kernels once their per-block system fences were removed
+    // (43.9 vs 43.3 ms per batch-1 step): the PCIe transfers, not the launches, bound it.
+    bool qtip_fused_decode(const Mb &mb, HostTransport *transport) const {
+        static const bool enabled = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_FUSED_DECODE");
+            return v && std::atoi(v) != 0;
+        }();
+        if (!enabled || !transport || !transport->zero_copy() || mb.overlap || mb.index != 0 ||
+            mb.rows < 1 || mb.rows > 4 || mb.bf16_projection || qtip_use_dma(mb.rows, transport) ||
+            !qtip_pub_counters.size())
+            return false;
+        const int t = qtip::row_transform_threshold();
+        if (t > 0 && mb.rows >= t)
+            return false;
+        if (!transport->zero_copy_eligible(size_t(mb.rows) * 14336))
+            return false;
+        return true;
+    }
+    // This rank's half of exchange e (words 32-bit words per rank), published by the epilogue.
+    qtip::WordPublish word_publish_of(const Mb &mb, const HostTransport::Exchange &e, size_t words) {
+        qtip::WordPublish p;
+        p.local = qtip_block(mb) + size_t(rank) * words;
+        p.host = e.mine;
+        p.flag = e.flag;
+        p.counter = e.counter;
+        p.seq = e.seq;
+        p.n4 = int(words / 4);
+        return p;
+    }
+    // Peer half of exchange e (words 32-bit words per rank) for an epilogue of micro-batch mb.
+    qtip::Peer peer_of(const Mb &mb, const HostTransport::Exchange &e, size_t words) {
+        qtip::Peer p;
+        p.data = e.peer;
+        p.dst = qtip_block(mb) + size_t(1 - rank) * words;
+        p.n4 = int(words / 4);
+        p.flag = e.peer_flag;
+        p.seq = e.seq;
+        p.barrier = qtip_sync.counters + 48;
+        return p;
+    }
+    // Publishing GEMV: the shard's rotated outputs for this rank's rows, summed over the K
+    // slices inside the kernel and published to the exchange block + host slot.
+    HostTransport::Exchange qtip_project_fused(Mb &mb, const qtip::GpuLinear &w, const qtip::GpuCodebook &lut,
+                                               int ldu, bool bf16, HostTransport *transport, size_t &words_out) {
+        const int rows = mb.rows;
+        const int slices = qtip::matmul_slices(w, rows);
+        const BFloat16 *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        float *partial = qtip_partial.data() + size_t(mb.r0) * 28672;
+        if (size_t(mb.r0) * 28672 + size_t(slices) * size_t(rows) * size_t(w.rows) > qtip_partial.size()) {
+            if (mb.r0)
+                throw std::logic_error("QTIP partial buffer too small for the micro-batch");
+            qtip_partial.resize(size_t(slices) * size_t(rows) * size_t(w.rows));
+            partial = qtip_partial.data();
+        }
+        const size_t elements = size_t(rows) * size_t(w.rows), words = bf16 ? elements / 2 : elements;
+        words_out = words;
+        const auto e = transport->begin_exchange(rank, words);
+        if (!e.valid)
+            throw std::logic_error("QTIP fused decode exchange: slot not eligible");
+        qtip::Publish pub;
+        pub.counters = qtip_pub_counters.data();
+        pub.local = qtip_block(mb) + size_t(rank) * words;
+        pub.bf16 = bf16; // host publish + flag: the consumer (word_publish_of)
+        measure(mb, "projections_ms", [&] {
+            qtip::matmul_publish(w, lut.lut.data(), u, ldu, rows, partial, slices, pub, mb.s);
+        });
+        return e;
+    }
     // A: q/k/v input transform (norm + SU + hadUt), stacked matmul, all-gather of the rotated
     // outputs, hadU + SV for this rank's heads, rope, KV append, attention, all-gather of the
     // head-sharded attention output.
@@ -1343,17 +1438,30 @@ struct Shard {
         auto &w = l.qtip;
         const int rows = mb.rows;
         BFloat16 *st = mb_state(mb), *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        BFloat16 *xn = w.fp8_kv ? norm.data() + size_t(mb.r0) * 12288 : nullptr;
         if (!mb.input_ready)
             measure(mb, "elementwise_ms", [&] {
-                qtip::input_transform(qtip::Source{st, 12288, 0, 12288, 0}, l.input_norm.data(),
-                                      1e-5f, w.su_qkv.data(), 12288, rows, u, 12288, mb.s);
+                mb.norm_ready = qtip::input_transform(qtip::Source{st, 12288, 0, 12288, 0}, l.input_norm.data(),
+                                                      1e-5f, w.su_qkv.data(), 12288, rows, u, 12288, mb.s, xn);
             });
         mb.input_ready = false;
-        qtip_project(mb, w.qkv, w.lut, 12288, mb.bf16_projection, comm, transport);
+        mb.fused = qtip_fused_decode(mb, transport);
         BFloat16 *qm = q.data() + size_t(mb.r0) * 6144, *km = k.data() + size_t(mb.r0) * 512,
                  *vm = v.data() + size_t(mb.r0) * 512;
         float *all = qtip_block(mb);
+        if (mb.fused) {
+            size_t words = 0;
+            const auto e = qtip_project_fused(mb, w.qkv, w.lut, 12288, false, transport, words);
+            measure(mb, "elementwise_ms", [&] {
+                qtip::output_qkv(all, word_publish_of(mb, e, words), peer_of(mb, e, words), rows, rank,
+                                 w.sv_q.data(), w.sv_k.data(),
+                                 w.sv_v.data(), qm, km, vm, mb.s, w.fp8_kv);
+            });
+        } else
+            qtip_project(mb, w.qkv, w.lut, 12288, mb.bf16_projection, comm, transport);
         measure(mb, "elementwise_ms", [&] {
+            if (mb.fused)
+                return;
             if (mb.bf16_projection)
                 qtip::output_qkv(reinterpret_cast<const BFloat16 *>(all), rows, rank,
                                  w.sv_q.data(), w.sv_k.data(), w.sv_v.data(), qm, km, vm, mb.s, w.fp8_kv);
@@ -1363,10 +1471,15 @@ struct Shard {
         });
         if (w.fp8_kv)
             measure(mb, "fp8_kv_projections_ms", [&] {
-                auto *xn = norm.data() + size_t(mb.r0) * 12288;
-                rms_norm(st, l.input_norm.data(), xn, rows, 12288, 1e-5f, mb.s);
-                qtip::fp8_linear(w.fp8_k, xn, 12288, rows, km, 512, mb.s);
-                qtip::fp8_linear(w.fp8_v, xn, 12288, rows, vm, 512, mb.s);
+                // the input transform / previous residual epilogue may have written the
+                // normalised row already (perf/single-decode: one rms_norm launch per layer saved)
+                if (!mb.norm_ready)
+                    rms_norm(st, l.input_norm.data(), xn, rows, 12288, 1e-5f, mb.s);
+                mb.norm_ready = false;
+                if (!qtip::fp8_linear_pair(w.fp8_k, w.fp8_v, xn, 12288, rows, km, vm, 512, mb.s)) {
+                    qtip::fp8_linear(w.fp8_k, xn, 12288, rows, km, 512, mb.s);
+                    qtip::fp8_linear(w.fp8_v, xn, 12288, rows, vm, 512, mb.s);
+                }
             });
         // Attention writes this rank's heads straight into its half of the exchange block.
         auto *attention_out = reinterpret_cast<BFloat16 *>(all) + size_t(rank) * size_t(rows) * 6144;
@@ -1390,7 +1503,10 @@ struct Shard {
             paged_attention(*mb.meta, view, attention_workspace.data(), attention_workspace.size(),
                             partition, mb.s);
         });
-        qtip_exchange(mb, nullptr, 0, 0, false, size_t(rows) * 3072, comm, transport);
+        if (mb.fused) // published by the o input transform (step B) before it waits for the peer
+            mb.attn_exchange = transport->begin_exchange(rank, size_t(rows) * 3072);
+        else
+            qtip_exchange(mb, nullptr, 0, 0, false, size_t(rows) * 3072, comm, transport);
     }
     // B: o input transform (hadUt over the gathered 12288), matmul, all-gather, residual epilogue
     // fused with the MLP input transform.
@@ -1399,6 +1515,24 @@ struct Shard {
         const int rows = mb.rows;
         BFloat16 *u = qtip_u.data() + size_t(mb.r0) * 28672;
         float *all = qtip_block(mb);
+        if (mb.fused) {
+            const auto &a = mb.attn_exchange;
+            const size_t words = size_t(rows) * 3072;
+            measure(mb, "elementwise_ms", [&] {
+                qtip::input_transform_o(reinterpret_cast<const BFloat16 *>(all), word_publish_of(mb, a, words),
+                                        peer_of(mb, a, words), rows,
+                                        rank, w.su_o.data(), u, 12288, mb.s);
+            });
+            size_t ow = 0;
+            const auto e = qtip_project_fused(mb, w.o, w.lut, 12288, false, transport, ow);
+            measure(mb, "elementwise_ms", [&] {
+                qtip::output_residual_input(all, word_publish_of(mb, e, ow), peer_of(mb, e, ow), rows, rank,
+                                            w.sv_o.data(), mb_state(mb),
+                                            l.post_norm.data(), 1e-5f, w.su_gate_up.data(), u, 12288, mb.s,
+                                            nullptr, qtip_sync.counters);
+            });
+            return;
+        }
         measure(mb, "elementwise_ms", [&] {
             qtip::input_transform(qtip::Source{all, 6144, size_t(rows) * 3072 * 2, 6144, 0}, nullptr,
                                   0.f, w.su_o.data(), 12288, rows, u, 12288, mb.s);
@@ -1419,9 +1553,20 @@ struct Shard {
     void qtip_step_gate_up(Layer &l, Mb &mb, ncclComm_t comm, HostTransport *transport) {
         auto &w = l.qtip;
         const int rows = mb.rows;
-        qtip_project(mb, w.gate_up, w.lut, 12288, true, comm, transport);
         BFloat16 *h = qtip_h.data() + size_t(mb.r0) * 28672,
                  *u = qtip_u.data() + size_t(mb.r0) * 28672;
+        if (mb.fused) {
+            size_t words = 0;
+            const auto e = qtip_project_fused(mb, w.gate_up, w.lut, 12288, true, transport, words);
+            measure(mb, "elementwise_ms", [&] {
+                qtip::output_gateup_down(reinterpret_cast<const BFloat16 *>(qtip_block(mb)),
+                                         word_publish_of(mb, e, words), peer_of(mb, e, words), rows, rank,
+                                         w.sv_gate.data(), w.sv_up.data(), h, w.su_down.data(), u, 28672,
+                                         qtip_sync.counters + 32, mb.s);
+            });
+            return;
+        }
+        qtip_project(mb, w.gate_up, w.lut, 12288, true, comm, transport);
         measure(mb, "elementwise_ms", [&] {
             qtip::output_gateup(reinterpret_cast<const BFloat16 *>(qtip_block(mb)), rows,
                                 w.sv_gate.data(), w.sv_up.data(), h, mb.s);
@@ -1434,21 +1579,42 @@ struct Shard {
     void qtip_step_down(Layer &l, Mb &mb, Layer *next, ncclComm_t comm, HostTransport *transport) {
         auto &w = l.qtip;
         const int rows = mb.rows;
+        if (mb.fused) {
+            size_t words = 0;
+            const auto e = qtip_project_fused(mb, w.down, w.lut, 28672, false, transport, words);
+            float *all = qtip_block(mb);
+            measure(mb, "elementwise_ms", [&] {
+                if (next) {
+                    BFloat16 *xn = next->qtip.fp8_kv ? norm.data() + size_t(mb.r0) * 12288 : nullptr;
+                    qtip::output_residual_input(all, word_publish_of(mb, e, words), peer_of(mb, e, words), rows,
+                                                rank, w.sv_down.data(),
+                                                mb_state(mb), next->input_norm.data(), 1e-5f,
+                                                next->qtip.su_qkv.data(), qtip_u.data() + size_t(mb.r0) * 28672,
+                                                12288, mb.s, xn, qtip_sync.counters);
+                    mb.input_ready = true;
+                    mb.norm_ready = xn != nullptr;
+                } else
+                    qtip::output_residual(all, word_publish_of(mb, e, words), peer_of(mb, e, words), rows, rank,
+                                          w.sv_down.data(), mb_state(mb), mb.s);
+            });
+            return;
+        }
         qtip_project(mb, w.down, w.lut, 28672, mb.bf16_projection, comm, transport);
         measure(mb, "elementwise_ms", [&] {
             const int t = qtip::row_transform_threshold();
             // row-batched sizes fuse from registers; decode sizes through the rendezvous kernel
             if (next && ((t > 0 && rows >= t) || qtip_sync_for(mb))) {
+                BFloat16 *xn = next->qtip.fp8_kv ? norm.data() + size_t(mb.r0) * 12288 : nullptr;
                 if (mb.bf16_projection)
-                    qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(qtip_block(mb)),
+                    mb.norm_ready = qtip::output_residual_input(reinterpret_cast<const BFloat16 *>(qtip_block(mb)),
                         rows, w.sv_down.data(), mb_state(mb), next->input_norm.data(), 1e-5f,
                         next->qtip.su_qkv.data(), qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s,
-                        qtip_sync_for(mb));
+                        qtip_sync_for(mb), xn);
                 else
-                    qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
+                    mb.norm_ready = qtip::output_residual_input(qtip_block(mb), rows, w.sv_down.data(), mb_state(mb),
                                                 next->input_norm.data(), 1e-5f, next->qtip.su_qkv.data(),
                                                 qtip_u.data() + size_t(mb.r0) * 28672, 12288, mb.s,
-                                                qtip_sync_for(mb));
+                                                qtip_sync_for(mb), xn);
                 mb.input_ready = true;
             } else if (mb.bf16_projection)
                 qtip::output_residual(reinterpret_cast<const BFloat16 *>(qtip_block(mb)), rows,
@@ -2037,6 +2203,7 @@ std::span<const float> TensorParallelModel::forward(const InferenceBatch &batch)
         }
     if (error)
         std::rethrow_exception(error);
+    const auto workers_done = std::chrono::steady_clock::now();
     size_t n = batch.sample_rows.size();
     std::span<const float> result{};
     if (n) {
@@ -2048,6 +2215,18 @@ std::span<const float> TensorParallelModel::forward(const InferenceBatch &batch)
                                  impl_->shards[0]->stream));
         HIP_CHECK(hipStreamSynchronize(impl_->shards[0]->stream));
         result = {impl_->logits_host, n * 32768};
+    }
+    static const int trace = [] {
+        const char *v = std::getenv("BEHEMOTH_LOOP_TRACE");
+        return v ? std::atoi(v) : 0;
+    }();
+    static int traced = 0;
+    if (traced < trace) {
+        ++traced;
+        const auto done = std::chrono::steady_clock::now();
+        std::cerr << "forward-trace: workers " << std::chrono::duration<double, std::milli>(workers_done - started).count()
+                  << " logits_d2h+sync " << std::chrono::duration<double, std::milli>(done - workers_done).count()
+                  << " ms\n";
     }
     if (impl_->profiling) {
         const auto execution_finished = std::chrono::steady_clock::now();

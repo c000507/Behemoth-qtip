@@ -452,8 +452,20 @@ struct Engine::Impl {
         cc_issue_ms += std::chrono::duration<double, std::milli>(Clock::now() - started).count();
     }
     double cc_issue_ms = 0, cc_issue_max = 0; // engine thread only; copied to cc under the lock
+    // BEHEMOTH_LOOP_TRACE=N: stderr timeline of the first N steps (host phases around forward()).
+    static int trace_steps() {
+        static const int n = [] {
+            const char *v = std::getenv("BEHEMOTH_LOOP_TRACE");
+            return v ? std::atoi(v) : 0;
+        }();
+        return n;
+    }
     void loop() {
+        using TC = std::chrono::steady_clock;
+        TC::time_point prev_forward_end{};
+        int traced = 0;
         for (;;) {
+            const auto t_top = TC::now();
             std::vector<std::pair<GenerationCallback, GenerationEvent>> events;
             ScheduledBatch step;
             InferenceBatch input;
@@ -583,8 +595,10 @@ struct Engine::Impl {
                 auto start = std::chrono::steady_clock::now();
                 const size_t sample_count = input.sample_rows.size();
                 const auto logits = model.forward(input);
+                const auto t_fwd_end = TC::now();
                 double elapsed =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                TC::time_point t_sampled{}, t_completed{};
                 {
                     std::lock_guard lock(mutex);
                     gpu_seconds += elapsed;
@@ -648,6 +662,7 @@ struct Engine::Impl {
                         }
                         samplers.run(jobs);
                     }
+                    t_sampled = TC::now();
                     for (size_t i = 0; i < step.requests.size(); ++i) {
                         const auto &request = step.requests[i];
                         const int token = sampled[i];
@@ -687,11 +702,25 @@ struct Engine::Impl {
                             last_token.erase(request.id);
                         }
                 }
+                t_completed = TC::now();
                 for (auto &[cb, e] : events)
                     try {
                         cb(e);
                     } catch (...) {
                     }
+                if (traced < trace_steps()) {
+                    ++traced;
+                    const auto t_cb = TC::now();
+                    auto ms = [](TC::time_point a, TC::time_point b) {
+                        return std::chrono::duration<double, std::milli>(b - a).count();
+                    };
+                    std::cerr << "loop-trace step " << traced << ": rows=" << input.tokens.size()
+                              << " since_prev_forward_end->loop_top " << (prev_forward_end.time_since_epoch().count() ? ms(prev_forward_end, t_top) : 0.0)
+                              << " top->forward_start " << ms(t_top, start) << " forward " << ms(start, t_fwd_end)
+                              << " sample " << ms(t_fwd_end, t_sampled) << " complete " << ms(t_sampled, t_completed)
+                              << " callbacks " << ms(t_completed, t_cb) << " ms\n";
+                }
+                prev_forward_end = t_fwd_end;
             } catch (const std::exception &error) {
                 std::vector<std::pair<GenerationCallback, GenerationEvent>> errors;
                 {

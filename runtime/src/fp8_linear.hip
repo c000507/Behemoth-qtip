@@ -127,6 +127,80 @@ __global__ void fp8_gemm(const uint8_t *w, const float *scale, int n, int out, c
                 y[size_t(first + c) * ldy + feature] = device::bf16(acc[i] * scale[feature]);
         }
 }
+// Decode-sized K and V in one launch (perf/single-decode): one wave per output feature of
+// either shard (features [0, k.rows) are K, the rest V), 8 waves per block. A lane owns 16
+// consecutive inputs of every 512-wide step; the 24 steps of n = 12288 are issued in batches of
+// 8 independent 128-bit loads, so every wave keeps 4 KiB of weight reads in flight (the previous
+// kernel's 512 blocks x 3 dependent steps streamed the 12 MB of K/V weights at ~200 GB/s).
+// Numerics as fp8_gemv_rows: fp32 fma over the inputs in ascending order per lane, wave sum,
+// bf16(value * scale).
+constexpr int pair_waves = 8;
+template <int R>
+__global__ __launch_bounds__(pair_waves * 32) void fp8_gemv_pair(
+    const uint8_t *__restrict__ wk, const float *__restrict__ sk, int k_rows,
+    const uint8_t *__restrict__ wv, const float *__restrict__ sv, int v_rows, int n,
+    const uint16_t *__restrict__ x, int ldx, int rows, uint16_t *__restrict__ yk,
+    uint16_t *__restrict__ yv, int ldy) {
+    const int lane = int(threadIdx.x) & 31,
+              feature = __builtin_amdgcn_readfirstlane(int(blockIdx.x) * pair_waves + int(threadIdx.x >> 5));
+    if (feature >= k_rows + v_rows)
+        return;
+    const bool is_k = feature < k_rows;
+    const int f = is_k ? feature : feature - k_rows;
+    const uint8_t *wf = (is_k ? wk : wv) + size_t(f) * size_t(n);
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        acc[r] = 0.f;
+    for (int d0 = lane * 16; d0 < n; d0 += 8 * 512) {
+        uint4 packed[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = d0 + i * 512;
+            packed[i] = d < n ? *reinterpret_cast<const uint4 *>(wf + d) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int d = d0 + i * 512;
+            if (d >= n)
+                break;
+            float wv16[16];
+            const uint32_t pw[4] = {packed[i].x, packed[i].y, packed[i].z, packed[i].w};
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                wv16[4 * q] = device::fp8(uint8_t(pw[q]));
+                wv16[4 * q + 1] = device::fp8(uint8_t(pw[q] >> 8));
+                wv16[4 * q + 2] = device::fp8(uint8_t(pw[q] >> 16));
+                wv16[4 * q + 3] = device::fp8(uint8_t(pw[q] >> 24));
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (r < rows) {
+                    const uint4 *xp = reinterpret_cast<const uint4 *>(x + size_t(r) * size_t(ldx) + d);
+                    const uint4 xa = xp[0], xb = xp[1];
+                    const uint32_t px[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) {
+                        acc[r] = fmaf(device::bf16(uint16_t(px[q])), wv16[2 * q], acc[r]);
+                        acc[r] = fmaf(device::bf16(uint16_t(px[q] >> 16)), wv16[2 * q + 1], acc[r]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        for (int s = 16; s; s /= 2)
+            acc[r] += __shfl_down(acc[r], s);
+    if (lane == 0) {
+        const float scale = is_k ? sk[f] : sv[f];
+        uint16_t *y = is_k ? yk : yv;
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (r < rows)
+                y[size_t(r) * size_t(ldy) + size_t(f)] = device::bf16(acc[r] * scale);
+    }
+}
 // BEHEMOTH_FP8_KV_KERNEL=legacy restores the per-row GEMV (rows <= 4) + WMMA GEMM dispatch.
 bool legacy_dispatch() {
     static const bool legacy = [] {
@@ -168,5 +242,33 @@ void fp8_linear(const GpuFp8Linear &w, const BFloat16 *x, int ldx, int rows,
         fp8_gemm<<<dim3((rows + 15) / 16, (w.rows + 63) / 64), 128, 0, s>>>(
             w.weight.data(), w.scale.data(), w.in, w.rows, xs, ldx, rows, ys, ldy);
     HIP_CHECK(hipGetLastError());
+}
+bool fp8_linear_pair(const GpuFp8Linear &k, const GpuFp8Linear &v, const BFloat16 *x, int ldx,
+                     int rows, BFloat16 *yk, BFloat16 *yv, int ldy, hipStream_t s) {
+    static const bool enabled = [] {
+        const char *e = std::getenv("BEHEMOTH_FP8_KV_PAIR");
+        return !e || std::atoi(e) != 0;
+    }();
+    if (!enabled || legacy_dispatch() || rows < 1 || rows > 4 || k.in != v.in || k.in % 16 ||
+        ldx % 8 || (reinterpret_cast<uintptr_t>(x) & 15) || ldy < k.rows || ldy < v.rows ||
+        k.weight.size() != size_t(k.in) * size_t(k.rows) || v.weight.size() != size_t(v.in) * size_t(v.rows) ||
+        k.scale.size() != size_t(k.rows) || v.scale.size() != size_t(v.rows))
+        return false;
+    const int features = k.rows + v.rows;
+    const dim3 grid((features + pair_waves - 1) / pair_waves);
+    auto launch = [&](auto kernel) {
+        kernel<<<grid, pair_waves * 32, 0, s>>>(
+            k.weight.data(), k.scale.data(), k.rows, v.weight.data(), v.scale.data(), v.rows, k.in,
+            reinterpret_cast<const uint16_t *>(x), ldx, rows, reinterpret_cast<uint16_t *>(yk),
+            reinterpret_cast<uint16_t *>(yv), ldy);
+    };
+    if (rows == 1)
+        launch(fp8_gemv_pair<1>);
+    else if (rows == 2)
+        launch(fp8_gemv_pair<2>);
+    else
+        launch(fp8_gemv_pair<4>);
+    HIP_CHECK(hipGetLastError());
+    return true;
 }
 } // namespace behemoth::qtip

@@ -595,6 +595,36 @@ static void reasoning_tests() {
         CHECK(answer == (inside ? "" : "answer "));
     }
 }
+// Default fast path (unsorted CDF walk): valid ids, argmax for a dominant logit, and the empirical
+// distribution of a 3-way choice within a few percent of softmax (seeded, deterministic).
+static void fast_sampler_tests_impl() {
+    std::vector<float> x(32768, -30.f);
+    x[1234] = 10.f;
+    SamplingOptions p;
+    p.temperature = .7f;
+    std::mt19937_64 rng(7);
+    for (int i = 0; i < 50; ++i)
+        CHECK(sample_logits(x, p, rng) == 1234);
+    std::vector<float> y(513, -1e9f);
+    y[5] = 0.f;
+    y[100] = float(std::log(2.0));
+    y[512] = float(std::log(4.0));
+    p.temperature = 1.f;
+    std::array<int, 3> counts{};
+    for (int i = 0; i < 20000; ++i) {
+        const int t = sample_logits(y, p, rng);
+        CHECK(t == 5 || t == 100 || t == 512);
+        counts[size_t(t == 5 ? 0 : t == 100 ? 1 : 2)]++;
+    }
+    CHECK(std::abs(counts[0] / 20000. - 1 / 7.) < .015);
+    CHECK(std::abs(counts[1] / 20000. - 2 / 7.) < .015);
+    CHECK(std::abs(counts[2] / 20000. - 4 / 7.) < .015);
+    // split-vocabulary form agrees with the contiguous form for the same seed
+    std::span<const float> low(y.data(), 256), high(y.data() + 256, 257);
+    std::mt19937_64 a(3), b(3);
+    for (int i = 0; i < 100; ++i)
+        CHECK(sample_logits(y, p, a) == sample_logits(low, high, p, b));
+}
 static void sampling_tests() {
     std::thread::id worker_id;
     {
@@ -942,6 +972,12 @@ static void fp8_checkpoint_tests() {
 }
 int main() {
     try {
+        // The exact-draw comparison against the reference sampler needs the sorted path; the
+        // default O(n) path (top_k 0, top_p 1) is checked separately by fast_sampler_tests.
+        unsetenv("BEHEMOTH_SAMPLER_SORTED");
+        fast_sampler_tests_impl();
+        std::cout << "PASS fast_sampler\n";
+        setenv("BEHEMOTH_SAMPLER_SORTED", "1", 1);
         CHECK(qtip_fp32_exchange_bytes == 147456);
         CHECK(qtip_bf16_exchange_bytes == 108544);
         CHECK(qtip_bf16_exchange_bytes * 100 / qtip_fp32_exchange_bytes == 73);

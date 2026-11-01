@@ -14,11 +14,15 @@ __global__ void publish_kernel(const float4 *__restrict__ values, float4 *__rest
     const int i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
     if (i < n4)
         mine[i] = values[i];
-    __threadfence_system();
+    // Per-block system-scope fences (L2 writeback) serialised at ~2.5 us each (14 blocks: 37 us
+    // exchange); the host buffer is fine-grained (uncached), so an agent-scope release before the
+    // arrival counter and one system-scope release in the last block order every block's stores
+    // before the flag (perf/single-decode).
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     __syncthreads();
     if (threadIdx.x == 0) {
-        // Last block to arrive publishes the flag after every block's stores.
-        const unsigned done = atomicAdd(counter, 1u) + 1;
+        const unsigned done =
+            __hip_atomic_fetch_add(counter, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) + 1;
         if (done == gridDim.x) {
             __threadfence_system();
             __hip_atomic_store(flag, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
