@@ -84,6 +84,10 @@ void gather_peer(const void *peer_host, void *all, size_t words, int rank,
 // the slices (Fp32 / Bf16 payload; n = elements) or copies n local 32-bit words (Words) into
 // `local` and the host exchange buffer, releases flag = seq, waits for the peer's flag and
 // copies the peer's payload from peer_host to peer_dst.
+// Stream-ordered flag release (after a D2H copy) and one-block wait for the peer's flag
+// (before an H2D copy): the copy-engine decode exchange.
+void flag_release(unsigned *flag, unsigned seq, hipStream_t);
+void flag_wait(const unsigned *peer_flag, unsigned seq, hipStream_t);
 enum class ExchangeMode { Fp32, Bf16, Words };
 void exchange(const float *partial, int slices, size_t n, ExchangeMode, void *local, void *host,
               unsigned *flag, unsigned *counter, unsigned seq, const void *peer_host, void *peer_dst,

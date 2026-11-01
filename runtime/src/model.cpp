@@ -315,6 +315,7 @@ class HostTransport {
     // one fused reduce+residual kernel.
     struct Exchange {
         float *mine{}, *peer{};       // device pointers of pinned host buffers
+        float *mine_host{}, *peer_host{}; // the same buffers as host pointers (copy engines)
         unsigned *flag{}, *peer_flag{}, *counter{};
         unsigned seq{};
         bool valid = false;
@@ -330,6 +331,8 @@ class HostTransport {
         Exchange e;
         e.mine = d.host[size_t(rank)][parity];
         e.peer = d.host[size_t(1 - rank)][parity];
+        e.mine_host = zc_host_[size_t(rank)][parity];
+        e.peer_host = zc_host_[size_t(1 - rank)][parity];
         e.flag = d.flag[size_t(rank)];
         e.peer_flag = d.flag[size_t(1 - rank)];
         e.counter = zc_counter_[size_t(rank)];
@@ -1150,6 +1153,33 @@ struct Shard {
             const char *v = std::getenv("BEHEMOTH_QTIP_FUSED_EXCHANGE");
             return !v || std::atoi(v) != 0;
         }();
+        // Copy-engine decode exchange (perf/batch-decode-2): kernel-issued PCIe stores run at
+        // ~7 GB/s and zero-copy loads of the peer's buffer slower still, so messages of at least
+        // BEHEMOTH_QTIP_SDMA_BYTES bytes (default 64 KiB; 0 disables) are published with a D2H
+        // copy on the rank stream followed by a one-thread flag release, and the peer half is
+        // fetched with an H2D copy after a one-block wait for the peer's flag. Same slots,
+        // flags and sequence as the fused kernel, so the two variants interleave freely as long
+        // as both ranks make the same choice (they see the same message sizes).
+        static const size_t sdma_bytes = [] {
+            const char *v = std::getenv("BEHEMOTH_QTIP_SDMA_BYTES");
+            return size_t(v ? std::atoll(v) : 65536);
+        }();
+        if (e.valid && sdma_bytes && words * 4 >= sdma_bytes) {
+            if (partial)
+                timings.measure("elementwise_ms", stream, [&] {
+                    qtip::reduce_publish(partial, slices, elements, bf16, local, nullptr, nullptr,
+                                         nullptr, 0, stream);
+                });
+            timings.measure("collectives_ms", stream, [&] {
+                HIP_CHECK(hipMemcpyAsync(e.mine_host, local, words * sizeof(float),
+                                         hipMemcpyDeviceToHost, stream));
+                qtip::flag_release(e.flag, e.seq, stream);
+                qtip::flag_wait(e.peer_flag, e.seq, stream);
+                HIP_CHECK(hipMemcpyAsync(all + size_t(1 - rank) * words, e.peer_host,
+                                         words * sizeof(float), hipMemcpyHostToDevice, stream));
+            });
+            return;
+        }
         // The fused kernel spins with <= 64 resident blocks: decode-sized messages only.
         if (e.valid && fused && words <= size_t(8) * 16384) {
             // one kernel: publish (slice sum) + flag, then the peer half

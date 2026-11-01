@@ -453,6 +453,17 @@ __global__ __launch_bounds__(256) void exchange_kernel(const float4 *__restrict_
     }
 }
 
+// Flag release / wait around copy-engine transfers (see Shard::qtip_exchange).
+__global__ void flag_release_kernel(unsigned *flag, unsigned seq) {
+    __threadfence_system();
+    __hip_atomic_store(flag, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__global__ void flag_wait_kernel(const unsigned *peer_flag, unsigned seq) {
+    if (threadIdx.x == 0)
+        while (__hip_atomic_load(peer_flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq)
+            __builtin_amdgcn_s_sleep(1);
+}
+
 // ---------------------------------------------------------------- Hadamard transforms
 // 256 threads hold the 1024 values of one chunk, 4 consecutive positions each; natural-order
 // (Sylvester) WHT: in-thread bits 0-1, lane shuffles for bits 2-6, LDS for bits 7-9.
@@ -1226,6 +1237,14 @@ void exchange(const float *partial, int slices, size_t n, ExchangeMode mode, voi
                                                        peer_host, peer_dst, peer_flag);
         break;
     }
+    HIP_CHECK(hipGetLastError());
+}
+void flag_release(unsigned *flag, unsigned seq, hipStream_t stream) {
+    flag_release_kernel<<<1, 1, 0, stream>>>(flag, seq);
+    HIP_CHECK(hipGetLastError());
+}
+void flag_wait(const unsigned *peer_flag, unsigned seq, hipStream_t stream) {
+    flag_wait_kernel<<<1, 32, 0, stream>>>(peer_flag, seq);
     HIP_CHECK(hipGetLastError());
 }
 void input_transform(const Source &x, const BFloat16 *norm, float epsilon, const float *su, int n,

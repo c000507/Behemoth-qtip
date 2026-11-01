@@ -318,7 +318,13 @@ samples), active requests, free pages, preemptions, tokens, and GPU-step time.
 
 ## PCIe transport: P2P is assumed unavailable
 
-Decode-sized QTIP steps exchange through the fused zero-copy kernel; steps of
+Decode-sized QTIP exchanges of at least `BEHEMOTH_QTIP_SDMA_BYTES` bytes (default 64 KiB; 0
+disables) go through the copy engines: D2H copy + one-thread flag release, one-block wait for
+the peer's flag + H2D copy of the peer half, on the same zero-copy slots and sequence as the
+fused kernel (`perf/batch-decode-2`: collectives per step 94 -> 51 ms at 16 rows, 37 -> 26 ms
+at 8 rows; concurrency 16 78.5 -> 97.7 tok/s, 8: 60 -> 65). Smaller messages (1-3 rows) keep
+the fused zero-copy kernel, which is latency-bound at ~23 us per exchange.
+Below that, decode-sized QTIP steps exchange through the fused zero-copy kernel; steps of
 `BEHEMOTH_QTIP_DMA_ROWS` rows or more (default 17) use the copy-engine all-gathers
 (`perf/batch-decode`: decode steps of 9-16 rows cost 140 ms of collectives per step on the
 copy engines versus 70-95 ms zero-copy). `BEHEMOTH_QTIP_EXCHANGE_BLOCKS` (default 64, clamped
