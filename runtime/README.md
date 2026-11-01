@@ -318,6 +318,16 @@ samples), active requests, free pages, preemptions, tokens, and GPU-step time.
 
 ## PCIe transport: P2P is assumed unavailable
 
+Decode-sized QTIP steps exchange through the fused zero-copy kernel; steps of
+`BEHEMOTH_QTIP_DMA_ROWS` rows or more (default 17) use the copy-engine all-gathers
+(`perf/batch-decode`: decode steps of 9-16 rows cost 140 ms of collectives per step on the
+copy engines versus 70-95 ms zero-copy). `BEHEMOTH_QTIP_EXCHANGE_BLOCKS` (default 64, clamped
+to the resident-block limit) sizes the spinning exchange grid: 256 was faster at 16 rows
+(collectives 94 -> 71 ms per step, 78 -> 85 tok/s at concurrency 16) but slower at 4-8 rows
+(37 -> 58 ms at 8 rows), so the default stays 64. `BEHEMOTH_FP8_KV_KERNEL=legacy` restores the
+pre-`perf/batch-decode` FP8 K/V dispatch (per-row GEMV up to 4 rows, then a WMMA GEMM whose
+8-block grid made 5-16 row decode steps cost 260 ms of K/V projections).
+
 `--transport host` is the default: device-to-pinned-host copies, FP32 CPU summation,
 then host-to-device copies, with abortable rendezvous between rank workers. It
 does not call `hipDeviceEnablePeerAccess` or use device-to-device copies.

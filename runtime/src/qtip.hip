@@ -1199,7 +1199,18 @@ void exchange(const float *partial, int slices, size_t n, ExchangeMode mode, voi
     if (n % 4)
         throw std::invalid_argument("QTIP exchange needs a multiple of four");
     const int n4 = int(n / 4);
-    const int blocks = std::max(1, std::min(64, (n4 + 255) / 256));
+    // Every block must be resident while it spins on the peer flag: cap the grid at the number
+    // of co-resident 256-thread blocks (BEHEMOTH_QTIP_EXCHANGE_BLOCKS, default 64, clamped to the
+    // occupancy limit of the three kernel variants).
+    static const int max_blocks = [] {
+        const char *v = std::getenv("BEHEMOTH_QTIP_EXCHANGE_BLOCKS");
+        int cap = v ? std::atoi(v) : 64;
+        int resident = multiprocessors() * std::min({occupancy(exchange_kernel<0>, 256, 0),
+                                                     occupancy(exchange_kernel<1>, 256, 0),
+                                                     occupancy(exchange_kernel<2>, 256, 0)});
+        return std::max(1, std::min(cap, resident));
+    }();
+    const int blocks = std::max(1, std::min(max_blocks, (n4 + 255) / 256));
     auto *pf = reinterpret_cast<const float4 *>(partial);
     switch (mode) {
     case ExchangeMode::Fp32:

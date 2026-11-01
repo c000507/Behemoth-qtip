@@ -1182,7 +1182,9 @@ struct Shard {
         });
     }
     // Copy-engine all-gathers for every QTIP step of more than BEHEMOTH_QTIP_DMA_ROWS - 1 rows
-    // (default 9; smaller steps keep the fused zero-copy kernels).
+    // (default 17; smaller steps keep the fused zero-copy kernels). Decode steps of 9-16 rows
+    // were measured at 140 ms of collectives per step on the copy engines versus ~70 ms with the
+    // fused zero-copy exchange (perf/batch-decode: concurrency 16, 62 -> 85+ tok/s).
     // bf16-output dense GEMMs straight into the exchange block (env BEHEMOTH_QTIP_BF16_DIRECT,
     // default 1; 0 restores the fp32 GEMM + reduce_publish rounding kernel).
     static bool qtip_bf16_direct() {
@@ -1195,7 +1197,7 @@ struct Shard {
     static bool qtip_use_dma(int rows, HostTransport *transport) {
         static const int min_rows = [] {
             const char *v = std::getenv("BEHEMOTH_QTIP_DMA_ROWS");
-            return v ? std::atoi(v) : 9;
+            return v ? std::atoi(v) : 17;
         }();
         return transport && min_rows > 0 && rows >= min_rows && transport->dma_eligible(1);
     }
