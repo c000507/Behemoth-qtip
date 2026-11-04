@@ -170,7 +170,7 @@ std::span<const std::byte> SafeTensorFile::bytes(const std::string &name) const 
         throw std::runtime_error("Tensor offsets out of bounds");
     std::string d = dtype(name);
     size_t width = d == "F32" ? 4
-                   : d == "F8_E4M3" ? 1
+                   : (d == "F8_E4M3" || d == "U8") ? 1
                    : (d == "F16" || d == "BF16" || d == "I16") ? 2
                    : d == "I64" ? 8 // QTIP rcp / tp_rank scalars
                                 : 0;
