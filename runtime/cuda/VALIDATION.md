@@ -1,5 +1,16 @@
 # CUDA execution validation — 2026-11-04
 
+This report describes baseline commit `021c434`. The subsequent opt-in split-K
+kernel and expanded split-count tests have not yet been executed on a GPU.
+RunPod could not restart the existing A100 pod because its host had no free GPUs.
+Do not attribute the execution results below to the experimental kernel.
+
+Offline candidate checks: the complete CUDA build succeeds with CUDA 12.9.86,
+GCC 14.2, and both `sm_75` and `sm_80` targets. The two CPU CTests pass; the
+two GPU CTests skip because this workspace has no GPU. The benchmark's `--help`
+runs, and a timing request exits 77 with an explicit GPU-unavailable message.
+The default CPU-only build also passes its two regression tests.
+
 Hardware: RunPod A100-SXM4-80GB, compute capability 8.0, driver 595.71.05.
 Build: CUDA 12.4.131, GCC 11.4.0, Release, sm_80. The QTIP kernels also compile
 for sm_75 with CUDA 12.9; this report contains no Turing/R9700 execution results.

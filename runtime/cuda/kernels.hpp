@@ -10,8 +10,10 @@ struct QtipMatrix {
     int in, out;
 };
 void initialize_tables();
+// z requires out * splits floats; scratch and rotated keep their original sizes.
+// Split partials are reduced before the optional BF16 rounding of the rotated output.
 void qtip_forward(QtipMatrix, const B16 *, B16 *, float *scratch, B16 *rotated, float *z, bool round_z,
-                  Stream);
+                  Stream, int splits = 1);
 void fp8_forward(const uint8_t *, const float *, const B16 *, B16 *, int in, int out, Stream);
 void embedding(const B16 *, B16 *, int token, int hidden, Stream);
 void residual(B16 *, const B16 *, int n, Stream);

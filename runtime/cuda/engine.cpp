@@ -5,7 +5,9 @@
 #include "minja/minja.hpp"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 namespace behemoth::cuda_runtime {
@@ -16,15 +18,16 @@ template <class T> void upload(Buffer<T> &d, const T *src, size_t n, Stream s) {
     checked(h2d(d, src, n * sizeof(T), s), "upload CUDA weights");
 }
 struct Linear {
-    int in = 0, out = 0;
+    int in = 0, out = 0, splits = 1;
     Buffer<B16> trellis;
     Buffer<float> su, sv, scales;
     Buffer<uint32_t> lut;
     Buffer<uint8_t> fp8;
-    void load(const Checkpoint &cp, int layer, const std::string &name, Stream s) {
+    void load(const Checkpoint &cp, int layer, const std::string &name, Stream s, int requested_splits) {
         auto h = behemoth::qtip::load_linear(cp, layer, name);
         in = h.in;
         out = h.out;
+        splits = std::min(requested_splits, in / 32);
         if (h.is_fp8()) {
             upload(fp8, h.fp8.data(), h.fp8.size(), s);
             upload(scales, h.fp8_scale.data(), h.fp8_scale.size(), s);
@@ -45,8 +48,8 @@ struct Linear {
         else {
             scratch.ensure(std::max(in, out), s);
             rotated.ensure(in, s);
-            z.ensure(out, s);
-            qtip_forward({trellis, su, sv, lut, in, out}, x, y, scratch, rotated, z, rz, s);
+            z.ensure(size_t(out) * splits, s);
+            qtip_forward({trellis, su, sv, lut, in, out}, x, y, scratch, rotated, z, rz, s, splits);
         }
     }
 };
@@ -54,6 +57,17 @@ json read(const fs::path &p) {
     std::ifstream f(p);
     check(bool(f), "Cannot read " + p.string());
     return json::parse(f);
+}
+int qtip_splits() {
+    const char *value = std::getenv("BEHEMOTH_CUDA_QTIP_SPLITS");
+    if (!value)
+        return 1; // Preserve the GPU-validated path until split-K is benchmarked on hardware.
+    int n = 0;
+    const char *end = value + std::char_traits<char>::length(value);
+    auto result = std::from_chars(value, end, n);
+    check(result.ec == std::errc{} && result.ptr == end && n >= 1 && n <= 32,
+          "BEHEMOTH_CUDA_QTIP_SPLITS must be an integer in 1..32");
+    return n;
 }
 } // namespace
 struct Model::Impl {
@@ -99,6 +113,7 @@ struct Model::Impl {
     }
     Impl(const fs::path &path, int d, int ctx)
         : checkpoint(path), device(d), context(ctx), layers(checkpoint.config.layers) {
+        int splits = qtip_splits();
         check(checkpoint.config.quantization == Quantization::Qtip, "CUDA runner requires a QTIP checkpoint");
         check(ctx > 0 && ctx <= checkpoint.config.max_context, "Invalid CUDA context limit");
         checked(set_device(d), "select CUDA device");
@@ -117,7 +132,7 @@ struct Model::Impl {
                 vector(prefix + "input_layernorm.weight", p.norm1);
                 vector(prefix + "post_attention_layernorm.weight", p.norm2);
                 for (int i = 0; i < 7; ++i)
-                    p.linear[i].load(checkpoint, l, names[i], stream);
+                    p.linear[i].load(checkpoint, l, names[i], stream, splits);
                 p.keys.ensure(size_t(ctx) * 1024, stream);
                 p.values.ensure(size_t(ctx) * 1024, stream);
                 std::cerr << "Loaded CUDA QTIP layer " << l + 1 << '/' << layers.size() << '\n';
@@ -126,6 +141,9 @@ struct Model::Impl {
             normed.ensure(12288, stream);
             attended.ensure(12288, stream);
             logits.ensure(32768, stream);
+            // Scores are scratch, so reserve them once instead of cudaMalloc/free
+            // at every new sequence length (cudaFree synchronizes the device).
+            scores.ensure(size_t(96) * ctx, stream);
             readback.ensure(32768);
             size_t free = 0, total = 0;
             checked(cudaMemGetInfo(&free, &total), "CUDA memory info");

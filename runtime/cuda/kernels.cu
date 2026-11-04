@@ -20,12 +20,25 @@ __device__ float warp_sum(float x) {
         x += __shfl_down_sync(0xffffffffU, x, d);
     return x;
 }
-__global__ void fwht(const B16 *x, const float *z, const float *su, float *out, int p, bool round_z) {
+template <bool Partial>
+__global__ void fwht(const B16 *x, const float *z, const float *su, float *out, int p, bool round_z,
+                     int splits = 1, int stride = 0) {
     extern __shared__ float a[];
     int block = blockIdx.x;
     for (int i = threadIdx.x; i < p; i += blockDim.x) {
         int j = block * p + i;
-        a[i] = x ? f32(x[j]) * su[j] : (round_z ? f32(b16(z[j])) : z[j]);
+        float v;
+        if (x)
+            v = f32(x[j]) * su[j];
+        else {
+            v = z[j];
+            if constexpr (Partial)
+                for (int part = 1; part < splits; ++part)
+                    v += z[size_t(part) * stride + j];
+            if (round_z)
+                v = f32(b16(v));
+        }
+        a[i] = v;
     }
     __syncthreads();
     for (int s = 1; s < p; s *= 2) {
@@ -51,7 +64,7 @@ __global__ void cross_had(const float *x, const float *sv, B16 *out, int k, int 
     int at = r * p + i;
     out[at] = b16(sum * rsqrtf(float(k * p)) * (sv ? sv[at] : 1));
 }
-__global__ void trellis_gemv(QtipMatrix w, const B16 *x, float *out) {
+template <bool Split> __global__ void trellis_gemv(QtipMatrix w, const B16 *x, float *out) {
     __shared__ uint32_t table[1024];
     for (int i = threadIdx.x; i < 1024; i += blockDim.x)
         table[i] = w.lut[i];
@@ -61,7 +74,17 @@ __global__ void trellis_gemv(QtipMatrix w, const B16 *x, float *out) {
         return;
     int A = lane / 4, B = lane % 4, n2 = w.in / 32;
     float acc[4] = {0, 0, 0, 0};
-    for (int j0 = 0; j0 < n2; ++j0) {
+    // Each CTA decodes a contiguous input slice. This supplies enough independent
+    // work even when the output has fewer row blocks than the GPU has SMs.
+    int first = 0, last = n2;
+    if constexpr (Split) {
+        first = n2 * blockIdx.y / gridDim.y;
+        last = n2 * (blockIdx.y + 1) / gridDim.y;
+    }
+    size_t offset = 0;
+    if constexpr (Split)
+        offset = size_t(blockIdx.y) * w.out;
+    for (int j0 = first; j0 < last; ++j0) {
         size_t base = (size_t(br) * n2 + j0) * 128;
         ushort4 a = reinterpret_cast<const ushort4 *>(w.trellis + base)[lane];
         ushort4 b = reinterpret_cast<const ushort4 *>(w.trellis + base)[(lane + 1) & 31];
@@ -82,7 +105,7 @@ __global__ void trellis_gemv(QtipMatrix w, const B16 *x, float *out) {
         acc[i] += __shfl_down_sync(0xffffffffU, acc[i], 2, 4);
         acc[i] += __shfl_down_sync(0xffffffffU, acc[i], 1, 4);
         if (!B)
-            out[br * 32 + (i / 2) * 16 + (i % 2) * 8 + A] = acc[i];
+            out[offset + br * 32 + (i / 2) * 16 + (i % 2) * 8 + A] = acc[i];
     }
 }
 __global__ void fp8_gemv(const uint8_t *w, const float *scales, const B16 *x, B16 *y, int in, int rows) {
@@ -185,14 +208,21 @@ void initialize_tables() {
     glm53::gpu::checked(cudaMemcpyToSymbol(had28, behemoth::qtip::kHad28, sizeof(had28)), "upload had28");
 }
 void qtip_forward(QtipMatrix w, const B16 *x, B16 *y, float *scratch, B16 *rotated, float *z, bool rz,
-                  Stream s) {
+                  Stream s, int splits) {
     int ki = factor(w.in), ko = factor(w.out), pi = w.in / ki, po = w.out / ko;
     if (w.in % 32 || w.out % 32 || pi > 1024 || po > 1024)
         throw std::runtime_error("Unsupported CUDA QTIP geometry");
-    fwht<<<ki, 256, size_t(pi) * 4, s>>>(x, nullptr, w.su, scratch, pi, false);
+    if (splits < 1 || splits > 32 || splits > w.in / 32)
+        throw std::runtime_error("CUDA QTIP splits must be 1..min(32, in/32)");
+    fwht<false><<<ki, 256, size_t(pi) * 4, s>>>(x, nullptr, w.su, scratch, pi, false);
     cross_had<<<dim3((pi + 255) / 256, ki), 256, 0, s>>>(scratch, nullptr, rotated, ki, pi, true);
-    trellis_gemv<<<(w.out / 32 + 3) / 4, 128, 0, s>>>(w, rotated, z);
-    fwht<<<ko, 256, size_t(po) * 4, s>>>(nullptr, z, nullptr, scratch, po, rz);
+    if (splits == 1) {
+        trellis_gemv<false><<<(w.out / 32 + 3) / 4, 128, 0, s>>>(w, rotated, z);
+        fwht<false><<<ko, 256, size_t(po) * 4, s>>>(nullptr, z, nullptr, scratch, po, rz);
+    } else {
+        trellis_gemv<true><<<dim3((w.out / 32 + 3) / 4, splits), 128, 0, s>>>(w, rotated, z);
+        fwht<true><<<ko, 256, size_t(po) * 4, s>>>(nullptr, z, nullptr, scratch, po, rz, splits, w.out);
+    }
     cross_had<<<dim3((po + 255) / 256, ko), 256, 0, s>>>(scratch, w.sv, y, ko, po, false);
     launch_check();
 }
