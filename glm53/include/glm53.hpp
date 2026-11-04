@@ -1,0 +1,109 @@
+#pragma once
+#include "behemoth/checkpoint.hpp"
+#include <functional>
+#include <set>
+namespace glm53 {
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+using Vec = std::vector<float>;
+void check(bool, const std::string &);
+json read_json(const fs::path &);
+struct Config {
+    int hidden, intermediate, layers, vocab, heads, qrank, kvrank, qdim, vdim;
+    int linear_heads, linear_dim, conv, streams, sinkhorn, index_heads, index_dim, pool, topk;
+    int experts, expert_topk, expert_intermediate, shared, groups, top_groups;
+    int max_context, bos = -1;
+    float eps, hc_eps, gate_lower, swiglu_limit, routed_scale;
+    bool norm_topk, tail;
+    std::vector<std::string> attention, mlp, indexers;
+    std::vector<int> eos;
+    explicit Config(const json &);
+    json summary() const;
+};
+class Tokenizer {
+    json config_;
+    std::map<std::string, int> vocab_, merges_, added_;
+    std::vector<std::string> decode_;
+    std::vector<std::string> patterns_;
+    std::string byte_map_[256];
+    std::map<std::string, unsigned char> inverse_;
+    bool prefix_space_ = false, ignore_merges_ = false;
+    void bpe(std::string_view, std::vector<int> &) const;
+
+  public:
+    explicit Tokenizer(const fs::path &);
+    std::vector<int> encode(const std::string &) const;
+    std::string decode(const std::vector<int> &, bool special = false) const;
+    std::string chat(const json &, bool generation = true) const;
+    json summary() const;
+};
+struct Tensor {
+    std::vector<size_t> shape;
+    Vec data;
+};
+struct Nvfp4 {
+    std::vector<uint8_t> packed, scales;
+    float global;
+    int rows, cols;
+};
+Nvfp4 quantize_nvfp4(const Vec &, int rows, int cols);
+Vec dequantize_nvfp4(const Nvfp4 &);
+class Weights {
+    fs::path path_;
+    json index_;
+    mutable std::map<std::string, std::shared_ptr<behemoth::SafeTensorFile>> files_;
+    mutable std::map<std::string, Tensor> cached_;
+
+  public:
+    std::string prefix;
+    explicit Weights(const fs::path &);
+    bool has(const std::string &) const;
+    const behemoth::SafeTensorFile &file(const std::string &) const;
+    Tensor tensor(const std::string &) const;
+    Vec row(const std::string &, int index, int width) const;
+    Tensor linear(const std::string &) const;
+    const Tensor &cached_linear(const std::string &name) const {
+        if (!cached_.contains(name))
+            cached_[name] = linear(name);
+        return cached_.at(name);
+    }
+    const json &index() const { return index_; }
+};
+void convert_nvfp4(const fs::path &, const fs::path &);
+struct KdaState {
+    Vec recurrent, convolution;
+};
+Vec kda_step(const Vec &, const Vec &, const Vec &, const Vec &, const Vec &, Vec &, int heads, int dim);
+struct Hyper {
+    Vec collapsed, post, mixing;
+};
+Hyper hyper_pre(const Vec &, const Tensor &, const Vec &, const Vec &, const Config &);
+Vec hyper_post(const Vec &, const Vec &, const Hyper &, const Config &);
+class Model {
+    Weights weights_;
+    struct State {
+        KdaState kda;
+        Vec latent, index_keys, index_gates;
+        std::vector<int> last_topk;
+    };
+    std::vector<State> states_;
+    size_t position_ = 0;
+    bool bf16_;
+    std::function<Vec(const Weights &, const std::string &, const Vec &)> projector_;
+    Vec matvec(const std::string &, const Vec &);
+    Vec norm(const Vec &, const std::string &, float);
+    Vec mlp(int, const Vec &);
+    Vec attention(int, const Vec &);
+    Vec round(Vec) const;
+
+  public:
+    Config config;
+    explicit Model(const fs::path &, bool bf16 = true);
+    void set_projector(std::function<Vec(const Weights &, const std::string &, const Vec &)> p) {
+        projector_ = std::move(p);
+    }
+    Vec step(int token);
+    void reset();
+};
+std::function<Vec(const Weights &, const std::string &, const Vec &)> gpu_projector(int device);
+} // namespace glm53
