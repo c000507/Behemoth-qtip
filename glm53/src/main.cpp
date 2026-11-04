@@ -15,9 +15,9 @@ glm53 generate --model DIR --tokens TOKENS.json [--steps 32] [--arithmetic bf16|
 glm53 generate --model DIR --input RENDERED_TEXT_FILE [--steps 32]
 glm53 generate --model DIR --messages CHAT.json [--steps 32]
 glm53 trace --model DIR --tokens REQUEST.json --out TRACE.json [--arithmetic bf16|fp32]
-Native CPU text reference backend. Quantize stores NVFP4 MLP weights and preserves other tensors.
+Native CPU reference or CUDA/HIP GPU inference. Quantize stores NVFP4 MLP weights and preserves other tensors.
 Tokenization applies tokenizer.json's BPE/regex and ignores serialized truncation.
-Generate uses greedy decoding and preserves recurrent state; this is not the GPU HTTP server.
+Generate uses greedy decoding and preserves recurrent state. The HTTP executable is glm53_server.
 )";
             return argc < 2 ? 1 : 0;
         }
@@ -105,14 +105,14 @@ Generate uses greedy decoding and preserves recurrent state; this is not the GPU
         Model model(path, arithmetic == "bf16");
         Vec logits;
         if (a.contains("--device") && a.at("--device") != "cpu") {
-#if defined(GLM53_HIP)
+#if defined(GLM53_HIP) || defined(GLM53_CUDA)
             check(arithmetic == "bf16", "GPU projections require bf16 arithmetic");
             size_t used = 0;
             int device = std::stoi(a.at("--device"), &used);
             check(used == a.at("--device").size() && device >= 0, "invalid GPU device");
-            model.set_projector(gpu_projector(device));
+            model.set_backend(gpu_backend(path, device));
 #else
-            throw std::runtime_error("rebuild with -DGLM53_HIP=ON for GPU projection offload");
+            throw std::runtime_error("rebuild with -DGLM53_HIP=ON or -DGLM53_CUDA=ON for GPU inference");
 #endif
         }
         std::vector<int> selected;
@@ -144,6 +144,7 @@ Generate uses greedy decoding and preserves recurrent state; this is not the GPU
                          {"tokens", ids},
                          {"logit_positions", selected},
                          {"logits", rows},
+                         {"device", a.contains("--device") ? a.at("--device") : "cpu"},
                          {"arithmetic", arithmetic}})
                        .dump()
                 << '\n';
@@ -165,7 +166,7 @@ Generate uses greedy decoding and preserves recurrent state; this is not the GPU
         json result = {{"tokens", generated},
                        {"arithmetic", arithmetic},
                        {"backend", a.contains("--device") && a.at("--device") != "cpu"
-                                       ? "CPU attention/state with streamed HIP projections"
+                                       ? "native GPU inference with streamed weights"
                                        : "native CPU reference"}};
         if (tokenizer)
             result["text"] = tokenizer->decode(generated);

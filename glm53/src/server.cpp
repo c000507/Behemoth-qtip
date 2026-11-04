@@ -1,4 +1,4 @@
-// Serial text server for the correctness/offload backend. It intentionally does
+// Serial text server for the CPU reference and CUDA/HIP backends. It intentionally does
 // not reuse Behemoth's fixed-size GQA scheduler/cache or its 32768-token sampler.
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
@@ -80,13 +80,13 @@ int main(int argc, char **argv) {
         Model model(args.at("--model"));
         Tokenizer tokenizer(args.at("--model"));
         if (args.contains("--device") && args.at("--device") != "cpu") {
-#if defined(GLM53_HIP)
+#if defined(GLM53_HIP) || defined(GLM53_CUDA)
             size_t used = 0;
             int device = std::stoi(args.at("--device"), &used);
             check(used == args.at("--device").size() && device >= 0, "invalid device");
-            model.set_projector(gpu_projector(device));
+            model.set_backend(gpu_backend(args.at("--model"), device));
 #else
-            throw std::runtime_error("rebuild with GLM53_HIP=ON for GPU offload");
+            throw std::runtime_error("rebuild with GLM53_HIP=ON or GLM53_CUDA=ON for GPU inference");
 #endif
         }
         auto name = args.contains("--name") ? args.at("--name") : "glm53";
@@ -97,8 +97,10 @@ int main(int argc, char **argv) {
         check(used == port_text.size() && port > 0 && port <= 65535, "invalid port");
         asio::io_context io;
         tcp::acceptor acceptor(io, {asio::ip::make_address(host), static_cast<unsigned short>(port)});
-        std::cerr << "GLM53 text reference server " << host << ':' << port
-                  << "; serialized requests, CPU attention/state\n";
+        std::cerr << "GLM53 text reference server " << host << ':' << port << "; serialized requests; "
+                  << (args.contains("--device") && args.at("--device") != "cpu" ? "GPU inference"
+                                                                                : "CPU reference")
+                  << '\n';
         uint64_t serial = 0;
         for (;;) {
             tcp::socket socket(io);

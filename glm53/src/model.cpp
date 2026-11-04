@@ -129,6 +129,8 @@ Model::Model(const fs::path &p, bool bf16) : weights_(p), bf16_(bf16), config(re
     states_.resize(config.layers);
 }
 void Model::reset() {
+    if (backend_)
+        backend_->reset();
     position_ = 0;
     states_.assign(config.layers, {});
 }
@@ -353,7 +355,7 @@ Vec Model::attention(int l, const Vec &x) {
     }
     s.last_topk = selected;
     check(!selected.empty(), "sparse MLA selected no visible keys");
-    const auto &kv = weights_.cached_linear(p + "kv_b_proj");
+    const auto &kv = weights_.cached_linear(p + "kv_b_proj", bf16_);
     check(kv.shape == std::vector<size_t>{size_t(c.heads) * (c.qdim + c.vdim), size_t(c.kvrank)},
           "MLA expansion geometry mismatch");
     Vec out(size_t(c.heads) * c.vdim);
@@ -398,10 +400,15 @@ Vec Model::attention(int l, const Vec &x) {
     return matvec(p + "o_proj", round(out));
 }
 Vec Model::step(int token) {
+    if (backend_) {
+        auto logits = backend_->step(token);
+        ++position_;
+        return logits;
+    }
     const auto &c = config;
     check(token >= 0 && token < c.vocab && position_ < size_t(c.max_context),
           "token/context outside model limits");
-    auto embed = weights_.row(weights_.prefix + "embed_tokens.weight", token, c.hidden);
+    auto embed = round(weights_.row(weights_.prefix + "embed_tokens.weight", token, c.hidden));
     Vec x(size_t(c.streams) * c.hidden);
     for (int h = 0; h < c.streams; ++h)
         std::copy(embed.begin(), embed.end(), x.begin() + size_t(h) * c.hidden);

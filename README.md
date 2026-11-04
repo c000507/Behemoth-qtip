@@ -2,7 +2,7 @@
 
 For GLM-5.3-Flash (original 320B MoE and the custom dense conversion), see the
 [standalone GLM text backend](glm53/README.md), including MLP-only NVFP4 conversion
-and its current GPU offload and validation limits.
+and CUDA/HIP inference kernels with their current validation limits.
 
 C++/HIP (ROCm, gfx1201) implementation of **QTIP** quantization ([arXiv 2406.11235](https://arxiv.org/abs/2406.11235),
 reference code [Cornell-RelaxML/qtip](https://github.com/Cornell-RelaxML/qtip)) for **Behemoth-R1-123B-v2**

@@ -62,10 +62,16 @@ class Weights {
     Tensor tensor(const std::string &) const;
     Vec row(const std::string &, int index, int width) const;
     Tensor linear(const std::string &) const;
-    const Tensor &cached_linear(const std::string &name) const {
-        if (!cached_.contains(name))
-            cached_[name] = linear(name);
-        return cached_.at(name);
+    const Tensor &cached_linear(const std::string &name, bool bf16 = false) const {
+        auto key = name + (bf16 ? "#bf16" : "#fp32");
+        if (!cached_.contains(key)) {
+            auto t = linear(name);
+            if (bf16)
+                for (float &v : t.data)
+                    v = float(behemoth::BFloat16(v));
+            cached_[key] = std::move(t);
+        }
+        return cached_.at(key);
     }
     const json &index() const { return index_; }
 };
@@ -79,6 +85,12 @@ struct Hyper {
 };
 Hyper hyper_pre(const Vec &, const Tensor &, const Vec &, const Vec &, const Config &);
 Vec hyper_post(const Vec &, const Vec &, const Hyper &, const Config &);
+class InferenceBackend {
+  public:
+    virtual ~InferenceBackend() = default;
+    virtual Vec step(int token) = 0;
+    virtual void reset() = 0;
+};
 class Model {
     Weights weights_;
     struct State {
@@ -90,6 +102,7 @@ class Model {
     size_t position_ = 0;
     bool bf16_;
     std::function<Vec(const Weights &, const std::string &, const Vec &)> projector_;
+    std::shared_ptr<InferenceBackend> backend_;
     Vec matvec(const std::string &, const Vec &);
     Vec norm(const Vec &, const std::string &, float);
     Vec mlp(int, const Vec &);
@@ -100,10 +113,16 @@ class Model {
     Config config;
     explicit Model(const fs::path &, bool bf16 = true);
     void set_projector(std::function<Vec(const Weights &, const std::string &, const Vec &)> p) {
+        check(!backend_, "cannot combine a full backend with a projection callback");
         projector_ = std::move(p);
+    }
+    void set_backend(std::shared_ptr<InferenceBackend> b) {
+        check(b && !projector_ && position_ == 0, "set a backend before processing tokens");
+        backend_ = std::move(b);
     }
     Vec step(int token);
     void reset();
 };
 std::function<Vec(const Weights &, const std::string &, const Vec &)> gpu_projector(int device);
+std::shared_ptr<InferenceBackend> gpu_backend(const fs::path &, int device);
 } // namespace glm53

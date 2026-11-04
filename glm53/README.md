@@ -5,11 +5,26 @@ supplied **80-layer dense conversion**. It implements their text architectures,
 MLP-only NVFP4 conversion, incremental generation, logit traces, and a small HTTP
 server. It does not use the Mistral-specific GQA engine in `runtime/`.
 
-This is an initial correctness and projection-offload implementation. Attention,
-mHC, routing, and recurrent state run on the CPU. Optional HIP offload streams
-linear weights to one GPU, widens them to BF16 there, and uses hipBLASLt with FP32
-accumulation. It is not a fully GPU-resident or tensor-parallel GLM engine. There
-are no full-size performance or model-quality results yet.
+The optional CUDA and HIP backends execute KDA, sparse MLA, mHC, routing,
+normalization, SwiGLU, and weight-decode GEMV on one GPU. Activations, KDA state,
+compressed MLA latents, and pooled index keys stay on the device. Large linear
+weights stream from the mmap-backed host checkpoint for each projection. Small
+constants and MLA expansion weights are retained on the GPU. The CPU schedules
+layers and experts, samples tokens, and reads logits; MoE routing transfers only
+the selected IDs and weights for expert loading.
+
+CUDA targets **RTX 2080 Ti / Turing (sm_75)** and newer NVIDIA devices. HIP targets
+**R9700 / gfx1201**, using wave32. Fused GEMV decodes BF16/F16/F32, channel/block
+FP8, or NVFP4 as it reads weights, with BF16 operand rounding and FP32 accumulation.
+BF16 values are stored as integer bits and converted in registers, so no BF16,
+FP8, or FP4 tensor-core instructions are needed on Turing. There is no FP16
+substitution that would narrow BF16's exponent range. The standalone GPU build
+requires the CUDA/HIP runtime, without a BLAS dependency.
+
+This is a first implementation: weights are not fully resident, execution is
+single-GPU, prefill replays tokens sequentially, and requests are serialized.
+Host-to-device weight transfers can dominate runtime. There are no full-size
+performance, GPU execution, or model-quality results yet.
 
 | Configuration | Original MoE | Supplied dense |
 |---|---:|---:|
@@ -42,7 +57,7 @@ cmake --build build-glm53 -j 8
 OMP_NUM_THREADS=8 ctest --test-dir build-glm53 --output-on-failure
 ```
 
-For projection offload, configure a separate build with ROCm and hipBLASLt:
+For R9700 inference, configure a separate ROCm build:
 
 ```sh
 cmake -S glm53 -B build-glm53-hip -G Ninja \
@@ -53,8 +68,27 @@ cmake --build build-glm53-hip -j 8
 ctest --test-dir build-glm53-hip --output-on-failure
 ```
 
-The HIP test compares source F32/BF16, channel FP8, block FP8, and NVFP4
-projections against independently widened CPU weights; it skips without a GPU.
+For RTX 2080 Ti inference, use a CUDA toolkit that still supports Turing (CUDA
+12.9 was used for compilation) and configure:
+
+```sh
+cmake -S glm53 -B build-glm53-cuda -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DGLM53_SERVER=ON -DGLM53_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build build-glm53-cuda -j 8
+ctest --test-dir build-glm53-cuda --output-on-failure
+```
+
+Choose one GPU provider per build. Both expose the same `--device 0` CLI/server
+interface; `--device cpu` (the default) uses the CPU reference. For other NVIDIA
+devices, set `CMAKE_CUDA_ARCHITECTURES` accordingly.
+
+The GPU tests compare F32/BF16 and FP8/NVFP4 projections with CPU widening, test
+KDA recurrence, check sparse top-k ordering, partial pools and causal tails, and
+compare tiny dense/MoE source and NVFP4 models over 33 tokens with state reset.
+They return CTest skip code 77 without an available GPU. Numerical BF16 model
+checks allow relative L2 error below 2% and maximum absolute logit error below
+0.03 per position; these thresholds are test criteria, not measured results.
 
 ## Inspect, convert, and generate
 
@@ -63,6 +97,7 @@ build-glm53/glm53 inspect --model /models/glm-source
 build-glm53/glm53 quantize --model /models/glm-source --out /models/glm-nvfp4
 build-glm53/glm53 generate --model /models/glm-nvfp4 --messages chat.json --steps 64
 build-glm53-hip/glm53 generate --model /models/glm-nvfp4 --messages chat.json --steps 64 --device 0
+build-glm53-cuda/glm53 generate --model /models/glm-nvfp4 --messages chat.json --steps 64 --device 0
 ```
 
 `chat.json` is an array, for example:
@@ -79,6 +114,7 @@ weights use a versioned `glm53_quant` marker and bundled safetensors shards.
 Non-MLP tensors retain their source dtype and bytes, including FP8 scales.
 Both original block-128 FP8 (`weight_scale_inv`) and converted per-output-channel
 FP8 (`weight_scale`) are supported. Execution widens scaled weights to BF16.
+GPU GEMV widens values in registers rather than expanding the entire MLP matrix.
 
 This converter uses nearest-value weight reconstruction; it has no calibration,
 teacher reconstruction, QAT, or GLM QTIP path. Conversion is not resumable. Keep
@@ -143,9 +179,13 @@ The oracle requires Transformers with `glm5_next` support (validated with
 absolute error below `6e-7`. Both real tokenizer families matched Hugging Face
 token IDs and Jinja rendering, including a 4,097-token input. These checks do not
 establish full-checkpoint accuracy, absence of repetition, long-context quality,
-or GPU correctness. HIP source compilation was checked for gfx1201; actual GPU
-execution and full-size checkpoints were unavailable in the implementation
-environment.
+or GPU correctness. The CUDA and HIP builds compile and link for sm_75 and
+gfx1201 respectively. CPU tests pass in GPU-enabled builds; the GPU tests skip
+because no device is present. Actual GPU execution and
+full-size checkpoints were unavailable in the implementation environment. The
+local CUDA 12.9 SDK needed the four standard `sinpi`/`cospi` declarations marked
+`noexcept` to match this environment's newer glibc; no SDK changes are shipped
+in this repository.
 
 The GLM CPU correctness suite also passes with address/undefined sanitizers;
 the existing runtime's core and structured-output regression suites pass after
