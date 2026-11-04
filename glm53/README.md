@@ -1,5 +1,9 @@
 # GLM-5.3-Flash text backend
 
+The [shared CUDA CLI/server](../runtime/cuda/README.md) also loads these GLM
+models and Llama/Mistral-layout Behemoth QTIP checkpoints through the same entry
+points. The standalone GLM build below remains available for HIP and CUDA.
+
 This standalone C++ backend loads the original **320B MoE GLM-5.3-Flash** and the
 supplied **80-layer dense conversion**. It implements their text architectures,
 MLP-only NVFP4 conversion, incremental generation, logit traces, and a small HTTP
@@ -23,8 +27,8 @@ requires the CUDA/HIP runtime, without a BLAS dependency.
 
 This is a first implementation: weights are not fully resident, execution is
 single-GPU, prefill replays tokens sequentially, and requests are serialized.
-Host-to-device weight transfers can dominate runtime. There are no full-size
-performance, GPU execution, or model-quality results yet.
+Host-to-device weight transfers can dominate runtime. Full-size GLM performance
+and model quality have not been measured.
 
 | Configuration | Original MoE | Supplied dense |
 |---|---:|---:|
@@ -179,10 +183,11 @@ The oracle requires Transformers with `glm5_next` support (validated with
 absolute error below `6e-7`. Both real tokenizer families matched Hugging Face
 token IDs and Jinja rendering, including a 4,097-token input. These checks do not
 establish full-checkpoint accuracy, absence of repetition, long-context quality,
-or GPU correctness. The CUDA and HIP builds compile and link for sm_75 and
-gfx1201 respectively. CPU tests pass in GPU-enabled builds; the GPU tests skip
-because no device is present. Actual GPU execution and
-full-size checkpoints were unavailable in the implementation environment. The
+or full-checkpoint GPU correctness. The CUDA and HIP builds compile and link for
+sm_75 and gfx1201 respectively. The CUDA kernel tests, tiny dense/MoE source and
+NVFP4 model comparisons, and state-reset tests now also pass on an A100 SXM 80GB
+with CUDA 12.4. The shared CUDA CLI/server dispatch tests pass on that device.
+Full-size GLM checkpoints and execution on Turing/R9700 remain unvalidated. The
 local CUDA 12.9 SDK needed the four standard `sinpi`/`cospi` declarations marked
 `noexcept` to match this environment's newer glibc; no SDK changes are shipped
 in this repository.

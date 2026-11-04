@@ -2,7 +2,11 @@
 // not reuse Behemoth's fixed-size GQA scheduler/cache or its 32768-token sampler.
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
+#if defined(BEHEMOTH_QTIP_CUDA)
+#include "behemoth/cuda.hpp"
+#else
 #include "glm53.hpp"
+#endif
 #include <algorithm>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -15,7 +19,13 @@
 namespace asio = boost::asio;
 namespace http = boost::beast::http;
 using tcp = asio::ip::tcp;
+#if defined(BEHEMOTH_QTIP_CUDA)
+using namespace behemoth::cuda_runtime;
+constexpr bool behemoth_cuda = true;
+#else
 using namespace glm53;
+constexpr bool behemoth_cuda = false;
+#endif
 namespace {
 int sample(const Vec &logits, float temperature, int topk, double topp, std::mt19937_64 &rng) {
     for (float x : logits)
@@ -66,17 +76,31 @@ int main(int argc, char **argv) {
         std::map<std::string, std::string> args;
         for (int i = 1; i < argc; i += 2) {
             if (std::string(argv[i]) == "--help") {
-                std::cout << "glm53_server --model DIR [--host 127.0.0.1] [--port 8080] [--name glm53] "
-                             "[--device cpu|0]\n";
+                std::cout << (behemoth_cuda ? "behemoth_cuda_server" : "glm53_server")
+                          << " --model DIR [--host 127.0.0.1] [--port 8080] [--name MODEL] [--device 0]"
+                          << (behemoth_cuda ? " [--context 4096]\n" : "\n");
                 return 0;
             }
             check(i + 1 < argc && args.emplace(argv[i], argv[i + 1]).second, "missing/duplicate argument");
         }
         for (const auto &[k, v] : args) {
             (void)v;
-            check(k == "--model" || k == "--host" || k == "--port" || k == "--name" || k == "--device",
+            check(k == "--model" || k == "--host" || k == "--port" || k == "--name" || k == "--device" ||
+                      (behemoth_cuda && k == "--context"),
                   "unknown option " + k);
         }
+#if defined(BEHEMOTH_QTIP_CUDA)
+        auto integer = [&](const char *key, int fallback) {
+            if (!args.contains(key))
+                return fallback;
+            size_t used = 0;
+            int value = std::stoi(args.at(key), &used);
+            check(used == args.at(key).size(), "invalid integer option");
+            return value;
+        };
+        Model model(args.at("--model"), integer("--device", 0), integer("--context", 4096));
+        Tokenizer tokenizer(args.at("--model"));
+#else
         Model model(args.at("--model"));
         Tokenizer tokenizer(args.at("--model"));
         if (args.contains("--device") && args.at("--device") != "cpu") {
@@ -89,7 +113,8 @@ int main(int argc, char **argv) {
             throw std::runtime_error("rebuild with GLM53_HIP=ON or GLM53_CUDA=ON for GPU inference");
 #endif
         }
-        auto name = args.contains("--name") ? args.at("--name") : "glm53";
+#endif
+        auto name = args.contains("--name") ? args.at("--name") : behemoth_cuda ? "behemoth-qtip" : "glm53";
         auto host = args.contains("--host") ? args.at("--host") : "127.0.0.1";
         size_t used = 0;
         std::string port_text = args.contains("--port") ? args.at("--port") : "8080";
@@ -97,9 +122,11 @@ int main(int argc, char **argv) {
         check(used == port_text.size() && port > 0 && port <= 65535, "invalid port");
         asio::io_context io;
         tcp::acceptor acceptor(io, {asio::ip::make_address(host), static_cast<unsigned short>(port)});
-        std::cerr << "GLM53 text reference server " << host << ':' << port << "; serialized requests; "
-                  << (args.contains("--device") && args.at("--device") != "cpu" ? "GPU inference"
-                                                                                : "CPU reference")
+        std::cerr << (behemoth_cuda ? "Behemoth CUDA server " : "GLM53 server ") << host << ':' << port
+                  << "; serialized requests; "
+                  << (behemoth_cuda || (args.contains("--device") && args.at("--device") != "cpu")
+                          ? "GPU inference"
+                          : "CPU reference")
                   << '\n';
         uint64_t serial = 0;
         for (;;) {
@@ -193,6 +220,7 @@ int main(int argc, char **argv) {
                     (void)reasoning.append("<think>");
                 std::string answer, thoughts;
                 int count = 0;
+                [[maybe_unused]] bool first_piece = true;
                 std::string finish = "length";
                 auto emit = [&](const std::string &s, bool end = false) {
                     for (const auto &p : reasoning.append(s, end)) {
@@ -213,7 +241,11 @@ int main(int argc, char **argv) {
                         finish = "stop";
                         break;
                     }
+#if defined(BEHEMOTH_QTIP_CUDA)
+                    emit(text.append(tokenizer.piece(token, first_piece, true)));
+#else
                     emit(text.append(tokenizer.decode({token}, true)));
+#endif
                     if (text.stopped()) {
                         finish = "stop";
                         break;

@@ -1,0 +1,46 @@
+#pragma once
+#include "tokenizer.hpp"
+#include <nlohmann/json.hpp>
+namespace glm53 {
+class Tokenizer;
+class InferenceBackend;
+} // namespace glm53
+namespace behemoth::cuda_runtime {
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+using Vec = std::vector<float>;
+inline void check(bool ok, const std::string &text) {
+    if (!ok)
+        throw std::runtime_error(text);
+}
+class Tokenizer {
+    std::unique_ptr<behemoth::Tokenizer> tokenizer_;
+    std::unique_ptr<glm53::Tokenizer> bpe_;
+    json settings_;
+    std::map<int, std::string> added_;
+
+  public:
+    explicit Tokenizer(const fs::path &);
+    ~Tokenizer();
+    std::vector<int> encode(const std::string &text) const;
+    std::string decode(const std::vector<int> &, bool special = false) const;
+    std::string piece(int, bool &first, bool special = false) const;
+    std::string chat(const json &) const;
+};
+class Model {
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<glm53::InferenceBackend> backend_;
+    int position_ = 0;
+
+  public:
+    struct Config {
+        int vocab = 32768, max_context;
+        std::vector<int> eos{2};
+    } config;
+    explicit Model(const fs::path &, int device = 0, int context = 4096);
+    ~Model();
+    Vec step(int token);
+    void reset();
+};
+} // namespace behemoth::cuda_runtime

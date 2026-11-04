@@ -47,6 +47,10 @@ Pipeline:
 
 ## Inference runtime (`runtime/`)
 
+For NVIDIA GPUs, the [shared CUDA engine](runtime/cuda/README.md) serves both the
+Llama/Mistral-layout Behemoth QTIP checkpoint and GLM-5.3-Flash models, selecting
+the architecture from `config.json`.
+
 `runtime/` is the Behemoth C++/HIP inference runtime and OpenAI-compatible server (`behemoth_server`), imported
 with its history from the AQLM codebase. It serves both the AQLM 1x16 model and QTIP 2-bit models written by
 `qtip_quant` (detected from `quip_params` in `config.json`): trellis-decode GEMV/WMMA kernels, Hadamard
