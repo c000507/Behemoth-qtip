@@ -38,6 +38,9 @@ static void usage() {
       "                      normalized MSE of the layer output)\n"
       "  --kl-tokens N        probe document length for the metric (default 512)\n"
       "  --adaptive-next-input original|quantized  source of the next layer's input activations\n"
+      "  --nvfp4-calibrate on|off   Hessian-aware LDLQ rounding of NVFP4 fallback layers (default on)\n"
+      "  --nvfp4-scale-search on|off  per-16-block E4M3 scale search for NVFP4 layers (default on)\n"
+      "  --nvfp4-compare      also evaluate naive / search-only / calibrated NVFP4 and record their metrics\n"
       "                      (default original: Hessians/KL use original-model activations, as the\n"
       "                      classic pipeline; quantized: chain flows through the chosen layers)\n");
 }
@@ -78,6 +81,11 @@ static Options parse(int argc, char** argv) {
     else if (a == "--kl-metric") o.kl_metric = next();
     else if (a == "--kl-tokens") o.kl_tokens = std::stoi(next());
     else if (a == "--adaptive-next-input") o.adaptive_next_input = next();
+    else if (a == "--nvfp4-calibrate" || a == "--nvfp4-scale-search") {
+      const std::string v = next();
+      QCHECK(v == "on" || v == "off", a + " expects on|off");
+      (a == "--nvfp4-calibrate" ? o.nvfp4_calibrate : o.nvfp4_scale_search) = v == "on";
+    } else if (a == "--nvfp4-compare") o.nvfp4_compare = true;
     else if (a == "--layers") {
       std::string v = next();
       auto c = v.find(':');

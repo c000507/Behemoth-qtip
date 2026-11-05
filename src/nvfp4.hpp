@@ -48,6 +48,9 @@ Nvfp4Tensor nvfp4_quantize(const float* w, int m, int n);
 // dequantize_nvfp4 / the GPU gemv that widens in registers with bf16 rounding).
 std::vector<float> nvfp4_dequantize(const Nvfp4Tensor& t);
 
+// Proxy error tr((W-What) H (W-What)^T) / (rows) of a dequantized matrix (host, for tests/reporting).
+double nvfp4_proxy_error(const float* w, const float* what, int m, int n, const float* H);
+
 // Decode one value (for tests / loaders).
 inline float nvfp4_level(uint8_t code) {
   constexpr float levels[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};

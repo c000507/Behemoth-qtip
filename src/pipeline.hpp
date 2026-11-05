@@ -46,6 +46,9 @@ struct Options {
   std::string kl_metric = "lmkl";          // lmkl (mean token KL of next-token logits) | mse (normalized)
   int kl_tokens = 512;                     // probe document length for the metric
   std::string adaptive_next_input = "original";  // original | quantized
+  bool nvfp4_calibrate = true;             // Hessian-aware (LDLQ-style) rounding of NVFP4 fallback layers
+  bool nvfp4_scale_search = true;          // per-16-block E4M3 scale search for NVFP4 fallback layers
+  bool nvfp4_compare = false;              // also measure the naive / search-only / calibrated variants (report only)
   long logit_tile = 0;                     // lm_head vocab rows per logits GEMM (0 = auto, ~256 MB fp32 tile)
   QuantOpts q;
 };

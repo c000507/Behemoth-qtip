@@ -61,4 +61,24 @@ std::vector<float> nvfp4_dequantize(const Nvfp4Tensor& t) {
   return out;
 }
 
+double nvfp4_proxy_error(const float* w, const float* what, int m, int n, const float* H) {
+  // tr(E H E^T) / m with E = w - what; H null => identity
+  double total = 0;
+#pragma omp parallel for reduction(+ : total) schedule(static)
+  for (int r = 0; r < m; ++r) {
+    std::vector<double> e(size_t(n), 0.0);
+    for (int j = 0; j < n; ++j) e[size_t(j)] = double(w[size_t(r) * n + j]) - what[size_t(r) * n + j];
+    if (!H) {
+      for (int j = 0; j < n; ++j) total += e[size_t(j)] * e[size_t(j)];
+      continue;
+    }
+    for (int i = 0; i < n; ++i) {
+      double acc = 0;
+      for (int j = 0; j < n; ++j) acc += double(H[size_t(i) * n + j]) * e[size_t(j)];
+      total += e[size_t(i)] * acc;
+    }
+  }
+  return total / m;
+}
+
 }  // namespace qtip

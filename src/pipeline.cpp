@@ -1,6 +1,7 @@
 // Pipeline implementation, extracted from main.cpp; see pipeline.hpp. The adaptive mode adds per-layer
 // QTIP-vs-NVFP4 selection (see docs/ADAPTIVE.md for the metric definitions).
 #include "pipeline.hpp"
+#include "nvfp4_gpu.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <tuple>
 
 namespace qtip {
 namespace fs = std::filesystem;
@@ -584,6 +586,7 @@ void Pipeline::adaptive_report_write_locked() {
   report_["threshold"] = o_.kl_threshold;
   report_["kl_tokens"] = o_.kl_tokens;
   report_["next_input"] = o_.adaptive_next_input;
+  report_["nvfp4"] = {{"calibrate", o_.nvfp4_calibrate}, {"scale_search", o_.nvfp4_scale_search}};
   report_["kv_format"] = o_.fp8_kv ? "fp8" : "qtip";
   report_["layers"] = layers;
   std::string p = o_.out + "/adaptive_report.json", tmp = p + ".tmp";
@@ -613,7 +616,12 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
   QuantOpts qo = o_.q;
   qo.want_hatW = true;
   json jl = json::object();
-  auto outs = run_qtip_groups(L, take_hessians(L), LH, qo, jl);
+  auto Hs = take_hessians(L);
+  if (Hs.empty() && fs::exists(hess_path(L))) Hs = read_hess(hess_path(L));  // resumed / seeded work dir
+  // the NVFP4 fallback needs the Hessians after the QTIP pass consumed them: keep a copy (~1 GB at Llama-8B size)
+  std::vector<std::vector<float>> Hnv;
+  if (o_.nvfp4_calibrate || o_.nvfp4_scale_search) Hnv = Hs;
+  auto outs = run_qtip_groups(L, std::move(Hs), LH, qo, jl);
   double t_qtip = now_s() - t_layer;
   // 2) metric vs the original layer on the probe document
   eval_runners_create(dev);
@@ -637,11 +645,15 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
   std::vector<Nvfp4Tensor> nvs(kNumLin);
   std::vector<uint16_t> y_nv;
   double m_nv = -1;
+  json nv_info = json::object();
   if (nv) {
+    // original weights as fp32 (all linears), then one NVFP4 pass per Hessian group
+    std::vector<std::vector<float>> Wf(kNumLin);
     for (int li = 0; li < kNumLin; ++li) {
       if (o_.fp8_kv && (li == LK || li == LV)) continue;
       const int m = LH->out_dim[li], n = LH->in_dim[li];
-      std::vector<float> W(size_t(m) * n);
+      std::vector<float>& W = Wf[size_t(li)];
+      W.resize(size_t(m) * n);
       for (long i = 0; i < m; ++i) {
         if (LH->bf16) {
           const uint16_t* row = reinterpret_cast<const uint16_t*>(LH->w[size_t(li)].data()) + size_t(i) * n;
@@ -652,8 +664,59 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
           for (long j = 0; j < n; ++j) W[size_t(i) * n + j] = fp8e4m3_to_f32(row[j]) * sc;
         }
       }
-      nvs[size_t(li)] = nvfp4_quantize(W.data(), m, n);
     }
+    struct Grp {
+      int hess;
+      std::vector<int> lins;
+    };
+    std::vector<Grp> groups = {{0, {LQ, LK, LV}}, {1, {LO}}, {2, {LGate, LUp}}, {3, {LDown}}};
+    if (o_.fp8_kv) groups[0].lins = {LQ};
+    hipStream_t ns = nullptr;
+    HIP_CHECK(hipStreamCreateWithFlags(&ns, hipStreamNonBlocking));
+    auto quantize_nv = [&](bool calibrate, bool search, bool* used_h) {
+      std::vector<Nvfp4Tensor> res(kNumLin);
+      bool all_cal = true;
+      for (const Grp& G : groups) {
+        std::vector<const float*> ws;
+        std::vector<int> ms;
+        for (int li : G.lins) ws.push_back(Wf[size_t(li)].data()), ms.push_back(LH->out_dim[li]);
+        const int n = LH->in_dim[G.lins[0]];
+        const float* Hp = Hnv.size() == 4 && long(Hnv[size_t(G.hess)].size()) == long(n) * n ? Hnv[size_t(G.hess)].data() : nullptr;
+        if (!Hp && (calibrate || search))
+          logf("WARNING layer %d NVFP4 group %s: Hessian unavailable, no calibration (scale search uses uniform weights)", L,
+               kHessName[G.hess]);
+        Nvfp4Opts no;
+        no.calibrate = calibrate;
+        no.scale_search = search;
+        no.sigma_reg = o_.q.sigma_reg;
+        bool cal = false;
+        auto t = nvfp4_quantize_group(ns, ws, ms, n, Hp, no, &cal);
+        all_cal = all_cal && (cal || !calibrate);
+        for (size_t k = 0; k < G.lins.size(); ++k) res[size_t(G.lins[k])] = std::move(t[k]);
+      }
+      if (used_h) *used_h = all_cal;
+      return res;
+    };
+    double t_nv0 = now_s();
+    if (o_.nvfp4_compare) {
+      json variants = json::object();
+      for (auto [name, cal, srch] : {std::tuple<const char*, bool, bool>{"naive", false, false}, {"scale_search", false, true},
+                                     {"calibrated", true, false}, {"calibrated_scale_search", true, true}}) {
+        double tv = now_s();
+        auto vn = quantize_nv(cal, srch, nullptr);
+        double qs = now_s() - tv;
+        double mv = metric_of(adaptive_layer_forward(LH, nullptr, &vn));
+        logf("adaptive layer %d: NVFP4 variant %-24s metric %.6g (quantize %.1fs)", L, name, mv, qs);
+        variants[name] = {{o_.kl_metric == "mse" ? "mse" : "kl", mv}, {"seconds", qs}};
+      }
+      nv_info["variants"] = variants;
+    }
+    bool used_h = false;
+    nvs = quantize_nv(o_.nvfp4_calibrate, o_.nvfp4_scale_search, &used_h);
+    nv_info["calibrate"] = o_.nvfp4_calibrate && used_h;
+    nv_info["scale_search"] = o_.nvfp4_scale_search;
+    nv_info["quantize_seconds"] = now_s() - t_nv0;
+    HIP_CHECK(hipStreamDestroy(ns));
     y_nv = adaptive_layer_forward(LH, nullptr, &nvs);
     m_nv = metric_of(y_nv);
     logf("adaptive layer %d: metric %s nvfp4 %.6g (qtip %.6g exceeded threshold %.6g)", L, o_.kl_metric.c_str(), m_nv,
@@ -672,6 +735,7 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
                     {o_.kl_metric == "mse" ? "mse_nvfp4" : "kl_nvfp4", nv ? json(m_nv) : json(nullptr)},
                     {"qtip_seconds", t_qtip},
                     {"eval_seconds", secs - t_qtip}};
+  if (nv) jl["adaptive"]["nvfp4"] = nv_info;
   // chosen weights + next probe input must be visible before the layer is marked done (other workers
   // replay the layer on the calibration activations as soon as done_ contains it)
   {
@@ -940,7 +1004,8 @@ void Pipeline::assemble() {
                                    {"metric", o_.kl_metric},
                                    {"threshold", o_.kl_threshold},
                                    {"kl_tokens", o_.kl_tokens},
-                                   {"next_input", o_.adaptive_next_input}};
+                                   {"next_input", o_.adaptive_next_input},
+                                   {"nvfp4", {{"calibrate", o_.nvfp4_calibrate}, {"scale_search", o_.nvfp4_scale_search}}}};
   }
   {
     std::ofstream f(o_.out + "/config.json");
