@@ -101,12 +101,12 @@ void linear_test(cg::Stream s, int out, int in, bool rz) {
         }
     }
 }
-void fp8_test(cg::Stream s) {
+void fp8_test(cg::Stream s, int in = 96, int rows = 64) {
     behemoth::qtip::HostLinear h;
-    h.in = 96;
-    h.out = 64;
-    h.fp8.resize(96 * 64);
-    h.fp8_scale.resize(64);
+    h.in = in;
+    h.out = rows;
+    h.fp8.resize(size_t(in) * rows);
+    h.fp8_scale.resize(rows);
     std::mt19937 gen(18);
     for (auto &v : h.fp8) {
         v = uint8_t(gen());
@@ -115,7 +115,7 @@ void fp8_test(cg::Stream s) {
     }
     for (auto &v : h.fp8_scale)
         v = float(1 + gen() % 7) / 4096;
-    std::vector<float> x(96);
+    std::vector<float> x(in);
     for (auto &v : x)
         v = float(BFloat16(float(int(gen() % 31) - 15) / 32));
     auto expected = behemoth::qtip::reference_forward(h, x, true);
@@ -127,15 +127,15 @@ void fp8_test(cg::Stream s) {
     put(w, h.fp8, s);
     put(scales, h.fp8_scale, s);
     put(input, bits(x), s);
-    out.ensure(64, s);
-    result.ensure(64, s);
-    cu::fp8_forward(w, scales, input, out, 96, 64, s);
-    cg::to_float(out, result, 64, s);
+    out.ensure(rows, s);
+    result.ensure(rows, s);
+    cu::fp8_forward(w, scales, input, out, in, rows, s);
+    cg::to_float(out, result, rows, s);
     cg::Pinned<float> host;
-    host.ensure(64);
-    cg::checked(cg::d2h(host.p, result, 64 * 4, s), "read FP8");
+    host.ensure(rows);
+    cg::checked(cg::d2h(host.p, result, size_t(rows) * 4, s), "read FP8");
     cg::checked(cg::sync(s), "finish FP8 test");
-    error({host.p, host.p + 64}, expected, "FP8 output-channel scaling");
+    error({host.p, host.p + rows}, expected, "FP8 output-channel scaling");
 }
 void nvfp4_test(cg::Stream s) {
     // Adaptive mixed-format checkpoints: NVFP4 projection (E2M1 pairs, E4M3 block scales over 16
@@ -302,6 +302,7 @@ int main(int argc, char **argv) {
                 linear_test(s, out, in, rz);
         fp8_test(s);
         nvfp4_test(s);
+        fp8_test(s, 12288, 512);
         attention_test(s);
         cg::checked(cg::stream_destroy(s), "test stream shutdown");
         std::cout << "PASS native CUDA QTIP, Hadamard orientations, FP8 scales, NVFP4 and causal GQA\n";

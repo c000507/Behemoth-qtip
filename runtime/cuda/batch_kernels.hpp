@@ -9,7 +9,8 @@ void bf16_multiply_batch(const B16 *weight, const B16 *input, float *out, int in
 void fp8_multiply_batch(const uint8_t *weight, const float *scale, const B16 *input, B16 *out, int in,
                         int rows, int tokens, Stream, float *workspace = nullptr);
 void embedding_batch(const B16 *, B16 *, const int *tokens, int rows, int hidden, Stream);
-void norm_batch(const B16 *, const float *, B16 *, int rows, int hidden, float epsilon, Stream);
+void norm_batch(const B16 *, const float *, B16 *, int rows, int hidden, float epsilon, Stream,
+                bool resident = true);
 void rope_batch(B16 *, B16 *, const int *positions, int rows, int sequence, int qheads, int kvheads, int dim,
                 float theta, Stream, int query_stride = 0);
 void cache_batch(const B16 *, const B16 *, B16 *, B16 *, const int *positions, int batch, int sequence,

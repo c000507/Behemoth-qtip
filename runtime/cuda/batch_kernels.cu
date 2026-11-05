@@ -232,6 +232,36 @@ __global__ void rms(const B16 *x, const float *weight, B16 *out, int width, floa
     for (int i = tid; i < width; i += 256)
         out[i] = b16(f32(x[i]) * inv * weight[i]);
 }
+template <int Width>
+__global__ void rms_resident(const B16 *x, const float *weight, B16 *out, float epsilon) {
+    __shared__ float red[8];
+    int tid = threadIdx.x;
+    x += size_t(blockIdx.x) * Width;
+    out += size_t(blockIdx.x) * Width;
+    float values[Width / 256];
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        values[j] = f32(x[tid + j * 256]);
+    // Preserve the original per-thread summation order and reduction tree.
+    float sum = 0;
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        sum += values[j] * values[j];
+    sum = warp_sum(sum);
+    if (!(tid & 31))
+        red[tid / 32] = sum;
+    __syncthreads();
+    sum = tid < 8 ? red[tid] : 0;
+    if (tid < 32)
+        sum = warp_sum(sum);
+    if (!tid)
+        red[0] = sum;
+    __syncthreads();
+    float inv = rsqrtf(red[0] / Width + epsilon);
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        out[tid + j * 256] = b16(values[j] * inv * weight[tid + j * 256]);
+}
 __global__ void rotate(B16 *q, B16 *k, const int *positions, int sequence, int qh, int kh, int dim,
                        float theta, int qstride) {
     int h = blockIdx.x, row = blockIdx.y, d = threadIdx.x;
@@ -574,8 +604,12 @@ void embedding_batch(const B16 *w, B16 *x, const int *ids, int rows, int width, 
     embed<<<(rows * width + 255) / 256, 256, 0, s>>>(w, x, ids, rows, width);
     launch_check();
 }
-void norm_batch(const B16 *x, const float *w, B16 *y, int rows, int width, float eps, Stream s) {
-    rms<<<rows, 256, 0, s>>>(x, w, y, width, eps);
+void norm_batch(const B16 *x, const float *w, B16 *y, int rows, int width, float eps, Stream s,
+                bool resident) {
+    if (resident && rows <= 16 && width == 12288)
+        rms_resident<12288><<<rows, 256, 0, s>>>(x, w, y, eps);
+    else
+        rms<<<rows, 256, 0, s>>>(x, w, y, width, eps);
     launch_check();
 }
 void rope_batch(B16 *q, B16 *k, const int *positions, int rows, int sequence, int qh, int kh, int dim,

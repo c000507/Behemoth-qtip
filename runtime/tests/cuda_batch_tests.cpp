@@ -228,6 +228,39 @@ void dense_test(cg::Stream s, int tokens) {
     cu::fp8_multiply_batch(low, scale, input, y, in, rows, tokens, s, partials);
     compare(read(y.p, expected.size(), s), expected, "FP8 split-K post-accumulation scale");
 }
+void norm_test(cg::Stream s, int batch) {
+    constexpr int width = 12288;
+    constexpr float epsilon = 2e-5f;
+    std::mt19937 gen(819);
+    std::normal_distribution<float> normal;
+    std::vector<float> x(size_t(batch) * width), weights(width), expected(x.size());
+    for (auto &v : x)
+        v = float(BFloat16(normal(gen)));
+    std::fill(x.begin(), x.begin() + width, 0.f);
+    for (auto &v : weights)
+        v = 1.f + normal(gen) * .03f;
+    for (int b = 0; b < batch; ++b) {
+        double squares = 0;
+        for (int i = 0; i < width; ++i)
+            squares += double(x[b * width + i]) * x[b * width + i];
+        double inv = 1 / std::sqrt(squares / width + epsilon);
+        for (int i = 0; i < width; ++i)
+            expected[b * width + i] = float(BFloat16(float(x[b * width + i] * inv * weights[i])));
+    }
+    cg::Buffer<uint16_t> input, output;
+    cg::Buffer<float> scale;
+    put(input, bits(x), s);
+    put(scale, weights, s);
+    output.ensure(x.size(), s);
+    cu::norm_batch(input, scale, output, batch, width, epsilon, s, false);
+    auto baseline = read(output.p, x.size(), s);
+    cu::norm_batch(input, scale, output, batch, width, epsilon, s, true);
+    require(baseline == read(output.p, x.size(), s),
+            "Resident RMS must match the original reduction exactly");
+    cu::norm_batch(input, scale, input, batch, width, epsilon, s, true);
+    require(baseline == read(input.p, x.size(), s), "Resident RMS must support in-place output");
+    compare(baseline, expected, "RMS normalization and epsilon", .003, .02);
+}
 void attention_test(cg::Stream s, int context = 17, int qh = 6, int kh = 2) {
     constexpr int batch = 3, dim = 128;
     std::vector<int> positions = context == 17 ? std::vector<int>{0, 3, 7} : std::vector<int>{128, 137, 256};
@@ -377,6 +410,8 @@ int main() {
             qtip_test(s, 96, 128, tokens);
         for (int tokens : {8, 17, 65})
             dense_test(s, tokens);
+        norm_test(s, 1);
+        norm_test(s, 8);
         attention_test(s);
         attention_test(s, 257, 24, 2);
         attention_test(s, 8193, 24, 2);

@@ -170,6 +170,7 @@ __global__ void fp8_gemv(const uint8_t *w, const float *scales, const B16 *x, B1
     int r = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
     float sum = 0;
     if (r < rows)
+#pragma unroll 8
         for (int c = lane; c < in; c += 32)
             sum += fp8(w[size_t(r) * in + c]) * f32(x[c]);
     sum = warp_sum(sum);
