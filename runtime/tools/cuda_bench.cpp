@@ -1,6 +1,7 @@
 #include "behemoth/cuda.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 using namespace behemoth::cuda_runtime;
@@ -55,17 +56,21 @@ int main(int argc, char **argv) {
             std::cerr << "Prefill seconds " << std::chrono::duration<double>(prefill_end - start).count()
                       << "; decode " << decode << " steps\n";
             std::vector<int> ids(batch);
+            std::vector<double> step_seconds;
             for (int step = 0; step < decode; ++step) {
+                auto step_start = std::chrono::steady_clock::now();
                 for (int b = 0; b < batch; ++b)
                     ids[b] = int(std::max_element(logits[b].begin(), logits[b].end()) - logits[b].begin());
                 logits = model.step_batch(ids);
+                step_seconds.push_back(
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start).count());
                 if ((step + 1) % 32 == 0)
                     std::cerr << "decode " << step + 1 << '/' << decode << '\n';
             }
             auto end = std::chrono::steady_clock::now();
             double prefill_seconds = std::chrono::duration<double>(prefill_end - start).count();
             double decode_seconds = std::chrono::duration<double>(end - prefill_end).count();
-            return json{{"tp", tp},
+            json result{{"tp", tp},
                         {"batch", batch},
                         {"prompt_tokens_per_sequence", prompt},
                         {"decode_tokens_per_sequence", decode},
@@ -75,6 +80,15 @@ int main(int argc, char **argv) {
                         {"decode_tokens_per_second", double(batch) * decode / decode_seconds},
                         {"ignore_eos", true},
                         {"kv_dtype", "BF16"}};
+            auto sorted = step_seconds;
+            std::sort(sorted.begin(), sorted.end());
+            result["decode_step_seconds_summary"] = {{"min", sorted.front()},
+                                                     {"median", sorted[sorted.size() / 2]},
+                                                     {"p95", sorted[(sorted.size() - 1) * 95 / 100]},
+                                                     {"max", sorted.back()}};
+            if (std::getenv("BEHEMOTH_CUDA_BENCH_STEP_TIMES"))
+                result["decode_step_seconds"] = step_seconds;
+            return result;
         };
         for (int i = 0; i < warmup; ++i) {
             std::cerr << "Warmup " << i + 1 << '/' << warmup << '\n';

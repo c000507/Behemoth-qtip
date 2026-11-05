@@ -355,6 +355,100 @@ __global__ void tensor_scores(const B16 *q, const B16 *k, float *out, const int 
     }
 #endif
 }
+__global__ void register_scores(const B16 *q, const B16 *k, float *out, const int *positions, int context,
+                                int qh, int kh, int stride) {
+#if __CUDA_ARCH__ >= 800
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int head = blockIdx.y % kh, batch = blockIdx.y / kh, group = qh / kh;
+    int start = blockIdx.x * 64 + warp * 8;
+    int g = lane / 4, d = (lane % 4) * 2;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int part = 0; part < 128; part += 16) {
+        const B16 *a = q + size_t(batch) * stride + (head * group + g) * 128 + part + d;
+        uint32_t a0 = g < group ? *reinterpret_cast<const uint32_t *>(a) : 0;
+        uint32_t a1 = g + 8 < group ? *reinterpret_cast<const uint32_t *>(a + 8 * 128) : 0;
+        uint32_t a2 = g < group ? *reinterpret_cast<const uint32_t *>(a + 8) : 0;
+        uint32_t a3 = g + 8 < group ? *reinterpret_cast<const uint32_t *>(a + 8 * 128 + 8) : 0;
+        int token = start + g;
+        size_t at = ((size_t(batch) * context + token) * kh + head) * 128 + part + d;
+        bool valid = token < context && token <= positions[batch];
+        uint32_t b0 = valid ? *reinterpret_cast<const uint32_t *>(k + at) : 0;
+        uint32_t b1 = valid ? *reinterpret_cast<const uint32_t *>(k + at + 8) : 0;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    }
+    int token = start + d;
+    size_t at = (size_t(batch) * qh + head * group + g) * context + token;
+    if (g < group && token < context && token <= positions[batch])
+        out[at] = c0 * rsqrtf(128.f);
+    if (g < group && token + 1 < context && token + 1 <= positions[batch])
+        out[at + 1] = c1 * rsqrtf(128.f);
+    if (g + 8 < group && token < context && token <= positions[batch])
+        out[at + 8 * context] = c2 * rsqrtf(128.f);
+    if (g + 8 < group && token + 1 < context && token + 1 <= positions[batch])
+        out[at + 8 * context + 1] = c3 * rsqrtf(128.f);
+#endif
+}
+[[maybe_unused]] __device__ uint32_t probability_pair(const float *p, int head, int group, int token,
+                                                      int last, int context) {
+    uint32_t lo = head < group && token <= last && token < context
+                      ? __float_as_uint(p[size_t(head) * context + token]) >> 16
+                      : 0;
+    uint32_t hi = head < group && token + 1 <= last && token + 1 < context
+                      ? __float_as_uint(p[size_t(head) * context + token + 1]) >> 16
+                      : 0;
+    return lo | hi << 16;
+}
+[[maybe_unused]] __device__ uint32_t value_pair(const B16 *v, int token, int last, int context, int kh,
+                                                int column) {
+    uint32_t lo = token <= last && token < context ? v[size_t(token) * kh * 128 + column] : 0;
+    uint32_t hi = token + 1 <= last && token + 1 < context ? v[size_t(token + 1) * kh * 128 + column] : 0;
+    return lo | hi << 16;
+}
+__global__ void register_values(const B16 *v, const float *p, float *out, const int *positions, int context,
+                                int qh, int kh) {
+#if __CUDA_ARCH__ >= 800
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int head = blockIdx.y % kh, batch = blockIdx.y / kh, group = qh / kh;
+    int start = blockIdx.x * 128, g = lane / 4, d = (lane % 4) * 2;
+    int last = positions[batch];
+    p += (size_t(batch) * qh + head * group) * context;
+    v += (size_t(batch) * context * kh + head) * 128;
+    float c[2][4] = {};
+    for (int part = 0; part < 128; part += 16) {
+        int token = start + part + d;
+        uint32_t a0 = probability_pair(p, g, group, token, last, context);
+        uint32_t a1 = probability_pair(p, g + 8, group, token, last, context);
+        uint32_t a2 = probability_pair(p, g, group, token + 8, last, context);
+        uint32_t a3 = probability_pair(p, g + 8, group, token + 8, last, context);
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            int column = warp * 8 + g + n * 64;
+            uint32_t b0 = value_pair(v, token, last, context, kh, column);
+            uint32_t b1 = value_pair(v, token + 8, last, context, kh, column);
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c[n][0]), "+f"(c[n][1]), "+f"(c[n][2]), "+f"(c[n][3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+    }
+    size_t base = (size_t(blockIdx.y) * gridDim.x + blockIdx.x) * 16 * 128;
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        int column = warp * 8 + d + n * 64;
+        if (g < group) {
+            out[base + g * 128 + column] = c[n][0];
+            out[base + g * 128 + column + 1] = c[n][1];
+        }
+        if (g + 8 < group) {
+            out[base + (g + 8) * 128 + column] = c[n][2];
+            out[base + (g + 8) * 128 + column + 1] = c[n][3];
+        }
+    }
+#endif
+}
 __global__ void tensor_values(const B16 *v, const float *p, float *out, const int *positions, int context,
                               int qh, int kh) {
 #if __CUDA_ARCH__ >= 800
@@ -443,7 +537,7 @@ void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int s
             splits > w.in / 32)
             throw std::runtime_error("Invalid register QTIP matmul geometry");
         trellis_mma8<<<dim3((w.out + 127) / 128, splits, (tokens + 7) / 8), 256, 0, s>>>(w, x, z, stride,
-                                                                                       tokens);
+                                                                                         tokens);
         glm53::gpu::checked(cudaGetLastError(), "register QTIP matmul launch");
     } else
         launch<0>(w, nullptr, nullptr, nullptr, x, z, stride, splits, tokens, s);
@@ -498,14 +592,22 @@ void cache_batch(const B16 *k, const B16 *v, B16 *keys, B16 *values, const int *
 }
 void gqa_batch(const B16 *q, const B16 *k, const B16 *v, B16 *out, float *work, const int *positions,
                int batch, int context, int max_tokens, int qh, int kh, int dim, Stream s, int qstride,
-               float *value_workspace) {
+               float *value_workspace, bool register_mma) {
     if (value_workspace && dim == 128 && qh / kh <= 16 && native_bf16()) {
-        tensor_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 128, 16 * 32 * 2 + 64 * 32 * 2, s>>>(
-            q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
+        if (register_mma)
+            register_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 256, 0, s>>>(
+                q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
+        else
+            tensor_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 128, 16 * 32 * 2 + 64 * 32 * 2, s>>>(
+                q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
         softmax<<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
         int parts = (max_tokens + 127) / 128;
-        tensor_values<<<dim3(parts, batch * kh), 128, 16 * 32 * 2 + 32 * 128 * 2, s>>>(
-            v, work, value_workspace, positions, context, qh, kh);
+        if (register_mma)
+            register_values<<<dim3(parts, batch * kh), 256, 0, s>>>(v, work, value_workspace, positions,
+                                                                    context, qh, kh);
+        else
+            tensor_values<<<dim3(parts, batch * kh), 128, 16 * 32 * 2 + 32 * 128 * 2, s>>>(
+                v, work, value_workspace, positions, context, qh, kh);
         sum_values<<<batch * qh, 128, 0, s>>>(value_workspace, out, parts, qh, kh);
         launch_check();
         return;

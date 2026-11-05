@@ -231,6 +231,8 @@ void dense_test(cg::Stream s, int tokens) {
 void attention_test(cg::Stream s, int context = 17, int qh = 6, int kh = 2) {
     constexpr int batch = 3, dim = 128;
     std::vector<int> positions = context == 17 ? std::vector<int>{0, 3, 7} : std::vector<int>{128, 137, 256};
+    if (context > 257)
+        positions = {context / 2, context - 129, context - 1};
     std::mt19937 gen(64);
     std::normal_distribution<float> normal(0, .2f);
     std::vector<float> q(batch * qh * dim), k(batch * context * kh * dim), v(k.size());
@@ -289,7 +291,21 @@ void attention_test(cg::Stream s, int context = 17, int qh = 6, int kh = 2) {
     cg::Buffer<float> parts;
     parts.ensure(size_t(batch) * kh * ((maximum + 127) / 128) * 16 * dim, s);
     cu::gqa_batch(dq, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s, 0, parts);
-    compare(read(out.p, q.size(), s), expected, "Tensor-core GQA groups, split context, padded tails");
+    auto registered = read(out.p, q.size(), s);
+    compare(registered, expected, "Register tensor-core GQA, split context, padded tails");
+    cu::gqa_batch(dq, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s, 0, parts, false);
+    require(registered == read(out.p, q.size(), s), "Register GQA must match WMMA staging exactly");
+    std::vector<uint16_t> wide(size_t(batch) * qh * dim * 2, 0x7fc0);
+    auto encoded = bits(q);
+    for (int b = 0; b < batch; ++b)
+        std::copy(encoded.begin() + size_t(b) * qh * dim, encoded.begin() + size_t(b + 1) * qh * dim,
+                  wide.begin() + size_t(2 * b + 1) * qh * dim);
+    cg::Buffer<uint16_t> strided_query;
+    put(strided_query, wide, s);
+    cu::gqa_batch(strided_query.p + qh * dim, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s,
+                  2 * qh * dim, parts);
+    require(registered == read(out.p, q.size(), s),
+            "Register GQA must respect rank offsets and query strides");
 }
 #if defined(BEHEMOTH_CUDA_FAST)
 void prefill_attention_test(cg::Stream s) {
@@ -363,6 +379,7 @@ int main() {
             dense_test(s, tokens);
         attention_test(s);
         attention_test(s, 257, 24, 2);
+        attention_test(s, 8193, 24, 2);
 #if defined(BEHEMOTH_CUDA_FAST)
         prefill_attention_test(s);
 #endif

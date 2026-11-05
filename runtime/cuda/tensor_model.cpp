@@ -254,6 +254,7 @@ struct TensorModel::Impl {
     std::map<std::pair<int, int>, std::unique_ptr<Graph>> graphs;
     std::set<int> warmed_batches;
     bool graphs_enabled = true;
+    bool register_attention = true;
     std::string profile_path;
     bool profile_reported = false;
     std::vector<std::unique_ptr<ProjectionProfile>> profile;
@@ -297,6 +298,8 @@ struct TensorModel::Impl {
         }
         if (const char *value = std::getenv("BEHEMOTH_CUDA_GRAPHS"))
             graphs_enabled = std::string(value) != "0";
+        if (const char *value = std::getenv("BEHEMOTH_CUDA_ATTENTION_REGISTER"))
+            register_attention = std::string(value) != "0";
         if (const char *value = std::getenv("BEHEMOTH_CUDA_PROFILE_PREFILL"))
             profile_path = value;
         if (const char *value = std::getenv("BEHEMOTH_CUDA_PROFILE_DECODE"))
@@ -554,7 +557,8 @@ struct TensorModel::Impl {
                     if (attention_bound)
                         maximum = attention_bound;
                     gqa_batch(q, layer.keys, layer.values, out, r.scores, r.positions, batch, context,
-                              maximum, QH / tp, KH / tp, D, r.stream, H, r.attention_parts);
+                              maximum, QH / tp, KH / tp, D, r.stream, H, r.attention_parts,
+                              register_attention);
                 }
             });
             mark_decode("attention");

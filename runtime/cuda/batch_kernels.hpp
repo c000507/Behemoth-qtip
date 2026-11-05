@@ -16,7 +16,7 @@ void cache_batch(const B16 *, const B16 *, B16 *, B16 *, const int *positions, i
                  int context, int kvwidth, Stream);
 void gqa_batch(const B16 *, const B16 *, const B16 *, B16 *, float *, const int *positions, int batch,
                int context, int max_tokens, int qheads, int kvheads, int dim, Stream, int query_stride = 0,
-               float *value_workspace = nullptr);
+               float *value_workspace = nullptr, bool register_mma = true);
 void select_rows(const B16 *, B16 *, const int *, int rows, int width, Stream);
 void reduce_products(float *, size_t elements, int splits, Stream);
 void scale_to_b16(const float *, const float *, B16 *, int rows, int width, Stream);

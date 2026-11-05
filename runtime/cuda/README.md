@@ -130,6 +130,12 @@ projection phase timings for the first prefill group.
 `BEHEMOTH_CUDA_PROFILE_DECODE=decode.json` records stage timings for the first
 uncaptured decode step. Event instrumentation adds overhead; use it to locate
 bottlenecks and disable it for throughput measurements.
+The benchmark also reports per-step latency summaries. Set
+`BEHEMOTH_CUDA_BENCH_STEP_TIMES=1` to retain all step times in its JSON output.
+
+Decode attention uses register-level tensor-core products. Set
+`BEHEMOTH_CUDA_ATTENTION_REGISTER=0` to compare the earlier WMMA staging path.
+Both paths retain BF16 probability rounding and the same split-context reduction.
 
 NCCL defaults to shared-memory transport (`NCCL_P2P_DISABLE=1`), two channels,
 and a 1 MiB buffer after a hosted A6000 pair showed a slow peer path. Explicit
