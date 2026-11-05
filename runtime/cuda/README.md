@@ -136,6 +136,19 @@ Use `--trace-logits FILE` for numerical comparisons: it records logits after
 bulk prefill and the final decode step, plus all generated token IDs. Trace
 serialization happens outside the timed regions; warmup runs do not write it.
 
+The fast build also provides a full-checkpoint regression for short prompts:
+
+```sh
+BEHEMOTH_CUDA_TP_TRANSPORT=host runtime/build-cuda-fast/behemoth_cuda_model_tests \
+  --model /models/Behemoth-R1-123B-v2-QTIP-2bit
+```
+
+It compares a cold 32-token prefill and decode against the same request after a
+1024-token request grows the arena. Logits must match bit for bit. This catches
+short-prefill split-workspace errors and stale state across resets. Configure
+`BEHEMOTH_CUDA_TEST_MODEL=/path/to/checkpoint` to include it in CTest; the checkpoint
+is not downloaded by the test.
+
 Small-batch QTIP decode uses 32 output rows per warp and reuses activation
 fragments across two tensor-core products. It is enabled for batches 2–16.
 Set `BEHEMOTH_CUDA_QTIP_MMA_WIDE=0` for the earlier kernel; `1` also selects

@@ -170,7 +170,16 @@
           "d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d"
         ]
       }
-    ]
+    ],
+    "short_prefill_regression": {
+      "passed": true,
+      "tp": 2,
+      "context": 2048,
+      "short_prompt_tokens": 32,
+      "arena_growth_prompt_tokens": 1024,
+      "prefill_bitwise_equal": true,
+      "decode_bitwise_equal": true
+    }
   },
   "targets_met": false,
   "limitations": [

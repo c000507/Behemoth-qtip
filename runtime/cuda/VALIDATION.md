@@ -98,6 +98,14 @@ zero warmups. These measurements should not be compared as a code regression
 against the earlier host's working peer transport. Exact timings, warmup counts,
 environment and numerical check hashes are in the [result artifact](results/a6000-us-ks-2.json).
 
+A subsequent HTTP smoke test exposed an under-allocation for cold short prompts:
+the small-prefill matmul uses split-K, while prefill reserved only one partial.
+The arena now reserves the actual split count below 128 padded rows. The optional
+`cuda_model_prefill` regression passes on the complete checkpoint: a cold 32-token
+prefill and its next decode step match bit for bit after a 1024-token request
+grows the arena and the model resets. The 8k benchmark uses the unchanged bulk
+allocation path.
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

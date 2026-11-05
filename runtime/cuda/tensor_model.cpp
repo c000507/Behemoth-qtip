@@ -806,7 +806,8 @@ struct TensorModel::Impl {
                               packed.p + size_t(b) * sequence);
                     host_selected.p[b] = b * sequence + tokens[base + b].size() - 1;
                 }
-                reserve(rows, 1, true);
+                bool bulk = rows >= 128;
+                reserve(rows, bulk ? 1 : splits, bulk);
                 each([&](Rank &r) {
                     checked(h2d(r.ids, packed.p, size_t(rows) * 4, r.stream), "upload prefill IDs");
                     checked(h2d(r.selected, host_selected.p, size_t(count) * 4, r.stream),
