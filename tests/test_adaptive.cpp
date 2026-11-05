@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <omp.h>
 
 #include "common.hpp"
 #include "nvfp4.hpp"
@@ -24,7 +25,8 @@ static int g_fail = 0;
 #define EXPECT(c, ...)                                                          \
   do {                                                                          \
     if (!(c)) {                                                                 \
-      std::printf("  FAIL(%s:%d): " __VA_ARGS__, fs::path(__FILE__).filename().c_str(), __LINE__); \
+      std::printf("  FAIL(%s:%d): ", fs::path(__FILE__).filename().c_str(), __LINE__); \
+      std::printf(__VA_ARGS__); \
       std::printf("\n");                                                        \
       ++g_fail;                                                                 \
     }                                                                           \
@@ -163,13 +165,15 @@ static Options base_options(const std::string& tag, double threshold, const char
   return o;
 }
 
-static void run_case(const std::string& tag, double threshold, const char* metric, const char* next_input) {
+static json run_case(const std::string& tag, double threshold, const char* metric, const char* next_input,
+                     bool cache_teacher = true) {
   fs::path root = fs::path("/tmp/opencode") / "adaptive-test" / tag;
   fs::remove_all(root);
   fs::create_directories(root);
   auto M = build_model(root / "model");
   write_tokens(root / "tokens.i32", 8);
   Options o = base_options(tag, threshold, metric, next_input);
+  o.cache_teacher_logits = cache_teacher;
   {
     Pipeline p(o);  // logs into the work dir
     p.run();
@@ -260,6 +264,7 @@ static void run_case(const std::string& tag, double threshold, const char* metri
     std::printf("  %s: NVFP4(o_proj) relative reconstruction error %.4f\n", tag.c_str(), rel);
     EXPECT(rel < 0.3, "%s NVFP4 reconstruction too lossy (%g)", tag.c_str(), rel);
   }
+  return report;
 }
 
 // pure host checks of the NVFP4 codec
@@ -281,6 +286,19 @@ static void test_nvfp4_codec() {
   std::printf("  round-trip relative error %.4f (global scale %.4g)\n", rel, q.global);
   EXPECT(rel < 0.15, "nvfp4 round trip too lossy");
   EXPECT(nvfp4_level(0) == 0 && nvfp4_level(7) == 6 && nvfp4_level(8 | 3) == -1.5, "e2m1 levels");
+  std::vector<float> large(1u << 20);
+  for (size_t i = 0; i < large.size(); ++i) large[i] = i % 128 < 16 ? 0.f : float(r.normal() * 0.1);
+  int saved_threads = omp_get_max_threads();
+  omp_set_num_threads(1);
+  auto serial = nvfp4_quantize(large.data(), 1024, 1024);
+  auto serial_decoded = nvfp4_dequantize(serial);
+  omp_set_num_threads(8);
+  auto parallel = nvfp4_quantize(large.data(), 1024, 1024);
+  auto parallel_decoded = nvfp4_dequantize(parallel);
+  omp_set_num_threads(saved_threads);
+  EXPECT(serial.global == parallel.global && serial.packed == parallel.packed && serial.scales == parallel.scales,
+         "NVFP4 encoding changes with thread count");
+  EXPECT(serial_decoded == parallel_decoded, "NVFP4 decoding changes with thread count");
 }
 
 int main(int argc, char** argv) {
@@ -298,7 +316,20 @@ int main(int argc, char** argv) {
   // all-QTIP: threshold so large the metric never exceeds it
   run_case("qtip", 1e30, "lmkl", "original");
   // all-NVFP4: threshold 0 and a strictly positive KL forces every layer to fall back
-  run_case("nvfp4", 0.0, "lmkl", "original");
+  auto cached = run_case("nvfp4", 0.0, "lmkl", "original");
+  auto uncached = run_case("nvfp4-uncached", 0.0, "lmkl", "original", false);
+  auto compare_metrics = [&](const json& a, const json& b) {
+    for (int layer = 0; layer < kLayers; ++layer)
+      for (const char* key : {"kl_qtip", "kl_nvfp4"}) {
+        double x = a["layers"][size_t(layer)]["adaptive"][key].get<double>();
+        double y = b["layers"][size_t(layer)]["adaptive"][key].get<double>();
+        EXPECT(std::abs(x - y) < 1e-10, "teacher cache changed L%d %s", layer, key);
+      }
+  };
+  compare_metrics(cached, uncached);
+  auto progressive = run_case("lmkl-quantized", 0.0, "lmkl", "quantized");
+  auto progressive_uncached = run_case("lmkl-quantized-uncached", 0.0, "lmkl", "quantized", false);
+  compare_metrics(progressive, progressive_uncached);
   // MSE metric + quantized-input chaining (probe and chain flow through the chosen layers)
   run_case("mse-quantized", 0.0, "mse", "quantized");
   std::printf(g_fail ? "ADAPTIVE TESTS FAILED (%d)\n" : "ALL ADAPTIVE TESTS PASSED\n", g_fail);

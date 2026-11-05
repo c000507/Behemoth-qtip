@@ -486,10 +486,12 @@ std::vector<uint16_t> Pipeline::adaptive_layer_forward(const std::shared_ptr<Lay
       const std::vector<float>& h = (*qtip_out)[size_t(li)].hatW;
       QCHECK(!h.empty(), "QTIP hatW missing for adaptive eval");
       w.resize(h.size());
+#pragma omp parallel for schedule(static) if(h.size() >= (1u << 20))
       for (size_t i = 0; i < h.size(); ++i) w[i] = f32_to_bf16(h[i]);
     } else {
       std::vector<float> h = nvfp4_dequantize((*nv)[size_t(li)]);
       w.resize(h.size());
+#pragma omp parallel for schedule(static) if(h.size() >= (1u << 20))
       for (size_t i = 0; i < h.size(); ++i) w[i] = f32_to_bf16(h[i]);
     }
     a_eval_->upload_raw(li, w.data());
@@ -507,6 +509,7 @@ std::vector<float> Pipeline::adaptive_logits(int L, std::vector<uint16_t> h) {
   const long H = cfg_.hidden;
   for (int l = L + 1; l < cfg_.layers; ++l) {
     auto LHl = cache_.get(l);
+    cache_.prefetch(l + 1);
     a_orig_->upload(*LHl);
     a_orig_->forward(h.data(), 1, nullptr);
   }
@@ -523,9 +526,13 @@ std::vector<float> Pipeline::adaptive_logits(int L, std::vector<uint16_t> h) {
     const int vc = int(std::min(tile, cfg_.vocab - v0));
     a_orig_->gemm().run(true, false, vc, T, int(H), d_head_ + v0 * H, H, normed, H, d_logits_, vc, OutT::F32,
                         1.f, 0.f);
-    // a col-major (vc x T) tile is row-major (T x vc): copy each token row into out[t][v0..]
+    // Transfer the contiguous tile once, then scatter its rows on the host.
+    // One staged transfer per token otherwise synchronizes thousands of times.
+    std::vector<float> host_tile(size_t(vc) * T);
+    d2h_staged(host_tile.data(), d_logits_, host_tile.size() * sizeof(float), s);
+#pragma omp parallel for schedule(static) if(T > 32)
     for (int t = 0; t < T; ++t)
-      d2h_staged(out.data() + size_t(t) * cfg_.vocab + size_t(v0), d_logits_ + size_t(t) * vc, size_t(vc) * 4, s);
+      std::memcpy(out.data() + size_t(t) * cfg_.vocab + size_t(v0), host_tile.data() + size_t(t) * vc, size_t(vc) * 4);
   }
   return out;
 }
@@ -533,7 +540,8 @@ std::vector<float> Pipeline::adaptive_logits(int L, std::vector<uint16_t> h) {
 double Pipeline::kl_mean_token(const std::vector<float>& p_logits, const std::vector<float>& q_logits) const {
   const int T = int(probe_tok_.size());
   const long V = cfg_.vocab;
-  double kl = 0;
+  std::vector<double> row_kl(static_cast<size_t>(T));
+#pragma omp parallel for schedule(static) if(long(T) * V >= (1u << 20))
   for (int t = 0; t < T; ++t) {
     const float *p = p_logits.data() + size_t(t) * V, *q = q_logits.data() + size_t(t) * V;
     double pm = -1e30, qm = -1e30;
@@ -553,8 +561,11 @@ double Pipeline::kl_mean_token(const std::vector<float>& p_logits, const std::ve
       double pi = std::exp(double(p[i]) - lse_p);
       if (pi > 0) row += pi * ((double(p[i]) - lse_p) - (double(q[i]) - lse_q));
     }
-    kl += row;
+    row_kl[size_t(t)] = row;
   }
+  // Preserve the original token summation order regardless of thread count.
+  double kl = 0;
+  for (double row : row_kl) kl += row;
   return kl / T;
 }
 
@@ -598,6 +609,7 @@ bool Pipeline::adaptive_prev_decided(int L) const { return L <= o_.layer_begin |
 
 static std::vector<uint16_t> bf16_copy(const std::vector<float>& h) {
   std::vector<uint16_t> w(h.size());
+#pragma omp parallel for schedule(static) if(h.size() >= (1u << 20))
   for (size_t i = 0; i < h.size(); ++i) w[i] = f32_to_bf16(h[i]);
   return w;
 }
@@ -624,11 +636,20 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     a_orig_->forward(y_orig.data(), 1, nullptr);
   }
   auto y_qtip = adaptive_layer_forward(LH, &outs, nullptr);
-  std::vector<float> logits_orig;
-  if (o_.kl_metric == "lmkl") logits_orig = adaptive_logits(L, y_orig);
+  std::vector<float> fresh_teacher;
+  const std::vector<float>* logits_orig = nullptr;
+  if (o_.kl_metric == "lmkl") {
+    if (o_.cache_teacher_logits && o_.adaptive_next_input == "original") {
+      if (teacher_logits_.empty()) teacher_logits_ = adaptive_logits(L, y_orig);
+      logits_orig = &teacher_logits_;
+    } else {
+      fresh_teacher = adaptive_logits(L, y_orig);
+      logits_orig = &fresh_teacher;
+    }
+  }
   auto metric_of = [&](const std::vector<uint16_t>& y_q) {
     if (o_.kl_metric == "mse") return nmse_layer(y_q, y_orig);
-    return kl_mean_token(logits_orig, adaptive_logits(L, y_q));
+    return kl_mean_token(*logits_orig, adaptive_logits(L, y_q));
   };
   double m_qtip = metric_of(y_qtip);
   logf("adaptive layer %d: metric %s qtip %.6g (threshold %.6g)", L, o_.kl_metric.c_str(), m_qtip, o_.kl_threshold);
@@ -642,6 +663,7 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
       if (o_.fp8_kv && (li == LK || li == LV)) continue;
       const int m = LH->out_dim[li], n = LH->in_dim[li];
       std::vector<float> W(size_t(m) * n);
+#pragma omp parallel for schedule(static) if(size_t(m) * n >= (1u << 20))
       for (long i = 0; i < m; ++i) {
         if (LH->bf16) {
           const uint16_t* row = reinterpret_cast<const uint16_t*>(LH->w[size_t(li)].data()) + size_t(i) * n;
@@ -680,7 +702,7 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     chosen_.layer = L;
     chosen_.quantized = o_.adaptive_next_input == "quantized";
     chosen_.w.resize(kNumLin);
-    for (int li = 0; li < kNumLin; ++li) {
+    for (int li = 0; chosen_.quantized && li < kNumLin; ++li) {
       if (o_.fp8_kv && (li == LK || li == LV)) continue;  // preserved originals
       if (nv)
         chosen_.w[size_t(li)] = bf16_copy(nvfp4_dequantize(nvs[size_t(li)]));

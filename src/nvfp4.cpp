@@ -12,6 +12,7 @@ Nvfp4Tensor nvfp4_quantize(const float* w, int m, int n) {
   QCHECK(m > 0 && n > 0 && n % 16 == 0, "NVFP4 needs n % 16 == 0");
   float maximum = 0;
   const size_t numel = size_t(m) * n;
+#pragma omp parallel for schedule(static) reduction(max:maximum) if(numel >= (1u << 20))
   for (size_t i = 0; i < numel; ++i) {
     QCHECK(std::isfinite(w[i]), "nonfinite NVFP4 input");
     maximum = std::max(maximum, std::fabs(w[i]));
@@ -35,6 +36,7 @@ Nvfp4Tensor nvfp4_quantize(const float* w, int m, int n) {
     }
     return uint8_t(code | (std::signbit(x) ? 8 : 0));
   };
+#pragma omp parallel for schedule(static) if(numel >= (1u << 20))
   for (size_t b = 0; b < t.scales.size(); ++b) {
     float mx = 0;
     for (int j = 0; j < 16; ++j) mx = std::max(mx, std::fabs(w[b * 16 + j]));
@@ -52,6 +54,7 @@ std::vector<float> nvfp4_dequantize(const Nvfp4Tensor& t) {
              t.scales.size() == size_t(t.m) * t.n / 16 && t.global > 0 && std::isfinite(t.global),
          "invalid NVFP4 payload");
   std::vector<float> out(size_t(t.m) * t.n);
+#pragma omp parallel for schedule(static) if(out.size() >= (1u << 20))
   for (size_t i = 0; i < out.size(); ++i) {
     uint8_t code = (t.packed[i / 2] >> (i % 2 * 4)) & 15;
     float s = fp8e4m3_to_f32(t.scales[i / 16]);
