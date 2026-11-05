@@ -253,13 +253,19 @@ void unswizzle_for_kernel(const uint16_t* in, int m, int n, uint16_t* packed) {
 }
 
 // ------------------------------------------------------------------ fp64 Cholesky
-// Right-looking blocked Cholesky. Trailing update C -= P P^T with an AVX-512 6x16 microkernel on packed panels.
+// Right-looking blocked Cholesky. Trailing update C -= P P^T on packed panels.
 namespace {
 constexpr int NB = 256;  // panel width
-constexpr int MR = 6, NR = 16;
+#if defined(__AVX512F__)
+constexpr int MR = 6;
+#else
+constexpr int MR = 3;  // twelve AVX2 accumulators fit alongside operands
+#endif
+constexpr int NR = 16;
 
 // C[MR x NR] (ldc) -= sum_p a[p*MR + i] * b[p*NR + j]
-static inline void micro_6x16(int kc, const double* a, const double* b, double* C, long ldc, int mr, int nr) {
+static inline void micro_update(int kc, const double* a, const double* b, double* C, long ldc, int mr, int nr) {
+#if defined(__AVX512F__)
   __m512d c[MR][2];
   for (int i = 0; i < MR; ++i) c[i][0] = c[i][1] = _mm512_setzero_pd();
   for (int p = 0; p < kc; ++p) {
@@ -285,6 +291,29 @@ static inline void micro_6x16(int kc, const double* a, const double* b, double* 
     for (int i = 0; i < mr; ++i)
       for (int j = 0; j < nr; ++j) C[i * ldc + j] -= t[i][j];
   }
+#elif defined(__AVX2__) && defined(__FMA__)
+  __m256d c[MR][4];
+  for (int i = 0; i < MR; ++i)
+    for (int q = 0; q < 4; ++q) c[i][q] = _mm256_setzero_pd();
+  for (int p = 0; p < kc; ++p)
+    for (int q = 0; q < 4; ++q) {
+      __m256d bv = _mm256_loadu_pd(b + p * NR + q * 4);
+      for (int i = 0; i < MR; ++i)
+        c[i][q] = _mm256_fmadd_pd(_mm256_set1_pd(a[p * MR + i]), bv, c[i][q]);
+    }
+  alignas(32) double t[MR][NR];
+  for (int i = 0; i < MR; ++i)
+    for (int q = 0; q < 4; ++q) _mm256_store_pd(t[i] + q * 4, c[i][q]);
+  for (int i = 0; i < mr; ++i)
+    for (int j = 0; j < nr; ++j) C[i * ldc + j] -= t[i][j];
+#else
+  double c[MR][NR] = {};
+  for (int p = 0; p < kc; ++p)
+    for (int i = 0; i < MR; ++i)
+      for (int j = 0; j < NR; ++j) c[i][j] += a[p * MR + i] * b[p * NR + j];
+  for (int i = 0; i < mr; ++i)
+    for (int j = 0; j < nr; ++j) C[i * ldc + j] -= c[i][j];
+#endif
 }
 }  // namespace
 
@@ -316,7 +345,7 @@ bool cholesky_inplace(double* A, int n, int nthreads) {
     if (nr <= 0) break;
     double tq1 = now_s();
     g_chol_t[0] += tq1 - tq0;
-    // 2+3) panel solve (rows i >= r0: x L11^T = a), 8 rows per AVX-512 vector, fused with packing the panel in
+    // 2+3) panel solve (rows i >= r0: x L11^T = a), groups of 8 rows, fused with packing the panel in
     //      MR- and NR-interleaved layouts for the trailing update
     int nA = (nr + MR - 1) / MR, nBk = (nr + NR - 1) / NR;
     packA.assign(size_t(nA) * MR * kb, 0.0);
@@ -334,6 +363,7 @@ bool cholesky_inplace(double* A, int n, int nthreads) {
         for (int r = 0; r < 8; ++r) X[p][r] = r < nrow ? A[long(r0 + rbeg + r) * n + k + p] : 0.0;
       for (int j = 0; j < kb; ++j) {
         const double* lj = Lkk.data() + size_t(j) * kb;
+#if defined(__AVX512F__)
         __m512d s0 = _mm512_load_pd(X[j]), s1 = _mm512_setzero_pd(), s2 = _mm512_setzero_pd(),
                 s3 = _mm512_setzero_pd();
         int p = 0;
@@ -346,6 +376,29 @@ bool cholesky_inplace(double* A, int n, int nthreads) {
         for (; p < j; ++p) s0 = _mm512_fnmadd_pd(_mm512_set1_pd(lj[p]), _mm512_load_pd(X[p]), s0);
         s0 = _mm512_add_pd(_mm512_add_pd(s0, s1), _mm512_add_pd(s2, s3));
         _mm512_store_pd(X[j], _mm512_mul_pd(s0, _mm512_set1_pd(rdiag[size_t(j)])));
+#elif defined(__AVX2__) && defined(__FMA__)
+        for (int r = 0; r < 8; r += 4) {
+          __m256d s0 = _mm256_load_pd(X[j] + r), s1 = _mm256_setzero_pd(),
+                  s2 = _mm256_setzero_pd(), s3 = _mm256_setzero_pd();
+          int p = 0;
+          for (; p + 4 <= j; p += 4) {
+            s0 = _mm256_fnmadd_pd(_mm256_set1_pd(lj[p]), _mm256_load_pd(X[p] + r), s0);
+            s1 = _mm256_fnmadd_pd(_mm256_set1_pd(lj[p + 1]), _mm256_load_pd(X[p + 1] + r), s1);
+            s2 = _mm256_fnmadd_pd(_mm256_set1_pd(lj[p + 2]), _mm256_load_pd(X[p + 2] + r), s2);
+            s3 = _mm256_fnmadd_pd(_mm256_set1_pd(lj[p + 3]), _mm256_load_pd(X[p + 3] + r), s3);
+          }
+          for (; p < j; ++p)
+            s0 = _mm256_fnmadd_pd(_mm256_set1_pd(lj[p]), _mm256_load_pd(X[p] + r), s0);
+          s0 = _mm256_add_pd(_mm256_add_pd(s0, s1), _mm256_add_pd(s2, s3));
+          _mm256_store_pd(X[j] + r, _mm256_mul_pd(s0, _mm256_set1_pd(rdiag[size_t(j)])));
+        }
+#else
+        for (int r = 0; r < 8; ++r) {
+          double s = X[j][r];
+          for (int p = 0; p < j; ++p) s -= lj[p] * X[p][r];
+          X[j][r] = s * rdiag[size_t(j)];
+        }
+#endif
       }
       for (int r = 0; r < nrow; ++r) {
         int i = rbeg + r;
@@ -379,7 +432,7 @@ bool cholesky_inplace(double* A, int n, int nthreads) {
         for (int ii = i0; ii < i1; ii += MR) {
           if (j0 > ii + MR - 1) continue;  // micro tile fully above the diagonal
           int mr = std::min(MR, nr - ii), nrr = std::min(NR, nr - j0);
-          micro_6x16(kb, packA.data() + size_t(ii / MR) * MR * kb, pb, A + long(r0 + ii) * n + r0 + j0, n, mr, nrr);
+          micro_update(kb, packA.data() + size_t(ii / MR) * MR * kb, pb, A + long(r0 + ii) * n + r0 + j0, n, mr, nrr);
         }
       }
     }

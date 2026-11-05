@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(QTIP_CPU_ARCH "icelake-server" CACHE STRING "-march for the host fp64 Cholesky (AVX-512)")
+set(QTIP_CPU_ARCH "native" CACHE STRING "-march for the host fp64 Cholesky (AVX-512, AVX2, or scalar)")
 
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Threads REQUIRED)
