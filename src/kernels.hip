@@ -1,6 +1,4 @@
 // Elementwise / layout / Hadamard / model-forward kernels.
-#include <hip/hip_runtime.h>
-
 #include <map>
 #include <mutex>
 

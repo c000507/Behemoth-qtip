@@ -1,8 +1,10 @@
 // Quantizer attention: 16-query / 32-key online-softmax WMMA tiles.
 // Adapted from training/src/flash.hip's native forward, for head-major Q/K/V.
 // Only Q/K/V and the final output live in global memory: no T-by-T workspace.
+// HIP path: gfx12 rocWMMA-style intrinsics; CUDA path: nvcuda::wmma (sm_80+), same schedule.
 #include "gpu.hpp"
 
+#ifndef QTIP_CUDA
 #include "../runtime/src/device_numeric.hpp"
 #include <algorithm>
 #include <cmath>
@@ -143,4 +145,193 @@ void k_tiled_attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, 
     attention_kernel<256><<<grid, waves * 32, 0, s>>>(q, k, v, out, T, nq, group, hd, scale);
   HIP_CHECK(hipGetLastError());
 }
+#else
+// ------------------------------------------------------------------ CUDA (sm_80+) wmma port
+#include <cuda_bf16.h>
+#include <mma.h>
+#include <algorithm>
+#include <cmath>
+
+namespace qtip {
+namespace {
+namespace wmma = nvcuda::wmma;
+using bf16_t = __nv_bfloat16;
+
+__device__ __forceinline__ uint16_t f2bf(float f) {
+  uint32_t u = __float_as_uint(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return uint16_t((u >> 16) | 0x40);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return uint16_t(u >> 16);
+}
+
+// One warp per query head, 16 queries x 32 keys per iteration, online softmax (fp32).
+// WMMA fragment element mapping for m16n16k16 (f32 accumulator and row-major bf16 A alike;
+// HMMA.16816 lane layout, stable since Volta): element i (0..7) of x belongs to
+//   row = (lane >> 2) + 8 * ((i >> 1) & 1),  col = (lane & 3) * 2 + (i & 1) + 8 * (i >> 2).
+// A row (query) is therefore spread over the 4 lanes of a lane>>2 group: the per-row max/sum
+// reductions below run over __shfl_xor_sync with offsets 1 and 2.
+template <int D>
+__global__ __launch_bounds__(256) void attention_kernel(const uint16_t* q, const uint16_t* k, const uint16_t* v,
+                                                         uint16_t* out, int T, int nq, int group, int hd,
+                                                         float scale) {
+  extern __shared__ __align__(16) uint16_t smem[];  // K[32][D] | V[32][D] | Q staging [4][16][D]
+  uint16_t* Ks = smem;
+  uint16_t* Vs = Ks + 32 * D;
+  uint16_t* Qs = Vs + 32 * D;
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int first = blockIdx.x * 16;
+  const int kh = blockIdx.y;
+  const int head0 = blockIdx.z * (int(blockDim.x) >> 5);
+  const int head = kh * group + head0 + wave;
+  const int count = min(int(blockDim.x) >> 5, group - head0);
+  const bool live = wave < count;
+  const int q0 = first + (lane >> 2);  // query row of fragment elements with ((i >> 1) & 1) == 0
+  const int q1 = q0 + 8;               // ... == 1
+  const bool l0 = live && q0 < T, l1 = live && q1 < T;
+
+  // Stage the Q tile through shared memory (4 heads at a time), then keep it in registers.
+  // D pads small / non-power-of-two head dimensions with zero.
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16_t, wmma::row_major> qf[D / 16];
+  for (int lo = 0; lo < count; lo += 4) {
+    const int heads = min(4, count - lo);
+    for (int i = tid; i < heads * 16 * D; i += blockDim.x) {
+      int w = i / (16 * D), row = i / D % 16, d = i % D;
+      Qs[i] = first + row < T && d < hd ? q[(size_t(kh * group + head0 + lo + w) * T + first + row) * hd + d] : 0;
+    }
+    __syncthreads();
+    if (wave >= lo && wave < lo + heads)
+#pragma unroll
+      for (int s = 0; s < D / 16; ++s)
+        wmma::load_matrix_sync(qf[s], reinterpret_cast<const bf16_t*>(Qs + (wave - lo) * 16 * D + 16 * s), D);
+    __syncthreads();
+  }
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[D / 16];
+#pragma unroll
+  for (int nd = 0; nd < D / 16; ++nd) wmma::fill_fragment(acc[nd], 0.f);
+  float mx0 = -INFINITY, mx1 = -INFINITY, den0 = 0, den1 = 0;
+  const int limit = min(first + 16, T);
+  for (int base = 0; base < limit; base += 32) {
+    for (int i = tid; i < 32 * D; i += blockDim.x) {
+      int key = i / D, d = i % D, t = base + key;
+      bool ok = t < limit && d < hd;
+      size_t idx = (size_t(kh) * T + t) * hd + d;
+      Ks[i] = ok ? k[idx] : 0;
+      Vs[i] = ok ? v[idx] : 0;
+    }
+    __syncthreads();
+    // scores[16 queries][32 keys] = Q K^T, two 16x16 accumulators (keys 0..15 / 16..31)
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> sc[2];
+    wmma::fill_fragment(sc[0], 0.f);
+    wmma::fill_fragment(sc[1], 0.f);
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int s = 0; s < D / 16; ++s) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16_t, wmma::col_major> bf;
+        wmma::load_matrix_sync(bf, reinterpret_cast<const bf16_t*>(Ks + 16 * n * D + 16 * s), D);  // B[d][key] = K[key][d]
+        wmma::mma_sync(sc[n], qf[s], bf, sc[n]);
+      }
+    // causal mask + log2 scale; per-thread row maxima, then merge over the 4 lanes holding the row
+    float top0 = -INFINITY, top1 = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        int key = base + 16 * n + ((lane & 3) * 2 + (i & 1) + 8 * (i >> 2));
+        bool r1 = (i >> 1) & 1;
+        float s = (r1 ? l1 && key <= q1 : l0 && key <= q0) ? sc[n].x[i] * scale : -INFINITY;
+        sc[n].x[i] = s;
+        if (r1) top1 = fmaxf(top1, s);
+        else top0 = fmaxf(top0, s);
+      }
+    top0 = fmaxf(top0, __shfl_xor_sync(0xffffffffu, top0, 1));
+    top0 = fmaxf(top0, __shfl_xor_sync(0xffffffffu, top0, 2));
+    top1 = fmaxf(top1, __shfl_xor_sync(0xffffffffu, top1, 1));
+    top1 = fmaxf(top1, __shfl_xor_sync(0xffffffffu, top1, 2));
+    const float nx0 = fmaxf(mx0, top0), nx1 = fmaxf(mx1, top1);
+    const float a0 = mx0 == nx0 ? 1.f : exp2f(mx0 - nx0);
+    const float a1 = mx1 == nx1 ? 1.f : exp2f(mx1 - nx1);
+    const float sh0 = isfinite(nx0) ? nx0 : 0.f, sh1 = isfinite(nx1) ? nx1 : 0.f;
+    float p[2][8], sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        bool r1 = (i >> 1) & 1;
+        float s = sc[n].x[i];
+        p[n][i] = isfinite(s) ? exp2f(s - (r1 ? sh1 : sh0)) : 0.f;
+        if (r1) sum1 += p[n][i];
+        else sum0 += p[n][i];
+      }
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+    sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+    sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+    den0 = den0 * a0 + sum0, mx0 = nx0;
+    den1 = den1 * a1 + sum1, mx1 = nx1;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16_t, wmma::row_major> pf[2];
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) pf[n].x[i] = __float2bfloat16_rn(p[n][i]);
+    // acc <- P V; rescale the old rows by their per-query alpha
+#pragma unroll
+    for (int nd = 0; nd < D / 16; ++nd)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) acc[nd].x[i] *= ((i >> 1) & 1) ? a1 : a0;
+#pragma unroll
+    for (int nd = 0; nd < D / 16; ++nd)
+#pragma unroll
+      for (int n = 0; n < 2; ++n) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16_t, wmma::row_major> bf;
+        wmma::load_matrix_sync(bf, reinterpret_cast<const bf16_t*>(Vs + 16 * n * D + 16 * nd), D);  // B[key][d] = V[key][d]
+        wmma::mma_sync(acc[nd], pf[n], bf, acc[nd]);
+      }
+    __syncthreads();
+  }
+  if (live) {
+    const float i0 = 1.f / den0, i1 = 1.f / den1;
+#pragma unroll
+    for (int nd = 0; nd < D / 16; ++nd)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        int d = 16 * nd + (lane & 3) * 2 + (i & 1) + 8 * (i >> 2);
+        bool r1 = (i >> 1) & 1;
+        int query = r1 ? q1 : q0;
+        if (d < hd && query < T)
+          out[(size_t(query) * nq + head) * hd + d] = f2bf(acc[nd].x[i] * (r1 ? i1 : i0));
+      }
+  }
+}
+
+template <int D>
+void launch_attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int T, int nq,
+                      int group, int hd, float scale, dim3 grid, int waves, hipStream_t s) {
+  constexpr int smem_bytes = (32 * D + 32 * D + 4 * 16 * D) * int(sizeof(uint16_t));
+  static bool smem_attr = [] {
+    return cudaFuncSetAttribute(attention_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                smem_bytes) == cudaSuccess;
+  }();
+  (void)smem_attr;
+  attention_kernel<D><<<grid, waves * 32, smem_bytes, s>>>(q, k, v, out, T, nq, group, hd, scale);
+}
+}  // namespace
+
+void k_tiled_attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out,
+                        int T, int nq, int nkv, int hd, hipStream_t s) {
+  QCHECK(q && k && v && out && T > 0 && nq > 0 && nkv > 0 && nq % nkv == 0 && hd > 0 && hd <= 256,
+         "invalid tiled attention shape (head_dim must be <=256)");
+  // <= 8 warps (256 threads): the D=256 register footprint (qf + acc fragments) needs 255 regs/thread,
+  // which fits an SM only up to 256 threads
+  int group = nq / nkv, waves = std::min(group, 8);
+  dim3 grid(unsigned((T + 15) / 16), unsigned(nkv), unsigned((group + waves - 1) / waves));
+  float scale = (1.f / std::sqrt(float(hd))) * 1.4426950408889634f;
+  if (hd <= 128)
+    launch_attention<128>(q, k, v, out, T, nq, group, hd, scale, grid, waves, s);
+  else
+    launch_attention<256>(q, k, v, out, T, nq, group, hd, scale, grid, waves, s);
+  HIP_CHECK(hipGetLastError());
+}
+#endif  // QTIP_CUDA
 }  // namespace qtip

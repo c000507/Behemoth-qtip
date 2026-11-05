@@ -313,7 +313,7 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
       swizzle_for_kernel(packed.data(), int(m), n, out[li].trellis.data());
     }
   }
-  if (!opt.dump_dir.empty()) {
+  if (!opt.dump_dir.empty() || opt.want_hatW) {
     // reconstructed weight in the original domain: hatW = diag(SV) T_m (hatWr * Wscale) T_n^T diag(SU)
     for (size_t li = 0; li < lins.size(); ++li) {
       long m = lins[li].m;
@@ -327,7 +327,8 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
       k_scale_rows_cols(b, m, n, n, d_sv + off[li], d_su, s);
       std::vector<float> h(size_t(m) * n);
       d2h_staged(h.data(), b, h.size() * 4, s);
-      write_f32(opt.dump_dir + "/" + tag + "_" + lins[li].name + ".hatW.f32", h.data(), h.size());
+      if (opt.want_hatW) out[li].hatW = std::move(h);
+      else write_f32(opt.dump_dir + "/" + tag + "_" + lins[li].name + ".hatW.f32", h.data(), h.size());
     }
   }
   T.pack += now_s() - t0;

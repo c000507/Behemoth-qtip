@@ -21,6 +21,8 @@ struct Linear {
     Buffer<float> su, sv, scales;
     Buffer<uint32_t> lut;
     Buffer<uint8_t> fp8;
+    Buffer<uint8_t> nv_packed, nv_scales;
+    float nv_global = 0;
     void load(const Checkpoint &cp, int layer, const std::string &name, Stream s) {
         auto h = behemoth::qtip::load_linear(cp, layer, name);
         in = h.in;
@@ -28,6 +30,10 @@ struct Linear {
         if (h.is_fp8()) {
             upload(fp8, h.fp8.data(), h.fp8.size(), s);
             upload(scales, h.fp8_scale.data(), h.fp8_scale.size(), s);
+        } else if (h.is_nvfp4()) {
+            nv_global = h.nvfp4_global;
+            upload(nv_packed, h.nvfp4_packed.data(), h.nvfp4_packed.size(), s);
+            upload(nv_scales, h.nvfp4_scales.data(), h.nvfp4_scales.size(), s);
         } else {
             auto cb = behemoth::qtip::make_codebook(h.tlut);
             upload(trellis, h.trellis.data(), h.trellis.size(), s);
@@ -42,6 +48,8 @@ struct Linear {
         y.ensure(out, s);
         if (fp8.p)
             fp8_forward(fp8, scales, x, y, in, out, s);
+        else if (nv_packed.p)
+            nvfp4_forward(nv_packed, nv_scales, nv_global, x, y, in, out, s);
         else {
             scratch.ensure(std::max(in, out), s);
             rotated.ensure(in, s);

@@ -200,6 +200,13 @@ void fp8_forward(const uint8_t *w, const float *scale, const B16 *x, B16 *y, int
     fp8_gemv<<<(out + 3) / 4, 128, 0, s>>>(w, scale, x, y, in, out);
     launch_check();
 }
+void nvfp4_forward(const uint8_t *packed, const uint8_t *block_scales, float global, const B16 *x, B16 *y, int in,
+                   int out, Stream s) {
+    // shared GLM gemv (format 2): register-widened E2M1 x E4M3 x global with bf16 rounding, fp32 accumulation
+    glm53::gpu::Matrix m{packed, nullptr, block_scales, out, in, 2, false, global};
+    glm53::gpu::gemv(m, x, y, false, s);
+    glm53::gpu::checked(cudaGetLastError(), "Behemoth CUDA NVFP4 gemv");
+}
 void embedding(const B16 *w, B16 *y, int t, int h, Stream s) {
     embed_kernel<<<(h + 255) / 256, 256, 0, s>>>(w, y, t, h);
     launch_check();

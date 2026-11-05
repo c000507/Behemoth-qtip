@@ -89,6 +89,11 @@ the other projections in QTIP 2-bit (`--kv-format qtip` selects legacy all-2-bit
 `qtip_reconstruct` performs sequential teacher-guided block fitting. See
 [FP8 K/V and block reconstruction](docs/MIXED_FP8_RECONSTRUCTION.md).
 
+`qtip_quant --mode adaptive` quantizes each layer to QTIP 2-bit and re-quantizes layers whose
+next-token KL (or normalized MSE) against the original model exceeds `--kl-threshold` to NVFP4,
+writing a mixed-format checkpoint (`adaptive_report.json` + `config.json:qtip_quant.layer_formats`;
+served by the CUDA runtime, see [adaptive mixed-format quantization](docs/ADAPTIVE.md)).
+
 For repeated paragraphs or reasoning loops, `qtip_diagnose` captures/replays exact
 tokens and compares source/student probabilities and block outputs; see
 [repetition diagnosis](docs/REPETITION_DIAGNOSIS.md).
@@ -161,7 +166,7 @@ Flags (`--help`):
 
 | flag | default | meaning |
 |---|---|---|
-| `--mode run\|collect\|quantize\|assemble` | run | `collect`: Hessians only (kept on disk). `quantize`: layers whose Hessian file exists in `--hess-dir`. `assemble`: write config/index/embeddings |
+| `--mode run\|collect\|quantize\|assemble\|adaptive` | run | `collect`: Hessians only (kept on disk). `quantize`: layers whose Hessian file exists in `--hess-dir`. `assemble`: write config/index/embeddings. `adaptive`: per-layer QTIP-vs-NVFP4 selection (see [docs/ADAPTIVE.md](docs/ADAPTIVE.md); extra flags `--kl-threshold`, `--kl-metric lmkl|mse`, `--kl-tokens`, `--adaptive-next-input original|quantized`) |
 | `--model DIR` | /mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic | FP8-Dynamic (compressed-tensors) checkpoint, read only |
 | `--tokens FILE`, `--ntok N`, `--seq-len N` | –, 4194304, 2048 | calibration tokens (raw int32 [nseq][seq_len]) |
 | `--layers A:B` | all | layer range [A, B) |
@@ -262,6 +267,10 @@ The native decoder and the committed numerical fixtures verify this reconstructi
   - GPU LDLQ vs a CPU port of `ldlq.LDLQ` (bit-identical trellises)
   - end-to-end `quantize_group` with a CPU decode of the packed output
   - `--shape` times one real-sized linear with a synthetic Hessian
+- `build/qtip_adaptive_tests [--device N]`: adaptive mixed-format mode on a synthetic 3-layer FP8
+  checkpoint — forces every branch (all-QTIP, KL-forced NVFP4 fallback, MSE metric with
+  quantized-input chaining) and checks layer tensors, `adaptive_report.json`, `config.json`
+  `layer_formats`, and NVFP4 decode fidelity.
 - Native runtime projection checks: `behemoth_qtip_tests` verifies decode and forward math;
   `qtip_check` compares selected logits against a captured `behemoth_eval` trace.
   See [fine-tuning validation](docs/FINE_TUNING.md) for commands and pending GPU gates.

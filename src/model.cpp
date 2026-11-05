@@ -195,6 +195,34 @@ void LayerRunner::upload(const LayerHost& L) {
   HIP_CHECK(hipStreamSynchronize(s_));
 }
 
+void LayerRunner::upload_raw(int li, const uint16_t* w_bf16, const float* scale) {
+  HIP_CHECK(hipSetDevice(dev_));
+  const long H = cfg_.hidden, F = cfg_.inter;
+  long qo = long(cfg_.nq) * cfg_.hd, ko = long(cfg_.nkv) * cfg_.hd;
+  uint16_t* dst;
+  float* sdst;
+  long m;
+  switch (li) {
+    case LQ: dst = wqkv_, sdst = sqkv_, m = qo; break;
+    case LK: dst = wqkv_ + qo * H, sdst = sqkv_ + qo, m = ko; break;
+    case LV: dst = wqkv_ + (qo + ko) * H, sdst = sqkv_ + qo + ko, m = ko; break;
+    case LO: dst = wo_, sdst = so_, m = H; break;
+    case LGate: dst = wgu_, sdst = sgu_, m = F; break;
+    case LUp: dst = wgu_ + F * H, sdst = sgu_ + F, m = F; break;
+    case LDown: dst = wd_, sdst = sd_, m = H; break;
+    default: QCHECK(false, "bad linear index"); return;
+  }
+  long in = (li == LDown) ? F : H;
+  HIP_CHECK(hipMemcpyAsync(dst, w_bf16, size_t(m) * in * 2, hipMemcpyHostToDevice, s_));
+  if (scale) {
+    HIP_CHECK(hipMemcpyAsync(sdst, scale, size_t(m) * 4, hipMemcpyHostToDevice, s_));
+  } else {
+    std::vector<float> ones(size_t(m), 1.f);
+    HIP_CHECK(hipMemcpyAsync(sdst, ones.data(), ones.size() * 4, hipMemcpyHostToDevice, s_));
+  }
+  HIP_CHECK(hipStreamSynchronize(s_));
+}
+
 void LayerRunner::forward(uint16_t* host_x, long nseq, HessAcc* acc) {
   HIP_CHECK(hipSetDevice(dev_));
   const long H = cfg_.hidden;

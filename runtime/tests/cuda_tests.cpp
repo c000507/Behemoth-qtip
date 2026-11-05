@@ -1,7 +1,10 @@
 #include "behemoth/qtip.hpp"
+#include "behemoth/numeric.hpp"
 #include "kernels.hpp"
+#include "safetensors.hpp"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <random>
 using namespace behemoth;
@@ -36,7 +39,7 @@ void error(const std::vector<float> &actual, const std::vector<float> &expected,
 void linear_test(cg::Stream s, int out, int in, bool rz) {
     std::mt19937 gen(41);
     std::normal_distribution<float> normal(0, .1f);
-    qtip::HostLinear h;
+    behemoth::qtip::HostLinear h;
     h.in = in;
     h.out = out;
     h.trellis.resize(size_t(in) * out / 8);
@@ -54,10 +57,10 @@ void linear_test(cg::Stream s, int out, int in, bool rz) {
     std::vector<float> x(in);
     for (auto &v : x)
         v = float(BFloat16(normal(gen)));
-    auto expected = qtip::reference_forward(h, x, true, rz);
+    auto expected = behemoth::qtip::reference_forward(h, x, true, rz);
     for (auto &v : expected)
         v = float(BFloat16(v));
-    auto codebook = qtip::make_codebook(h.tlut);
+    auto codebook = behemoth::qtip::make_codebook(h.tlut);
     cg::Buffer<uint16_t> trellis, input, rotated, output;
     cg::Buffer<float> su, sv, scratch, z, result;
     cg::Buffer<uint32_t> lut;
@@ -81,7 +84,7 @@ void linear_test(cg::Stream s, int out, int in, bool rz) {
     error({host.p, host.p + out}, expected, "QTIP trellis/RHT");
 }
 void fp8_test(cg::Stream s) {
-    qtip::HostLinear h;
+    behemoth::qtip::HostLinear h;
     h.in = 96;
     h.out = 64;
     h.fp8.resize(96 * 64);
@@ -97,7 +100,7 @@ void fp8_test(cg::Stream s) {
     std::vector<float> x(96);
     for (auto &v : x)
         v = float(BFloat16(float(int(gen() % 31) - 15) / 32));
-    auto expected = qtip::reference_forward(h, x, true);
+    auto expected = behemoth::qtip::reference_forward(h, x, true);
     for (auto &v : expected)
         v = float(BFloat16(v));
     cg::Buffer<uint8_t> w;
@@ -115,6 +118,99 @@ void fp8_test(cg::Stream s) {
     cg::checked(cg::d2h(host.p, result, 64 * 4, s), "read FP8");
     cg::checked(cg::sync(s), "finish FP8 test");
     error({host.p, host.p + 64}, expected, "FP8 output-channel scaling");
+}
+void nvfp4_test(cg::Stream s) {
+    // Adaptive mixed-format checkpoints: NVFP4 projection (E2M1 pairs, E4M3 block scales over 16
+    // input channels, F32 global scale) through the loader and the shared gemv kernel.
+    const int out = 64, in = 96;
+    std::mt19937 gen(29);
+    std::normal_distribution<float> normal(0, .05f);
+    std::vector<float> w(size_t(out) * in);
+    for (auto &v : w)
+        v = normal(gen);
+    float maximum = 0;
+    for (float v : w)
+        maximum = std::max(maximum, std::abs(v));
+    const float global = maximum / (448.f * 6);
+    auto fp4 = [](float x) {
+        constexpr float levels[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+        float a = std::abs(x), best = INFINITY;
+        int code = 0;
+        for (int i = 0; i < 8; ++i) {
+            float e = std::abs(a - levels[i]);
+            if (e < best || (e == best && (i % 2 == 0))) {
+                best = e;
+                code = i;
+            }
+        }
+        return uint8_t(code | (std::signbit(x) ? 8 : 0));
+    };
+    std::vector<uint8_t> packed(w.size() / 2), scales(w.size() / 16);
+    std::vector<float> wq(w.size());
+    for (size_t b = 0; b < scales.size(); ++b) {
+        float m = 0;
+        for (int j = 0; j < 16; ++j)
+            m = std::max(m, std::abs(w[b * 16 + j]));
+        uint8_t code = encode_e4m3(m / (6 * global));
+        scales[b] = code;
+        float scale = decode_e4m3(code) * global;
+        for (int j = 0; j < 16; j += 2)
+            packed[b * 8 + j / 2] =
+                fp4(scale ? w[b * 16 + j] / scale : 0) | (fp4(scale ? w[b * 16 + j + 1] / scale : 0) << 4);
+    }
+    // exact dequantized values (device rounding: level * scale * global rounded to bf16)
+    constexpr float levels[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+    for (size_t b = 0; b < scales.size(); ++b) {
+        float scale = decode_e4m3(scales[b]) * global;
+        for (int j = 0; j < 16; ++j) {
+            uint8_t c = (packed[b * 8 + j / 2] >> (4 * (j & 1))) & 15;
+            wq[b * 16 + j] = float(BFloat16((c & 8 ? -1.f : 1.f) * levels[c & 7] * scale));
+        }
+    }
+    std::vector<float> x(in);
+    for (auto &v : x)
+        v = float(BFloat16(normal(gen)));
+    std::vector<float> expected(out);
+    for (int o = 0; o < out; ++o) {
+        double sum = 0;
+        for (int i = 0; i < in; ++i)
+            sum += double(wq[size_t(o) * in + i]) * double(x[size_t(i)]);
+        expected[size_t(o)] = float(BFloat16(float(sum)));
+    }
+    // loader: write a layer shard exactly as qtip_quant --mode adaptive does and read it back
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "behemoth_nvfp4_test";
+    std::filesystem::create_directories(dir);
+    const std::string base = "model.layers.0.self_attn.q_proj.";
+    {
+        ::qtip::SafeTensorsWriter writer;
+        writer.add(base + "weight_packed", "U8", {out, in / 2}, packed.data(), packed.size());
+        writer.add(base + "weight_scale", "F8_E4M3", {out, in / 16}, scales.data(), scales.size());
+        writer.add(base + "weight_global_scale", "F32", {}, &global, 4);
+        writer.add(base + "input_layernorm.weight", "BF16", {16}, std::vector<uint16_t>(16).data(), 32);
+        writer.write((dir / "model-layer-00000.safetensors").string());
+    }
+    SafeTensorFile file(dir / "model-layer-00000.safetensors");
+    auto h = behemoth::qtip::load_nvfp4_linear(file, 0, "self_attn.q_proj");
+    require(h.is_nvfp4() && h.in == in && h.out == out, "NVFP4 loader geometry");
+    require(h.nvfp4_packed == packed && h.nvfp4_scales == scales, "NVFP4 loader payload");
+    require(h.nvfp4_global == global, "NVFP4 loader global scale");
+    require(behemoth::qtip::load_linear(file, 0, "self_attn.q_proj").is_nvfp4(), "NVFP4 dispatch through load_linear");
+    // kernel: expected computed from the same dequantized bf16 weights
+    cg::Buffer<uint8_t> d_packed, d_scales;
+    cg::Buffer<uint16_t> input, out_b;
+    cg::Buffer<float> result;
+    put(d_packed, packed, s);
+    put(d_scales, scales, s);
+    put(input, bits(x), s);
+    out_b.ensure(out, s);
+    result.ensure(out, s);
+    cu::nvfp4_forward(d_packed, d_scales, global, input, out_b, in, out, s);
+    cg::to_float(out_b, result, out, s);
+    cg::Pinned<float> host;
+    host.ensure(out);
+    cg::checked(cg::d2h(host.p, result, size_t(out) * 4, s), "read NVFP4");
+    cg::checked(cg::sync(s), "finish NVFP4 test");
+    error({host.p, host.p + out}, expected, "NVFP4 mixed-format projection");
 }
 void attention_test(cg::Stream s) {
     constexpr int heads = 6, kvheads = 2, dim = 128, max_tokens = 17;
@@ -185,9 +281,10 @@ int main(int argc, char **argv) {
             for (bool rz : {false, true})
                 linear_test(s, out, in, rz);
         fp8_test(s);
+        nvfp4_test(s);
         attention_test(s);
         cg::checked(cg::stream_destroy(s), "test stream shutdown");
-        std::cout << "PASS native CUDA QTIP, Hadamard orientations, FP8 scales and causal GQA\n";
+        std::cout << "PASS native CUDA QTIP, Hadamard orientations, FP8 scales, NVFP4 and causal GQA\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
         if (s)

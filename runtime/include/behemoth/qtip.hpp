@@ -51,6 +51,13 @@ struct HostLinear {
     std::vector<uint8_t> fp8;
     std::vector<float> fp8_scale;
     bool is_fp8() const { return !fp8.empty(); }
+    // NVFP4 weight-only projection (adaptive mixed-format checkpoints, qtip_quant --mode adaptive):
+    // two E2M1 values per byte (low nibble first), one E4M3 scale per 16 input channels of a row,
+    // one F32 global scale per matrix. Mutually exclusive with trellis/SU/SV/tlut and fp8.
+    std::vector<uint8_t> nvfp4_packed;   // [out][in/2]
+    std::vector<uint8_t> nvfp4_scales;   // [out][in/16] E4M3
+    float nvfp4_global = 0;
+    bool is_nvfp4() const { return !nvfp4_packed.empty(); }
     // Kernel-layout word c (0..31) of tile (tile_row, tile_col):
     // trellis[(((i0*(in/32) + j0)*32 + c)*2 + j1)*2 + i1], tile_row = 2*i0+i1, tile_col = 2*j0+j1.
     uint16_t word(int tile_row, int tile_col, int c) const {
@@ -83,6 +90,9 @@ HostLinear load_linear(const Checkpoint &, int layer, const std::string &name);
 HostLinear load_linear(const SafeTensorFile &, int layer, const std::string &name);
 HostLinear load_fp8_linear(const SafeTensorFile &, int layer, const std::string &name);
 HostLinear load_fp8_linear(const SafeTensorFile &weight, const SafeTensorFile &scale, int layer, const std::string &name);
+// NVFP4 projection written by qtip_quant --mode adaptive (weight_packed/weight_scale/
+// weight_global_scale tensors of one layer shard).
+HostLinear load_nvfp4_linear(const SafeTensorFile &packed_file, int layer, const std::string &name);
 // Reference transformer block of a QTIP checkpoint for one token at position zero (same
 // semantics/rounding as reference_block for AQLM: bf16 norms, residual and projection outputs,
 // FP8 attention reference), using decoded weights. Slow (decodes the full layer on the CPU).

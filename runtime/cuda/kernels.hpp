@@ -13,6 +13,9 @@ void initialize_tables();
 void qtip_forward(QtipMatrix, const B16 *, B16 *, float *scratch, B16 *rotated, float *z, bool round_z,
                   Stream);
 void fp8_forward(const uint8_t *, const float *, const B16 *, B16 *, int in, int out, Stream);
+// NVFP4 weight-only projection (E2M1 pairs, E4M3 block scales / 16 input channels, F32 global scale).
+void nvfp4_forward(const uint8_t *packed, const uint8_t *block_scales, float global, const B16 *, B16 *, int in,
+                   int out, Stream);
 void embedding(const B16 *, B16 *, int token, int hidden, Stream);
 void residual(B16 *, const B16 *, int n, Stream);
 void rope(B16 *, B16 *, int position, int qheads, int kvheads, int dim, float theta, Stream);

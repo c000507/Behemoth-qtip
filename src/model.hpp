@@ -74,6 +74,9 @@ class LayerRunner {
   LayerRunner(int device, const ModelConfig& cfg, int max_rows, int seq_len);
   ~LayerRunner();
   void upload(const LayerHost& L);  // fp8 -> bf16 on device (exact), scales -> fp32
+  // Replace one linear's device weights with raw bf16 [out_dim][in_dim] values that already include any
+  // scaling (quantized reconstructions: QTIP hatW or NVFP4 dequantized). scale defaults to 1.
+  void upload_raw(int li, const uint16_t* w_bf16, const float* scale = nullptr);
   // In-place forward of nseq sequences (host bf16 [nseq][T][hidden]); if acc: accumulate Hessians.
   void forward(uint16_t* host_x, long nseq, HessAcc* acc);
   void alloc_hess(HessAcc& a);

@@ -194,6 +194,8 @@ HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::strin
     if (layer < 0 || layer >= checkpoint.config.layers)
         throw std::invalid_argument("Invalid QTIP layer");
     const auto base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    if (checkpoint.has_tensor(base + "weight_packed"))
+        return load_nvfp4_linear(checkpoint.tensor(base + "weight_packed"), layer, name);
     const bool fp8 = checkpoint.config.fp8_kv && (name == "self_attn.k_proj" || name == "self_attn.v_proj");
     if (fp8) {
         for (const auto *suffix : {"trellis", "SU", "SV", "tlut", "rcp", "tp_rank"})
@@ -212,6 +214,8 @@ HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::strin
 }
 HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string &name) {
     const auto prefix = "model.layers." + std::to_string(layer) + "." + name + ".";
+    if (file.contains(prefix + "weight_packed"))
+        return load_nvfp4_linear(file, layer, name);
     if (file.contains(prefix + "weight"))
         return load_fp8_linear(file, layer, name);
     int in = 12288, out = 12288;
@@ -274,6 +278,33 @@ HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string 
 }
 HostLinear load_fp8_linear(const SafeTensorFile &file, int layer, const std::string &name) {
     return load_fp8_linear(file, file, layer, name);
+}
+HostLinear load_nvfp4_linear(const SafeTensorFile &packed_file, int layer, const std::string &name) {
+    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    auto ps = packed_file.shape(base + "weight_packed");
+    if (packed_file.dtype(base + "weight_packed") != "U8" || ps.size() != 2 || !ps[0] || !ps[1] ||
+        ps[0] > size_t(INT32_MAX) || ps[1] > size_t(INT32_MAX) || (ps[1] * 2) % 16 ||
+        packed_file.contains(base + "trellis") || packed_file.contains(base + "SU") ||
+        packed_file.contains(base + "weight"))
+        throw std::invalid_argument("Invalid or ambiguous NVFP4 projection: " + base);
+    HostLinear w;
+    w.out = int(ps[0]);
+    w.in = int(ps[1] * 2);
+    auto ss = packed_file.shape(base + "weight_scale");
+    if (packed_file.dtype(base + "weight_scale") != "F8_E4M3" ||
+        ss != std::vector<size_t>{size_t(w.out), size_t(w.in / 16)})
+        throw std::invalid_argument("Invalid NVFP4 block scales: " + base);
+    auto gs = packed_file.floats(base + "weight_global_scale");
+    if (gs.size() != 1 || !std::isfinite(gs[0]) || gs[0] <= 0)
+        throw std::invalid_argument("Invalid NVFP4 global scale: " + base);
+    w.nvfp4_global = gs[0];
+    auto packed = packed_file.bytes(base + "weight_packed");
+    w.nvfp4_packed.resize(packed.size());
+    std::memcpy(w.nvfp4_packed.data(), packed.data(), packed.size());
+    auto scales = packed_file.bytes(base + "weight_scale");
+    w.nvfp4_scales.resize(scales.size());
+    std::memcpy(w.nvfp4_scales.data(), scales.data(), scales.size());
+    return w;
 }
 HostLinear load_fp8_linear(const SafeTensorFile &file, const SafeTensorFile &scale_file, int layer, const std::string &name) {
     const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";

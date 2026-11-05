@@ -15,6 +15,7 @@ struct QuantOpts {
   int ldl_threads = 16;          // CPU threads for the fp64 Cholesky
   bool share_su = true;          // one SU (and one LDL) per Hessian group
   std::string dump_dir;          // if set: write W (fp32) and the reconstructed hatW (fp32) per linear
+  bool want_hatW = false;        // fill LinearOut::hatW (original-domain reconstructed weight, fp32)
 };
 
 struct LinearIn {
@@ -35,6 +36,9 @@ struct LinearOut {
   double proxy = 0;          // tr(dW H dW^T)/tr(W H W^T), unregularized H (original domain, = rotated)
   double proxy_rot_reg = 0;  // same with the regularized rotated Hessian (what the reference prints)
   double seconds = 0;        // share of the group time (by weight count)
+  // Reconstructed weight [m][n] fp32 in the original domain (diag(SV) T_m (hatWr*Wscale) T_n^T diag(SU)),
+  // exactly what a runtime decodes. Filled only when QuantOpts::want_hatW (adaptive layer evaluation).
+  std::vector<float> hatW;
 };
 
 struct GroupTiming {

@@ -1,5 +1,119 @@
-// HIP helpers + kernel launch wrappers (implemented in kernels.hip / viterbi.hip) + hipBLASLt GEMM wrapper.
+// GPU helpers + kernel launch wrappers (implemented in kernels.hip / viterbi.hip) + BLASLt GEMM wrapper.
+// Single source for both backends: with QTIP_CUDA defined (CMake -DQTIP_CUDA=ON, nvcc + cuBLASLt) the
+// HIP API below maps onto the CUDA runtime; otherwise the native HIP / hipBLASLt path is used unchanged.
+// Warp size is 32 on both.
 #pragma once
+
+#ifdef QTIP_CUDA
+// ---------------------------------------------------------------- NVIDIA CUDA backend (sm_86, cuBLASLt)
+#include <cuda_runtime.h>
+#include <cublasLt.h>
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "common.hpp"
+
+using hipStream_t = cudaStream_t;
+using hipEvent_t = cudaEvent_t;
+using hipError_t = cudaError_t;
+using hipMemcpyKind = cudaMemcpyKind;
+using hipDataType = cudaDataType;
+using hipblasStatus_t = cublasStatus_t;
+using hipblasOperation_t = cublasOperation_t;
+using hipblasLtHandle_t = cublasLtHandle_t;
+using hipblasLtMatmulDesc_t = cublasLtMatmulDesc_t;
+using hipblasLtMatrixLayout_t = cublasLtMatrixLayout_t;
+using hipblasLtMatmulAlgo_t = cublasLtMatmulAlgo_t;
+using hipblasLtMatmulPreference_t = cublasLtMatmulPreference_t;
+using hipblasLtMatmulHeuristicResult_t = cublasLtMatmulHeuristicResult_t;
+
+#define hipSuccess cudaSuccess
+#define hipMemcpyHostToDevice cudaMemcpyHostToDevice
+#define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define hipMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
+#define hipHostMallocDefault cudaHostAllocDefault
+#define hipStreamNonBlocking cudaStreamNonBlocking
+#define hipEventDisableTiming cudaEventDisableTiming
+
+#define hipFree cudaFree
+#define hipHostFree cudaFreeHost
+#define hipMallocAsync cudaMallocAsync
+#define hipFreeAsync cudaFreeAsync
+#define hipMemcpy cudaMemcpy
+#define hipMemcpyAsync cudaMemcpyAsync
+#define hipMemcpy2DAsync cudaMemcpy2DAsync
+#define hipMemsetAsync cudaMemsetAsync
+#define hipGetDevice cudaGetDevice
+#define hipGetDeviceCount cudaGetDeviceCount
+#define hipGetLastError cudaGetLastError
+#define hipSetDevice cudaSetDevice
+#define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipStreamSynchronize cudaStreamSynchronize
+#define hipStreamCreate cudaStreamCreate
+#define hipStreamCreateWithFlags cudaStreamCreateWithFlags
+#define hipStreamDestroy cudaStreamDestroy
+#define hipEventCreate cudaEventCreate
+#define hipEventCreateWithFlags cudaEventCreateWithFlags
+#define hipEventRecord cudaEventRecord
+#define hipEventSynchronize cudaEventSynchronize
+#define hipEventDestroy cudaEventDestroy
+#define hipEventElapsedTime cudaEventElapsedTime
+
+// cudaMalloc takes void** strictly; HIP's hipMalloc accepts any T**. Wrap the typed call sites.
+template <class T>
+inline hipError_t hipMalloc(T* p, size_t bytes) {
+  return cudaMalloc(reinterpret_cast<void**>(p), bytes);
+}
+template <class T>
+inline hipError_t hipHostMalloc(T* p, size_t bytes, unsigned) {
+  return cudaHostAlloc(reinterpret_cast<void**>(p), bytes, cudaHostAllocDefault);
+}
+inline const char* hipGetErrorString(hipError_t e) { return cudaGetErrorString(e); }
+
+// HIP shuffles assume an implicit full warp; CUDA (sm_70+) requires an explicit mask.
+#define __shfl_xor(var, off, width) __shfl_xor_sync(0xffffffffu, var, off, width)
+
+// hipBLASLt -> cuBLASLt (identical argument lists)
+#define HIPBLAS_STATUS_SUCCESS CUBLAS_STATUS_SUCCESS
+#define HIPBLAS_COMPUTE_32F CUBLAS_COMPUTE_32F
+#define HIP_R_32F CUDA_R_32F
+#define HIP_R_16BF CUDA_R_16BF
+#define HIPBLAS_OP_T CUBLAS_OP_T
+#define HIPBLAS_OP_N CUBLAS_OP_N
+#define HIPBLASLT_MATMUL_DESC_TRANSA CUBLASLT_MATMUL_DESC_TRANSA
+#define HIPBLASLT_MATMUL_DESC_TRANSB CUBLASLT_MATMUL_DESC_TRANSB
+#define HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT
+#define HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET
+#define HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES
+#define hipblasLtCreate cublasLtCreate
+#define hipblasLtDestroy cublasLtDestroy
+#define hipblasLtMatmulDescCreate cublasLtMatmulDescCreate
+#define hipblasLtMatmulDescDestroy cublasLtMatmulDescDestroy
+#define hipblasLtMatmulDescSetAttribute cublasLtMatmulDescSetAttribute
+#define hipblasLtMatrixLayoutCreate cublasLtMatrixLayoutCreate
+#define hipblasLtMatrixLayoutDestroy cublasLtMatrixLayoutDestroy
+#define hipblasLtMatrixLayoutSetAttribute cublasLtMatrixLayoutSetAttribute
+#define hipblasLtMatmulPreferenceCreate cublasLtMatmulPreferenceCreate
+#define hipblasLtMatmulPreferenceDestroy cublasLtMatmulPreferenceDestroy
+#define hipblasLtMatmulPreferenceSetAttribute cublasLtMatmulPreferenceSetAttribute
+#define hipblasLtMatmulAlgoGetHeuristic cublasLtMatmulAlgoGetHeuristic
+#define hipblasLtMatmul cublasLtMatmul
+
+#define CUDA_CHECK(x)                                                                                 \
+  do {                                                                                                \
+    cudaError_t e_ = (x);                                                                             \
+    if (e_ != cudaSuccess)                                                                            \
+      ::qtip::die(std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " #x " -> " +           \
+                  cudaGetErrorString(e_));                                                            \
+  } while (0)
+#define HIP_CHECK CUDA_CHECK
+
+#else
+// ---------------------------------------------------------------- AMD HIP backend (gfx1201, hipBLASLt)
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 
@@ -18,6 +132,7 @@
       ::qtip::die(std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " #x " -> " +          \
                   hipGetErrorString(e_));                                                            \
   } while (0)
+#endif  // QTIP_CUDA
 
 namespace qtip {
 

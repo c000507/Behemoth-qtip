@@ -6,6 +6,7 @@ checkpoint's `config.json`:
 | Model profile | CUDA backend |
 |---|---|
 | Llama/Mistral-layout Behemoth-R1-123B-v2 QTIP | 88 layers, hidden 12288, GQA 96/8, RoPE, QTIP HYB and optional FP8 K/V projections |
+| Behemoth adaptive mixed-format (`qtip_quant --mode adaptive`) | same geometry; per-layer QTIP or NVFP4 (E2M1 + E4M3 block scales) projections, selected per linear from the checkpoint tensors |
 | `glm5_next` / `glm5_next_text` | Original 320B MoE or custom dense config, KDA, NoPE sparse MLA, mHC, FP8/BF16 and NVFP4 MLPs |
 
 The Llama/Mistral QTIP profile currently uses the supported Behemoth geometry
@@ -65,10 +66,14 @@ binds to loopback by default; use SSH forwarding to access it remotely.
 For Behemoth, compressed QTIP and FP8 projection weights remain resident on the
 GPU. QTIP GEMV fuses the tail-biting trellis decoder with matrix-vector products;
 the input/output Hadamard transforms preserve the SU/SV conventions of the CPU
-reference. FP8 K/V scales apply after FP32 accumulation. Activations and the
+reference. FP8 K/V scales apply after FP32 accumulation. Mixed-format layers
+written by `qtip_quant --mode adaptive` run NVFP4 projections through the shared
+GLM gemv (register-widened E2M1 with bf16 rounding); the format is probed per
+linear from the layer tensors. Activations and the
 RoPE GQA KV cache are BF16. This cache differs from the original ROCm runtime's
 FP8 cache. The 123B public mixed checkpoint occupies about 33.3 GiB with a 4k
-context allocation; a 32k cache adds about 9.6 GiB.
+context allocation; a 32k cache adds about 9.6 GiB. An adaptive checkpoint with
+N NVFP4 layers adds roughly 1.3 GiB per NVFP4 layer over the all-QTIP size.
 
 GLM uses the [shared GLM kernels](../../glm53/README.md), with GPU attention and
 recurrent state and streamed large weights. Both backends currently replay
@@ -88,6 +93,10 @@ On an A100 SXM 80GB, the following passed:
   the correct answer `4` to the arithmetic smoke prompt above.
 - Real-checkpoint HTTP generation and reset consistency: a 64-token explanation
   of Rayleigh scattering took about 18.8 seconds including 13 prompt tokens.
+
+Additionally, on an RTX A4000 (sm_86, CUDA 12.0): the NVFP4 mixed-format
+loader/gemv unit test (`behemoth_cuda_tests`, `nvfp4_test`) and the synthetic
+adaptive-quantizer suite (`qtip_adaptive_tests`) pass.
 
 Detailed hardware, checkpoint revision, and measurements are in
 [VALIDATION.md](VALIDATION.md).
