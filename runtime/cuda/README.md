@@ -154,6 +154,11 @@ payloads and copy engines for large prefill transfers. `peer-dma` uses copy
 engines for every transfer and provides an A/B comparison. The peer tests
 check exact rank data, repeated buffer reuse, and cross-device graph replay.
 The default remains `nccl` because peer-copy performance varies greatly by host.
+Peer transport now checks small and bulk transfers against known byte patterns
+at startup. Some hosted PCIe systems advertise peer access but return incorrect
+data. Such a host is rejected before model loading; use `nccl` there. The fast
+build adds `cuda_nccl_collectives` to test exact rank data and graph replay through
+NCCL. Run `behemoth_cuda_peer_tests --dma` to isolate the peer DMA path.
 
 ## Experimental QTIP split-K benchmark
 

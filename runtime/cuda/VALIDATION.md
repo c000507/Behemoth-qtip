@@ -46,6 +46,15 @@ These are complete model runs with zero warmup runs and fixed generation
 lengths. They remain below the requested targets. The rebased equivalents are
 `e5e492a` and `8d37814`; performance has not yet been remeasured after the rebase.
 
+On the replacement US-KS-2 A6000 host, both peer GPU stores and peer DMA left
+the receiving rank's sentinel bytes unchanged (first byte 238 instead of 83),
+despite driver-reported peer access. Those model timings are invalid. The new
+startup check rejects both peer modes on this host. NCCL with peer access disabled
+passes exact 56 KiB, 224 KiB and 8 MiB AllGather checks, repeated buffer reuse,
+and three graph replays with changing inputs. The other six CTests pass here,
+including the rebased Llama geometry tests. Peer execution still requires a host
+that passes its own integrity checks.
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

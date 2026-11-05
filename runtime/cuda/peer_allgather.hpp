@@ -1,8 +1,10 @@
 #pragma once
 #include "kernels.hpp"
+#include <algorithm>
 #include <array>
+#include <vector>
 namespace behemoth::cuda_runtime {
-// Two-rank, in-place AllGather using the copy engines. Receive buffers contain
+// Two-rank, in-place AllGather using GPU stores or copy engines. Receive buffers contain
 // [rank0 bytes][rank1 bytes]; send buffers may alias their own receive region.
 class PeerAllGather {
     struct Device {
@@ -17,6 +19,51 @@ class PeerAllGather {
     std::array<Stream, 2> streams;
     std::array<cudaEvent_t, 2> ready{}, done{};
     bool kernel_small;
+    void validate(size_t bytes) {
+        using glm53::gpu::checked;
+        std::array<void *, 2> buffers{};
+        auto release = [&] {
+            for (int r = 0; r < 2; ++r) {
+                Device device(devices[r]);
+                if (buffers[r])
+                    (void)cudaFree(buffers[r]);
+            }
+        };
+        try {
+            std::array<std::vector<uint8_t>, 2> patterns;
+            std::array<const void *, 2> send;
+            for (int r = 0; r < 2; ++r) {
+                Device device(devices[r]);
+                checked(cudaMalloc(&buffers[r], bytes * 2), "allocate peer validation buffer");
+                checked(cudaMemsetAsync(buffers[r], 0xee, bytes * 2, streams[r]), "clear peer validation");
+                patterns[r].resize(bytes);
+                for (size_t i = 0; i < bytes; ++i)
+                    patterns[r][i] = uint8_t(i * 17 + r * 83 + 19);
+                auto *own = static_cast<uint8_t *>(buffers[r]) + r * bytes;
+                checked(cudaMemcpyAsync(own, patterns[r].data(), bytes, cudaMemcpyHostToDevice, streams[r]),
+                        "upload peer validation pattern");
+                send[r] = own;
+            }
+            run(send, buffers, bytes);
+            std::vector<uint8_t> result(bytes * 2);
+            for (int r = 0; r < 2; ++r) {
+                Device device(devices[r]);
+                checked(
+                    cudaMemcpyAsync(result.data(), buffers[r], bytes * 2, cudaMemcpyDeviceToHost, streams[r]),
+                    "read peer validation result");
+                checked(cudaStreamSynchronize(streams[r]), "complete peer validation");
+                for (int sender = 0; sender < 2; ++sender)
+                    if (!std::equal(patterns[sender].begin(), patterns[sender].end(),
+                                    result.begin() + sender * bytes))
+                        throw std::runtime_error("CUDA peer transfer failed data integrity on this host; "
+                                                 "use BEHEMOTH_CUDA_TP_TRANSPORT=nccl");
+            }
+        } catch (...) {
+            release();
+            throw;
+        }
+        release();
+    }
     void clear() {
         for (int r = 0; r < 2; ++r) {
             Device device(devices[r]);
@@ -50,6 +97,10 @@ class PeerAllGather {
                 checked(cudaEventCreateWithFlags(&done[r], cudaEventDisableTiming),
                         "create peer completion event");
             }
+            // Driver-reported peer access is insufficient on some hosted PCIe
+            // topologies. Check both small and bulk transfers before inference.
+            validate(4096);
+            validate(2 * 1024 * 1024);
         } catch (...) {
             clear();
             throw;
