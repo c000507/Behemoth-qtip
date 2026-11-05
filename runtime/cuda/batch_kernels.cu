@@ -1,6 +1,7 @@
 #include "batch_kernels.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <mma.h>
 namespace behemoth::cuda_runtime {
@@ -178,6 +179,90 @@ __global__ void trellis_mma8(QtipMatrix w, const B16 *x, float *out, int stride,
     if (token + 1 < tokens) {
         out[at + stride] = c1;
         out[at + stride + 8] = c3;
+    }
+#endif
+}
+// A warp decodes all 32 output rows of a packed tile, reusing the activation
+// fragment for its two 16-row products. Prefetch the next tile before decoding.
+template <int Copies>
+__global__ void trellis_mma32(QtipMatrix w, const B16 *x, float *out, int stride, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ uint32_t lut[1024 * Copies];
+    for (int i = threadIdx.x; i < 1024 * Copies; i += blockDim.x)
+        lut[i] = w.lut[i / Copies];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int row = blockIdx.x * (blockDim.x / 32) * 32 + warp * 32;
+    if (row >= w.out)
+        return;
+    int chunks = w.in / 32;
+    int first = chunks * blockIdx.y / gridDim.y, last = chunks * (blockIdx.y + 1) / gridDim.y;
+    int token_base = blockIdx.z * 8, token = token_base + lane / 4;
+    struct Tile {
+        uint2 weight;
+        uint32_t b[4];
+    };
+    auto load = [&](int chunk, Tile &tile) {
+        chunk = min(chunk, last - 1);
+        size_t base = (size_t(row / 32) * chunks + chunk) * 32;
+        tile.weight = reinterpret_cast<const uint2 *>(w.trellis)[base + lane];
+        if (token < tokens) {
+            const uint32_t *input =
+                reinterpret_cast<const uint32_t *>(x) + size_t(token) * (w.in / 2) + chunk * 16 + lane % 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                tile.b[i] = input[i * 4];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                tile.b[i] = 0;
+        }
+    };
+    float c[2][4] = {};
+    auto compute = [&](const Tile &tile) {
+        uint2 next{__shfl_sync(0xffffffffU, tile.weight.x, (lane + 1) & 31),
+                   __shfl_sync(0xffffffffU, tile.weight.y, (lane + 1) & 31)};
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            uint32_t own = half ? tile.weight.y : tile.weight.x, peer = half ? next.y : next.x;
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                uint32_t u = __byte_perm(own, peer, r ? 0x3276 : 0x1054), a[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    uint32_t state = u >> (16 - 4 * t);
+                    uint32_t index = ((state * state + state) >> 6) & 1023U;
+                    a[t] = lut[index * Copies + (lane & (Copies - 1))];
+                }
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[r][0]), "+f"(c[r][1]), "+f"(c[r][2]), "+f"(c[r][3])
+                             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(tile.b[half * 2]),
+                               "r"(tile.b[half * 2 + 1]));
+            }
+        }
+    };
+    if (first < last) {
+        Tile next;
+        load(first, next);
+        for (int chunk = first; chunk < last; ++chunk) {
+            Tile current = next;
+            load(chunk + 1, next);
+            compute(current);
+        }
+    }
+    token = token_base + (lane % 4) * 2;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        size_t at = (size_t(blockIdx.y) * tokens + token) * stride + row + r * 16 + lane / 4;
+        if (token < tokens) {
+            out[at] = c[r][0];
+            out[at + 8] = c[r][2];
+        }
+        if (token + 1 < tokens) {
+            out[at + stride] = c[r][1];
+            out[at + stride + 8] = c[r][3];
+        }
     }
 #endif
 }
@@ -559,7 +644,30 @@ __global__ void decode_fp8(const uint8_t *x, B16 *y, size_t n) {
 }
 void launch_check() { glm53::gpu::checked(cudaGetLastError(), "CUDA batch operation launch"); }
 } // namespace
-void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int splits, int tokens, Stream s) {
+void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int splits, int tokens, Stream s,
+                         int implementation) {
+    if (implementation < 0) {
+        static const int wide = [] {
+            const char *value = std::getenv("BEHEMOTH_CUDA_QTIP_MMA_WIDE");
+            if (!value)
+                return -1;
+            if (std::string(value) == "0")
+                return 0;
+            if (std::string(value) == "1")
+                return 1;
+            throw std::runtime_error("BEHEMOTH_CUDA_QTIP_MMA_WIDE must be 0 or 1");
+        }();
+        implementation = tokens <= 16 && (wide >= 0 ? wide != 0 : tokens > 1) ? 1 : 0;
+    }
+    if (implementation == 1 && native_bf16()) {
+        if (w.in % 32 || w.out % 32 || stride < w.out || tokens <= 0 || splits <= 0 || splits > 32 ||
+            splits > w.in / 32)
+            throw std::runtime_error("Invalid wide register QTIP matmul geometry");
+        trellis_mma32<4>
+            <<<dim3((w.out + 255) / 256, splits, (tokens + 7) / 8), 256, 0, s>>>(w, x, z, stride, tokens);
+        glm53::gpu::checked(cudaGetLastError(), "wide register QTIP matmul launch");
+        return;
+    }
     if (tokens == 1 || !native_bf16())
         qtip_multiply(w, x, z, stride, splits, s, tokens);
     else if (tokens <= 16) {

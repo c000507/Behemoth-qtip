@@ -133,6 +133,11 @@ bottlenecks and disable it for throughput measurements.
 The benchmark also reports per-step latency summaries. Set
 `BEHEMOTH_CUDA_BENCH_STEP_TIMES=1` to retain all step times in its JSON output.
 
+Small-batch QTIP decode uses 32 output rows per warp and reuses activation
+fragments across two tensor-core products. It is enabled for batches 2–16.
+Set `BEHEMOTH_CUDA_QTIP_MMA_WIDE=0` for the earlier kernel; `1` also selects
+the tensor-core path for batch 1, which changes its FP32 summation order.
+
 Decode attention uses register-level tensor-core products. Set
 `BEHEMOTH_CUDA_ATTENTION_REGISTER=0` to compare the earlier WMMA staging path.
 Both paths retain BF16 probability rounding and the same split-context reduction.

@@ -2,7 +2,8 @@
 #include "kernels.hpp"
 namespace behemoth::cuda_runtime {
 // Token-major activations; split-major, token-major FP32 products.
-void qtip_multiply_batch(QtipMatrix, const B16 *, float *, int stride, int splits, int tokens, Stream);
+void qtip_multiply_batch(QtipMatrix, const B16 *, float *, int stride, int splits, int tokens, Stream,
+                         int implementation = -1);
 void qtip_decode_matrix(QtipMatrix, B16 *, Stream);
 void bf16_multiply_batch(const B16 *weight, const B16 *input, float *out, int in, int rows, int tokens,
                          Stream);

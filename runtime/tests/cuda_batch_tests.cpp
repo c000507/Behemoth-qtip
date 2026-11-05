@@ -120,7 +120,12 @@ void qtip_test(cg::Stream s, int out, int in, int tokens) {
                 require(batched == read(rotated.p, size_t(tokens) * in, s),
                         "Fused input Hadamard must match per-token transform exactly");
             }
-            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s);
+            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s, 0);
+            auto baseline_products = read(z.p, size_t(tokens) * out * splits, s);
+            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s, 1);
+            if (tokens > 1)
+                require(baseline_products == read(z.p, size_t(tokens) * out * splits, s),
+                        "Wide register QTIP must preserve tensor-core products exactly");
             cu::qtip_finish(w, z, output, work, rz, splits, s, tokens);
             if (tokens == 65 && splits == 1) {
                 auto batched = read(output.p, size_t(tokens) * out, s);
@@ -406,8 +411,10 @@ int main() {
             for (int tokens : {8, 17, 65})
                 qtip_test(s, out, in, tokens);
         // Exercise the register kernel's partial row tile and both token tiles.
-        for (int tokens : {2, 7, 16})
+        for (int tokens : {1, 2, 7, 16})
             qtip_test(s, 96, 128, tokens);
+        qtip_test(s, 32, 12288, 1);
+        qtip_test(s, 32, 28672, 1);
         for (int tokens : {8, 17, 65})
             dense_test(s, tokens);
         norm_test(s, 1);

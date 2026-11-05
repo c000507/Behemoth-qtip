@@ -20,6 +20,14 @@ rank, repeated send-buffer reuse, and three graph replays with changing pinned
 host inputs. `cudaMemcpyPeerAsync` was rejected during capture; the implemented
 UVA `cudaMemcpyAsync` path passes both uncaptured and captured checks.
 
+The 32-row QTIP register kernel matches the earlier tensor-core products
+bit for bit across partial row/token tiles, split counts 1/3/8, and batches
+2/7/8/16/17/65. Batch 1 is checked against the independent CPU projection
+reference at input widths 12288 and 28672; its default remains the SIMT kernel.
+On real checkpoint shards at batch 8, isolated product times decreased from
+0.097/0.188/0.186 ms to 0.062/0.137/0.128 ms for Q/gate/down respectively.
+These microbenchmarks do not establish whole-model throughput.
+
 The complete portable build also compiles for sm_75 and sm_80. Local CPU
 regressions pass; local GPU tests skip because that workspace has no GPU.
 This does not establish Turing execution, model quality, or the requested
