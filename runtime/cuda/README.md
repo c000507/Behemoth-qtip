@@ -144,6 +144,15 @@ the tensor-core path for batch 1, which changes its FP32 summation order.
 Decode attention uses register-level tensor-core products. Set
 `BEHEMOTH_CUDA_ATTENTION_REGISTER=0` to compare the earlier WMMA staging path.
 Both paths retain BF16 probability rounding and the same split-context reduction.
+For contexts through 8448 tokens, decode softmax retains scores and exponentials
+in registers, preserving the earlier reduction tree. Set
+`BEHEMOTH_CUDA_RESIDENT_SOFTMAX=0` for an A/B comparison.
+
+Prefill uses fused Hadamard transforms. Set `BEHEMOTH_CUDA_FUSED_HAD=0` for
+the earlier path. The fused kernels keep each token's intermediate values on-chip for widths 12288 and 28672
+and at least 256 rows. Unsupported geometry, insufficient shared memory, and
+unsafe overlapping layouts use the earlier two-pass transform. The MLP up
+projection uses a separate output buffer so its rank-major input remains intact.
 
 NCCL defaults to shared-memory transport (`NCCL_P2P_DISABLE=1`), two channels,
 and a 1 MiB buffer after a hosted A6000 pair showed a slow peer path. Explicit

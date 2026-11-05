@@ -462,9 +462,10 @@ struct TensorModel::Impl {
             float *out = r.z.p + r.rank * n;
             r.multiply(w, rotated_ptr(r), out, rows, parts, large,
                        timing && r.rank == 0 ? timing->events[2] : nullptr);
-            reduce_products(out, n, parts, r.stream);
             if (rz)
-                from_float(out, r.b.p + r.rank * n, n, r.stream);
+                reduce_to_b16(out, nullptr, r.b.p + r.rank * n, n, w.local, parts, r.stream);
+            else
+                reduce_products(out, n, parts, r.stream);
         });
         mark(3);
         size_t n = size_t(rows) * ranks[0]->layers[layer].weights[index].local;
@@ -581,9 +582,11 @@ struct TensorModel::Impl {
             bool shared = ranks[0]->layers[l].shared_su;
             project(l, 4, rows, true, false, false, large, 0, 1, !shared);
             mark_decode("gate");
-            project(l, 5, rows, true, false, shared, large, 0, 2);
+            bool up_in_input = large && fused_prefill_hadamard();
+            project(l, 5, rows, true, false, shared, large, 0, up_in_input ? 0 : 2);
             mark_decode("up");
-            each([&](Rank &r) { swiglu(r.a, r.b, rows * I, INFINITY, r.stream); });
+            each(
+                [&](Rank &r) { swiglu(r.a, up_in_input ? r.input.p : r.b.p, rows * I, INFINITY, r.stream); });
             mark_decode("swiglu");
             project(l, 6, rows, false, false, false, large, 1, 0);
             mark_decode("down");

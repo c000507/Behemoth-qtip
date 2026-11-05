@@ -55,6 +55,25 @@ and three graph replays with changing inputs. The other six CTests pass here,
 including the rebased Llama geometry tests. Peer execution still requires a host
 that passes its own integrity checks.
 
+The prefill Hadamard candidate matches the per-token GPU reference bit for bit
+at widths 12288 and 28672 with 257 rows, FP32/BF16 inputs, both orientations,
+rotated-output rounding, rank-major layouts and in-place fallback cases.
+At 8192 rows, isolated input/output transforms decreased from about 2.6 to
+1.3 ms at width 12288 and from 6.6–6.9 to 3.1–3.9 ms at width 28672.
+Register-resident softmax preserves attention outputs exactly through context
+8448 and falls back above that bound; batch-8 8k attention decreased from
+0.391 to 0.353 ms. Fused split reduction/scale/BF16 compaction matches the
+separate kernels exactly, and every finite E4M3 code decodes exactly, including
+signed zero and subnormals.
+
+Using NCCL on all 88 layers, the combined candidate matches the rebased baseline
+bit for bit after 256-token bulk prefill and 32 greedy decode steps at batches 1 and 8.
+The complete prefill/final logits and generated tokens have identical trace
+SHA256 values, respectively:
+`d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f` and
+`d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d`.
+This finite comparison does not establish long-context model quality.
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

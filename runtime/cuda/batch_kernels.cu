@@ -13,9 +13,12 @@ __device__ B16 b16(float x) {
     return B16((u + 0x7fffU + ((u >> 16) & 1)) >> 16);
 }
 __device__ float fp8(uint8_t x) {
-    int e = (x >> 3) & 15, m = x & 7;
-    float v = e ? __uint_as_float(unsigned(e + 120) << 23 | unsigned(m) << 20) : float(m) / 512;
-    return e == 15 && m == 7 ? nanf("") : (x & 128 ? -v : v);
+    unsigned magnitude = x & 127U;
+    unsigned bits = (magnitude << 20) + (120U << 23);
+    if (magnitude < 8)
+        bits = __float_as_uint(float(magnitude) * (1.f / 512.f));
+    bits |= unsigned(x & 128U) << 24;
+    return magnitude == 127 ? nanf("") : __uint_as_float(bits);
 }
 __device__ void decode_tile(QtipMatrix w, const uint32_t *lut, int br, int chunk, B16 *a, int ld) {
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
@@ -417,6 +420,47 @@ __global__ void softmax(float *x, const int *positions, int context, int qh) {
     for (int i = tid; i < n; i += 256)
         x[i] = f32(b16(x[i] / sum));
 }
+// Preserve the legacy reduction tree while avoiding intermediate exponentials
+// in global memory. At 8k context each thread retains 33 FP32 scores.
+template <int Slots> __global__ void resident_softmax(float *x, const int *positions, int context, int qh) {
+    __shared__ float red[256];
+    int h = blockIdx.x, tid = threadIdx.x, n = positions[h / qh] + 1;
+    x += size_t(h) * context;
+    float values[Slots], top = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        int at = tid + i * 256;
+        values[i] = at < n ? x[at] : -INFINITY;
+        top = fmaxf(top, values[i]);
+    }
+    red[tid] = top;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            red[tid] = fmaxf(red[tid], red[tid + d]);
+        __syncthreads();
+    }
+    top = red[0];
+    __syncthreads();
+    float sum = 0;
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        values[i] = expf(values[i] - top);
+        sum += values[i];
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            red[tid] += red[tid + d];
+        __syncthreads();
+    }
+    sum = red[0];
+#pragma unroll
+    for (int i = 0; i < Slots; ++i)
+        if (tid + i * 256 < n)
+            x[tid + i * 256] = f32(b16(values[i] / sum));
+}
 __global__ void weighted_value(const B16 *v, const float *p, B16 *out, const int *positions, int context,
                                int qh, int kh, int dim) {
     int h = blockIdx.x % qh, b = blockIdx.x / qh, d = threadIdx.x;
@@ -637,6 +681,16 @@ __global__ void scale_output(const float *x, const float *scale, B16 *y, size_t 
     if (i < n)
         y[i] = b16(x[i] * scale[i % width]);
 }
+__global__ void compact_products(const float *x, const float *scale, B16 *y, size_t n, int width,
+                                 int splits) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float sum = x[i];
+        for (int part = 1; part < splits; ++part)
+            sum += x[size_t(part) * n + i];
+        y[i] = b16(scale ? sum * scale[i % width] : sum);
+    }
+}
 __global__ void decode_fp8(const uint8_t *x, B16 *y, size_t n) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n)
@@ -702,8 +756,7 @@ void fp8_multiply_batch(const uint8_t *w, const float *scale, const B16 *x, B16 
         int parts = std::min(32, in / 32);
         launch<3>({nullptr, nullptr, nullptr, nullptr, in, rows}, nullptr, w, nullptr, x, workspace, rows,
                   parts, tokens, s);
-        reduce_products(workspace, size_t(tokens) * rows, parts, s);
-        scale_to_b16(workspace, scale, y, tokens, rows, s);
+        reduce_to_b16(workspace, scale, y, size_t(tokens) * rows, rows, parts, s);
     } else
         launch<2>({nullptr, nullptr, nullptr, nullptr, in, rows}, nullptr, w, scale, x, y, rows, 1, tokens,
                   s);
@@ -734,7 +787,7 @@ void cache_batch(const B16 *k, const B16 *v, B16 *keys, B16 *values, const int *
 }
 void gqa_batch(const B16 *q, const B16 *k, const B16 *v, B16 *out, float *work, const int *positions,
                int batch, int context, int max_tokens, int qh, int kh, int dim, Stream s, int qstride,
-               float *value_workspace, bool register_mma) {
+               float *value_workspace, bool register_mma, bool resident) {
     if (value_workspace && dim == 128 && qh / kh <= 16 && native_bf16()) {
         if (register_mma)
             register_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 256, 0, s>>>(
@@ -742,7 +795,18 @@ void gqa_batch(const B16 *q, const B16 *k, const B16 *v, B16 *out, float *work, 
         else
             tensor_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 128, 16 * 32 * 2 + 64 * 32 * 2, s>>>(
                 q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
-        softmax<<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        static const bool enabled = !std::getenv("BEHEMOTH_CUDA_RESIDENT_SOFTMAX") ||
+                                    std::string(std::getenv("BEHEMOTH_CUDA_RESIDENT_SOFTMAX")) != "0";
+        if (resident && enabled && max_tokens <= 256)
+            resident_softmax<1><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 1024)
+            resident_softmax<4><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 4096)
+            resident_softmax<16><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 8448)
+            resident_softmax<33><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else
+            softmax<<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
         int parts = (max_tokens + 127) / 128;
         if (register_mma)
             register_values<<<dim3(parts, batch * kh), 256, 0, s>>>(v, work, value_workspace, positions,
@@ -767,6 +831,10 @@ void select_rows(const B16 *x, B16 *y, const int *selected, int rows, int width,
 void reduce_products(float *x, size_t n, int splits, Stream s) {
     if (splits > 1)
         reduce<<<(n + 255) / 256, 256, 0, s>>>(x, n, splits);
+    launch_check();
+}
+void reduce_to_b16(const float *x, const float *scale, B16 *y, size_t n, int width, int splits, Stream s) {
+    compact_products<<<(n + 255) / 256, 256, 0, s>>>(x, scale, y, n, width, splits);
     launch_check();
 }
 void scale_to_b16(const float *x, const float *scale, B16 *y, int rows, int width, Stream s) {
