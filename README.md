@@ -28,7 +28,7 @@ Pipeline:
      host.
    - Activations stay in host RAM (bf16, about 98 GB for 4.19M tokens).
 3. **Quantization**: one Hessian group at a time (q, o, gate+up, down), preserving source FP8 K/V by default
-   (`--kv-format qtip` quantizes q+k+v for the legacy format).
+   (`--kv-format qtip` quantizes q+k+v for the legacy format; for BF16 sources `--kv-format fp8` converts K/V to FP8 instead).
    - **RHT**: random sign vectors SU/SV, then the reference's Hadamard factorisation `hadK ⊗ H_{2^p}` on both
      sides (12288 = 12·1024, 28672 = 28·1024, 1024 = 2^10).
    - **Damping**: `regularize_H` (σ = 1e-2 · mean diag).
@@ -269,8 +269,15 @@ of 32 and `2^p`, `12*2^p` or `28*2^p` with `2^p <= 8192`; `rope_scaling` other t
   quantizer's calibration forward (`k_qkv_rope_scaled`) and by the CUDA runtime (`rope_scaled`). The
   assembled `config.json` keeps the source `rope_scaling` block verbatim.
 - **BF16 sources**: the quantizer detects BF16 (vs FP8-Dynamic) source linears from `q_proj`'s dtype. There
-  are no FP8 K/V to preserve, so `--kv-format` defaults to `qtip` (all 7 linears quantized); an explicit
-  `--kv-format fp8` is rejected.
+  are no FP8 K/V to preserve, so `--kv-format` defaults to `qtip` (all 7 linears quantized). An explicit
+  `--kv-format fp8` is accepted: k_proj/v_proj are converted to FP8-Dynamic (E4M3 `weight` + per-output-channel
+  BF16 `weight_scale` = absmax/448, round-to-nearest-even, saturating; same layout as an FP8-Dynamic source, so the
+  runtime loads them as W8A16 exactly like Behemoth) and only q/o/MLP are QTIP/NVFP4. Relative weight L2 error
+  of the conversion is about 2.6% (Anubis-Mini-8B layers 0-2). They are the smallest, most error-sensitive
+  linears (v_proj is the worst by proxy) and cost about +6 MB/layer on the 8B (1024x4096 k+v: 8 MB FP8 vs
+  about 2 MB QTIP). Adaptive mode keeps k/v FP8 in QTIP and NVFP4 layers and the KL evaluation uses the
+  dequantized FP8 weights. The work directory remembers the K/V format (`progress.json`); resuming with a
+  different `--kv-format` is refused.
 - **Adaptive mode**: the lm_head logits GEMM for the metric probe runs in vocab-row tiles (about 256 MB of
   fp32 logits at most, `Options::logit_tile` overrides it), so the 128256-row head only needs its bf16 copy
   (~2.1 GB) resident on the device. Tiled and untiled metrics are asserted equal.

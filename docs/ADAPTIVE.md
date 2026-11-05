@@ -22,7 +22,9 @@ qtip_quant --mode adaptive --tokens calibration/tokens.i32 \
 
 All other flags (`--kv-format`, `--sigma-reg`, `--vit-batch`, `--layers`, resume behavior) are shared
 with the classic pipeline. K/V projections follow `--kv-format` exactly as before (default: source FP8
-preserved, in both QTIP and NVFP4 layers).
+preserved, in both QTIP and NVFP4 layers). With a BF16 source, `--kv-format fp8` converts k/v to FP8-Dynamic
+(E4M3 + per-row BF16 scale) first; they then stay FP8 in both QTIP and NVFP4 layers, and the candidate layer's KL
+evaluation uses the dequantized FP8 k/v (not the original bf16), so `lmkl` reflects the written checkpoint.
 
 ## Per-layer flow
 
@@ -89,7 +91,8 @@ inside a layer differ by format:
   `<linear>.weight_scale` (F8_E4M3 `[m, n/16]`, one scale per 16 consecutive input channels of a row)
   and `<linear>.weight_global_scale` (F32 scalar) — the same format `glm53 quantize` writes for GLM
   MLPs. NVFP4 quantization starts from the exactly-decoded original FP8 weights.
-- FP8-preserved K/V (default `--kv-format fp8`): `weight` + `weight_scale` as before, in both formats.
+- FP8 K/V (default for FP8 sources; `--kv-format fp8` for BF16 sources): `weight` F8_E4M3 + `weight_scale` BF16 [out], in both formats.
+  Cost on BF16 sources: about +6 MB/layer for the 8B (k+v 8 MB FP8 instead of about 2 MB QTIP).
 
 `config.json` gains `qtip_quant.layer_formats` (a per-layer list, e.g.
 `["qtip", "nvfp4", ...]`) and `qtip_quant.adaptive` (metric/threshold/kl_tokens/next_input).
@@ -125,7 +128,7 @@ inside a layer differ by format:
 
 Adaptive mode works with BF16 sources and the Llama 3.3 geometry (dims from `config.json`, llama3
 RoPE scaling in the probe/chain forward). BF16 linears are used directly for both the QTIP and the NVFP4
-candidates (no FP8 K/V preservation; `kv_format` is `qtip`). Memory: the metric probe's lm_head GEMM is tiled
+candidates (default `kv_format` is `qtip`; `--kv-format fp8` converts k/v to FP8 and keeps them out of both candidates). Memory: the metric probe's lm_head GEMM is tiled
 over vocab rows (`logit_tile`, default about 256 MB of fp32 logits per tile) instead of materialising
 `T x 128256` logits, so the device holds the bf16 head (128256 x 8192 x 2 B ~ 2.1 GB) plus the two
 evaluation runners. Verified only on the synthetic Llama-geometry checkpoint (`qtip_llama_tests`: tiled and

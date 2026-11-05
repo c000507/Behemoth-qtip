@@ -19,7 +19,7 @@ embeddings/head ~4.2 GB).
 Llama 3.3 verification: `behemoth_cuda_llama_tests` (llama3 frequency table and RoPE kernel vs a fp64 HF
 transcription; synthetic Llama-geometry-scaled QTIP, QTIP+NVFP4 and plain-RoPE checkpoints end to end vs a CPU
 reference; Llama 3 tokenizer/chat template with a synthetic tokenizer; config rejection) and the 8192/28672
-projection shapes in `behemoth_cuda_tests`. Not verified: real Llama weights/tokenizer, a full-size run.
+projection shapes in `behemoth_cuda_tests`. Llama checkpoints written with `qtip_quant --kv-format fp8` from a BF16 source (K/V as F8_E4M3 `weight` + BF16 `weight_scale`, `qtip_quant.kv_format = "fp8"`, in QTIP and NVFP4 layers) load through the same per-linear FP8 W8A16 path as Behemoth and are covered by a synthetic CUDA-vs-CPU case in `behemoth_cuda_llama_tests`. Not verified: real Llama weights/tokenizer, a full-size run.
 GLM dimensions and dense/MoE layer types come from its configuration. Tokenizer
 selection follows the tokenizer assets: SentencePiece for Behemoth, or byte-level
 BPE for GLM and Llama-3-style assets. The checkpoint's actual Jinja template is
