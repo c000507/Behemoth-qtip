@@ -2,31 +2,105 @@
 #include "behemoth/qtip.hpp"
 #include "glm53.hpp"
 #include "kernels.hpp"
+#if defined(BEHEMOTH_CUDA_FAST)
+#include "tensor_model.hpp"
+#endif
 #include "minja/minja.hpp"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 namespace behemoth::cuda_runtime {
 namespace {
 using namespace glm53::gpu;
+struct DeviceGuard {
+    int previous;
+    explicit DeviceGuard(int device) {
+        checked(cudaGetDevice(&previous), "read current CUDA device");
+        checked(set_device(device), "select CUDA peer device");
+    }
+    ~DeviceGuard() { (void)set_device(previous); }
+};
+struct DeviceEvent {
+    int device;
+    cudaEvent_t event{};
+    explicit DeviceEvent(int d) : device(d) {
+        DeviceGuard guard(d);
+        checked(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create CUDA peer event");
+    }
+    ~DeviceEvent() {
+        DeviceGuard guard(device);
+        (void)cudaEventDestroy(event);
+    }
+};
+struct PeerContext {
+    int primary, device;
+    Stream stream{};
+    DeviceEvent ready, done;
+    Buffer<B16> input;
+    Buffer<float> partial;
+    PeerContext(int p, int d) : primary(p), device(d), ready(p), done(d) {
+        for (auto [from, to] : {std::pair{p, d}, std::pair{d, p}}) {
+            DeviceGuard guard(from);
+            int supported = 0;
+            checked(cudaDeviceCanAccessPeer(&supported, from, to), "query CUDA peer access");
+            check(supported != 0, "TP=2 requires bidirectional CUDA peer access");
+            auto error = cudaDeviceEnablePeerAccess(to, 0);
+            if (error == cudaErrorPeerAccessAlreadyEnabled)
+                (void)cudaGetLastError();
+            else
+                checked(error, "enable CUDA peer access");
+        }
+        DeviceGuard guard(d);
+        checked(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create CUDA peer stream");
+        input.ensure(28672, stream);
+        partial.ensure(size_t(28672) * 32 / 2, stream);
+    }
+    ~PeerContext() {
+        DeviceGuard guard(device);
+        if (stream) {
+            (void)sync(stream);
+            input.clear();
+            partial.clear();
+            (void)stream_destroy(stream);
+        }
+    }
+};
+struct PeerWeights {
+    int device;
+    Buffer<B16> trellis;
+    Buffer<uint32_t> lut;
+    explicit PeerWeights(int d) : device(d) {}
+    ~PeerWeights() {
+        DeviceGuard guard(device);
+        trellis.clear();
+        lut.clear();
+    }
+};
 template <class T> void upload(Buffer<T> &d, const T *src, size_t n, Stream s) {
     d.ensure(n, s);
     checked(h2d(d, src, n * sizeof(T), s), "upload CUDA weights");
 }
 struct Linear {
-    int in = 0, out = 0;
+    int in = 0, out = 0, splits = 1;
     Buffer<B16> trellis;
     Buffer<float> su, sv, scales;
     Buffer<uint32_t> lut;
     Buffer<uint8_t> fp8;
     Buffer<uint8_t> nv_packed, nv_scales;
     float nv_global = 0;
-    void load(const Checkpoint &cp, int layer, const std::string &name, Stream s) {
+    PeerContext *parallel = nullptr;
+    std::unique_ptr<PeerWeights> peer;
+    void load(const Checkpoint &cp, int layer, const std::string &name, Stream s, int requested_splits,
+              PeerContext *context) {
+        parallel = context;
         auto h = behemoth::qtip::load_linear(cp, layer, name);
         in = h.in;
         out = h.out;
+        splits = std::min(requested_splits, in / 32);
         if (h.is_fp8()) {
             upload(fp8, h.fp8.data(), h.fp8.size(), s);
             upload(scales, h.fp8_scale.data(), h.fp8_scale.size(), s);
@@ -36,10 +110,19 @@ struct Linear {
             upload(nv_scales, h.nvfp4_scales.data(), h.nvfp4_scales.size(), s);
         } else {
             auto cb = behemoth::qtip::make_codebook(h.tlut);
-            upload(trellis, h.trellis.data(), h.trellis.size(), s);
+            size_t local = h.trellis.size() / (parallel ? 2 : 1);
+            upload(trellis, h.trellis.data(), local, s);
             upload(su, h.su.data(), h.su.size(), s);
             upload(sv, h.sv.data(), h.sv.size(), s);
             upload(lut, cb.bf16x2.data(), cb.bf16x2.size(), s);
+            if (parallel) {
+                check(out % 64 == 0, "TP=2 QTIP outputs must be divisible by 64");
+                DeviceGuard guard(parallel->device);
+                peer = std::make_unique<PeerWeights>(parallel->device);
+                upload(peer->trellis, h.trellis.data() + local, local, parallel->stream);
+                upload(peer->lut, cb.bf16x2.data(), cb.bf16x2.size(), parallel->stream);
+                checked(sync(parallel->stream), "finish peer weight upload");
+            }
         }
         checked(sync(s), "finish weight upload");
     }
@@ -53,8 +136,38 @@ struct Linear {
         else {
             scratch.ensure(std::max(in, out), s);
             rotated.ensure(in, s);
-            z.ensure(out, s);
-            qtip_forward({trellis, su, sv, lut, in, out}, x, y, scratch, rotated, z, rz, s);
+            z.ensure(size_t(out) * splits, s);
+            QtipMatrix full{trellis, su, sv, lut, in, out};
+            if (!parallel)
+                qtip_forward(full, x, y, scratch, rotated, z, rz, s, splits);
+            else {
+                qtip_prepare(full, x, scratch, rotated, s);
+                checked(cudaEventRecord(parallel->ready.event, s), "record TP input ready");
+                {
+                    DeviceGuard guard(parallel->device);
+                    checked(cudaStreamWaitEvent(parallel->stream, parallel->ready.event, 0),
+                            "wait for TP input");
+                    checked(cudaMemcpyPeerAsync(parallel->input, parallel->device, rotated, parallel->primary,
+                                                size_t(in) * 2, parallel->stream),
+                            "broadcast TP input");
+                    qtip_multiply({peer->trellis, nullptr, nullptr, peer->lut, in, out / 2}, parallel->input,
+                                  parallel->partial, out / 2, splits, parallel->stream);
+                    cudaMemcpy3DPeerParms copy{};
+                    size_t width = size_t(out / 2) * sizeof(float);
+                    copy.srcPtr = make_cudaPitchedPtr(parallel->partial, width, width, splits);
+                    copy.dstPtr = make_cudaPitchedPtr(z.p + out / 2, width * 2, width * 2, splits);
+                    copy.srcDevice = parallel->device;
+                    copy.dstDevice = parallel->primary;
+                    copy.extent = make_cudaExtent(width, splits, 1);
+                    checked(cudaMemcpy3DPeerAsync(&copy, parallel->stream), "gather TP partials");
+                    checked(cudaEventRecord(parallel->done.event, parallel->stream), "record TP completion");
+                }
+                auto local = full;
+                local.out /= 2;
+                qtip_multiply(local, rotated, z, out, splits, s);
+                checked(cudaStreamWaitEvent(s, parallel->done.event, 0), "wait for TP projection");
+                qtip_finish(full, z, y, scratch, rz, splits, s);
+            }
         }
     }
 };
@@ -63,11 +176,23 @@ json read(const fs::path &p) {
     check(bool(f), "Cannot read " + p.string());
     return json::parse(f);
 }
+int qtip_splits(int tp) {
+    const char *value = std::getenv("BEHEMOTH_CUDA_QTIP_SPLITS");
+    if (!value)
+        return tp == 2 ? 16 : 1;
+    int n = 0;
+    const char *end = value + std::char_traits<char>::length(value);
+    auto result = std::from_chars(value, end, n);
+    check(result.ec == std::errc{} && result.ptr == end && n >= 1 && n <= 32,
+          "BEHEMOTH_CUDA_QTIP_SPLITS must be an integer in 1..32");
+    return n;
+}
 } // namespace
 struct Model::Impl {
     Checkpoint checkpoint;
     int device, context, position = 0;
     Stream stream{};
+    std::unique_ptr<PeerContext> peer;
     bool failed = false;
     struct Layer {
         std::array<Linear, 7> linear;
@@ -105,13 +230,21 @@ struct Model::Impl {
         }
         checked(sync(stream), "finish dense weight upload");
     }
-    Impl(const fs::path &path, int d, int ctx)
+    Impl(const fs::path &path, int d, int ctx, int tp)
         : checkpoint(path), device(d), context(ctx), layers(checkpoint.config.layers) {
+        int splits = qtip_splits(tp);
+        check(tp == 1 || tp == 2, "CUDA tensor parallel degree must be 1 or 2");
         check(checkpoint.config.quantization == Quantization::Qtip, "CUDA runner requires a QTIP checkpoint");
         check(ctx > 0 && ctx <= checkpoint.config.max_context, "Invalid CUDA context limit");
         checked(set_device(d), "select CUDA device");
         checked(stream_create(&stream), "create CUDA stream");
         try {
+            if (tp == 2) {
+                int count = 0;
+                checked(device_count(&count), "count CUDA devices");
+                check(d >= 0 && d + 1 < count, "TP=2 requires two CUDA devices starting at --device");
+                peer = std::make_unique<PeerContext>(d, d + 1);
+            }
             initialize_tables();
             dense("model.embed_tokens.weight", embeddings);
             dense("lm_head.weight", head);
@@ -125,7 +258,7 @@ struct Model::Impl {
                 vector(prefix + "input_layernorm.weight", p.norm1);
                 vector(prefix + "post_attention_layernorm.weight", p.norm2);
                 for (int i = 0; i < 7; ++i)
-                    p.linear[i].load(checkpoint, l, names[i], stream);
+                    p.linear[i].load(checkpoint, l, names[i], stream, splits, peer.get());
                 p.keys.ensure(size_t(ctx) * 1024, stream);
                 p.values.ensure(size_t(ctx) * 1024, stream);
                 std::cerr << "Loaded CUDA QTIP layer " << l + 1 << '/' << layers.size() << '\n';
@@ -134,12 +267,19 @@ struct Model::Impl {
             normed.ensure(12288, stream);
             attended.ensure(12288, stream);
             logits.ensure(32768, stream);
+            // Scores are scratch, so reserve them once instead of cudaMalloc/free
+            // at every new sequence length (cudaFree synchronizes the device).
+            scores.ensure(size_t(96) * ctx, stream);
             readback.ensure(32768);
             size_t free = 0, total = 0;
             checked(cudaMemGetInfo(&free, &total), "CUDA memory info");
             std::cerr << "CUDA QTIP ready: " << double(total - free) / (1ull << 30) << " GiB used, context "
                       << ctx << '\n';
         } catch (...) {
+            if (peer) {
+                DeviceGuard guard(peer->device);
+                (void)sync(peer->stream);
+            }
             (void)sync(stream);
             (void)stream_destroy(stream);
             stream = nullptr;
@@ -148,6 +288,10 @@ struct Model::Impl {
     }
     ~Impl() {
         (void)set_device(device);
+        if (peer) {
+            DeviceGuard guard(peer->device);
+            (void)sync(peer->stream);
+        }
         if (stream) {
             (void)sync(stream);
             (void)stream_destroy(stream);
@@ -191,32 +335,92 @@ struct Model::Impl {
             ++position;
             return out;
         } catch (...) {
+            if (peer) {
+                DeviceGuard guard(peer->device);
+                (void)sync(peer->stream);
+            }
             failed = true;
             throw;
         }
     }
 };
-Model::Model(const fs::path &p, int device, int context) : config{32768, context, {2}} {
+Model::Model(const fs::path &p, int device, int context, int tp, int max_batch)
+    : config{32768, context, {2}} {
     auto raw = read(p / "config.json");
     auto kind = raw.value("model_type", "");
     if (kind == "glm5_next" || kind == "glm5_next_text") {
+        check(tp == 1, "GLM tensor parallel inference is not implemented yet");
         glm53::Config c(raw);
         check(context > 0 && context <= c.max_context, "Invalid GLM context limit");
         config = {c.vocab, context, c.eos};
         backend_ = glm53::gpu_backend(p, device);
-    } else
-        impl_ = std::make_unique<Impl>(p, device, context);
+    } else {
+#if defined(BEHEMOTH_CUDA_FAST)
+        if (tp == 2 || max_batch > 1 || std::getenv("BEHEMOTH_CUDA_FAST_PATH")) {
+            tensor_ = std::make_unique<TensorModel>(p, device, context, tp, max_batch);
+            return;
+        }
+#else
+        check(max_batch == 1, "Rebuild with BEHEMOTH_CUDA_FAST=ON for batched inference");
+#endif
+        impl_ = std::make_unique<Impl>(p, device, context, tp);
+    }
 }
 Model::~Model() = default;
 Vec Model::step(int token) {
+#if defined(BEHEMOTH_CUDA_FAST)
+    if (tensor_) {
+        auto out = tensor_->step({token});
+        ++position_;
+        return std::move(out[0]);
+    }
+#endif
     check(token >= 0 && token < config.vocab && position_ < config.max_context,
           "Token/context outside configured limits");
     auto out = backend_ ? backend_->step(token) : impl_->step(token);
     ++position_;
     return out;
 }
+Vec Model::prefill(const std::vector<int> &tokens) {
+    auto result = prefill_batch({tokens});
+    return std::move(result[0]);
+}
+std::vector<Vec> Model::prefill_batch(const std::vector<std::vector<int>> &tokens) {
+#if defined(BEHEMOTH_CUDA_FAST)
+    if (tensor_) {
+        auto out = tensor_->prefill(tokens);
+        position_ = 0;
+        for (const auto &row : tokens)
+            position_ = std::max(position_, int(row.size()));
+        return out;
+    }
+#endif
+    check(tokens.size() == 1 && !tokens[0].empty(), "This backend requires a single prefill sequence");
+    reset();
+    Vec out;
+    for (int id : tokens[0])
+        out = step(id);
+    return {std::move(out)};
+}
+std::vector<Vec> Model::step_batch(const std::vector<int> &tokens) {
+#if defined(BEHEMOTH_CUDA_FAST)
+    if (tensor_) {
+        auto out = tensor_->step(tokens);
+        ++position_;
+        return out;
+    }
+#endif
+    check(tokens.size() == 1, "This backend requires a single decode sequence");
+    return {step(tokens[0])};
+}
 void Model::reset() {
     position_ = 0;
+#if defined(BEHEMOTH_CUDA_FAST)
+    if (tensor_) {
+        tensor_->reset();
+        return;
+    }
+#endif
     if (backend_) {
         backend_->reset();
         return;

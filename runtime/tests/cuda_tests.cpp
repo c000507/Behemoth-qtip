@@ -72,16 +72,34 @@ void linear_test(cg::Stream s, int out, int in, bool rz) {
     put(lut, table, s);
     scratch.ensure(std::max(in, out), s);
     rotated.ensure(in, s);
-    z.ensure(out, s);
+    z.ensure(size_t(out) * std::min(32, in / 32), s);
     output.ensure(out, s);
     result.ensure(out, s);
-    cu::qtip_forward({trellis, su, sv, lut, in, out}, input, output, scratch, rotated, z, rz, s);
-    cg::to_float(output, result, out, s);
     cg::Pinned<float> host;
     host.ensure(out);
-    cg::checked(cg::d2h(host.p, result, size_t(out) * 4, s), "read QTIP result");
-    cg::checked(cg::sync(s), "finish QTIP test");
-    error({host.p, host.p + out}, expected, "QTIP trellis/RHT");
+    for (int splits : {1, 2, 3, 4, 8, 16, 32}) {
+        if (splits > in / 32)
+            continue;
+        cu::qtip_forward({trellis, su, sv, lut, in, out}, input, output, scratch, rotated, z, rz, s, splits);
+        cg::to_float(output, result, out, s);
+        cg::checked(cg::d2h(host.p, result, size_t(out) * 4, s), "read QTIP result");
+        cg::checked(cg::sync(s), "finish QTIP test");
+        std::cout << "shape=" << out << 'x' << in << " round_z=" << rz << " splits=" << splits << ' ';
+        error({host.p, host.p + out}, expected, "QTIP trellis/RHT");
+        if (out % 64 == 0) {
+            cu::QtipMatrix full{trellis, su, sv, lut, in, out};
+            cu::qtip_prepare(full, input, scratch, rotated, s);
+            cu::QtipMatrix half{trellis, su, sv, lut, in, out / 2};
+            cu::qtip_multiply(half, rotated, z, out, splits, s);
+            half.trellis = trellis.p + h.trellis.size() / 2;
+            cu::qtip_multiply(half, rotated, z.p + out / 2, out, splits, s);
+            cu::qtip_finish(full, z, output, scratch, rz, splits, s);
+            cg::to_float(output, result, out, s);
+            cg::checked(cg::d2h(host.p, result, size_t(out) * 4, s), "read partitioned QTIP result");
+            cg::checked(cg::sync(s), "finish partitioned QTIP test");
+            error({host.p, host.p + out}, expected, "QTIP row partitions/global output transform");
+        }
+    }
 }
 void fp8_test(cg::Stream s) {
     behemoth::qtip::HostLinear h;

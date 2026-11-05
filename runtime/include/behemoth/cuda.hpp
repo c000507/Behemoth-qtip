@@ -6,6 +6,7 @@ class Tokenizer;
 class InferenceBackend;
 } // namespace glm53
 namespace behemoth::cuda_runtime {
+class TensorModel;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 using Vec = std::vector<float>;
@@ -31,6 +32,9 @@ class Model {
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::shared_ptr<glm53::InferenceBackend> backend_;
+#if defined(BEHEMOTH_CUDA_FAST)
+    std::unique_ptr<TensorModel> tensor_;
+#endif
     int position_ = 0;
 
   public:
@@ -38,9 +42,12 @@ class Model {
         int vocab = 32768, max_context;
         std::vector<int> eos{2};
     } config;
-    explicit Model(const fs::path &, int device = 0, int context = 4096);
+    explicit Model(const fs::path &, int device = 0, int context = 4096, int tp = 1, int max_batch = 1);
     ~Model();
     Vec step(int token);
+    Vec prefill(const std::vector<int> &tokens);
+    std::vector<Vec> prefill_batch(const std::vector<std::vector<int>> &tokens);
+    std::vector<Vec> step_batch(const std::vector<int> &tokens);
     void reset();
 };
 } // namespace behemoth::cuda_runtime

@@ -79,7 +79,43 @@ GLM uses the [shared GLM kernels](../../glm53/README.md), with GPU attention and
 recurrent state and streamed large weights. Both backends currently replay
 prefill one token at a time and run one request on one GPU.
 
-On an A100 SXM 80GB, the following passed:
+## Experimental QTIP split-K benchmark
+
+The Behemoth trellis GEMV can split each input reduction across independent CTAs.
+The partial FP32 sums are combined inside the output Hadamard transform, before
+the MLP's optional BF16 rounding. There are no atomics or extra reduction launches.
+The summation order changes, so this requires numerical and full-model validation.
+The default remains one split; GLM and FP8 projections do not use this setting.
+
+```sh
+# Tests split counts 1/2/3/4/8/16/32 against the independent CPU reference:
+OMP_NUM_THREADS=8 ctest --test-dir runtime/build-cuda -R cuda_qtip_correctness --output-on-failure
+
+# Warm projection microbenchmark: GPU event times, five batches, median per call.
+# Omit --model to use synthetic weights at the actual Behemoth projection sizes.
+runtime/build-cuda/behemoth_cuda_qtip_bench \
+  --model /models/Behemoth-R1-123B-v2-QTIP-2bit --iterations 20
+
+# Opt in for full-model A/B checks using the same prompt, seed and context:
+BEHEMOTH_CUDA_QTIP_SPLITS=16 runtime/build-cuda/behemoth_cuda \
+  --model /models/Behemoth-R1-123B-v2-QTIP-2bit \
+  --prompt 'Explain briefly why the sky is blue.' --context 32768 --max-tokens 128
+```
+
+The benchmark checks output differences against the unsplit path and reports
+CSV timings for q, gate and down projections (covering the three matrix shapes).
+It includes the input and output Hadamard transforms. Repeated isolated calls
+have different cache behavior from whole-model decoding: these timings cannot
+be presented as a tokens-per-second improvement. GPU correctness and performance
+of split-K are pending; compilation is not an execution check.
+
+Attention-score scratch space is now reserved at model load to avoid device
+allocation/free at each new sequence length. This adds `96 * context * 4` bytes
+of persistent scratch, or 12 MiB at a 32k context.
+
+## Validated baseline
+
+On an A100 SXM 80GB, the following passed at commit `021c434`, before split-K:
 
 - CPU core and structured-output regressions.
 - CUDA trellis GEMV versus the independent double-precision QTIP reference,
