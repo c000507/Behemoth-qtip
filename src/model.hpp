@@ -26,6 +26,7 @@ struct ModelConfig {
   float eps = 1e-5f, theta = 1e6f;
   long max_pos = 131072;
   bool bf16_source = false;  // plain BF16 source linears (e.g. Llama 3.3), no FP8 weights/scales
+  bool convert_kv_fp8 = false;  // BF16 source + --kv-format fp8: read_layer also builds FP8 K/V (LayerHost::kv8)
   bool rope_llama3 = false;
   RopeScalingLlama3 rope;
   std::string raw_json;  // original config.json
@@ -44,6 +45,10 @@ struct LayerHost {
   std::vector<uint16_t> sc[kNumLin]; // bf16 per-output-channel scale [out] (empty for bf16 sources)
   std::vector<uint16_t> ln_in, ln_post;  // bf16 [hidden]
   int out_dim[kNumLin] = {}, in_dim[kNumLin] = {};
+  // BF16 sources with --kv-format fp8: converted K/V (only LK/LV filled): E4M3 [out][in], bf16 scale [out], and
+  // the dequantized bf16 weights used for the KL evaluation
+  std::vector<uint8_t> kv8_w[kNumLin];
+  std::vector<uint16_t> kv8_sc[kNumLin], kv8_deq[kNumLin];
   bool bf16 = false;  // w[] holds bf16 bits instead of fp8 bytes
   double read_s = 0;
 };

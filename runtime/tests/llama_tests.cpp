@@ -131,6 +131,8 @@ struct Geometry {
     bool mix_linears = false;  // QTIP and NVFP4 projections interleaved inside every layer (loader probes per linear)
     std::vector<int> eos{261, 264}; // <|end_of_text|>, <|eot_id|> of the synthetic tokenizer
     bool tokenizer = true;
+    bool fp8_kv = false;       // K/V as FP8-Dynamic (E4M3 weight + bf16 per-channel weight_scale), as written by
+                               // qtip_quant --kv-format fp8 from a BF16 source
 };
 std::pair<int, int> shape_of(const Geometry &g, const std::string &name) {
     if (name == "self_attn.q_proj" || name == "self_attn.o_proj")
@@ -197,6 +199,28 @@ void add_nvfp4(::qtip::SafeTensorsWriter &w, const std::string &base, int in, in
     w.add(base + "weight_scale", "F8_E4M3", {out, in / 16}, scales.data(), scales.size());
     w.add(base + "weight_global_scale", "F32", {}, &global, 4);
 }
+void add_fp8_dynamic(::qtip::SafeTensorsWriter &w, const std::string &base, int in, int out, std::mt19937 &gen,
+                     float gain) {
+    std::normal_distribution<float> normal(0, gain / std::sqrt(float(in)));
+    std::vector<uint8_t> codes(size_t(out) * in);
+    std::vector<uint16_t> scales(static_cast<size_t>(out));
+    for (int o = 0; o < out; ++o) {
+        std::vector<float> row(static_cast<size_t>(in));
+        float maximum = 0;
+        for (auto &v : row) {
+            v = float(BFloat16(normal(gen)));
+            maximum = std::max(maximum, std::abs(v));
+        }
+        BFloat16 scale(maximum / 448.f);
+        if (float(scale) * 448.f < maximum)
+            ++scale.bits;
+        scales[size_t(o)] = scale.bits;
+        for (int i = 0; i < in; ++i)
+            codes[size_t(o) * in + size_t(i)] = encode_e4m3(row[size_t(i)] / float(scale));
+    }
+    w.add(base + "weight", "F8_E4M3", {out, in}, codes.data(), codes.size());
+    w.add(base + "weight_scale", "BF16", {out}, scales.data(), scales.size() * 2);
+}
 void add_bf16(::qtip::SafeTensorsWriter &w, const std::string &name, std::vector<int64_t> shape, size_t n,
               std::mt19937 &gen, float mean, float sd) {
     std::normal_distribution<float> normal(mean, sd);
@@ -231,7 +255,10 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
             // large q/k and o gains make attention (and therefore RoPE) dominate the logits
             const std::string n = name;
             const float gain = n == "self_attn.q_proj" || n == "self_attn.k_proj" ? 8.f : n == "self_attn.o_proj" ? 4.f : 1.f;
-            (fp4_here ? add_nvfp4 : add_qtip)(w, p + name + ".", in, out, gen, gain);
+            if (g.fp8_kv && (n == "self_attn.k_proj" || n == "self_attn.v_proj"))
+                add_fp8_dynamic(w, p + name + ".", in, out, gen, gain);
+            else
+                (fp4_here ? add_nvfp4 : add_qtip)(w, p + name + ".", in, out, gen, gain);
         }
     }
     w.write((root / "model-00000.safetensors").string());
@@ -248,7 +275,7 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
               {"quip_params", {{"codebook", "bitshift"}, {"codebook_version", 0}, {"L", 16}, {"K", 2}, {"V", 2},
                                {"tlut_bits", 9}, {"decode_mode", "quantlut_sym"}, {"td_x", 16}, {"td_y", 16},
                                {"split_for_tp", false}, {"skip_list", nullptr}}},
-              {"qtip_quant", {{"kv_format", "qtip"}, {"layer_formats", layer_formats}}}};
+              {"qtip_quant", {{"kv_format", g.fp8_kv ? "fp8" : "qtip"}, {"layer_formats", layer_formats}}}};
     if (g.llama3)
         // Llama 3.3 factors; original_max_position_embeddings scaled with the toy head_dim so that
         // the scaled, interpolated and untouched frequency bands are all hit by short test sequences.
@@ -667,6 +694,12 @@ int main(int argc, char **argv) {
         per_linear.layers = 3;
         compare(write_checkpoint(tmp / "llama_mixed_linears", per_linear, 4), 16,
                 "synthetic Llama with QTIP and NVFP4 projections mixed inside each layer");
+        Geometry fp8kv;
+        fp8kv.fp8_kv = true;
+        fp8kv.nvfp4_layer1 = true;
+        fp8kv.layers = 3;
+        compare(write_checkpoint(tmp / "llama_fp8_kv", fp8kv, 5), 16,
+                "synthetic Llama with FP8 K/V (BF16-source --kv-format fp8) in QTIP and NVFP4 layers");
         Geometry plain;
         plain.llama3 = false;
         plain.theta = 1000000;

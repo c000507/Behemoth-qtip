@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "common.hpp"
+#include "fp8_kv.hpp"
 #include "gpu.hpp"
 #include "model.hpp"
 #include "pipeline.hpp"
@@ -141,6 +142,14 @@ struct LayerFile {
   bool has(const std::string& n) const { return header.contains(n); }
   std::string dtype(const std::string& n) const { return header[n]["dtype"]; }
   std::vector<int64_t> shape(const std::string& n) const { return header[n]["shape"].get<std::vector<int64_t>>(); }
+  std::vector<uint8_t> bytes(const std::string& n) {
+    auto off = header[n]["data_offsets"].get<std::vector<uint64_t>>();
+    std::vector<uint8_t> v(off[1] - off[0]);
+    f.clear();
+    f.seekg(std::streamoff(8 + hlen + off[0]));
+    f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size()));
+    return v;
+  }
 };
 static LayerFile open_layer(const fs::path& out, int L) {
   char b[64];
@@ -155,14 +164,15 @@ static LayerFile open_layer(const fs::path& out, int L) {
   return lf;
 }
 
-static void check_output(const fs::path& out, const std::string& tag, bool nvfp4_all, const std::vector<bool>* per_layer_nvfp4 = nullptr) {
+static void check_output(const fs::path& out, const std::string& tag, bool nvfp4_all, const std::vector<bool>* per_layer_nvfp4 = nullptr,
+                         bool fp8_kv = false, const fs::path& source = {}) {
   json config = json::parse(std::ifstream(out / "config.json"));
   EXPECT(config["model_type"] == "llama" && config["quip_params"]["K"] == 2, "%s config", tag.c_str());
   EXPECT(config["rope_scaling"].is_object() && config["rope_scaling"]["rope_type"] == "llama3" &&
              config["rope_scaling"]["factor"] == 8.0 &&
              config["rope_scaling"]["original_max_position_embeddings"] == kRope.original_max_position_embeddings,
          "%s rope_scaling must be preserved in the assembled config", tag.c_str());
-  EXPECT(config["qtip_quant"]["kv_format"] == "qtip", "%s BF16 sources default to --kv-format qtip", tag.c_str());
+  EXPECT(config["qtip_quant"]["kv_format"] == (fp8_kv ? "fp8" : "qtip"), "%s kv_format (BF16 sources default to qtip)", tag.c_str());
   EXPECT(config["rope_theta"] == 500000.0 && config["vocab_size"] == kVocab, "%s config geometry", tag.c_str());
   EXPECT(fs::exists(out / "generation_config.json") && fs::exists(out / "model.safetensors.index.json") &&
              fs::exists(out / "model-embed.safetensors"),
@@ -173,6 +183,21 @@ static void check_output(const fs::path& out, const std::string& tag, bool nvfp4
     const std::string pre = "model.layers." + std::to_string(L) + ".";
     for (int li = 0; li < kNumLin; ++li) {
       const std::string b = pre + kLinName[li] + ".";
+      if (fp8_kv && (li == LK || li == LV)) {
+        EXPECT(lf.has(b + "weight") && lf.dtype(b + "weight") == "F8_E4M3" && lf.shape(b + "weight")[0] == out_dim(li) &&
+                   lf.shape(b + "weight")[1] == in_dim(li) && lf.has(b + "weight_scale") &&
+                   lf.dtype(b + "weight_scale") == "BF16" && lf.shape(b + "weight_scale").size() == 1 &&
+                   lf.shape(b + "weight_scale")[0] == out_dim(li) && !lf.has(b + "trellis") && !lf.has(b + "weight_packed"),
+               "%s L%d %s: FP8 K/V layout", tag.c_str(), L, kLinName[li]);
+        // bytes must equal the converter applied to the bf16 source tensor
+        SafeTensorsReader st(source.string());
+        auto src = st.read(b + "weight");
+        Fp8Linear f = bf16_to_fp8_dynamic(reinterpret_cast<const uint16_t*>(src.data()), out_dim(li), in_dim(li));
+        auto w8 = lf.bytes(b + "weight"), sc = lf.bytes(b + "weight_scale");
+        EXPECT(w8 == f.w && sc.size() == f.scale.size() * 2 && !std::memcmp(sc.data(), f.scale.data(), sc.size()),
+               "%s L%d %s: FP8 bytes differ from converter", tag.c_str(), L, kLinName[li]);
+        continue;
+      }
       EXPECT(!lf.has(b + "weight"), "%s L%d %s: K/V must not stay FP8/bf16 for BF16 sources", tag.c_str(), L, kLinName[li]);
       if (nvfp4) {
         EXPECT(lf.has(b + "weight_packed") && lf.shape(b + "weight_packed")[0] == out_dim(li) &&
@@ -360,20 +385,27 @@ int main(int argc, char** argv) {
     p.run();
     check_output(o.out, "qtip", false);
   }
-  std::printf("[run] explicit --kv-format fp8 with a BF16 source must be rejected\n");
+  std::printf("[run] --kv-format fp8 with a BF16 source: K/V converted to FP8-Dynamic, rest QTIP\n");
   {
+    Options o = base_options(root, "fp8kv", "run");
+    o.fp8_kv = true;
+    o.kv_explicit = true;
+    Pipeline p(o);
+    p.run();
+    check_output(o.out, "fp8kv", false, nullptr, true, root / "source");
+    // work dir written with another K/V format must be refused on resume
     pid_t pid = fork();
     if (pid == 0) {
       if (!freopen("/dev/null", "w", stderr)) _exit(2);
-      Options o = base_options(root, "reject", "run");
-      o.fp8_kv = true;
-      o.kv_explicit = true;
-      Pipeline p(o);
+      Options q = base_options(root, "fp8kv", "run");
+      q.fp8_kv = false;
+      q.kv_explicit = true;
+      Pipeline pq(q);
       _exit(0);
     }
     int st = 0;
     waitpid(pid, &st, 0);
-    EXPECT(!(WIFEXITED(st) && WEXITSTATUS(st) == 0), "BF16 + --kv-format fp8 must fail");
+    EXPECT(!(WIFEXITED(st) && WEXITSTATUS(st) == 0), "resuming an fp8-K/V work dir with --kv-format qtip must fail");
   }
   std::printf("[adaptive] all-QTIP, then all-NVFP4 with a tiled lm_head (3 tiles of 96 over vocab %d)\n", kVocab);
   {
@@ -404,6 +436,37 @@ int main(int argc, char** argv) {
     Pipeline p(o);
     p.run();
     check_output(o.out, "nvfp4", true);
+    json cfg = json::parse(std::ifstream(fs::path(o.out) / "config.json"));
+    for (auto& f : cfg["qtip_quant"]["layer_formats"]) EXPECT(f == "nvfp4", "all layers nvfp4");
+  }
+  std::printf("[adaptive] --kv-format fp8: K/V FP8 in QTIP and (forced) NVFP4 layers; KL uses dequantized FP8 K/V\n");
+  {
+    Options o = base_options(root, "adaptive-fp8kv-qtip", "adaptive");
+    o.kl_threshold = 1e30;
+    o.fp8_kv = true;
+    o.kv_explicit = true;
+    Pipeline p(o);
+    p.run();
+    check_output(o.out, "adaptive-fp8kv-qtip", false, nullptr, true, root / "source");
+    json rep = json::parse(std::ifstream(fs::path(o.out) / "adaptive_report.json"));
+    EXPECT(rep["kv_format"] == "fp8", "adaptive_report kv_format");
+    auto with_fp8 = metric_values(o.out, "kl_qtip");
+    auto with_qkv = metric_values(root / "adaptive-qtip", "kl_qtip");
+    bool differs = false;
+    for (size_t i = 0; i < with_fp8.size(); ++i) {
+      std::printf("  layer %zu kl_qtip fp8-kv %.6g qtip-kv %.6g\n", i, with_fp8[i], with_qkv[i]);
+      differs |= with_fp8[i] != with_qkv[i];
+    }
+    EXPECT(differs, "KL must reflect the FP8 K/V candidate");
+  }
+  {
+    Options o = base_options(root, "adaptive-fp8kv-nvfp4", "adaptive");
+    o.kl_threshold = 0.0;
+    o.fp8_kv = true;
+    o.kv_explicit = true;
+    Pipeline p(o);
+    p.run();
+    check_output(o.out, "adaptive-fp8kv-nvfp4", true, nullptr, true, root / "source");
     json cfg = json::parse(std::ifstream(fs::path(o.out) / "config.json"));
     for (auto& f : cfg["qtip_quant"]["layer_formats"]) EXPECT(f == "nvfp4", "all layers nvfp4");
   }

@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 
+#include "fp8_kv.hpp"
 #include "qtip_core.hpp"
 
 namespace qtip {
@@ -123,6 +124,12 @@ std::shared_ptr<LayerHost> read_layer(const SafeTensorsReader& st, const ModelCo
       QCHECK(w.dtype == "BF16" && w.shape.size() == 2, std::string("expected BF16 weight ") + kLinName[i]);
       L->w[i].resize(w.bytes());
       st.read_into(pre + kLinName[i] + ".weight", L->w[i].data(), L->w[i].size());
+      if (cfg.convert_kv_fp8 && (i == LK || i == LV)) {
+        Fp8Linear f = bf16_to_fp8_dynamic(reinterpret_cast<const uint16_t*>(L->w[i].data()), L->out_dim[i], L->in_dim[i]);
+        L->kv8_deq[i] = fp8_dynamic_dequant_bf16(f);
+        L->kv8_w[i] = std::move(f.w);
+        L->kv8_sc[i] = std::move(f.scale);
+      }
       continue;
     }
     QCHECK(w.dtype == "F8_E4M3" && w.shape.size() == 2, std::string("unexpected weight ") + kLinName[i]);
