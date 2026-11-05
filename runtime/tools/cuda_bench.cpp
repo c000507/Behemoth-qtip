@@ -1,6 +1,7 @@
 #include "behemoth/cuda.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 using namespace behemoth::cuda_runtime;
@@ -10,7 +11,8 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i += 2) {
             if (std::string(argv[i]) == "--help") {
                 std::cout << "behemoth_cuda_bench --model DIR [--tp 2] [--device 0] [--batch 1|8] "
-                             "[--prompt-tokens 8192] [--decode-tokens 256] [--warmup 1] [--output FILE]\n";
+                             "[--prompt-tokens 8192] [--decode-tokens 256] [--warmup 1] [--output FILE] "
+                             "[--trace-logits FILE]\n";
                 return 0;
             }
             check(i + 1 < argc && args.emplace(argv[i], argv[i + 1]).second,
@@ -20,7 +22,7 @@ int main(int argc, char **argv) {
             (void)value;
             check(name == "--model" || name == "--tp" || name == "--device" || name == "--batch" ||
                       name == "--prompt-tokens" || name == "--decode-tokens" || name == "--warmup" ||
-                      name == "--output",
+                      name == "--output" || name == "--trace-logits",
                   "Unknown benchmark option: " + name);
         }
         auto number = [&](const char *name, int fallback) {
@@ -46,7 +48,7 @@ int main(int argc, char **argv) {
             for (int t = 0; t < prompt; ++t)
                 input[b][t] = seed[(t + b * 7) % seed.size()];
         Model model(args.at("--model"), device, prompt + decode, tp, batch);
-        auto run = [&] {
+        auto run = [&](bool record_trace) {
             model.reset();
             std::cerr << "Prefill " << batch << " x " << prompt << " tokens\n";
             auto start = std::chrono::steady_clock::now();
@@ -55,17 +57,39 @@ int main(int argc, char **argv) {
             std::cerr << "Prefill seconds " << std::chrono::duration<double>(prefill_end - start).count()
                       << "; decode " << decode << " steps\n";
             std::vector<int> ids(batch);
+            std::vector<double> step_seconds;
+            std::vector<Vec> prefill_logits;
+            std::vector<std::vector<int>> generated;
+            if (record_trace) {
+                prefill_logits = logits;
+                generated.reserve(decode);
+            }
+            auto decode_start = std::chrono::steady_clock::now();
             for (int step = 0; step < decode; ++step) {
+                auto step_start = std::chrono::steady_clock::now();
                 for (int b = 0; b < batch; ++b)
                     ids[b] = int(std::max_element(logits[b].begin(), logits[b].end()) - logits[b].begin());
                 logits = model.step_batch(ids);
+                step_seconds.push_back(
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start).count());
                 if ((step + 1) % 32 == 0)
                     std::cerr << "decode " << step + 1 << '/' << decode << '\n';
+                if (record_trace)
+                    generated.push_back(ids);
             }
             auto end = std::chrono::steady_clock::now();
             double prefill_seconds = std::chrono::duration<double>(prefill_end - start).count();
-            double decode_seconds = std::chrono::duration<double>(end - prefill_end).count();
-            return json{{"tp", tp},
+            double decode_seconds = std::chrono::duration<double>(end - decode_start).count();
+            if (record_trace) {
+                std::ofstream trace(args.at("--trace-logits"));
+                trace << json{{"prefill_logits", prefill_logits},
+                              {"final_logits", logits},
+                              {"generated_token_ids", generated}}
+                             .dump()
+                      << '\n';
+                check(bool(trace), "Cannot write benchmark logits trace");
+            }
+            json result{{"tp", tp},
                         {"batch", batch},
                         {"prompt_tokens_per_sequence", prompt},
                         {"decode_tokens_per_sequence", decode},
@@ -75,12 +99,21 @@ int main(int argc, char **argv) {
                         {"decode_tokens_per_second", double(batch) * decode / decode_seconds},
                         {"ignore_eos", true},
                         {"kv_dtype", "BF16"}};
+            auto sorted = step_seconds;
+            std::sort(sorted.begin(), sorted.end());
+            result["decode_step_seconds_summary"] = {{"min", sorted.front()},
+                                                     {"median", sorted[sorted.size() / 2]},
+                                                     {"p95", sorted[(sorted.size() - 1) * 95 / 100]},
+                                                     {"max", sorted.back()}};
+            if (std::getenv("BEHEMOTH_CUDA_BENCH_STEP_TIMES"))
+                result["decode_step_seconds"] = step_seconds;
+            return result;
         };
         for (int i = 0; i < warmup; ++i) {
             std::cerr << "Warmup " << i + 1 << '/' << warmup << '\n';
-            (void)run();
+            (void)run(false);
         }
-        auto result = run();
+        auto result = run(args.contains("--trace-logits"));
         result["warmup_runs"] = warmup;
         std::cout << result.dump(2) << '\n';
         if (args.contains("--output")) {

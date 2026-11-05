@@ -10,6 +10,8 @@ struct QtipMatrix {
     int in, out;
 };
 void initialize_tables();
+bool fused_prefill_hadamard();
+void peer_store(const void *source, void *destination, size_t bytes, Stream);
 void qtip_prepare(QtipMatrix, const B16 *, float *scratch, B16 *rotated, Stream, int tokens = 1,
                   bool rank_major = false);
 void qtip_multiply(QtipMatrix, const B16 *rotated, float *z, int stride, int splits, Stream, int tokens = 1);

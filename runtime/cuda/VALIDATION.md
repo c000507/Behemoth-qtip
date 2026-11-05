@@ -1,7 +1,118 @@
-# CUDA execution validation — 2026-11-04
+# CUDA execution validation
 
-This report describes baseline commit `021c434`. The subsequent opt-in split-K
-kernel and expanded split-count tests have not yet been executed on a GPU.
+## RTX A6000 fast backend — 2026-11-05
+
+Two RTX A6000s on a RunPod US-TX-1 host, driver 595.91.07, CUDA 12.4.131,
+GCC 11.4, sm_86. The fast build uses NCCL 2.21.5 and cuDNN 9.1. There is no
+NVLink; the GPUs appear as NODE in the topology report.
+
+All six CTests pass: core, structured outputs, QTIP, batched kernels, peer
+collectives, and architecture dispatch. Batched projections are checked against
+the independent CPU reference, including factors 1/12/28, split reductions,
+rotated-output rounding, rank-major layouts, aliased buffers, and partial row
+and token tiles. Native decode GQA checks cache isolation and a group of twelve
+query heads sharing each KV head. cuDNN prefill checks strided query heads,
+causal masking, and unequal sequence lengths against high-precision attention
+(relative L2 0.0018332, maximum absolute error 0.00195312 for that fixture).
+
+The two-GPU peer test checks byte-exact AllGather with 56 KiB and 8 MiB per
+rank, repeated send-buffer reuse, and three graph replays with changing pinned
+host inputs. `cudaMemcpyPeerAsync` was rejected during capture; the implemented
+UVA `cudaMemcpyAsync` path passes both uncaptured and captured checks.
+
+The 32-row QTIP register kernel matches the earlier tensor-core products
+bit for bit across partial row/token tiles, split counts 1/3/8, and batches
+2/7/8/16/17/65. Batch 1 is checked against the independent CPU projection
+reference at input widths 12288 and 28672; its default remains the SIMT kernel.
+On real checkpoint shards at batch 8, isolated product times decreased from
+0.097/0.188/0.186 ms to 0.062/0.137/0.128 ms for Q/gate/down respectively.
+These microbenchmarks do not establish whole-model throughput.
+
+The complete portable build also compiles for sm_75 and sm_80. Local CPU
+regressions pass; local GPU tests skip because that workspace has no GPU.
+This does not establish Turing execution, model quality, or the requested
+20/100/500 tok/s throughput targets. Full-model fast-path measurements and
+quality comparisons are still in progress.
+
+Measured before the main rebase, with the public mixed FP8-K/V checkpoint,
+TP2 peer transport, BF16 KV, 8192 prompt tokens and 256 decode steps:
+
+| Revision at measurement | Batch | Decode tok/s (aggregate) | Prefill tok/s |
+|---|---:|---:|---:|
+| `895cfd9` | 1 | 15.54 | 454.49 |
+| `3624ea7` | 8 | 60.79 | 470.16 |
+
+These are complete model runs with zero warmup runs and fixed generation
+lengths. They remain below the requested targets. The rebased equivalents are
+`e5e492a` and `8d37814`; performance has not yet been remeasured after the rebase.
+
+On the replacement US-KS-2 A6000 host, both peer GPU stores and peer DMA left
+the receiving rank's sentinel bytes unchanged (first byte 238 instead of 83),
+despite driver-reported peer access. Those model timings are invalid. The new
+startup check rejects both peer modes on this host. NCCL with peer access disabled
+passes exact 56 KiB, 224 KiB and 8 MiB AllGather checks, repeated buffer reuse,
+and three graph replays with changing inputs. The other six CTests pass here,
+including the rebased Llama geometry tests. Peer execution still requires a host
+that passes its own integrity checks.
+
+The prefill Hadamard candidate matches the per-token GPU reference bit for bit
+at widths 12288 and 28672 with 257 rows, FP32/BF16 inputs, both orientations,
+rotated-output rounding, rank-major layouts and in-place fallback cases.
+At 8192 rows, isolated input/output transforms decreased from about 2.6 to
+1.3 ms at width 12288 and from 6.6–6.9 to 3.1–3.9 ms at width 28672.
+Register-resident softmax preserves attention outputs exactly through context
+8448 and falls back above that bound; batch-8 8k attention decreased from
+0.391 to 0.353 ms. Fused split reduction/scale/BF16 compaction matches the
+separate kernels exactly, and every finite E4M3 code decodes exactly, including
+signed zero and subnormals.
+
+Using NCCL on all 88 layers, the combined candidate matches the rebased baseline
+bit for bit after 256-token bulk prefill and 32 greedy decode steps at batches 1 and 8.
+The complete prefill/final logits and generated tokens have identical trace
+SHA256 values, respectively:
+`d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f` and
+`d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d`.
+This finite comparison does not establish long-context model quality.
+
+The staged host AllGather also passes exact data and graph replay checks on
+US-KS-2, including an 8 MiB + 13-byte transfer through 1 MiB ring slots. Eight
+non-peer CTests pass, including NCCL and host collectives; the peer test still
+rejects this host. Full 88-layer traces at batches 1 and 8 match the NCCL
+reference exactly after 256-token prefill and 32 decode steps.
+
+For a 448 MiB payload per rank on this host, uncaptured host-staged AllGather
+takes 103 ms versus 136 ms with NCCL. Small memcpy graphs have higher host launch
+overhead, so inference keeps transfers through 1 MiB on NCCL. This is an opt-in
+alternative; it does not establish the requested full-model throughput targets.
+
+Final US-KS-2 measurements at source `b5108f2`, TP2, BF16 KV and 8192/256 tokens:
+
+| Transport | Batch | Warmup runs | Decode tok/s | Prefill tok/s |
+|---|---:|---:|---:|---:|
+| Host bulk staging, NCCL small transfers | 1 | 1 | 15.05 | 245.55 |
+| Host bulk staging, NCCL small transfers | 8 | 0 | 51.53 | 242.58 |
+
+The targets remain unmet. The same host's NCCL-only candidate runs measured
+14.15/51.59 decode tok/s and 193.23/199.23 prefill tok/s at batches 1/8 with
+zero warmups. These measurements should not be compared as a code regression
+against the earlier host's working peer transport. Exact timings, warmup counts,
+environment and numerical check hashes are in the [result artifact](results/a6000-us-ks-2.json).
+
+A subsequent HTTP smoke test exposed an under-allocation for cold short prompts:
+the small-prefill matmul uses split-K, while prefill reserved only one partial.
+The arena now reserves the actual split count below 128 padded rows. The optional
+`cuda_model_prefill` regression passes on the complete checkpoint: a cold 32-token
+prefill and its next decode step match bit for bit after a 1024-token request
+grows the arena and the model resets. The 8k benchmark uses the unchanged bulk
+allocation path.
+After this fix, the TP2 server with context 32768 passes two identical greedy
+HTTP requests for `What is 2 + 2?`: both return `4`, populate `reasoning_content`,
+and stop on EOS. The server's health endpoint returns HTTP 200.
+
+## Historical A100 baseline — 2026-11-04
+
+The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K
+kernel and expanded split-count tests had not yet been executed on a GPU.
 RunPod could not restart the existing A100 pod because its host had no free GPUs.
 Do not attribute the execution results below to the experimental kernel.
 

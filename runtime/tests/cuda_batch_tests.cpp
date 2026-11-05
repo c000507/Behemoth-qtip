@@ -4,6 +4,7 @@
 #include "fast_prefill.hpp"
 #endif
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -113,8 +114,28 @@ void qtip_test(cg::Stream s, int out, int in, int tokens) {
             if (splits > in / 32)
                 continue;
             cu::qtip_prepare(w, input, work, rotated, s, tokens);
-            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s);
+            if (tokens == 65 && splits == 1) {
+                auto batched = read(rotated.p, size_t(tokens) * in, s);
+                for (int t = 0; t < tokens; ++t)
+                    cu::qtip_prepare(w, input.p + size_t(t) * in, work, rotated.p + size_t(t) * in, s);
+                require(batched == read(rotated.p, size_t(tokens) * in, s),
+                        "Fused input Hadamard must match per-token transform exactly");
+            }
+            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s, 0);
+            auto baseline_products = read(z.p, size_t(tokens) * out * splits, s);
+
+            cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s, 1);
+            if (tokens > 1)
+                require(baseline_products == read(z.p, size_t(tokens) * out * splits, s),
+                        "Wide register QTIP must preserve tensor-core products exactly");
             cu::qtip_finish(w, z, output, work, rz, splits, s, tokens);
+            if (tokens == 65 && splits == 1) {
+                auto batched = read(output.p, size_t(tokens) * out, s);
+                for (int t = 0; t < tokens; ++t)
+                    cu::qtip_finish(w, z.p + size_t(t) * out, output.p + size_t(t) * out, work, rz, 1, s);
+                require(batched == read(output.p, size_t(tokens) * out, s),
+                        "Fused output Hadamard must match per-token transform exactly");
+            }
             std::cout << "QTIP " << out << 'x' << in << " tokens=" << tokens << " splits=" << splits
                       << " round_z=" << rz << ' ';
             compare(read(output.p, expected.size(), s), expected, "batch RHT/tensor product");
@@ -214,9 +235,146 @@ void dense_test(cg::Stream s, int tokens) {
     cu::fp8_multiply_batch(low, scale, input, y, in, rows, tokens, s, partials);
     compare(read(y.p, expected.size(), s), expected, "FP8 split-K post-accumulation scale");
 }
+void prefill_hadamard_test(cg::Stream s, int width) {
+    constexpr int tokens = 257;
+    size_t count = size_t(tokens) * width;
+    std::mt19937 gen(617);
+    std::uniform_real_distribution<float> distribution(-.3f, .3f);
+    std::vector<float> x(count), signs(width), scales(width);
+    for (auto &v : x)
+        v = distribution(gen);
+    for (int i = 0; i < width; ++i) {
+        signs[i] = gen() % 2 ? 1 : -1;
+        scales[i] = (gen() % 2 ? 1 : -1) * .003f;
+    }
+    cg::Buffer<uint16_t> input, output, reference;
+    cg::Buffer<float> z, su, sv, scratch;
+    put(input, bits(x), s);
+    put(su, signs, s);
+    put(sv, scales, s);
+    put(z, x, s);
+    output.ensure(count, s);
+    reference.ensure(count, s);
+    scratch.ensure(count, s);
+    cu::QtipMatrix w{nullptr, su, sv, nullptr, width, width};
+    auto ranked = [&](const auto &data) {
+        auto packed = data;
+        for (int rank = 0; rank < 2; ++rank)
+            for (int t = 0; t < tokens; ++t)
+                std::copy_n(data.data() + size_t(t) * width + rank * width / 2, width / 2,
+                            packed.data() + (size_t(rank) * tokens + t) * (width / 2));
+        return packed;
+    };
+    for (int t = 0; t < tokens; ++t)
+        cu::qtip_prepare(w, input.p + size_t(t) * width, scratch, reference.p + size_t(t) * width, s);
+    auto expected = read(reference.p, count, s);
+    for (bool rank_major : {false, true}) {
+        auto data = bits(x);
+        put(input, rank_major ? ranked(data) : data, s);
+        cu::qtip_prepare(w, input, scratch, output, s, tokens, rank_major);
+        require(read(output.p, count, s) == expected, "Prefill input Hadamard changed bits");
+        cu::qtip_prepare(w, input, scratch, input, s, tokens, rank_major);
+        require(read(input.p, count, s) == expected, "Aliased prefill input Hadamard changed bits");
+    }
+    for (bool round_z : {false, true}) {
+        for (int t = 0; t < tokens; ++t)
+            cu::qtip_finish(w, z.p + size_t(t) * width, reference.p + size_t(t) * width, scratch, round_z, 1,
+                            s);
+        expected = read(reference.p, count, s);
+        for (bool rank_major : {false, true}) {
+            cg::Buffer<float> source;
+            put(source, rank_major ? ranked(x) : x, s);
+            cu::qtip_finish(w, source, output, scratch, round_z, 1, s, tokens, rank_major);
+            require(read(output.p, count, s) == expected, "Prefill FP32 output Hadamard changed bits");
+            if (round_z) {
+                auto data = bits(x);
+                put(input, rank_major ? ranked(data) : data, s);
+                cu::qtip_finish_b16(w, input, output, scratch, tokens, s, rank_major);
+                require(read(output.p, count, s) == expected, "Prefill BF16 output Hadamard changed bits");
+                cu::qtip_finish_b16(w, input, input, scratch, tokens, s, rank_major);
+                require(read(input.p, count, s) == expected, "Aliased output Hadamard changed bits");
+            }
+        }
+    }
+    std::cout << "Prefill Hadamard width=" << width << " bitwise reference passed\n";
+}
+void compact_test(cg::Stream s) {
+    constexpr int width = 513, rows = 7;
+    constexpr size_t n = width * rows;
+    std::mt19937 gen(46);
+    std::uniform_real_distribution<float> distribution(-3.f, 3.f);
+    std::vector<float> data(n * 32), scales(width);
+    for (auto &v : data)
+        v = distribution(gen);
+    for (auto &v : scales)
+        v = distribution(gen);
+    cg::Buffer<float> source, scale;
+    cg::Buffer<uint16_t> expected, actual;
+    put(scale, scales, s);
+    expected.ensure(n, s);
+    actual.ensure(n, s);
+    for (int splits : {1, 3, 16, 32})
+        for (bool scaled : {false, true}) {
+            put(source, data, s);
+            cu::reduce_to_b16(source, scaled ? scale.p : nullptr, actual, n, width, splits, s);
+            cu::reduce_products(source, n, splits, s);
+            if (scaled)
+                cu::scale_to_b16(source, scale, expected, rows, width, s);
+            else
+                cg::from_float(source, expected, n, s);
+            require(read(actual.p, n, s) == read(expected.p, n, s),
+                    "Fused split reduction/scale/BF16 rounding changed bits");
+        }
+    std::vector<uint8_t> codes(256);
+    for (int i = 0; i < 256; ++i)
+        codes[i] = (i & 127) == 127 ? 0 : uint8_t(i);
+    cg::Buffer<uint8_t> bytes;
+    put(bytes, codes, s);
+    cu::decode_fp8_matrix(bytes, actual, codes.size(), s);
+    auto decoded = read(actual.p, codes.size(), s);
+    for (size_t i = 0; i < codes.size(); ++i)
+        require(std::bit_cast<uint32_t>(decoded[i]) == std::bit_cast<uint32_t>(decode_e4m3(codes[i])),
+                "FP8 finite decoding must be exact, including signed zero and subnormals");
+    std::cout << "Compact split products and exhaustive finite E4M3 decoding passed\n";
+}
+void norm_test(cg::Stream s, int batch) {
+    constexpr int width = 12288;
+    constexpr float epsilon = 2e-5f;
+    std::mt19937 gen(819);
+    std::normal_distribution<float> normal;
+    std::vector<float> x(size_t(batch) * width), weights(width), expected(x.size());
+    for (auto &v : x)
+        v = float(BFloat16(normal(gen)));
+    std::fill(x.begin(), x.begin() + width, 0.f);
+    for (auto &v : weights)
+        v = 1.f + normal(gen) * .03f;
+    for (int b = 0; b < batch; ++b) {
+        double squares = 0;
+        for (int i = 0; i < width; ++i)
+            squares += double(x[b * width + i]) * x[b * width + i];
+        double inv = 1 / std::sqrt(squares / width + epsilon);
+        for (int i = 0; i < width; ++i)
+            expected[b * width + i] = float(BFloat16(float(x[b * width + i] * inv * weights[i])));
+    }
+    cg::Buffer<uint16_t> input, output;
+    cg::Buffer<float> scale;
+    put(input, bits(x), s);
+    put(scale, weights, s);
+    output.ensure(x.size(), s);
+    cu::norm_batch(input, scale, output, batch, width, epsilon, s, false);
+    auto baseline = read(output.p, x.size(), s);
+    cu::norm_batch(input, scale, output, batch, width, epsilon, s, true);
+    require(baseline == read(output.p, x.size(), s),
+            "Resident RMS must match the original reduction exactly");
+    cu::norm_batch(input, scale, input, batch, width, epsilon, s, true);
+    require(baseline == read(input.p, x.size(), s), "Resident RMS must support in-place output");
+    compare(baseline, expected, "RMS normalization and epsilon", .003, .02);
+}
 void attention_test(cg::Stream s, int context = 17, int qh = 6, int kh = 2) {
     constexpr int batch = 3, dim = 128;
     std::vector<int> positions = context == 17 ? std::vector<int>{0, 3, 7} : std::vector<int>{128, 137, 256};
+    if (context > 257)
+        positions = {context / 2, context - 129, context - 1};
     std::mt19937 gen(64);
     std::normal_distribution<float> normal(0, .2f);
     std::vector<float> q(batch * qh * dim), k(batch * context * kh * dim), v(k.size());
@@ -275,7 +433,22 @@ void attention_test(cg::Stream s, int context = 17, int qh = 6, int kh = 2) {
     cg::Buffer<float> parts;
     parts.ensure(size_t(batch) * kh * ((maximum + 127) / 128) * 16 * dim, s);
     cu::gqa_batch(dq, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s, 0, parts);
-    compare(read(out.p, q.size(), s), expected, "Tensor-core GQA groups, split context, padded tails");
+    auto registered = read(out.p, q.size(), s);
+    compare(registered, expected, "Register tensor-core GQA, split context, padded tails");
+    cu::gqa_batch(dq, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s, 0, parts, false,
+                  false);
+    require(registered == read(out.p, q.size(), s), "Register GQA must match WMMA staging exactly");
+    std::vector<uint16_t> wide(size_t(batch) * qh * dim * 2, 0x7fc0);
+    auto encoded = bits(q);
+    for (int b = 0; b < batch; ++b)
+        std::copy(encoded.begin() + size_t(b) * qh * dim, encoded.begin() + size_t(b + 1) * qh * dim,
+                  wide.begin() + size_t(2 * b + 1) * qh * dim);
+    cg::Buffer<uint16_t> strided_query;
+    put(strided_query, wide, s);
+    cu::gqa_batch(strided_query.p + qh * dim, dk, dv, out, work, pos, batch, context, maximum, qh, kh, dim, s,
+                  2 * qh * dim, parts);
+    require(registered == read(out.p, q.size(), s),
+            "Register GQA must respect rank offsets and query strides");
 }
 #if defined(BEHEMOTH_CUDA_FAST)
 void prefill_attention_test(cg::Stream s) {
@@ -342,10 +515,23 @@ int main() {
         for (auto [out, in] : {std::pair{128, 128}, std::pair{768, 1792}, std::pair{1792, 768}})
             for (int tokens : {8, 17, 65})
                 qtip_test(s, out, in, tokens);
+        // Exercise the register kernel's partial row tile and both token tiles.
+        for (int tokens : {1, 2, 7, 16})
+            qtip_test(s, 96, 128, tokens);
+        qtip_test(s, 32, 12288, 1);
+        qtip_test(s, 32, 28672, 1);
         for (int tokens : {8, 17, 65})
             dense_test(s, tokens);
+        prefill_hadamard_test(s, 12288);
+        prefill_hadamard_test(s, 28672);
+        compact_test(s);
+        norm_test(s, 1);
+        norm_test(s, 8);
         attention_test(s);
         attention_test(s, 257, 24, 2);
+        attention_test(s, 8193, 24, 2);
+        attention_test(s, 8448, 24, 2);
+        attention_test(s, 8449, 24, 2);
 #if defined(BEHEMOTH_CUDA_FAST)
         prefill_attention_test(s);
 #endif

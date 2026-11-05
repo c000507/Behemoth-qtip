@@ -1,6 +1,7 @@
 #include "batch_kernels.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <mma.h>
 namespace behemoth::cuda_runtime {
@@ -12,9 +13,12 @@ __device__ B16 b16(float x) {
     return B16((u + 0x7fffU + ((u >> 16) & 1)) >> 16);
 }
 __device__ float fp8(uint8_t x) {
-    int e = (x >> 3) & 15, m = x & 7;
-    float v = e ? __uint_as_float(unsigned(e + 120) << 23 | unsigned(m) << 20) : float(m) / 512;
-    return e == 15 && m == 7 ? nanf("") : (x & 128 ? -v : v);
+    unsigned magnitude = x & 127U;
+    unsigned bits = (magnitude << 20) + (120U << 23);
+    if (magnitude < 8)
+        bits = __float_as_uint(float(magnitude) * (1.f / 512.f));
+    bits |= unsigned(x & 128U) << 24;
+    return magnitude == 127 ? nanf("") : __uint_as_float(bits);
 }
 __device__ void decode_tile(QtipMatrix w, const uint32_t *lut, int br, int chunk, B16 *a, int ld) {
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
@@ -126,6 +130,145 @@ bool native_bf16() {
     }
     return major[device] >= 8;
 }
+// QTIP's four decoded pairs already have the register ordering required by
+// mma.m16n8k16. Keep them in registers instead of staging a 32x32 BF16 tile.
+__global__ void trellis_mma8(QtipMatrix w, const B16 *x, float *out, int stride, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ uint32_t lut[1024];
+    for (int i = threadIdx.x; i < 1024; i += blockDim.x)
+        lut[i] = w.lut[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int row = blockIdx.x * (blockDim.x / 32) * 16 + warp * 16;
+    if (row >= w.out)
+        return;
+    int chunks = w.in / 32;
+    int first = chunks * blockIdx.y / gridDim.y;
+    int last = chunks * (blockIdx.y + 1) / gridDim.y;
+    int token_base = blockIdx.z * 8;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int chunk = first; chunk < last; ++chunk) {
+        size_t base = (size_t(row / 32) * chunks + chunk) * 128;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            unsigned word = w.trellis[base + lane * 4 + half * 2 + (warp & 1)];
+            unsigned next = __shfl_sync(0xffffffffU, word, (lane + 1) & 31);
+            unsigned u = word << 16 | next;
+            uint32_t a[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                unsigned state = (u >> (16 - 4 * t)) & 65535U;
+                a[t] = lut[((state * (state + 1)) >> 6) & 1023U];
+            }
+            int token = token_base + lane / 4;
+            size_t at = size_t(token) * w.in + chunk * 32 + half * 16 + (lane % 4) * 2;
+            uint32_t b0 = 0, b1 = 0;
+            if (token < tokens) {
+                b0 = *reinterpret_cast<const uint32_t *>(x + at);
+                b1 = *reinterpret_cast<const uint32_t *>(x + at + 8);
+            }
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        }
+    }
+    int token = token_base + (lane % 4) * 2;
+    size_t at = (size_t(blockIdx.y) * tokens + token) * stride + row + lane / 4;
+    if (token < tokens) {
+        out[at] = c0;
+        out[at + 8] = c2;
+    }
+    if (token + 1 < tokens) {
+        out[at + stride] = c1;
+        out[at + stride + 8] = c3;
+    }
+#endif
+}
+// A warp decodes all 32 output rows of a packed tile, reusing the activation
+// fragment for its two 16-row products. Prefetch the next tile before decoding.
+template <int Copies>
+__global__ void trellis_mma32(QtipMatrix w, const B16 *x, float *out, int stride, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ uint32_t lut[1024 * Copies];
+    for (int i = threadIdx.x; i < 1024 * Copies; i += blockDim.x)
+        lut[i] = w.lut[i / Copies];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int row = blockIdx.x * (blockDim.x / 32) * 32 + warp * 32;
+    if (row >= w.out)
+        return;
+    int chunks = w.in / 32;
+    int first = chunks * blockIdx.y / gridDim.y, last = chunks * (blockIdx.y + 1) / gridDim.y;
+    int token_base = blockIdx.z * 8, token = token_base + lane / 4;
+    struct Tile {
+        uint2 weight;
+        uint32_t b[4];
+    };
+    auto load = [&](int chunk, Tile &tile) {
+        chunk = min(chunk, last - 1);
+        size_t base = (size_t(row / 32) * chunks + chunk) * 32;
+        tile.weight = reinterpret_cast<const uint2 *>(w.trellis)[base + lane];
+        if (token < tokens) {
+            const uint32_t *input =
+                reinterpret_cast<const uint32_t *>(x) + size_t(token) * (w.in / 2) + chunk * 16 + lane % 4;
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                tile.b[i] = input[i * 4];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                tile.b[i] = 0;
+        }
+    };
+    float c[2][4] = {};
+    auto compute = [&](const Tile &tile) {
+        uint2 next{__shfl_sync(0xffffffffU, tile.weight.x, (lane + 1) & 31),
+                   __shfl_sync(0xffffffffU, tile.weight.y, (lane + 1) & 31)};
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            uint32_t own = half ? tile.weight.y : tile.weight.x, peer = half ? next.y : next.x;
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                uint32_t u = __byte_perm(own, peer, r ? 0x3276 : 0x1054), a[4];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    uint32_t state = u >> (16 - 4 * t);
+                    uint32_t index = ((state * state + state) >> 6) & 1023U;
+                    a[t] = lut[index * Copies + (lane & (Copies - 1))];
+                }
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[r][0]), "+f"(c[r][1]), "+f"(c[r][2]), "+f"(c[r][3])
+                             : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(tile.b[half * 2]),
+                               "r"(tile.b[half * 2 + 1]));
+            }
+        }
+    };
+    if (first < last) {
+        Tile next;
+        load(first, next);
+        for (int chunk = first; chunk < last; ++chunk) {
+            Tile current = next;
+            load(chunk + 1, next);
+            compute(current);
+        }
+    }
+    token = token_base + (lane % 4) * 2;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        size_t at = (size_t(blockIdx.y) * tokens + token) * stride + row + r * 16 + lane / 4;
+        if (token < tokens) {
+            out[at] = c[r][0];
+            out[at + 8] = c[r][2];
+        }
+        if (token + 1 < tokens) {
+            out[at + stride] = c[r][1];
+            out[at + stride + 8] = c[r][3];
+        }
+    }
+#endif
+}
 template <int Format>
 void launch(QtipMatrix w, const B16 *dense, const uint8_t *low, const float *scale, const B16 *x, void *out,
             int stride, int splits, int tokens, Stream stream) {
@@ -176,6 +319,36 @@ __global__ void rms(const B16 *x, const float *weight, B16 *out, int width, floa
     float inv = rsqrtf(red[0] / width + epsilon);
     for (int i = tid; i < width; i += 256)
         out[i] = b16(f32(x[i]) * inv * weight[i]);
+}
+template <int Width>
+__global__ void rms_resident(const B16 *x, const float *weight, B16 *out, float epsilon) {
+    __shared__ float red[8];
+    int tid = threadIdx.x;
+    x += size_t(blockIdx.x) * Width;
+    out += size_t(blockIdx.x) * Width;
+    float values[Width / 256];
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        values[j] = f32(x[tid + j * 256]);
+    // Preserve the original per-thread summation order and reduction tree.
+    float sum = 0;
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        sum += values[j] * values[j];
+    sum = warp_sum(sum);
+    if (!(tid & 31))
+        red[tid / 32] = sum;
+    __syncthreads();
+    sum = tid < 8 ? red[tid] : 0;
+    if (tid < 32)
+        sum = warp_sum(sum);
+    if (!tid)
+        red[0] = sum;
+    __syncthreads();
+    float inv = rsqrtf(red[0] / Width + epsilon);
+#pragma unroll
+    for (int j = 0; j < Width / 256; ++j)
+        out[tid + j * 256] = b16(values[j] * inv * weight[tid + j * 256]);
 }
 __global__ void rotate(B16 *q, B16 *k, const int *positions, int sequence, int qh, int kh, int dim,
                        float theta, int qstride) {
@@ -247,6 +420,47 @@ __global__ void softmax(float *x, const int *positions, int context, int qh) {
     for (int i = tid; i < n; i += 256)
         x[i] = f32(b16(x[i] / sum));
 }
+// Preserve the legacy reduction tree while avoiding intermediate exponentials
+// in global memory. At 8k context each thread retains 33 FP32 scores.
+template <int Slots> __global__ void resident_softmax(float *x, const int *positions, int context, int qh) {
+    __shared__ float red[256];
+    int h = blockIdx.x, tid = threadIdx.x, n = positions[h / qh] + 1;
+    x += size_t(h) * context;
+    float values[Slots], top = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        int at = tid + i * 256;
+        values[i] = at < n ? x[at] : -INFINITY;
+        top = fmaxf(top, values[i]);
+    }
+    red[tid] = top;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            red[tid] = fmaxf(red[tid], red[tid + d]);
+        __syncthreads();
+    }
+    top = red[0];
+    __syncthreads();
+    float sum = 0;
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        values[i] = expf(values[i] - top);
+        sum += values[i];
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            red[tid] += red[tid + d];
+        __syncthreads();
+    }
+    sum = red[0];
+#pragma unroll
+    for (int i = 0; i < Slots; ++i)
+        if (tid + i * 256 < n)
+            x[tid + i * 256] = f32(b16(values[i] / sum));
+}
 __global__ void weighted_value(const B16 *v, const float *p, B16 *out, const int *positions, int context,
                                int qh, int kh, int dim) {
     int h = blockIdx.x % qh, b = blockIdx.x / qh, d = threadIdx.x;
@@ -297,6 +511,100 @@ __global__ void tensor_scores(const B16 *q, const B16 *k, float *out, const int 
         int g = i / 64, t = start + i % 64;
         if (g < group && t < context && t <= positions[batch])
             out[(size_t(batch) * qh + head * group + g) * context + t] = values[i] * rsqrtf(128.f);
+    }
+#endif
+}
+__global__ void register_scores(const B16 *q, const B16 *k, float *out, const int *positions, int context,
+                                int qh, int kh, int stride) {
+#if __CUDA_ARCH__ >= 800
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int head = blockIdx.y % kh, batch = blockIdx.y / kh, group = qh / kh;
+    int start = blockIdx.x * 64 + warp * 8;
+    int g = lane / 4, d = (lane % 4) * 2;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int part = 0; part < 128; part += 16) {
+        const B16 *a = q + size_t(batch) * stride + (head * group + g) * 128 + part + d;
+        uint32_t a0 = g < group ? *reinterpret_cast<const uint32_t *>(a) : 0;
+        uint32_t a1 = g + 8 < group ? *reinterpret_cast<const uint32_t *>(a + 8 * 128) : 0;
+        uint32_t a2 = g < group ? *reinterpret_cast<const uint32_t *>(a + 8) : 0;
+        uint32_t a3 = g + 8 < group ? *reinterpret_cast<const uint32_t *>(a + 8 * 128 + 8) : 0;
+        int token = start + g;
+        size_t at = ((size_t(batch) * context + token) * kh + head) * 128 + part + d;
+        bool valid = token < context && token <= positions[batch];
+        uint32_t b0 = valid ? *reinterpret_cast<const uint32_t *>(k + at) : 0;
+        uint32_t b1 = valid ? *reinterpret_cast<const uint32_t *>(k + at + 8) : 0;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    }
+    int token = start + d;
+    size_t at = (size_t(batch) * qh + head * group + g) * context + token;
+    if (g < group && token < context && token <= positions[batch])
+        out[at] = c0 * rsqrtf(128.f);
+    if (g < group && token + 1 < context && token + 1 <= positions[batch])
+        out[at + 1] = c1 * rsqrtf(128.f);
+    if (g + 8 < group && token < context && token <= positions[batch])
+        out[at + 8 * context] = c2 * rsqrtf(128.f);
+    if (g + 8 < group && token + 1 < context && token + 1 <= positions[batch])
+        out[at + 8 * context + 1] = c3 * rsqrtf(128.f);
+#endif
+}
+[[maybe_unused]] __device__ uint32_t probability_pair(const float *p, int head, int group, int token,
+                                                      int last, int context) {
+    uint32_t lo = head < group && token <= last && token < context
+                      ? __float_as_uint(p[size_t(head) * context + token]) >> 16
+                      : 0;
+    uint32_t hi = head < group && token + 1 <= last && token + 1 < context
+                      ? __float_as_uint(p[size_t(head) * context + token + 1]) >> 16
+                      : 0;
+    return lo | hi << 16;
+}
+[[maybe_unused]] __device__ uint32_t value_pair(const B16 *v, int token, int last, int context, int kh,
+                                                int column) {
+    uint32_t lo = token <= last && token < context ? v[size_t(token) * kh * 128 + column] : 0;
+    uint32_t hi = token + 1 <= last && token + 1 < context ? v[size_t(token + 1) * kh * 128 + column] : 0;
+    return lo | hi << 16;
+}
+__global__ void register_values(const B16 *v, const float *p, float *out, const int *positions, int context,
+                                int qh, int kh) {
+#if __CUDA_ARCH__ >= 800
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int head = blockIdx.y % kh, batch = blockIdx.y / kh, group = qh / kh;
+    int start = blockIdx.x * 128, g = lane / 4, d = (lane % 4) * 2;
+    int last = positions[batch];
+    p += (size_t(batch) * qh + head * group) * context;
+    v += (size_t(batch) * context * kh + head) * 128;
+    float c[2][4] = {};
+    for (int part = 0; part < 128; part += 16) {
+        int token = start + part + d;
+        uint32_t a0 = probability_pair(p, g, group, token, last, context);
+        uint32_t a1 = probability_pair(p, g + 8, group, token, last, context);
+        uint32_t a2 = probability_pair(p, g, group, token + 8, last, context);
+        uint32_t a3 = probability_pair(p, g + 8, group, token + 8, last, context);
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            int column = warp * 8 + g + n * 64;
+            uint32_t b0 = value_pair(v, token, last, context, kh, column);
+            uint32_t b1 = value_pair(v, token + 8, last, context, kh, column);
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c[n][0]), "+f"(c[n][1]), "+f"(c[n][2]), "+f"(c[n][3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+    }
+    size_t base = (size_t(blockIdx.y) * gridDim.x + blockIdx.x) * 16 * 128;
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        int column = warp * 8 + d + n * 64;
+        if (g < group) {
+            out[base + g * 128 + column] = c[n][0];
+            out[base + g * 128 + column + 1] = c[n][1];
+        }
+        if (g + 8 < group) {
+            out[base + (g + 8) * 128 + column] = c[n][2];
+            out[base + (g + 8) * 128 + column + 1] = c[n][3];
+        }
     }
 #endif
 }
@@ -373,6 +681,16 @@ __global__ void scale_output(const float *x, const float *scale, B16 *y, size_t 
     if (i < n)
         y[i] = b16(x[i] * scale[i % width]);
 }
+__global__ void compact_products(const float *x, const float *scale, B16 *y, size_t n, int width,
+                                 int splits) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float sum = x[i];
+        for (int part = 1; part < splits; ++part)
+            sum += x[size_t(part) * n + i];
+        y[i] = b16(scale ? sum * scale[i % width] : sum);
+    }
+}
 __global__ void decode_fp8(const uint8_t *x, B16 *y, size_t n) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n)
@@ -380,10 +698,40 @@ __global__ void decode_fp8(const uint8_t *x, B16 *y, size_t n) {
 }
 void launch_check() { glm53::gpu::checked(cudaGetLastError(), "CUDA batch operation launch"); }
 } // namespace
-void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int splits, int tokens, Stream s) {
+void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int splits, int tokens, Stream s,
+                         int implementation) {
+    if (implementation < 0) {
+        static const int wide = [] {
+            const char *value = std::getenv("BEHEMOTH_CUDA_QTIP_MMA_WIDE");
+            if (!value)
+                return -1;
+            if (std::string(value) == "0")
+                return 0;
+            if (std::string(value) == "1")
+                return 1;
+            throw std::runtime_error("BEHEMOTH_CUDA_QTIP_MMA_WIDE must be 0 or 1");
+        }();
+        implementation = tokens <= 16 && (wide >= 0 ? wide != 0 : tokens > 1) ? 1 : 0;
+    }
+    if (implementation == 1 && native_bf16()) {
+        if (w.in % 32 || w.out % 32 || stride < w.out || tokens <= 0 || splits <= 0 || splits > 32 ||
+            splits > w.in / 32)
+            throw std::runtime_error("Invalid wide register QTIP matmul geometry");
+        trellis_mma32<4>
+            <<<dim3((w.out + 255) / 256, splits, (tokens + 7) / 8), 256, 0, s>>>(w, x, z, stride, tokens);
+        glm53::gpu::checked(cudaGetLastError(), "wide register QTIP matmul launch");
+        return;
+    }
     if (tokens == 1 || !native_bf16())
         qtip_multiply(w, x, z, stride, splits, s, tokens);
-    else
+    else if (tokens <= 16) {
+        if (w.in % 32 || w.out % 32 || stride < w.out || tokens <= 0 || splits <= 0 || splits > 32 ||
+            splits > w.in / 32)
+            throw std::runtime_error("Invalid register QTIP matmul geometry");
+        trellis_mma8<<<dim3((w.out + 127) / 128, splits, (tokens + 7) / 8), 256, 0, s>>>(w, x, z, stride,
+                                                                                         tokens);
+        glm53::gpu::checked(cudaGetLastError(), "register QTIP matmul launch");
+    } else
         launch<0>(w, nullptr, nullptr, nullptr, x, z, stride, splits, tokens, s);
 }
 void qtip_decode_matrix(QtipMatrix w, B16 *out, Stream s) {
@@ -408,8 +756,7 @@ void fp8_multiply_batch(const uint8_t *w, const float *scale, const B16 *x, B16 
         int parts = std::min(32, in / 32);
         launch<3>({nullptr, nullptr, nullptr, nullptr, in, rows}, nullptr, w, nullptr, x, workspace, rows,
                   parts, tokens, s);
-        reduce_products(workspace, size_t(tokens) * rows, parts, s);
-        scale_to_b16(workspace, scale, y, tokens, rows, s);
+        reduce_to_b16(workspace, scale, y, size_t(tokens) * rows, rows, parts, s);
     } else
         launch<2>({nullptr, nullptr, nullptr, nullptr, in, rows}, nullptr, w, scale, x, y, rows, 1, tokens,
                   s);
@@ -418,8 +765,12 @@ void embedding_batch(const B16 *w, B16 *x, const int *ids, int rows, int width, 
     embed<<<(rows * width + 255) / 256, 256, 0, s>>>(w, x, ids, rows, width);
     launch_check();
 }
-void norm_batch(const B16 *x, const float *w, B16 *y, int rows, int width, float eps, Stream s) {
-    rms<<<rows, 256, 0, s>>>(x, w, y, width, eps);
+void norm_batch(const B16 *x, const float *w, B16 *y, int rows, int width, float eps, Stream s,
+                bool resident) {
+    if (resident && rows <= 16 && width == 12288)
+        rms_resident<12288><<<rows, 256, 0, s>>>(x, w, y, eps);
+    else
+        rms<<<rows, 256, 0, s>>>(x, w, y, width, eps);
     launch_check();
 }
 void rope_batch(B16 *q, B16 *k, const int *positions, int rows, int sequence, int qh, int kh, int dim,
@@ -436,14 +787,33 @@ void cache_batch(const B16 *k, const B16 *v, B16 *keys, B16 *values, const int *
 }
 void gqa_batch(const B16 *q, const B16 *k, const B16 *v, B16 *out, float *work, const int *positions,
                int batch, int context, int max_tokens, int qh, int kh, int dim, Stream s, int qstride,
-               float *value_workspace) {
+               float *value_workspace, bool register_mma, bool resident) {
     if (value_workspace && dim == 128 && qh / kh <= 16 && native_bf16()) {
-        tensor_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 128, 16 * 32 * 2 + 64 * 32 * 2, s>>>(
-            q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
-        softmax<<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        if (register_mma)
+            register_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 256, 0, s>>>(
+                q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
+        else
+            tensor_scores<<<dim3((max_tokens + 63) / 64, batch * kh), 128, 16 * 32 * 2 + 64 * 32 * 2, s>>>(
+                q, k, work, positions, context, qh, kh, qstride ? qstride : qh * dim);
+        static const bool enabled = !std::getenv("BEHEMOTH_CUDA_RESIDENT_SOFTMAX") ||
+                                    std::string(std::getenv("BEHEMOTH_CUDA_RESIDENT_SOFTMAX")) != "0";
+        if (resident && enabled && max_tokens <= 256)
+            resident_softmax<1><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 1024)
+            resident_softmax<4><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 4096)
+            resident_softmax<16><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else if (resident && enabled && max_tokens <= 8448)
+            resident_softmax<33><<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
+        else
+            softmax<<<batch * qh, 256, 0, s>>>(work, positions, context, qh);
         int parts = (max_tokens + 127) / 128;
-        tensor_values<<<dim3(parts, batch * kh), 128, 16 * 32 * 2 + 32 * 128 * 2, s>>>(
-            v, work, value_workspace, positions, context, qh, kh);
+        if (register_mma)
+            register_values<<<dim3(parts, batch * kh), 256, 0, s>>>(v, work, value_workspace, positions,
+                                                                    context, qh, kh);
+        else
+            tensor_values<<<dim3(parts, batch * kh), 128, 16 * 32 * 2 + 32 * 128 * 2, s>>>(
+                v, work, value_workspace, positions, context, qh, kh);
         sum_values<<<batch * qh, 128, 0, s>>>(value_workspace, out, parts, qh, kh);
         launch_check();
         return;
@@ -461,6 +831,10 @@ void select_rows(const B16 *x, B16 *y, const int *selected, int rows, int width,
 void reduce_products(float *x, size_t n, int splits, Stream s) {
     if (splits > 1)
         reduce<<<(n + 255) / 256, 256, 0, s>>>(x, n, splits);
+    launch_check();
+}
+void reduce_to_b16(const float *x, const float *scale, B16 *y, size_t n, int width, int splits, Stream s) {
+    compact_products<<<(n + 255) / 256, 256, 0, s>>>(x, scale, y, n, width, splits);
     launch_check();
 }
 void scale_to_b16(const float *x, const float *scale, B16 *y, int rows, int width, Stream s) {
