@@ -6,13 +6,38 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 
+#include "qtip_core.hpp"
+
 namespace qtip {
 
 const char* kLinName[kNumLin] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                                  "mlp.gate_proj",    "mlp.up_proj",      "mlp.down_proj"};
 const char* kHessName[4] = {"qkv", "o", "gateup", "down"};
 
-ModelConfig load_model_config(const std::string& dir) {
+void llama3_inv_freq(int hd, double theta, const RopeScalingLlama3& r, std::vector<float>& out) {
+  // HF transformers _compute_llama3_parameters: per-dim wavelength interpolation between the
+  // unscaled frequency and the frequency divided by `factor`.
+  const double low_wavelen = double(r.original_max_position_embeddings) / r.low_freq_factor;
+  const double high_wavelen = double(r.original_max_position_embeddings) / r.high_freq_factor;
+  out.resize(size_t(hd / 2));
+  for (int d = 0; d < hd / 2; ++d) {
+    double freq = std::pow(theta, -2.0 * d / hd);
+    double wavelen = 2.0 * M_PI / freq;
+    double scale;
+    if (wavelen < high_wavelen)
+      scale = 1.0;
+    else if (wavelen > low_wavelen)
+      scale = 1.0 / r.factor;
+    else {
+      double smooth = (double(r.original_max_position_embeddings) / wavelen - r.low_freq_factor) /
+                      (r.high_freq_factor - r.low_freq_factor);
+      scale = (1.0 - smooth) / r.factor + smooth;
+    }
+    out[size_t(d)] = float(freq * scale);
+  }
+}
+
+ModelConfig load_model_config(const std::string& dir, const SafeTensorsReader* st) {
   std::ifstream f(dir + "/config.json");
   QCHECK(f, "no config.json in " + dir);
   std::stringstream ss;
@@ -20,28 +45,87 @@ ModelConfig load_model_config(const std::string& dir) {
   ModelConfig c;
   c.raw_json = ss.str();
   auto j = nlohmann::json::parse(c.raw_json);
-  c.hidden = j["hidden_size"];
-  c.inter = j["intermediate_size"];
-  c.nq = j["num_attention_heads"];
-  c.nkv = j["num_key_value_heads"];
-  c.hd = j.value("head_dim", c.hidden / c.nq);
-  c.layers = j["num_hidden_layers"];
-  c.vocab = j["vocab_size"];
+  c.hidden = j.at("hidden_size");
+  c.inter = j.at("intermediate_size");
+  c.nq = j.at("num_attention_heads");
+  c.nkv = j.at("num_key_value_heads");
+  c.hd = j.value("head_dim", int(c.hidden / c.nq));
+  c.layers = j.at("num_hidden_layers");
+  c.vocab = j.at("vocab_size");
   c.eps = j.value("rms_norm_eps", 1e-5f);
   c.theta = j.value("rope_theta", 1e6f);
+  c.max_pos = j.value("max_position_embeddings", 131072L);
+  // rope_scaling: only HF type "llama3" is supported (e.g. Llama 3.3 70B).
+  if (j.contains("rope_scaling") && !j["rope_scaling"].is_null()) {
+    const auto& rs = j["rope_scaling"];
+    std::string type = rs.value("rope_type", rs.value("type", std::string()));
+    QCHECK(type == "llama3", "unsupported rope_scaling type '" + type + "' (only llama3)");
+    c.rope.factor = rs.at("factor");
+    c.rope.low_freq_factor = rs.at("low_freq_factor");
+    c.rope.high_freq_factor = rs.at("high_freq_factor");
+    c.rope.original_max_position_embeddings = rs.at("original_max_position_embeddings");
+    QCHECK(c.rope.factor > 0 && c.rope.low_freq_factor > 0 &&
+               c.rope.high_freq_factor > c.rope.low_freq_factor &&
+               c.rope.original_max_position_embeddings > 0,
+           "invalid llama3 rope_scaling factors");
+    c.rope_llama3 = true;
+  }
+  // shape validation: everything the QTIP pipeline (RHT factorisation, 16x16 trellis kernel layout,
+  // LDLQ 128-column buffers, attention tiles) requires
+  auto positive = [&](long v, const char* what) { QCHECK(v > 0, std::string(what) + " must be positive"); };
+  positive(c.hidden, "hidden_size");
+  positive(c.inter, "intermediate_size");
+  positive(c.layers, "num_hidden_layers");
+  positive(c.vocab, "vocab_size");
+  positive(c.nq, "num_attention_heads");
+  positive(c.nkv, "num_key_value_heads");
+  QCHECK(c.hd > 0 && c.hd <= 256 && c.hd % 2 == 0 && c.nq % c.nkv == 0,
+         "invalid attention geometry (head_dim must be even and <=256, heads must be a GQA multiple)");
+  auto mult32 = [&](long v, const char* what) {
+    QCHECK(v % 32 == 0, std::string(what) + " must be a multiple of 32");
+  };
+  mult32(c.hidden, "hidden_size");
+  mult32(c.inter, "intermediate_size");
+  mult32(long(c.nq) * c.hd, "num_attention_heads * head_dim");
+  mult32(long(c.nkv) * c.hd, "num_key_value_heads * head_dim");
+  QCHECK(c.hidden % 128 == 0 && c.inter % 128 == 0, "hidden_size and intermediate_size must be multiples of 128");
+  for (int n : {c.hidden, c.inter, c.nq * c.hd, c.nkv * c.hd}) {
+    int K = had_K(n);
+    QCHECK(K > 0, "unsupported Hadamard dimension " + std::to_string(n) + " (need 2^p, 12*2^p or 28*2^p)");
+    QCHECK(n / K <= 8192, "Hadamard power-of-two part of " + std::to_string(n) + " exceeds 8192");
+  }
+  // source weight format: FP8-Dynamic (F8_E4M3 + weight_scale) or plain BF16
+  if (st) {
+    const TensorInfo& w = st->info("model.layers.0.self_attn.q_proj.weight");
+    if (w.dtype == "F8_E4M3") {
+      QCHECK(st->has("model.layers.0.self_attn.q_proj.weight_scale"), "FP8 source needs weight_scale tensors");
+      c.bf16_source = false;
+    } else if (w.dtype == "BF16") {
+      c.bf16_source = true;
+    } else {
+      die("unsupported source weight dtype " + w.dtype + " (need F8_E4M3 FP8-Dynamic or BF16)");
+    }
+  }
   return c;
 }
 
 std::shared_ptr<LayerHost> read_layer(const SafeTensorsReader& st, const ModelConfig& cfg, int idx) {
   auto L = std::make_shared<LayerHost>();
   L->idx = idx;
+  L->bf16 = cfg.bf16_source;
   double t0 = now_s();
   std::string pre = "model.layers." + std::to_string(idx) + ".";
   for (int i = 0; i < kNumLin; ++i) {
     const TensorInfo& w = st.info(pre + kLinName[i] + ".weight");
-    QCHECK(w.dtype == "F8_E4M3" && w.shape.size() == 2, std::string("unexpected weight ") + kLinName[i]);
     L->out_dim[i] = int(w.shape[0]);
     L->in_dim[i] = int(w.shape[1]);
+    if (L->bf16) {
+      QCHECK(w.dtype == "BF16" && w.shape.size() == 2, std::string("expected BF16 weight ") + kLinName[i]);
+      L->w[i].resize(w.bytes());
+      st.read_into(pre + kLinName[i] + ".weight", L->w[i].data(), L->w[i].size());
+      continue;
+    }
+    QCHECK(w.dtype == "F8_E4M3" && w.shape.size() == 2, std::string("unexpected weight ") + kLinName[i]);
     L->w[i].resize(w.bytes());
     st.read_into(pre + kLinName[i] + ".weight", L->w[i].data(), L->w[i].size());
     const TensorInfo& s = st.info(pre + kLinName[i] + ".weight_scale");
@@ -148,6 +232,12 @@ LayerRunner::LayerRunner(int device, const ModelConfig& cfg, int max_rows, int s
   Kp_.alloc(size_t(cfg.nkv) * T_ * cfg.hd);
   Vp_.alloc(size_t(cfg.nkv) * T_ * cfg.hd);
   pin_.alloc(size_t(R) * H);
+  if (cfg_.rope_llama3) {
+    std::vector<float> f;
+    llama3_inv_freq(cfg_.hd, cfg_.theta, cfg_.rope, f);
+    inv_freq_.alloc(f.size());
+    HIP_CHECK(hipMemcpy(inv_freq_, f.data(), f.size() * 4, hipMemcpyHostToDevice));
+  }
 }
 LayerRunner::~LayerRunner() { (void)hipStreamDestroy(s_); }
 
@@ -173,6 +263,12 @@ void LayerRunner::zero_hess(HessAcc& a) {
 void LayerRunner::upload(const LayerHost& L) {
   HIP_CHECK(hipSetDevice(dev_));
   auto up = [&](int li, uint16_t* dst, float* sdst) {
+    if (L.bf16) {
+      HIP_CHECK(hipMemcpyAsync(dst, L.w[li].data(), L.w[li].size(), hipMemcpyHostToDevice, s_));
+      std::vector<float> ones(L.out_dim[li], 1.f);
+      HIP_CHECK(hipMemcpyAsync(sdst, ones.data(), ones.size() * 4, hipMemcpyHostToDevice, s_));
+      return;
+    }
     size_t n = L.w[li].size();
     HIP_CHECK(hipMemcpyAsync(stage8_, L.w[li].data(), n, hipMemcpyHostToDevice, s_));
     k_fp8_to_bf16(stage8_, dst, long(n), s_);
@@ -267,7 +363,10 @@ void LayerRunner::forward_batch(long R, HessAcc* acc) {
   hess(0, h_, H);
   proj(h_, H, wqkv_, nqkv, qkv_);
   for (long sq = 0; sq < R / T; ++sq) {
-    k_qkv_rope(qkv_ + sq * T * long(nqkv), sqkv_, Qp_, Kp_, Vp_, T, nq, nkv, hd, cfg_.theta, s_);
+    if (cfg_.rope_llama3)
+      k_qkv_rope_scaled(qkv_ + sq * T * long(nqkv), sqkv_, Qp_, Kp_, Vp_, T, nq, nkv, hd, inv_freq_, s_);
+    else
+      k_qkv_rope(qkv_ + sq * T * long(nqkv), sqkv_, Qp_, Kp_, Vp_, T, nq, nkv, hd, cfg_.theta, s_);
     k_tiled_attention(Qp_, Kp_, Vp_, attn_ + sq * T * long(A), T, nq, nkv, hd, s_);
     // Causal useful work; the final 16-query tile also computes masked entries.
     gemm_flops += 2.0 * nq * hd * T * double(T + 1);

@@ -1997,6 +1997,19 @@ TensorParallelModel::TensorParallelModel(const RuntimeOptions &options)
         qtip::set_row_transform_threshold(options.qtip_row_transforms);
     tensor_parallel_smoke(options.devices, options.rccl_shared_memory);
     Checkpoint checkpoint(options.model);
+    {
+        // The ROCm engine keeps the Behemoth geometry inline (96/8 heads, theta 1e6, 88 layers...);
+        // ModelConfig now also admits other llama-layout QTIP checkpoints (e.g. Llama 3.3 70B, served
+        // by the CUDA runtime), so reject them here instead of mis-serving them.
+        const ModelConfig behemoth;
+        const auto &c = checkpoint.config;
+        if (c.hidden != behemoth.hidden || c.intermediate != behemoth.intermediate || c.layers != behemoth.layers ||
+            c.q_heads != behemoth.q_heads || c.kv_heads != behemoth.kv_heads || c.dim != behemoth.dim ||
+            c.vocab != behemoth.vocab || c.theta != behemoth.theta || c.epsilon != behemoth.epsilon ||
+            c.rope_llama3)
+            throw std::invalid_argument("The ROCm runtime supports the Behemoth-R1-123B geometry only; "
+                                        "use the CUDA runtime (behemoth_cuda) for other llama-layout checkpoints");
+    }
     if (checkpoint.config.quantization != Quantization::Qtip && options.token_budget > 1024)
         throw std::invalid_argument("AQLM token budget must be 1..1024");
     for (int rank = 0; rank < 2; ++rank)

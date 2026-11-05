@@ -24,7 +24,7 @@ static void usage() {
       "  --hess-dir DIR       Hessian files (default <work>/hess)\n"
       "  --backlog N          max layers with collected-but-unquantized Hessians (default 2, ~5.1 GB each)\n"
       "  --keep-hessians      do not delete Hessians after a layer is quantized\n"
-      "  --kv-format fp8|qtip K/V weight format (default fp8; qtip restores legacy all-2-bit)\n"
+      "  --kv-format fp8|qtip K/V weight format (default fp8 for FP8-Dynamic sources, qtip for BF16 sources)\n"
       "  --vit-batch N        trellises per Viterbi launch (default 1024; 260 KB scratch each)\n"
       "  --sigma-reg X        Hessian damping (default 1e-2)   --scale-override X (default 0.9)\n"
       "  --ldl-threads N      CPU threads per fp64 LDL (default 16)\n"
@@ -65,6 +65,7 @@ static Options parse(int argc, char** argv) {
       auto value = next();
       QCHECK(value == "fp8" || value == "qtip", "--kv-format must be fp8 or qtip");
       o.fp8_kv = value == "fp8";
+      o.kv_explicit = true;
     }
     else if (a == "--vit-batch") o.q.vit_batch = std::stoi(next());
     else if (a == "--sigma-reg") o.q.sigma_reg = std::stod(next());

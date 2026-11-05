@@ -147,6 +147,18 @@ __global__ void rope_kernel(B16 *q, B16 *k, int position, int qheads, int dim, f
     x[d] = b16(a * c - b * s);
     x[d + dim / 2] = b16(b * c + a * s);
 }
+// llama3 rope_scaling: inv_freq[dim/2] precomputed on the host in double precision
+__global__ void rope_scaled_kernel(B16 *q, B16 *k, int position, int qheads, int dim, const float *inv_freq) {
+    int h = blockIdx.x, d = threadIdx.x;
+    if (d >= dim / 2)
+        return;
+    B16 *x = h < qheads ? q + size_t(h) * dim : k + size_t(h - qheads) * dim;
+    float angle = float(position) * inv_freq[d], s, c;
+    sincosf(angle, &s, &c);
+    float a = f32(x[d]), b = f32(x[d + dim / 2]);
+    x[d] = b16(a * c - b * s);
+    x[d + dim / 2] = b16(b * c + a * s);
+}
 __global__ void gqa_scores(const B16 *q, const B16 *k, float *out, int tokens, int qheads, int kvheads,
                            int dim) {
     int h = blockIdx.y, t = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31,
@@ -218,7 +230,8 @@ void initialize_tables() {
 void qtip_prepare(QtipMatrix w, const B16 *x, float *scratch, B16 *rotated, Stream s, int tokens,
                   bool rank_major) {
     int ki = factor(w.in), pi = w.in / ki;
-    if (w.in % 32 || pi > 1024)
+    // pi * 4 bytes of dynamic shared memory in fwht: 8192 (Llama 3.3 hidden) needs 32 KiB
+    if (w.in % 32 || pi > 8192)
         throw std::runtime_error("Unsupported CUDA QTIP geometry");
     fwht<false><<<dim3(ki, tokens), 256, size_t(pi) * 4, s>>>(x, nullptr, w.su, scratch, pi, false, 1, 0,
                                                               w.in, rank_major);
@@ -237,7 +250,7 @@ void qtip_multiply(QtipMatrix w, const B16 *rotated, float *z, int stride, int s
 void qtip_finish(QtipMatrix w, const float *z, B16 *y, float *scratch, bool rz, int splits, Stream s,
                  int tokens, bool rank_major) {
     int ko = factor(w.out), po = w.out / ko;
-    if (w.out % 32 || po > 1024 || splits < 1 || splits > 32)
+    if (w.out % 32 || po > 8192 || splits < 1 || splits > 32)
         throw std::runtime_error("Invalid CUDA QTIP output geometry");
     if (splits == 1) {
         fwht<false><<<dim3(ko, tokens), 256, size_t(po) * 4, s>>>(nullptr, z, nullptr, scratch, po, rz, 1, 0,
@@ -285,6 +298,10 @@ void residual(B16 *x, const B16 *y, int n, Stream s) {
 }
 void rope(B16 *q, B16 *k, int p, int qh, int kh, int d, float theta, Stream s) {
     rope_kernel<<<qh + kh, 128, 0, s>>>(q, k, p, qh, d, theta);
+    launch_check();
+}
+void rope_scaled(B16 *q, B16 *k, int p, int qh, int kh, int d, const float *inv_freq, Stream s) {
+    rope_scaled_kernel<<<qh + kh, 128, 0, s>>>(q, k, p, qh, d, inv_freq);
     launch_check();
 }
 void gqa(const B16 *q, const B16 *k, const B16 *v, B16 *out, float *scores, int n, int qh, int kh, int d,

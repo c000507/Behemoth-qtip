@@ -219,6 +219,11 @@ std::vector<LinearOut> quantize_group(hipStream_t s, Gemm& gemm, const std::vect
         HIP_CHECK(hipMemcpyAsync(w8, L.w_fp8, size_t(L.m) * n, hipMemcpyHostToDevice, s));
         HIP_CHECK(hipMemcpyAsync(sc, L.scale_bf16, size_t(L.m) * 2, hipMemcpyHostToDevice, s));
         k_fp8_to_f32(w8, sc, Wt, L.m, n, s);
+      } else if (L.w_bf16) {
+        DBuf<uint16_t> wb;
+        wb.ensure(size_t(L.m) * n);
+        HIP_CHECK(hipMemcpyAsync(wb, L.w_bf16, size_t(L.m) * n * 2, hipMemcpyHostToDevice, s));
+        k_bf16_to_f32(wb, Wt, size_t(L.m) * n, s);
       } else {
         HIP_CHECK(hipMemcpyAsync(Wt, L.w_f32, size_t(L.m) * n * 4, hipMemcpyHostToDevice, s));
       }

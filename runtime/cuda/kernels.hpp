@@ -27,6 +27,8 @@ void nvfp4_forward(const uint8_t *packed, const uint8_t *block_scales, float glo
 void embedding(const B16 *, B16 *, int token, int hidden, Stream);
 void residual(B16 *, const B16 *, int n, Stream);
 void rope(B16 *, B16 *, int position, int qheads, int kvheads, int dim, float theta, Stream);
+// llama3 rope_scaling: inv_freq [dim/2] precomputed on the host (llama3_inv_freq)
+void rope_scaled(B16 *, B16 *, int position, int qheads, int kvheads, int dim, const float *inv_freq, Stream);
 void gqa(const B16 *, const B16 *, const B16 *, B16 *, float *scores, int tokens, int qheads, int kvheads,
          int dim, Stream);
 } // namespace behemoth::cuda_runtime

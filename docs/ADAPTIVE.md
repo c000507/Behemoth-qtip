@@ -120,3 +120,14 @@ inside a layer differ by format:
   temporaries and the evaluation runners alternate on GPU 0 (runners are freed before the next
   layer's QTIP pass); peak is roughly the classic pipeline's peak plus the lm_head
   (vocab x hidden bf16) during evaluation.
+
+## Llama 3.3 70B (BF16 source, 128256 vocab)
+
+Adaptive mode works with BF16 sources and the Llama 3.3 geometry (dims from `config.json`, llama3
+RoPE scaling in the probe/chain forward). BF16 linears are used directly for both the QTIP and the NVFP4
+candidates (no FP8 K/V preservation; `kv_format` is `qtip`). Memory: the metric probe's lm_head GEMM is tiled
+over vocab rows (`logit_tile`, default about 256 MB of fp32 logits per tile) instead of materialising
+`T x 128256` logits, so the device holds the bf16 head (128256 x 8192 x 2 B ~ 2.1 GB) plus the two
+evaluation runners. Verified only on the synthetic Llama-geometry checkpoint (`qtip_llama_tests`: tiled and
+untiled metrics equal, all-QTIP and all-NVFP4 outputs load in the CUDA runtime); a full-size run and its VRAM
+peak on a 16 GB card are **not** verified.

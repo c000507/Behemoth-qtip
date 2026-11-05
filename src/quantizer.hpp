@@ -23,6 +23,7 @@ struct LinearIn {
   int m = 0;             // out features
   const uint8_t* w_fp8 = nullptr;     // [m][n] host
   const uint16_t* scale_bf16 = nullptr;  // [m] host (per-output-channel FP8 scale)
+  const uint16_t* w_bf16 = nullptr;   // alternatively raw bf16 bits [m][n] host (BF16 source models)
   const float* w_f32 = nullptr;       // alternatively a dense fp32 weight [m][n] (tests)
 };
 

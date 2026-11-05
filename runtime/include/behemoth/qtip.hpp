@@ -87,7 +87,8 @@ std::vector<float> reference_forward(const HostLinear &, std::span<const float> 
 // Linear `name` (e.g. "self_attn.q_proj") of a layer of a QTIP checkpoint, full matrix.
 HostLinear load_linear(const Checkpoint &, int layer, const std::string &name);
 // The same from one layer file (model-layer-XXXXX.safetensors) without an assembled checkpoint.
-HostLinear load_linear(const SafeTensorFile &, int layer, const std::string &name);
+HostLinear load_linear(const SafeTensorFile &, int layer, const std::string &name,
+                       const ModelConfig *config = nullptr);
 HostLinear load_fp8_linear(const SafeTensorFile &, int layer, const std::string &name);
 HostLinear load_fp8_linear(const SafeTensorFile &weight, const SafeTensorFile &scale, int layer, const std::string &name);
 // NVFP4 projection written by qtip_quant --mode adaptive (weight_packed/weight_scale/

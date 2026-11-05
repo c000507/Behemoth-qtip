@@ -28,7 +28,7 @@ static hipStream_t S;
 // ---- Hadamard: k_hadamard_rows vs hadamard_rows_ref (fp64), hadU/hadUt, strided rows ----------------
 static void test_hadamard() {
   std::printf("[hadamard cuda] vs fp64 reference (hadU / hadUt, strided rows)\n");
-  for (int n : {96, 1024, 12288, 28672}) {
+  for (int n : {96, 1024, 8192, 12288, 28672}) {
     long rows = 6, ld = n + 32;
     Rng r(n);
     std::vector<float> x(size_t(rows) * ld);

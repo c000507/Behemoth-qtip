@@ -38,6 +38,7 @@ struct Options {
   int backlog = 2;
   bool keep_hessians = false;
   bool fp8_kv = true;
+  bool kv_explicit = false;  // --kv-format was passed (BF16 sources default to qtip)
   uint64_t seed = 0;
   std::string dump_acts;  // write the first sequence of GPU 0 after every chain layer (bf16)
   // ---- adaptive mode (--mode adaptive)
@@ -45,6 +46,7 @@ struct Options {
   std::string kl_metric = "lmkl";          // lmkl (mean token KL of next-token logits) | mse (normalized)
   int kl_tokens = 512;                     // probe document length for the metric
   std::string adaptive_next_input = "original";  // original | quantized
+  long logit_tile = 0;                     // lm_head vocab rows per logits GEMM (0 = auto, ~256 MB fp32 tile)
   QuantOpts q;
 };
 

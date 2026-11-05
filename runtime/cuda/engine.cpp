@@ -194,6 +194,10 @@ struct Model::Impl {
     Stream stream{};
     std::unique_ptr<PeerContext> peer;
     bool failed = false;
+    // llama geometry from config.json (Behemoth Mistral-Large layout or Llama 3.3)
+    int hidden, inter, vocab, q_heads, kv_heads, head_dim;
+    float eps, theta;
+    std::vector<float> inv_freq; // llama3 rope_scaling table (empty for plain RoPE)
     struct Layer {
         std::array<Linear, 7> linear;
         Buffer<float> norm1, norm2;
@@ -201,11 +205,11 @@ struct Model::Impl {
     };
     std::vector<Layer> layers;
     Buffer<B16> embeddings, head, x, normed, q, k, v, attended, projected, gate, up, rotated;
-    Buffer<float> final_norm, scratch, z, scores, logits;
+    Buffer<float> final_norm, scratch, z, scores, logits, rope_freq;
     Pinned<float> readback;
     void vector(const std::string &name, Buffer<float> &out) {
         auto view = checkpoint.tensor(name).floats(name);
-        check(view.size() == 12288, "Invalid normalization shape: " + name);
+        check(view.size() == size_t(hidden), "Invalid normalization shape: " + name);
         Vec data(view.size());
         for (size_t i = 0; i < data.size(); ++i) {
             data[i] = view[i];
@@ -217,8 +221,8 @@ struct Model::Impl {
     void dense(const std::string &name, Buffer<B16> &out) {
         const auto &f = checkpoint.tensor(name);
         auto shape = f.shape(name);
-        check(shape == std::vector<size_t>{32768, 12288}, "Invalid embedding/head shape");
-        size_t n = size_t(32768) * 12288;
+        check(shape == std::vector<size_t>{size_t(vocab), size_t(hidden)}, "Invalid embedding/head shape");
+        size_t n = size_t(vocab) * hidden;
         out.ensure(n, stream);
         if (f.dtype(name) == "BF16") {
             auto bytes = f.bytes(name);
@@ -231,7 +235,18 @@ struct Model::Impl {
         checked(sync(stream), "finish dense weight upload");
     }
     Impl(const fs::path &path, int d, int ctx, int tp)
-        : checkpoint(path), device(d), context(ctx), layers(checkpoint.config.layers) {
+        : checkpoint(path), device(d), context(ctx), layers(size_t(checkpoint.config.layers)) {
+        const auto &cfg = checkpoint.config;
+        hidden = cfg.hidden;
+        inter = cfg.intermediate;
+        vocab = cfg.vocab;
+        q_heads = cfg.q_heads;
+        kv_heads = cfg.kv_heads;
+        head_dim = cfg.dim;
+        eps = cfg.epsilon;
+        theta = cfg.theta;
+        if (cfg.rope_llama3)
+            inv_freq = llama3_inv_freq(head_dim, theta, cfg.rope);
         int splits = qtip_splits(tp);
         check(tp == 1 || tp == 2, "CUDA tensor parallel degree must be 1 or 2");
         check(checkpoint.config.quantization == Quantization::Qtip, "CUDA runner requires a QTIP checkpoint");
@@ -249,9 +264,15 @@ struct Model::Impl {
             dense("model.embed_tokens.weight", embeddings);
             dense("lm_head.weight", head);
             vector("model.norm.weight", final_norm);
+            if (!inv_freq.empty()) {
+                rope_freq.ensure(inv_freq.size(), stream);
+                checked(h2d(rope_freq, inv_freq.data(), inv_freq.size() * 4, stream),
+                        "upload llama3 RoPE table");
+            }
             const std::array<const char *, 7> names = {
                 "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                 "mlp.gate_proj",    "mlp.up_proj",      "mlp.down_proj"};
+            const int kv = kv_heads * head_dim;
             for (int l = 0; l < int(layers.size()); ++l) {
                 auto &p = layers[l];
                 auto prefix = "model.layers." + std::to_string(l) + ".";
@@ -259,18 +280,18 @@ struct Model::Impl {
                 vector(prefix + "post_attention_layernorm.weight", p.norm2);
                 for (int i = 0; i < 7; ++i)
                     p.linear[i].load(checkpoint, l, names[i], stream, splits, peer.get());
-                p.keys.ensure(size_t(ctx) * 1024, stream);
-                p.values.ensure(size_t(ctx) * 1024, stream);
+                p.keys.ensure(size_t(ctx) * kv, stream);
+                p.values.ensure(size_t(ctx) * kv, stream);
                 std::cerr << "Loaded CUDA QTIP layer " << l + 1 << '/' << layers.size() << '\n';
             }
-            x.ensure(12288, stream);
-            normed.ensure(12288, stream);
-            attended.ensure(12288, stream);
-            logits.ensure(32768, stream);
+            x.ensure(hidden, stream);
+            normed.ensure(hidden, stream);
+            attended.ensure(hidden, stream);
+            logits.ensure(vocab, stream);
             // Scores are scratch, so reserve them once instead of cudaMalloc/free
             // at every new sequence length (cudaFree synchronizes the device).
-            scores.ensure(size_t(96) * ctx, stream);
-            readback.ensure(32768);
+            scores.ensure(size_t(q_heads) * ctx, stream);
+            readback.ensure(vocab);
             size_t free = 0, total = 0;
             checked(cudaMemGetInfo(&free, &total), "CUDA memory info");
             std::cerr << "CUDA QTIP ready: " << double(total - free) / (1ull << 30) << " GiB used, context "
@@ -299,37 +320,42 @@ struct Model::Impl {
     }
     Vec step(int token) {
         check(!failed, "Reset the CUDA model after an inference failure");
-        check(token >= 0 && token < 32768 && position < context,
+        check(token >= 0 && token < vocab && position < context,
               "Token or context exceeds CUDA model limits");
         checked(set_device(device), "select CUDA device");
         try {
-            embedding(embeddings, x, token, 12288, stream);
+            const int kv = kv_heads * head_dim;
+            embedding(embeddings, x, token, hidden, stream);
             for (auto &layer : layers) {
-                norm(x, layer.norm1, nullptr, normed, 12288, 1e-5f, false, stream);
+                norm(x, layer.norm1, nullptr, normed, hidden, eps, false, stream);
                 layer.linear[0].forward(normed, q, scratch, rotated, z, false, stream);
                 layer.linear[1].forward(normed, k, scratch, rotated, z, false, stream);
                 layer.linear[2].forward(normed, v, scratch, rotated, z, false, stream);
-                rope(q, k, position, 96, 8, 128, 1000000.f, stream);
-                checked(d2d(layer.keys.p + size_t(position) * 1024, k, 2048, stream),
+                if (rope_freq.p)
+                    rope_scaled(q, k, position, q_heads, kv_heads, head_dim, rope_freq, stream);
+                else
+                    rope(q, k, position, q_heads, kv_heads, head_dim, theta, stream);
+                checked(d2d(layer.keys.p + size_t(position) * kv, k, size_t(kv) * 2, stream),
                         "append CUDA key cache");
-                checked(d2d(layer.values.p + size_t(position) * 1024, v, 2048, stream),
+                checked(d2d(layer.values.p + size_t(position) * kv, v, size_t(kv) * 2, stream),
                         "append CUDA value cache");
-                scores.ensure(size_t(96) * (position + 1), stream);
-                gqa(q, layer.keys, layer.values, attended, scores, position + 1, 96, 8, 128, stream);
+                scores.ensure(size_t(q_heads) * (position + 1), stream);
+                gqa(q, layer.keys, layer.values, attended, scores, position + 1, q_heads, kv_heads,
+                    head_dim, stream);
                 layer.linear[3].forward(attended, projected, scratch, rotated, z, false, stream);
-                residual(x, projected, 12288, stream);
-                norm(x, layer.norm2, nullptr, normed, 12288, 1e-5f, false, stream);
+                residual(x, projected, hidden, stream);
+                norm(x, layer.norm2, nullptr, normed, hidden, eps, false, stream);
                 layer.linear[4].forward(normed, gate, scratch, rotated, z, true, stream);
                 layer.linear[5].forward(normed, up, scratch, rotated, z, true, stream);
-                swiglu(gate, up, 28672, INFINITY, stream);
+                swiglu(gate, up, inter, INFINITY, stream);
                 layer.linear[6].forward(gate, projected, scratch, rotated, z, false, stream);
-                residual(x, projected, 12288, stream);
+                residual(x, projected, hidden, stream);
             }
-            norm(x, final_norm, nullptr, normed, 12288, 1e-5f, false, stream);
-            gemv({head, nullptr, nullptr, 32768, 12288, 4, false, 1}, normed, logits, true, stream);
-            checked(d2h(readback.p, logits, 32768 * 4, stream), "read CUDA logits");
+            norm(x, final_norm, nullptr, normed, hidden, eps, false, stream);
+            gemv({head, nullptr, nullptr, vocab, hidden, 4, false, 1}, normed, logits, true, stream);
+            checked(d2h(readback.p, logits, size_t(vocab) * 4, stream), "read CUDA logits");
             checked(sync(stream), "finish CUDA token");
-            Vec out(readback.p, readback.p + 32768);
+            Vec out(readback.p, readback.p + vocab);
             for (float a : out)
                 check(std::isfinite(a), "Nonfinite CUDA logits");
             ++position;
@@ -344,8 +370,7 @@ struct Model::Impl {
         }
     }
 };
-Model::Model(const fs::path &p, int device, int context, int tp, int max_batch)
-    : config{32768, context, {2}} {
+Model::Model(const fs::path &p, int device, int context, int tp, int max_batch) {
     auto raw = read(p / "config.json");
     auto kind = raw.value("model_type", "");
     if (kind == "glm5_next" || kind == "glm5_next_text") {
@@ -355,8 +380,19 @@ Model::Model(const fs::path &p, int device, int context, int tp, int max_batch)
         config = {c.vocab, context, c.eos};
         backend_ = glm53::gpu_backend(p, device);
     } else {
+        // Llama/Mistral-layout QTIP checkpoint: geometry and stop tokens come from config.json
+        // (behemoth::ModelConfig::read also validates the quip_params QTIP format).
+        auto cfg = behemoth::ModelConfig::read(p / "config.json");
+        config = {cfg.vocab, context, cfg.eos};
 #if defined(BEHEMOTH_CUDA_FAST)
         if (tp == 2 || max_batch > 1 || std::getenv("BEHEMOTH_CUDA_FAST_PATH")) {
+            // The batched/tensor-parallel profile still carries the Behemoth geometry inline.
+            const bool behemoth = cfg.hidden == 12288 && cfg.intermediate == 28672 && cfg.layers == 88 &&
+                                  cfg.q_heads == 96 && cfg.kv_heads == 8 && cfg.dim == 128 &&
+                                  cfg.vocab == 32768 && !cfg.rope_llama3;
+            check(behemoth,
+                  "The fast tensor-parallel/batched CUDA profile supports the Behemoth geometry only; "
+                  "run this checkpoint with a single sequence on one GPU");
             tensor_ = std::make_unique<TensorModel>(p, device, context, tp, max_batch);
             return;
         }

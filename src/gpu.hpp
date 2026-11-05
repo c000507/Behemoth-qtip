@@ -253,6 +253,9 @@ void k_rmsnorm(const uint16_t* x, const uint16_t* w, uint16_t* out, long rows, i
 // Vp[8][T][128] bf16 (per-sequence; T tokens; positions 0..T-1)
 void k_qkv_rope(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t* Kp, uint16_t* Vp, int T,
                 int nq, int nkv, int hd, float theta, hipStream_t s);
+// llama3 rope_scaling variant: inv_freq [hd/2] on the device (llama3_inv_freq, host double precision)
+void k_qkv_rope_scaled(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t* Kp, uint16_t* Vp, int T,
+                       int nq, int nkv, int hd, const float* inv_freq, hipStream_t s);
 // Causal GQA attention: Q[nq][T][hd], K/V[nkv][T][hd] -> out[T][nq*hd].
 // BF16 operands/output, FP32 scores/online softmax/accumulation, hd<=256.
 // No global score/probability workspace. All T tokens form one causal document.

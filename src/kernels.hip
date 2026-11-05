@@ -210,10 +210,10 @@ void k_transpose(const float* in, long rows, long cols, long ld_in, float* out, 
 }
 
 // ---------------------------------------------------------------- Hadamard
-// stage 1: natural-order FWHT on each contiguous chunk of P (power of two <= 4096) entries
+// stage 1: natural-order FWHT on each contiguous chunk of P (power of two <= 8192) entries
 __global__ __launch_bounds__(256) void fwht_chunks_kernel(float* X, long rows, int n, long ld, int P, int K,
                                                           float scale) {
-  __shared__ float v[4096];
+  __shared__ float v[8192];
   long row = blockIdx.x / K;
   int chunk = blockIdx.x % K;
   float* x = X + row * ld + long(chunk) * P;
@@ -294,7 +294,7 @@ void k_hadamard_rows(float* X, long rows, int n, long ld, bool transpose, hipStr
   int K = had_K(n);
   QCHECK(K > 0, "unsupported hadamard dim " + std::to_string(n));
   int P = n / K;
-  QCHECK(P <= 4096, "hadamard pow2 part > 4096 unsupported");
+  QCHECK(P <= 8192, "hadamard pow2 part > 8192 unsupported");
   float sc = 1.0f / std::sqrt(float(n));
   fwht_chunks_kernel<<<unsigned(rows * K), 256, 0, s>>>(X, rows, n, ld, P, K, K == 1 ? sc : 1.0f);
   HIP_CHECK(hipGetLastError());
@@ -375,6 +375,46 @@ void k_qkv_rope(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t
                 int nkv, int hd, float theta, hipStream_t s) {
   long total = long(T) * (nq + 2 * nkv) * (hd / 2);
   qkv_rope_kernel<<<nblocks(total, 256), 256, 0, s>>>(qkv, col_scale, Qp, Kp, Vp, T, nq, nkv, hd, theta);
+  HIP_CHECK(hipGetLastError());
+}
+
+// llama3 rope_scaling variant: inv_freq[d] (device, hd/2 entries) was precomputed on the host in
+// double precision (llama3_inv_freq); everything else matches qkv_rope_kernel.
+__global__ void qkv_rope_scaled_kernel(const float* qkv, const float* cs, uint16_t* Qp, uint16_t* Kp, uint16_t* Vp,
+                                       int T, int nq, int nkv, int hd, const float* inv_freq) {
+  long idx = long(blockIdx.x) * blockDim.x + threadIdx.x;
+  int half = hd / 2;
+  int nh = nq + 2 * nkv;
+  long total = long(T) * nh * half;
+  if (idx >= total) return;
+  int d = int(idx % half);
+  long rest = idx / half;
+  int h = int(rest % nh);
+  int t = int(rest / nh);
+  long width = long(nh) * hd;
+  long col = long(h) * hd + d;
+  const float* row = qkv + long(t) * width;
+  float a = bf2f(f2bf(row[col] * cs[col]));                  // q_proj output in bf16
+  float b = bf2f(f2bf(row[col + half] * cs[col + half]));
+  if (h >= nq + nkv) {  // v: no rope
+    int hv = h - nq - nkv;
+    uint16_t* o = Vp + (long(hv) * T + t) * hd;
+    o[d] = f2bf(a);
+    o[d + half] = f2bf(b);
+    return;
+  }
+  float ang = float(t) * inv_freq[d];
+  float c = bf2f(f2bf(cosf(ang))), sn = bf2f(f2bf(sinf(ang)));
+  float o1 = a * c - b * sn;  // x[d] cos - x[d+half] sin
+  float o2 = b * c + a * sn;  // x[d+half] cos + x[d] sin
+  uint16_t* o = (h < nq) ? Qp + (long(h) * T + t) * hd : Kp + (long(h - nq) * T + t) * hd;
+  o[d] = f2bf(o1);
+  o[d + half] = f2bf(o2);
+}
+void k_qkv_rope_scaled(const float* qkv, const float* col_scale, uint16_t* Qp, uint16_t* Kp, uint16_t* Vp, int T,
+                       int nq, int nkv, int hd, const float* inv_freq, hipStream_t s) {
+  long total = long(T) * (nq + 2 * nkv) * (hd / 2);
+  qkv_rope_scaled_kernel<<<nblocks(total, 256), 256, 0, s>>>(qkv, col_scale, Qp, Kp, Vp, T, nq, nkv, hd, inv_freq);
   HIP_CHECK(hipGetLastError());
 }
 

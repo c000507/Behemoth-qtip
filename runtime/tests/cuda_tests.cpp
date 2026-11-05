@@ -295,7 +295,9 @@ int main(int argc, char **argv) {
         cu::initialize_tables();
         for (auto [out, in] :
              {std::pair{32, 32}, std::pair{128, 128}, std::pair{768, 1792}, std::pair{1792, 768},
-              std::pair{1024, 12288}, std::pair{12288, 1024}, std::pair{28672, 32}})
+              std::pair{1024, 12288}, std::pair{12288, 1024}, std::pair{28672, 32},
+              // Llama 3.3 70B projections (hidden 8192 = 2^13: no hadK factor, pow2 part 8192)
+              std::pair{8192, 8192}, std::pair{1024, 8192}, std::pair{28672, 8192}, std::pair{8192, 28672}})
             for (bool rz : {false, true})
                 linear_test(s, out, in, rz);
         fp8_test(s);

@@ -17,6 +17,11 @@ struct FloatTensorView {
 // Weight format of the checkpoint: AQLM 1x16 (the original runtime format) or QTIP 2-bit HYB
 // (qtip_quant output, QTIP-hfized llama layout with config.quip_params; see qtip.hpp).
 enum class Quantization { Aqlm, Qtip };
+// llama3 RoPE frequency scaling (HF rope_scaling type "llama3", e.g. Llama 3.3 70B).
+struct RopeScalingLlama3 {
+    double factor = 0, low_freq_factor = 0, high_freq_factor = 0;
+    long original_max_position_embeddings = 0;
+};
 struct ModelConfig {
     Quantization quantization = Quantization::Aqlm;
     bool fp8_kv = false; // Mixed QTIP checkpoint: original E4M3 K/V projections.
@@ -24,8 +29,15 @@ struct ModelConfig {
         vocab = 32768;
     int max_context = 131072;
     float epsilon = 1e-5f, theta = 1000000;
+    bool rope_llama3 = false;
+    RopeScalingLlama3 rope;
+    std::vector<int> eos{2};
+    int bos = 1;
     static ModelConfig read(const std::filesystem::path &);
 };
+// inv_freq[d] (d < dim/2) with llama3 wavelength scaling; fp64 host computation (HF
+// _compute_llama3_parameters), returned as floats for the device tables.
+std::vector<float> llama3_inv_freq(int dim, double theta, const RopeScalingLlama3 &);
 class SafeTensorFile {
     int fd_ = -1;
     size_t bytes_ = 0, data_start_ = 0;

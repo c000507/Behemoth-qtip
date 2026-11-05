@@ -190,6 +190,21 @@ std::vector<float> reference_forward(const HostLinear &l, std::span<const float>
     }
     return y;
 }
+namespace {
+// expected (in, out) of a llama-layout projection from the checkpoint configuration
+std::pair<int, int> projection_geometry(const ModelConfig &c, const std::string &name) {
+    const int kv = c.kv_heads * c.dim;
+    if (name == "self_attn.q_proj" || name == "self_attn.o_proj")
+        return {c.hidden, c.hidden};
+    if (name == "self_attn.k_proj" || name == "self_attn.v_proj")
+        return {c.hidden, kv};
+    if (name == "mlp.gate_proj" || name == "mlp.up_proj")
+        return {c.hidden, c.intermediate};
+    if (name == "mlp.down_proj")
+        return {c.intermediate, c.hidden};
+    throw std::invalid_argument("Unknown projection " + name);
+}
+} // namespace
 HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::string &name) {
     if (layer < 0 || layer >= checkpoint.config.layers)
         throw std::invalid_argument("Invalid QTIP layer");
@@ -202,7 +217,8 @@ HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::strin
             if (checkpoint.has_tensor(base + suffix))
                 throw std::invalid_argument("Mixed checkpoint has both FP8 and QTIP K/V: " + base);
         auto w = load_fp8_linear(checkpoint.tensor(base + "weight"), checkpoint.tensor(base + "weight_scale"), layer, name);
-        if (w.in != 12288 || w.out != 1024)
+        auto geometry = projection_geometry(checkpoint.config, name);
+        if (w.in != geometry.first || w.out != geometry.second)
             throw std::invalid_argument("Invalid FP8 K/V geometry: " + base);
         return w;
     }
@@ -210,23 +226,18 @@ HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::strin
         throw std::invalid_argument("FP8 projection requires qtip_quant.kv_format=fp8: " + base);
     return load_linear(
         checkpoint.tensor("model.layers." + std::to_string(layer) + "." + name + ".trellis"), layer,
-        name);
+        name, &checkpoint.config);
 }
-HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string &name) {
+HostLinear load_linear(const SafeTensorFile &file, int layer, const std::string &name,
+                       const ModelConfig *config) {
     const auto prefix = "model.layers." + std::to_string(layer) + "." + name + ".";
     if (file.contains(prefix + "weight_packed"))
         return load_nvfp4_linear(file, layer, name);
     if (file.contains(prefix + "weight"))
         return load_fp8_linear(file, layer, name);
-    int in = 12288, out = 12288;
-    if (name == "self_attn.k_proj" || name == "self_attn.v_proj")
-        out = 1024;
-    else if (name == "mlp.gate_proj" || name == "mlp.up_proj")
-        out = 28672;
-    else if (name == "mlp.down_proj")
-        in = 28672;
-    else if (name != "self_attn.q_proj" && name != "self_attn.o_proj")
-        throw std::invalid_argument("Unknown projection " + name);
+    // geometry from the checkpoint configuration (default: the original Behemoth layout)
+    const ModelConfig defaults;
+    auto [in, out] = projection_geometry(config ? *config : defaults, name);
     const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
     HostLinear l;
     l.in = in;

@@ -1,5 +1,6 @@
 #include "behemoth/checkpoint.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -66,21 +67,59 @@ static nlohmann::json read_json(const std::filesystem::path &p) {
         throw std::runtime_error("Cannot read " + p.string());
     return nlohmann::json::parse(f);
 }
+std::vector<float> llama3_inv_freq(int dim, double theta, const RopeScalingLlama3 &r) {
+    // HF transformers _compute_llama3_parameters: per-dim wavelength interpolation between the
+    // unscaled frequency and the frequency divided by `factor`, computed in double precision.
+    const double low_wavelen = double(r.original_max_position_embeddings) / r.low_freq_factor;
+    const double high_wavelen = double(r.original_max_position_embeddings) / r.high_freq_factor;
+    std::vector<float> out(size_t(dim / 2));
+    for (int d = 0; d < dim / 2; ++d) {
+        double freq = std::pow(theta, -2.0 * d / dim);
+        double wavelen = 2.0 * M_PI / freq;
+        double scale;
+        if (wavelen < high_wavelen)
+            scale = 1.0;
+        else if (wavelen > low_wavelen)
+            scale = 1.0 / r.factor;
+        else {
+            double smooth = (double(r.original_max_position_embeddings) / wavelen - r.low_freq_factor) /
+                            (r.high_freq_factor - r.low_freq_factor);
+            scale = (1.0 - smooth) / r.factor + smooth;
+        }
+        out[size_t(d)] = float(freq * scale);
+    }
+    return out;
+}
+static int hadamard_pow2_part(int n) {
+    // p with n = hadK * 2^p for the QTIP factorisation (hadK in {1, 12, 28}); 0 when unsupported
+    auto pow2 = [](long v) { return v > 0 && (v & (v - 1)) == 0; };
+    if (n % 28 == 0 && pow2(long(n) / 28))
+        return n / 28;
+    if (n % 12 == 0 && pow2(long(n) / 12))
+        return n / 12;
+    return pow2(long(n)) ? n : 0;
+}
+static std::vector<int> parse_token_ids(const nlohmann::json &j, const char *key) {
+    std::vector<int> ids;
+    if (!j.contains(key) || j.at(key).is_null())
+        return ids;
+    if (j.at(key).is_array())
+        ids = j.at(key).get<std::vector<int>>();
+    else
+        ids.push_back(j.at(key).get<int>());
+    return ids;
+}
 ModelConfig ModelConfig::read(const std::filesystem::path &path) {
     auto j = read_json(path);
     ModelConfig c;
-    // QTIP checkpoints (qtip_quant --mode assemble) are QTIP-hfized llama configs of the same
-    // Mistral-Large architecture: model_type llama + quip_params, no quantization_config.
+    // QTIP checkpoints (qtip_quant --mode assemble) are QTIP-hfized llama configs (Behemoth's
+    // Mistral-Large layout, Llama 3.3 or other supported llama shapes): model_type llama +
+    // quip_params, no quantization_config. Dimensions are derived from the config; the AQLM
+    // path below still requires the exact original Behemoth geometry.
     const bool qtip = j.contains("quip_params");
-    if (j.at("hidden_size") != c.hidden || j.at("intermediate_size") != c.intermediate ||
-        j.at("num_hidden_layers") != c.layers || j.at("num_attention_heads") != c.q_heads ||
-        j.at("num_key_value_heads") != c.kv_heads || j.at("head_dim") != c.dim ||
-        j.at("vocab_size") != c.vocab || j.at("model_type") != (qtip ? "llama" : "mistral") ||
-        j.at("hidden_act") != "silu" || j.at("tie_word_embeddings") != false ||
-        (j.contains("sliding_window") && !j.at("sliding_window").is_null()) ||
-        (!qtip && !j.contains("sliding_window")))
-        throw std::invalid_argument("Checkpoint is not the supported Behemoth architecture");
     if (qtip) {
+        if (j.at("model_type") != "llama")
+            throw std::invalid_argument("QTIP checkpoint must use model_type llama");
         auto q = j.at("quip_params");
         if (q.at("codebook") != "bitshift" || q.at("L") != 16 || q.at("K") != 2 || q.at("V") != 2 ||
             q.at("tlut_bits") != 9 || q.at("decode_mode") != "quantlut_sym" || q.at("td_x") != 16 ||
@@ -94,13 +133,82 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
         if (format != "qtip" && format != "fp8")
             throw std::invalid_argument("qtip_quant.kv_format must be qtip or fp8");
         c.fp8_kv = format == "fp8";
-    } else {
-        auto q = j.at("quantization_config");
-        if (q.at("quant_method") != "aqlm" || q.at("in_group_size") != 8 ||
-            q.at("out_group_size") != 1 || q.at("num_codebooks") != 1 ||
-            q.at("nbits_per_codebook") != 16)
-            throw std::invalid_argument("Unsupported AQLM format");
+        c.hidden = j.at("hidden_size").get<int>();
+        c.intermediate = j.at("intermediate_size").get<int>();
+        c.layers = j.at("num_hidden_layers").get<int>();
+        c.q_heads = j.at("num_attention_heads").get<int>();
+        c.kv_heads = j.at("num_key_value_heads").get<int>();
+        c.dim = j.contains("head_dim") && !j.at("head_dim").is_null()
+                    ? j.at("head_dim").get<int>()
+                    : c.hidden / c.q_heads;
+        c.vocab = j.at("vocab_size").get<int>();
+        if (j.at("hidden_act") != "silu" || j.at("tie_word_embeddings") != false ||
+            (j.contains("sliding_window") && !j.at("sliding_window").is_null()))
+            throw std::invalid_argument("QTIP checkpoint requires bias-free SiLU llama layers with "
+                                        "untied embeddings and no sliding window");
+        if (c.hidden <= 0 || c.intermediate <= 0 || c.layers <= 0 || c.vocab <= 0 || c.vocab > (1 << 24) ||
+            c.q_heads <= 0 || c.kv_heads <= 0 || c.q_heads % c.kv_heads != 0 ||
+            c.dim <= 0 || c.dim > 256 || c.dim % 2 != 0)
+            throw std::invalid_argument("Invalid attention/vocabulary geometry in config.json");
+        for (int n : {c.hidden, c.intermediate, c.q_heads * c.dim, c.kv_heads * c.dim})
+            if (n % 32 != 0 || hadamard_pow2_part(n) == 0 || hadamard_pow2_part(n) > 8192)
+                throw std::invalid_argument("Unsupported projection dimension " + std::to_string(n) +
+                                            " (need 2^p / 12*2^p / 28*2^p, multiple of 32, pow2 part <= 8192)");
+        c.max_context = j.at("max_position_embeddings").get<int>();
+        c.epsilon = j.at("rms_norm_eps").get<float>();
+        c.theta = j.at("rope_theta").get<float>();
+        if (c.max_context <= 0 || !(c.epsilon > 0) || !std::isfinite(c.epsilon) || !(c.theta > 0) ||
+            !std::isfinite(c.theta))
+            throw std::invalid_argument("Invalid position/normalization configuration");
+        if (j.contains("rope_scaling") && !j.at("rope_scaling").is_null()) {
+            const auto &rs = j.at("rope_scaling");
+            std::string type = rs.value("rope_type", rs.value("type", std::string()));
+            if (type != "llama3")
+                throw std::invalid_argument("Unsupported rope_scaling type '" + type + "' (only llama3)");
+            c.rope.factor = rs.at("factor").get<double>();
+            c.rope.low_freq_factor = rs.at("low_freq_factor").get<double>();
+            c.rope.high_freq_factor = rs.at("high_freq_factor").get<double>();
+            c.rope.original_max_position_embeddings =
+                rs.at("original_max_position_embeddings").get<long>();
+            if (!(c.rope.factor > 0) || !(c.rope.low_freq_factor > 0) ||
+                !(c.rope.high_freq_factor > c.rope.low_freq_factor) ||
+                c.rope.original_max_position_embeddings <= 0)
+                throw std::invalid_argument("Invalid llama3 rope_scaling factors");
+            c.rope_llama3 = true;
+        }
+        // stop tokens: generation_config.json eos list (e.g. Llama 3.3 <|end_of_text|>/<|eot_id|>),
+        // else the config.json eos_token_id; defaults keep the original Behemoth {2}.
+        std::filesystem::path generation = path.parent_path() / "generation_config.json";
+        std::vector<int> eos;
+        if (std::filesystem::exists(generation))
+            eos = parse_token_ids(read_json(generation), "eos_token_id");
+        if (eos.empty())
+            eos = parse_token_ids(j, "eos_token_id");
+        if (!eos.empty())
+            c.eos = std::move(eos);
+        if (j.contains("bos_token_id") && !j.at("bos_token_id").is_null())
+            c.bos = j.at("bos_token_id").get<int>();
+        for (int id : c.eos)
+            if (id < 0 || id >= c.vocab)
+                throw std::invalid_argument("EOS token outside the vocabulary");
+        if (c.bos < -1 || c.bos >= c.vocab)
+            throw std::invalid_argument("BOS token outside the vocabulary");
+        return c;
     }
+    // AQLM 1x16 (the original Behemoth runtime format): exact geometry.
+    if (j.at("hidden_size") != c.hidden || j.at("intermediate_size") != c.intermediate ||
+        j.at("num_hidden_layers") != c.layers || j.at("num_attention_heads") != c.q_heads ||
+        j.at("num_key_value_heads") != c.kv_heads || j.at("head_dim") != c.dim ||
+        j.at("vocab_size") != c.vocab || j.at("model_type") != "mistral" ||
+        j.at("hidden_act") != "silu" || j.at("tie_word_embeddings") != false ||
+        (j.contains("sliding_window") && !j.at("sliding_window").is_null()) ||
+        !j.contains("sliding_window"))
+        throw std::invalid_argument("Checkpoint is not the supported Behemoth architecture");
+    auto q = j.at("quantization_config");
+    if (q.at("quant_method") != "aqlm" || q.at("in_group_size") != 8 ||
+        q.at("out_group_size") != 1 || q.at("num_codebooks") != 1 ||
+        q.at("nbits_per_codebook") != 16)
+        throw std::invalid_argument("Unsupported AQLM format");
     c.max_context = j.at("max_position_embeddings");
     c.epsilon = j.at("rms_norm_eps");
     c.theta = j.at("rope_theta");

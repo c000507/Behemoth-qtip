@@ -7,10 +7,19 @@ checkpoint's `config.json`:
 |---|---|
 | Llama/Mistral-layout Behemoth-R1-123B-v2 QTIP | 88 layers, hidden 12288, GQA 96/8, RoPE, QTIP HYB and optional FP8 K/V projections |
 | Behemoth adaptive mixed-format (`qtip_quant --mode adaptive`) | same geometry; per-layer QTIP or NVFP4 (E2M1 + E4M3 block scales) projections, selected per linear from the checkpoint tensors |
+| Llama 3.3 70B Instruct QTIP (`qtip_quant` output) | 80 layers, hidden 8192, GQA 64/8, `head_dim` 128, FFN 28672, vocab 128256, rope_theta 5e5 with `llama3` rope_scaling, byte-level BPE tokenizer, stop on the `generation_config.json` eos list (`<|end_of_text|>`, `<|eot_id|>`, ...); single sequence, one GPU (no TP2/batching) |
 | `glm5_next` / `glm5_next_text` | Original 320B MoE or custom dense config, KDA, NoPE sparse MLA, mHC, FP8/BF16 and NVFP4 MLPs |
 
-The Llama/Mistral QTIP profile currently uses the supported Behemoth geometry
-and HYB L16/K2/V2 codebook; other Llama sizes and other QTIP codebooks are rejected.
+The Llama/Mistral QTIP profile reads its geometry from `config.json` (Behemoth, Llama 3.3 70B or any
+llama-layout shape whose dimensions are `2^p`, `12*2^p` or `28*2^p` multiples of 32 with `2^p <= 8192`),
+supports `rope_scaling` type `llama3` only, and requires the HYB L16/K2/V2 codebook; other codebooks and
+unsupported shapes are rejected. The batched / TP2 fast profile (`BEHEMOTH_CUDA_FAST`) is Behemoth-only and
+refuses other geometries. A 70B 2-bit checkpoint needs more than 16 GB of VRAM (trellis ~17.5 GB + bf16
+embeddings/head ~4.2 GB).
+Llama 3.3 verification: `behemoth_cuda_llama_tests` (llama3 frequency table and RoPE kernel vs a fp64 HF
+transcription; synthetic Llama-geometry-scaled QTIP, QTIP+NVFP4 and plain-RoPE checkpoints end to end vs a CPU
+reference; Llama 3 tokenizer/chat template with a synthetic tokenizer; config rejection) and the 8192/28672
+projection shapes in `behemoth_cuda_tests`. Not verified: real Llama weights/tokenizer, a full-size run.
 GLM dimensions and dense/MoE layer types come from its configuration. Tokenizer
 selection follows the tokenizer assets: SentencePiece for Behemoth, or byte-level
 BPE for GLM and Llama-3-style assets. The checkpoint's actual Jinja template is

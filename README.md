@@ -253,6 +253,51 @@ y = SV ⊙ hadU_m( hadUt_n(x ⊙ SU) · Ŵᵀ )
 
 The native decoder and the committed numerical fixtures verify this reconstruction.
 
+## Llama 3.3 70B Instruct (`meta-llama/Llama-3.3-70B-Instruct`)
+
+Besides Behemoth, `qtip_quant` (classic and `--mode adaptive`) and the shared CUDA runtime
+(`behemoth_cuda`, `behemoth_cuda_server`) support the Llama 3.3 70B layout. All dimensions come from
+`config.json` (hidden, FFN, layers, q/kv heads, `head_dim`, vocab, `rms_norm_eps`, `rope_theta`); Behemoth
+output is unchanged. Unsupported shapes are rejected with an error (hidden/FFN/head dims must be a multiple
+of 32 and `2^p`, `12*2^p` or `28*2^p` with `2^p <= 8192`; `rope_scaling` other than `llama3` is rejected).
+
+- Geometry: 80 layers, hidden 8192 (= 2^13, no hadK factor), 64/8 heads, `head_dim` 128, FFN 28672
+  (= 28*1024), vocab 128256, untied embeddings. Hadamard dims: q/o in 8192 out 8192, k/v out 1024,
+  gate/up in 8192 out 28672, down in 28672 out 8192 (the FWHT kernels now allow a 2^13 chunk).
+- **llama3 RoPE scaling** (factor 8, low/high_freq_factor 1/4, original_max_position_embeddings 8192): the
+  inverse-frequency table is computed in fp64 on the host (HF `_compute_llama3_parameters`) and used by the
+  quantizer's calibration forward (`k_qkv_rope_scaled`) and by the CUDA runtime (`rope_scaled`). The
+  assembled `config.json` keeps the source `rope_scaling` block verbatim.
+- **BF16 sources**: the quantizer detects BF16 (vs FP8-Dynamic) source linears from `q_proj`'s dtype. There
+  are no FP8 K/V to preserve, so `--kv-format` defaults to `qtip` (all 7 linears quantized); an explicit
+  `--kv-format fp8` is rejected.
+- **Adaptive mode**: the lm_head logits GEMM for the metric probe runs in vocab-row tiles (about 256 MB of
+  fp32 logits at most, `Options::logit_tile` overrides it), so the 128256-row head only needs its bf16 copy
+  (~2.1 GB) resident on the device. Tiled and untiled metrics are asserted equal.
+- **Runtime**: stop tokens come from `generation_config.json` `eos_token_id` (list), else `config.json`
+  (Behemoth: 2). Tokenizer: the Llama 3 `tokenizer.json` (byte-level BPE, `Split` regex + ByteLevel) goes
+  through the existing BPE path; the checkpoint's Jinja chat template renders the header/`<|eot_id|>` tokens
+  (the current date is supplied as `date_string`, as `strftime_now` is in HF). The batched / TP2 fast profile
+  remains Behemoth-only; Llama 3.3 runs single-sequence on one GPU. The ROCm runtime (`behemoth_server`)
+  rejects non-Behemoth geometries.
+- Memory note: a 2-bit 70B model is ~17.5 GB of trellis data plus ~4.2 GB of bf16 embeddings/head, so the
+  single-GPU CUDA runner needs a card larger than 16 GB (e.g. A100 40/80 GB); a 16 GB A4000 only holds the
+  synthetic test checkpoints and the quantizer's adaptive evaluation.
+
+**Verified** (RTX A4000, CUDA 12.0): a synthetic Llama-3.3-geometry-scaled checkpoint (hidden 256, FFN 896 =
+28*32, 8 q / 1 kv heads, `head_dim` 32, theta 5e5 + llama3 scaling) is generated, quantized (QTIP,
+adaptive all-QTIP / all-NVFP4, tiled head) and run end to end; CUDA logits match a CPU reference of the whole
+model (relative L2 <= 1.4e-2; the unscaled-RoPE reference differs by ~1.0, so the test is sensitive to the
+scaling), and the quantized projections are within the expected 2-bit / NVFP4 distance of the BF16 source.
+`tools/llama_synthetic_e2e.sh` chains the quantizer and runtime tests. The `llama3` frequency table and the
+RoPE kernels are checked against a literal fp64 transcription of the HF function (real Llama 3.3 parameters
+included); 8192x8192, 1024x8192, 28672x8192 and 8192x28672 QTIP projections are checked against the CPU
+reference. **Not verified** (no Llama weights or tokenizer on this box): real-checkpoint quality/perplexity,
+the real `tokenizer.json`/`chat_template` of the release (a synthetic Llama-3-style tokenizer and a
+reproduction of the 3.x template structure are tested; the tool-calling branches of the real template are
+not), a full 80-layer / 128256-vocab run and its memory peak on a 16 GB card, multi-shard BF16 reading at
+full size, and everything on ROCm.
+
 ## Tests
 
 - `build/qtip_tests_cpu tests/refvec`: compares against the committed upstream reference fixtures in `tests/refvec`:
@@ -267,6 +312,11 @@ The native decoder and the committed numerical fixtures verify this reconstructi
   - GPU LDLQ vs a CPU port of `ldlq.LDLQ` (bit-identical trellises)
   - end-to-end `quantize_group` with a CPU decode of the packed output
   - `--shape` times one real-sized linear with a synthetic Hessian
+- `build/qtip_llama_tests [--device N] [--keep DIR]`: Llama 3.3 support on a synthetic BF16
+  Llama-geometry checkpoint: config parsing/rejection, 8192/28672 Hadamard, llama3 RoPE kernel vs fp64 HF
+  reference, QTIP and adaptive (all-QTIP, all-NVFP4, tiled lm_head) runs, kv-format handling.
+  `--keep DIR` retains the checkpoints for `behemoth_cuda_llama_tests --checkpoint` (see
+  `tools/llama_synthetic_e2e.sh`).
 - `build/qtip_adaptive_tests [--device N]`: adaptive mixed-format mode on a synthetic 3-layer FP8
   checkpoint — forces every branch (all-QTIP, KL-forced NVFP4 fallback, MSE metric with
   quantized-input chaining) and checks layer tensors, `adaptive_report.json`, `config.json`

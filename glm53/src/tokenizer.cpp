@@ -1,3 +1,4 @@
+#include <ctime>
 #include "glm53.hpp"
 #include "minja/minja.hpp"
 #define PCRE2_CODE_UNIT_WIDTH 8
@@ -254,6 +255,16 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
                                      {"eos_token", token("eos_token")},
                                      {"add_generation_prompt", generation},
                                      {"tools", nullptr}};
+    // Llama 3.x templates take the current date from `strftime_now("%d %b %Y")` (HF supplies it) or a
+    // `date_string` variable; minja has no strftime_now, so provide the same value as date_string.
+    if (source.get<std::string>().find("date_string") != std::string::npos) {
+        char buffer[32];
+        std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        check(std::strftime(buffer, sizeof buffer, "%d %b %Y", &local) > 0, "cannot format the current date");
+        inputs["date_string"] = std::string(buffer);
+    }
     auto parsed =
         minja::Parser::parse(source.get<std::string>(),
                              {.trim_blocks = true, .lstrip_blocks = true, .keep_trailing_newline = false});

@@ -15,12 +15,24 @@
 
 namespace qtip {
 
+// llama3 RoPE frequency scaling (HF rope_scaling type "llama3").
+struct RopeScalingLlama3 {
+  double factor = 0, low_freq_factor = 0, high_freq_factor = 0;
+  long original_max_position_embeddings = 0;
+};
+
 struct ModelConfig {
   int hidden = 12288, inter = 28672, nq = 96, nkv = 8, hd = 128, layers = 88, vocab = 32768;
   float eps = 1e-5f, theta = 1e6f;
+  long max_pos = 131072;
+  bool bf16_source = false;  // plain BF16 source linears (e.g. Llama 3.3), no FP8 weights/scales
+  bool rope_llama3 = false;
+  RopeScalingLlama3 rope;
   std::string raw_json;  // original config.json
 };
-ModelConfig load_model_config(const std::string& dir);
+// inv_freq[d] (d < hd/2) with llama3 wavelength scaling applied; out is resized to hd/2.
+void llama3_inv_freq(int hd, double theta, const RopeScalingLlama3& r, std::vector<float>& out);
+ModelConfig load_model_config(const std::string& dir, const SafeTensorsReader* st = nullptr);
 
 // linear order inside a layer
 enum Lin { LQ = 0, LK, LV, LO, LGate, LUp, LDown, kNumLin };
@@ -28,10 +40,11 @@ extern const char* kLinName[kNumLin];  // "self_attn.q_proj", ...
 
 struct LayerHost {
   int idx = -1;
-  std::vector<uint8_t> w[kNumLin];   // fp8 e4m3 [out][in]
-  std::vector<uint16_t> sc[kNumLin]; // bf16 per-output-channel scale [out]
+  std::vector<uint8_t> w[kNumLin];   // fp8 e4m3 [out][in], or raw bf16 bits [out][in] when bf16
+  std::vector<uint16_t> sc[kNumLin]; // bf16 per-output-channel scale [out] (empty for bf16 sources)
   std::vector<uint16_t> ln_in, ln_post;  // bf16 [hidden]
   int out_dim[kNumLin] = {}, in_dim[kNumLin] = {};
+  bool bf16 = false;  // w[] holds bf16 bits instead of fp8 bytes
   double read_s = 0;
 };
 std::shared_ptr<LayerHost> read_layer(const SafeTensorsReader& st, const ModelConfig& cfg, int idx);
@@ -100,7 +113,7 @@ class LayerRunner {
   DBuf<uint8_t> stage8_;
   // activations
   DBuf<uint16_t> x_, h_, attn_, act_, Qp_, Kp_, Vp_;
-  DBuf<float> qkv_, y_, gu_;
+  DBuf<float> qkv_, y_, gu_, inv_freq_;
   HBuf<uint16_t> pin_;
 };
 

@@ -44,9 +44,15 @@ static std::vector<std::vector<float>> read_hess(const std::string& path) {
   return H;
 }
 
-Pipeline::Pipeline(const Options& o) : o_(o), st_(o.model), cfg_(load_model_config(o.model)), cache_(st_, cfg_, 4) {
+Pipeline::Pipeline(const Options& o) : o_(o), st_(o.model), cfg_(load_model_config(o.model, &st_)), cache_(st_, cfg_, 4) {
   if (o_.layer_end < 0) o_.layer_end = cfg_.layers;
   if (o_.hess_dir.empty()) o_.hess_dir = o_.work + "/hess";
+  // BF16 sources (e.g. Llama 3.3) have no FP8 K/V to preserve: default to all-QTIP, reject an
+  // explicit --kv-format fp8.
+  if (cfg_.bf16_source) {
+    QCHECK(!o_.kv_explicit || !o_.fp8_kv, "--kv-format fp8 requires an FP8-Dynamic source; BF16 sources use qtip");
+    o_.fp8_kv = false;
+  }
   adaptive_ = o_.mode == "adaptive";
   QCHECK(!adaptive_ || (o_.kl_metric == "lmkl" || o_.kl_metric == "mse"), "--kl-metric must be lmkl or mse");
   QCHECK(!adaptive_ || o_.kl_threshold >= 0, "--kl-threshold must be >= 0");
@@ -265,8 +271,11 @@ std::vector<LinearOut> Pipeline::run_qtip_groups(int L, std::vector<std::vector<
       LinearIn in;
       in.name = kLinName[li];
       in.m = LH->out_dim[li];
-      in.w_fp8 = LH->w[li].data();
-      in.scale_bf16 = LH->sc[li].data();
+      if (LH->bf16) in.w_bf16 = reinterpret_cast<const uint16_t*>(LH->w[li].data());
+      else {
+        in.w_fp8 = LH->w[li].data();
+        in.scale_bf16 = LH->sc[li].data();
+      }
       ins.push_back(in);
     }
     double tw = now_s();
@@ -436,7 +445,6 @@ void Pipeline::adaptive_load_head() {
   d_norm_.alloc(norm_w_.size());
   HIP_CHECK(hipMemcpy(d_norm_, norm_w_.data(), norm_w_.size() * 2, hipMemcpyHostToDevice));
   d_x_.alloc(size_t(T) * cfg_.hidden);
-  d_logits_.alloc(size_t(T) * cfg_.vocab);
   // probe document (built once): embeddings of the first T calibration tokens, one causal document
   if (probe_.empty()) {
     std::vector<uint16_t> emb = tensor_to_bf16(st_, "model.embed_tokens.weight");
@@ -491,7 +499,9 @@ std::vector<uint16_t> Pipeline::adaptive_layer_forward(const std::shared_ptr<Lay
   return y;
 }
 
-// final norm + lm_head logits of a hidden state h [T][hidden], remaining layers (L+1..) kept original
+// final norm + lm_head logits of a hidden state h [T][hidden], remaining layers (L+1..) kept original.
+// The lm_head GEMM runs in vocab-row tiles so the fp32 logit buffer on the device stays bounded
+// (Llama 3.3: 128256 vocab; the full head itself is resident, ~2.1 GB bf16).
 std::vector<float> Pipeline::adaptive_logits(int L, std::vector<uint16_t> h) {
   const int T = int(probe_tok_.size());
   const long H = cfg_.hidden;
@@ -506,10 +516,17 @@ std::vector<float> Pipeline::adaptive_logits(int L, std::vector<uint16_t> h) {
   DBuf<uint16_t> normed(size_t(T) * H);
   k_rmsnorm(d_x_, d_norm_, normed, T, int(H), cfg_.eps, s);
   // logits (T x V) = normed @ lm_head^T ; col-major: (V x T) = W_cm^T (V x H) * X_cm (H x T)
-  a_orig_->gemm().run(true, false, cfg_.vocab, T, int(H), d_head_, H, normed, H, d_logits_, cfg_.vocab, OutT::F32,
-                      1.f, 0.f);
   std::vector<float> out(size_t(T) * cfg_.vocab);
-  d2h_staged(out.data(), d_logits_, out.size() * 4, s);
+  const long tile = o_.logit_tile > 0 ? o_.logit_tile : std::max<long>(1024, (256ll << 20) / (long(T) * 4));
+  d_logits_.ensure(size_t(std::min(tile, long(cfg_.vocab))) * T);
+  for (long v0 = 0; v0 < cfg_.vocab; v0 += tile) {
+    const int vc = int(std::min(tile, cfg_.vocab - v0));
+    a_orig_->gemm().run(true, false, vc, T, int(H), d_head_ + v0 * H, H, normed, H, d_logits_, vc, OutT::F32,
+                        1.f, 0.f);
+    // a col-major (vc x T) tile is row-major (T x vc): copy each token row into out[t][v0..]
+    for (int t = 0; t < T; ++t)
+      d2h_staged(out.data() + size_t(t) * cfg_.vocab + size_t(v0), d_logits_ + size_t(t) * vc, size_t(vc) * 4, s);
+  }
   return out;
 }
 
@@ -626,9 +643,14 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
       const int m = LH->out_dim[li], n = LH->in_dim[li];
       std::vector<float> W(size_t(m) * n);
       for (long i = 0; i < m; ++i) {
-        float sc = bf16_to_f32(LH->sc[size_t(li)][size_t(i)]);
-        const uint8_t* row = LH->w[size_t(li)].data() + size_t(i) * n;
-        for (long j = 0; j < n; ++j) W[size_t(i) * n + j] = fp8e4m3_to_f32(row[j]) * sc;
+        if (LH->bf16) {
+          const uint16_t* row = reinterpret_cast<const uint16_t*>(LH->w[size_t(li)].data()) + size_t(i) * n;
+          for (long j = 0; j < n; ++j) W[size_t(i) * n + j] = bf16_to_f32(row[j]);
+        } else {
+          float sc = bf16_to_f32(LH->sc[size_t(li)][size_t(i)]);
+          const uint8_t* row = LH->w[size_t(li)].data() + size_t(i) * n;
+          for (long j = 0; j < n; ++j) W[size_t(i) * n + j] = fp8e4m3_to_f32(row[j]) * sc;
+        }
       }
       nvs[size_t(li)] = nvfp4_quantize(W.data(), m, n);
     }
@@ -898,7 +920,9 @@ void Pipeline::assemble() {
   c["attention_bias"] = false;
   c["mlp_bias"] = false;
   c["pretraining_tp"] = 1;
-  c["rope_scaling"] = nullptr;
+  // Keep the source RoPE configuration: Behemoth (plain RoPE) gets an explicit null like before;
+  // Llama 3.3 keeps its llama3 rope_scaling block verbatim (the runtime needs it).
+  if (!c.contains("rope_scaling") || c["rope_scaling"].is_null()) c["rope_scaling"] = nullptr;
   c["quip_params"] = {{"codebook", "bitshift"}, {"codebook_version", 0}, {"L", kL},      {"K", kK},
                       {"V", kV},                {"tlut_bits", kTlutBits}, {"decode_mode", "quantlut_sym"},
                       {"td_x", kTd},            {"td_y", kTd},           {"split_for_tp", false},
