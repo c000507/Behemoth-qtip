@@ -25,6 +25,20 @@ static int g_fail = 0;
 
 static hipStream_t S;
 
+// The compressed CUDA LUT must preserve every original half2 bit pattern,
+// including the sign of the first component, across all 65536 states.
+static void test_compact_codebook() {
+  const auto& lut = codebook().lut_h2;
+  std::vector<uint32_t> compact(1024);
+  std::vector<bool> seen(1024, false);
+  for (uint32_t s = 0; s < 65536; ++s) {
+    uint32_t idx = ((s * (s + 1)) >> 6) & 1023;
+    if (seen[idx]) EXPECT(compact[idx] == lut[s], "compact LUT collision at state %u", s);
+    else compact[idx] = lut[s], seen[idx] = true;
+  }
+  EXPECT(std::all_of(seen.begin(), seen.end(), [](bool x) { return x; }), "compact LUT has uninitialized entries");
+}
+
 // ---- Hadamard: k_hadamard_rows vs hadamard_rows_ref (fp64), hadU/hadUt, strided rows ----------------
 static void test_hadamard() {
   std::printf("[hadamard cuda] vs fp64 reference (hadU / hadUt, strided rows)\n");
@@ -122,8 +136,8 @@ static void test_viterbi(int bench) {
     gpu_quantize_seqs(Xb, bench, st, hat);
     gpu_quantize_seqs(Xb, bench, st, hat);
     double secs = now_s() - t0;
-    std::printf("  bench: %d sequences x 2 passes in %.3f s -> %.1f us per sequence-pass, %.2f Mweight/s\n", bench,
-                secs, secs / (2.0 * bench) * 1e6, bench * 256.0 / secs / 1e6);
+    std::printf("  bench: %d sequences x 2 quantizations in %.3f s -> %.1f us per sequence, %.2f Mweight/s\n", bench,
+                secs, secs / (2.0 * bench) * 1e6, 2.0 * bench * 256.0 / secs / 1e6);
   }
 }
 
@@ -140,6 +154,7 @@ int main(int argc, char** argv) {
   }
   HIP_CHECK(hipSetDevice(dev));
   HIP_CHECK(hipStreamCreate(&S));
+  test_compact_codebook();
   test_hadamard();
   test_viterbi(bench);
   HIP_CHECK(hipStreamDestroy(S));

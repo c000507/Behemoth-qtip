@@ -4,7 +4,8 @@
 // Viterbi layout: one 1024-thread workgroup per 256-weight sequence (128 trellis steps, 2^16 states).
 // Thread t owns the 64 states s = (d << 12) | (4t + q), d = 0..15, q = 0..3, i.e. the 16 predecessor candidates of
 // the 4 successor groups j' = 4t + q (a group j collects the states with s & 0xfff == j; all states s' with
-// s' >> 4 == j share the same best predecessor). The thread keeps its 64 fp16 LUT pairs and |lut|^2 in registers;
+// s' >> 4 == j share the same best predecessor). HIP keeps its 64 fp16 LUT pairs and |lut|^2 in registers;
+// CUDA uses packed indices into a compact shared LUT to fit its smaller per-block register budget.
 // per step it reads 16 predecessor-group minima M[(d << 8) | (t >> 2)] from LDS, forms the 64 costs with
 // an fp16 dot product accumulated in fp32 (v_dot2_f32_f16 / __fmaf_rn chain), takes
 // the 4 group minima with the predecessor index d tagged into the low 4 mantissa bits, writes
@@ -57,6 +58,32 @@ __global__ __launch_bounds__(1024) void viterbi_fwd_kernel(const float* __restri
   const float* xb = X + size_t(b) * 256;
   if (t < 256) xs[t] = float(Q_H16(roll ? xb[(t + 128) & 255] : xb[t]));  // reference quantizes in fp16
 
+#ifdef QTIP_CUDA
+  // A 1024-thread CUDA block has only 64 registers per thread. Keeping all
+  // 64 pairs and norms live spills hundreds of bytes per thread. The LUT has
+  // just 1024 distinct values: bits 6..15 of s*(s+1) identify both the pair
+  // and its sign. Pack two indices per register and fetch pairs from shared
+  // memory instead. Volatile loads keep the compiler from hoisting the full
+  // expanded codebook back into registers across the trellis loop.
+  __shared__ uint32_t compact[1024];
+  for (int state = t; state < 65536; state += 1024) {
+    uint32_t s = uint32_t(state);
+    uint32_t idx = ((s * (s + 1)) >> 6) & 1023;
+    // All states with this index have identical LUT bits; atomic stores also
+    // make their concurrent initialization well-defined.
+    atomicExch(compact + idx, lut_h2[state]);
+  }
+  uint32_t indices[16][2];
+#pragma unroll
+  for (int d = 0; d < 16; ++d)
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      uint32_t s0 = uint32_t((d << 12) | (t << 2) | (p * 2));
+      uint32_t s1 = s0 + 1;
+      indices[d][p] = (((s0 * (s0 + 1)) >> 6) & 1023) |
+                      ((((s1 * (s1 + 1)) >> 6) & 1023) << 16);
+    }
+#else
   h2_t l[16][4];
   float nrm[16][4];
 #pragma unroll
@@ -69,6 +96,7 @@ __global__ __launch_bounds__(1024) void viterbi_fwd_kernel(const float* __restri
       float a = float(v.x), c = float(v.y);
       nrm[d][q] = a * a + c * c;
     }
+#endif
   const int ov = overlap ? overlap[b] : -1;
   for (int k = t; k < 4096; k += 1024) M[0][k] = (ov < 0 || k == ov) ? 0.f : kBig;
   __syncthreads();
@@ -85,7 +113,16 @@ __global__ __launch_bounds__(1024) void viterbi_fwd_kernel(const float* __restri
       const float mp = M[cur][(d << 8) | g] + xx;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
+#ifdef QTIP_CUDA
+        uint32_t idx = (indices[d][q >> 1] >> ((q & 1) * 16)) & 1023;
+        uint32_t u = static_cast<volatile uint32_t*>(compact)[idx];
+        h2_t v = q_bitcast_h2(u);
+        float a = float(v.x), b1 = float(v.y);
+        float norm = a * a + b1 * b1;
+        float c = q_dot2(v, xm2, norm + mp);
+#else
         float c = q_dot2(l[d][q], xm2, nrm[d][q] + mp);
+#endif
         uint32_t tg = (__float_as_uint(c) & ~15u) | uint32_t(d);
         best[q] = fminf(best[q], __uint_as_float(tg));
       }
@@ -115,7 +152,16 @@ __global__ __launch_bounds__(1024) void viterbi_fwd_kernel(const float* __restri
       for (int q = 0; q < 4; ++q) {
         int j = (t << 2) | q;
         if (ov >= 0 && j != ov) continue;
+#ifdef QTIP_CUDA
+        uint32_t idx = (indices[d][q >> 1] >> ((q & 1) * 16)) & 1023;
+        uint32_t u = static_cast<volatile uint32_t*>(compact)[idx];
+        h2_t v = q_bitcast_h2(u);
+        float a = float(v.x), b1 = float(v.y);
+        float norm = a * a + b1 * b1;
+        float c = q_dot2(v, xm2, norm + mp);
+#else
         float c = q_dot2(l[d][q], xm2, nrm[d][q] + mp);
+#endif
         uint32_t s = (uint32_t(d) << 12) | uint32_t(j);
         if (c < bv || (c == bv && s < bs)) bv = c, bs = s;
       }
