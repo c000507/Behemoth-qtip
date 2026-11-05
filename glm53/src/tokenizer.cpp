@@ -255,9 +255,10 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
                                      {"eos_token", token("eos_token")},
                                      {"add_generation_prompt", generation},
                                      {"tools", nullptr}};
-    // Llama 3.x templates take the current date from `strftime_now("%d %b %Y")` (HF supplies it) or a
-    // `date_string` variable; minja has no strftime_now, so provide the same value as date_string.
-    if (source.get<std::string>().find("date_string") != std::string::npos) {
+    // HF supplies strftime_now; minja does not, so supply date_string for
+    // templates that call it. A template with a fixed default date (Anubis)
+    // must keep that default, just as it does in Hugging Face.
+    if (source.get<std::string>().find("strftime_now") != std::string::npos) {
         char buffer[32];
         std::time_t now = std::time(nullptr);
         std::tm local{};

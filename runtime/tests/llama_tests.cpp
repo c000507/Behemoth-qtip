@@ -552,6 +552,20 @@ void tokenizer_test(const fs::path &root) {
                 ids[ids.size() - 3] == 263 && ids.back() == '\n',
             "header/eot special ids in the encoded prompt");
     require(tokenizer.decode(ids, true) == no_system, "chat prompt round trip");
+    // Anubis ships a fixed date default, without a strftime_now branch. Do
+    // not override it merely because the template mentions date_string.
+    std::ifstream settings_file(root / "tokenizer_config.json");
+    const json original_settings = json::parse(settings_file);
+    json fixed_settings = original_settings;
+    fixed_settings["chat_template"] =
+        "{%- if not date_string is defined %}{%- set date_string = '26 Jul 2024' %}{%- endif %}{{- date_string }}";
+    std::ofstream(root / "tokenizer_config.json") << fixed_settings.dump();
+    {
+        cu::Tokenizer fixed(root);
+        require(fixed.chat(json::array({{{"role", "user"}, {"content", "hello"}}})) == "26 Jul 2024",
+                "preserve fixed chat-template date default");
+    }
+    std::ofstream(root / "tokenizer_config.json") << original_settings.dump();
     std::cout << "Llama 3 tokenizer/chat template (synthetic tokenizer.json) OK\n";
 }
 
