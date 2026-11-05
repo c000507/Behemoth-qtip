@@ -105,6 +105,9 @@ The arena now reserves the actual split count below 128 padded rows. The optiona
 prefill and its next decode step match bit for bit after a 1024-token request
 grows the arena and the model resets. The 8k benchmark uses the unchanged bulk
 allocation path.
+After this fix, the TP2 server with context 32768 passes two identical greedy
+HTTP requests for `What is 2 + 2?`: both return `4`, populate `reasoning_content`,
+and stop on EOS. The server's health endpoint returns HTTP 200.
 
 ## Historical A100 baseline — 2026-11-04
 

@@ -179,6 +179,15 @@
       "arena_growth_prompt_tokens": 1024,
       "prefill_bitwise_equal": true,
       "decode_bitwise_equal": true
+    },
+    "server_smoke": {
+      "source_commit": "45796b5",
+      "tp": 2,
+      "context": 32768,
+      "http_status": 200,
+      "repeated_identical_messages": true,
+      "content": "4",
+      "reasoning_content_present": true
     }
   },
   "targets_met": false,
