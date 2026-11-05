@@ -34,6 +34,18 @@ This does not establish Turing execution, model quality, or the requested
 20/100/500 tok/s throughput targets. Full-model fast-path measurements and
 quality comparisons are still in progress.
 
+Measured before the main rebase, with the public mixed FP8-K/V checkpoint,
+TP2 peer transport, BF16 KV, 8192 prompt tokens and 256 decode steps:
+
+| Revision at measurement | Batch | Decode tok/s (aggregate) | Prefill tok/s |
+|---|---:|---:|---:|
+| `895cfd9` | 1 | 15.54 | 454.49 |
+| `3624ea7` | 8 | 60.79 | 470.16 |
+
+These are complete model runs with zero warmup runs and fixed generation
+lengths. They remain below the requested targets. The rebased equivalents are
+`e5e492a` and `8d37814`; performance has not yet been remeasured after the rebase.
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

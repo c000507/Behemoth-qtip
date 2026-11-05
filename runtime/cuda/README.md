@@ -132,6 +132,9 @@ uncaptured decode step. Event instrumentation adds overhead; use it to locate
 bottlenecks and disable it for throughput measurements.
 The benchmark also reports per-step latency summaries. Set
 `BEHEMOTH_CUDA_BENCH_STEP_TIMES=1` to retain all step times in its JSON output.
+Use `--trace-logits FILE` for numerical comparisons: it records logits after
+bulk prefill and the final decode step, plus all generated token IDs. Trace
+serialization happens outside the timed regions; warmup runs do not write it.
 
 Small-batch QTIP decode uses 32 output rows per warp and reuses activation
 fragments across two tensor-core products. It is enabled for batches 2–16.
