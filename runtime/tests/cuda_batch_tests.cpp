@@ -342,6 +342,9 @@ int main() {
         for (auto [out, in] : {std::pair{128, 128}, std::pair{768, 1792}, std::pair{1792, 768}})
             for (int tokens : {8, 17, 65})
                 qtip_test(s, out, in, tokens);
+        // Exercise the register kernel's partial row tile and both token tiles.
+        for (int tokens : {2, 7, 16})
+            qtip_test(s, 96, 128, tokens);
         for (int tokens : {8, 17, 65})
             dense_test(s, tokens);
         attention_test(s);

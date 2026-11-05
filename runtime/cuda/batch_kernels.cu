@@ -126,6 +126,61 @@ bool native_bf16() {
     }
     return major[device] >= 8;
 }
+// QTIP's four decoded pairs already have the register ordering required by
+// mma.m16n8k16. Keep them in registers instead of staging a 32x32 BF16 tile.
+__global__ void trellis_mma8(QtipMatrix w, const B16 *x, float *out, int stride, int tokens) {
+#if __CUDA_ARCH__ >= 800
+    __shared__ uint32_t lut[1024];
+    for (int i = threadIdx.x; i < 1024; i += blockDim.x)
+        lut[i] = w.lut[i];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int row = blockIdx.x * (blockDim.x / 32) * 16 + warp * 16;
+    if (row >= w.out)
+        return;
+    int chunks = w.in / 32;
+    int first = chunks * blockIdx.y / gridDim.y;
+    int last = chunks * (blockIdx.y + 1) / gridDim.y;
+    int token_base = blockIdx.z * 8;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int chunk = first; chunk < last; ++chunk) {
+        size_t base = (size_t(row / 32) * chunks + chunk) * 128;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            unsigned word = w.trellis[base + lane * 4 + half * 2 + (warp & 1)];
+            unsigned next = __shfl_sync(0xffffffffU, word, (lane + 1) & 31);
+            unsigned u = word << 16 | next;
+            uint32_t a[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                unsigned state = (u >> (16 - 4 * t)) & 65535U;
+                a[t] = lut[((state * (state + 1)) >> 6) & 1023U];
+            }
+            int token = token_base + lane / 4;
+            size_t at = size_t(token) * w.in + chunk * 32 + half * 16 + (lane % 4) * 2;
+            uint32_t b0 = 0, b1 = 0;
+            if (token < tokens) {
+                b0 = *reinterpret_cast<const uint32_t *>(x + at);
+                b1 = *reinterpret_cast<const uint32_t *>(x + at + 8);
+            }
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        }
+    }
+    int token = token_base + (lane % 4) * 2;
+    size_t at = (size_t(blockIdx.y) * tokens + token) * stride + row + lane / 4;
+    if (token < tokens) {
+        out[at] = c0;
+        out[at + 8] = c2;
+    }
+    if (token + 1 < tokens) {
+        out[at + stride] = c1;
+        out[at + stride + 8] = c3;
+    }
+#endif
+}
 template <int Format>
 void launch(QtipMatrix w, const B16 *dense, const uint8_t *low, const float *scale, const B16 *x, void *out,
             int stride, int splits, int tokens, Stream stream) {
@@ -383,7 +438,14 @@ void launch_check() { glm53::gpu::checked(cudaGetLastError(), "CUDA batch operat
 void qtip_multiply_batch(QtipMatrix w, const B16 *x, float *z, int stride, int splits, int tokens, Stream s) {
     if (tokens == 1 || !native_bf16())
         qtip_multiply(w, x, z, stride, splits, s, tokens);
-    else
+    else if (tokens <= 16) {
+        if (w.in % 32 || w.out % 32 || stride < w.out || tokens <= 0 || splits <= 0 || splits > 32 ||
+            splits > w.in / 32)
+            throw std::runtime_error("Invalid register QTIP matmul geometry");
+        trellis_mma8<<<dim3((w.out + 127) / 128, splits, (tokens + 7) / 8), 256, 0, s>>>(w, x, z, stride,
+                                                                                       tokens);
+        glm53::gpu::checked(cudaGetLastError(), "register QTIP matmul launch");
+    } else
         launch<0>(w, nullptr, nullptr, nullptr, x, z, stride, splits, tokens, s);
 }
 void qtip_decode_matrix(QtipMatrix w, B16 *out, Stream s) {
