@@ -50,6 +50,7 @@ struct Options {
   bool nvfp4_scale_search = true;          // per-16-block E4M3 scale search for NVFP4 fallback layers
   bool nvfp4_compare = false;              // also measure the naive / search-only / calibrated variants (report only)
   long logit_tile = 0;                     // lm_head vocab rows per logits GEMM (0 = auto, ~256 MB fp32 tile)
+  bool cache_teacher_logits = true;        // original-input chaining has the same teacher at every layer
   QuantOpts q;
 };
 
@@ -137,6 +138,7 @@ class Pipeline {
   DBuf<uint16_t> d_head_, d_norm_;
   DBuf<uint16_t> d_x_;
   DBuf<float> d_logits_;
+  std::vector<float> teacher_logits_;       // original model logits, independent of candidate layer
   ChosenLayer chosen_;
   json report_;                     // adaptive_report.json content
   std::map<int, std::string> layer_format_;  // decisions (for report/assemble)
