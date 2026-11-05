@@ -141,7 +141,9 @@ NCCL defaults to shared-memory transport (`NCCL_P2P_DISABLE=1`), two channels,
 and a 1 MiB buffer after a hosted A6000 pair showed a slow peer path. Explicit
 NCCL environment settings override these defaults; measure on your topology.
 On hosts with working CUDA peer access, set
-`BEHEMOTH_CUDA_TP_TRANSPORT=peer` to use copy-engine AllGather instead. Its tests
+`BEHEMOTH_CUDA_TP_TRANSPORT=peer` to use GPU store kernels for small AllGather
+payloads and copy engines for large prefill transfers. `peer-dma` uses copy
+engines for every transfer and provides an A/B comparison. The peer tests
 check exact rank data, repeated buffer reuse, and cross-device graph replay.
 The default remains `nccl` because peer-copy performance varies greatly by host.
 

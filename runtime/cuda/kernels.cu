@@ -1,5 +1,6 @@
 #include "../src/qtip_tables.hpp"
 #include "kernels.hpp"
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 namespace behemoth::cuda_runtime {
@@ -20,16 +21,30 @@ __device__ float warp_sum(float x) {
         x += __shfl_down_sync(0xffffffffU, x, d);
     return x;
 }
+template <class T> __global__ void peer_write(const T *source, T *destination, size_t count) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(blockDim.x) * gridDim.x)
+        destination[i] = source[i];
+    // Keep the writer count small: every participating warp must complete its
+    // remote writes before the graph can release the receiving rank.
+    __threadfence_system();
+}
 template <bool Partial>
 __global__ void fwht(const B16 *x, const float *z, const float *su, float *out, int p, bool round_z,
                      int splits = 1, int stride = 0, int width = 0, bool rank_major = false,
                      bool b16_z = false) {
     extern __shared__ float a[];
     int block = blockIdx.x;
+    int source_base = blockIdx.y * width + block * p;
+    bool rank_block = rank_major && gridDim.x > 1;
+    if (rank_block) {
+        int half = width / 2, rank = block >= gridDim.x / 2;
+        source_base = (rank * gridDim.y + blockIdx.y) * half + block * p - rank * half;
+    }
     for (int i = threadIdx.x; i < p; i += blockDim.x) {
-        int j = block * p + i, offset = blockIdx.y * width;
-        int source = offset + j;
-        if (rank_major) {
+        int j = block * p + i;
+        int source = source_base + i;
+        if (rank_major && !rank_block) {
             int half = width / 2;
             source = ((j / half) * gridDim.y + blockIdx.y) * half + j % half;
         }
@@ -262,8 +277,19 @@ void initialize_tables() {
     glm53::gpu::checked(cudaMemcpyToSymbol(had12, behemoth::qtip::kHad12, sizeof(had12)), "upload had12");
     glm53::gpu::checked(cudaMemcpyToSymbol(had28, behemoth::qtip::kHad28, sizeof(had28)), "upload had28");
 }
+void peer_store(const void *source, void *destination, size_t bytes, Stream stream) {
+    unsigned blocks = unsigned(std::max(size_t(1), (bytes + 65535) / 65536));
+    if (((reinterpret_cast<uintptr_t>(source) | reinterpret_cast<uintptr_t>(destination) | bytes) & 15) == 0)
+        peer_write<<<blocks, 256, 0, stream>>>(static_cast<const uint4 *>(source),
+                                               static_cast<uint4 *>(destination), bytes / 16);
+    else
+        peer_write<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t *>(source),
+                                               static_cast<uint8_t *>(destination), bytes);
+    launch_check();
+}
 void qtip_prepare(QtipMatrix w, const B16 *x, float *scratch, B16 *rotated, Stream s, int tokens,
                   bool rank_major) {
+    rank_major = rank_major && tokens > 1;
     int ki = factor(w.in), pi = w.in / ki;
     // pi * 4 bytes of dynamic shared memory in fwht: 8192 (Llama 3.3 hidden) needs 32 KiB
     if (w.in % 32 || pi > 8192)
@@ -284,6 +310,7 @@ void qtip_multiply(QtipMatrix w, const B16 *rotated, float *z, int stride, int s
 }
 void qtip_finish(QtipMatrix w, const float *z, B16 *y, float *scratch, bool rz, int splits, Stream s,
                  int tokens, bool rank_major) {
+    rank_major = rank_major && tokens > 1;
     int ko = factor(w.out), po = w.out / ko;
     if (w.out % 32 || po > 8192 || splits < 1 || splits > 32)
         throw std::runtime_error("Invalid CUDA QTIP output geometry");
@@ -299,6 +326,7 @@ void qtip_finish(QtipMatrix w, const float *z, B16 *y, float *scratch, bool rz, 
 }
 void qtip_finish_b16(QtipMatrix w, const B16 *z, B16 *y, float *scratch, int tokens, Stream s,
                      bool rank_major) {
+    rank_major = rank_major && tokens > 1;
     int ko = factor(w.out), po = w.out / ko;
     fwht<false><<<dim3(ko, tokens), 256, size_t(po) * 4, s>>>(nullptr, reinterpret_cast<const float *>(z),
                                                               nullptr, scratch, po, false, 1, 0, w.out,

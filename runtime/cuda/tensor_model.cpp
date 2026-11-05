@@ -251,6 +251,7 @@ struct TensorModel::Impl {
     Event graph_join, graph_done;
     std::unique_ptr<PeerAllGather> peer_gather;
     bool peer_transport = false;
+    bool peer_kernel = true;
     std::map<std::pair<int, int>, std::unique_ptr<Graph>> graphs;
     std::set<int> warmed_batches;
     bool graphs_enabled = true;
@@ -275,9 +276,11 @@ struct TensorModel::Impl {
         setenv("NCCL_MAX_NCHANNELS", "2", 0);
         setenv("NCCL_BUFFSIZE", "1048576", 0);
         if (const char *value = std::getenv("BEHEMOTH_CUDA_TP_TRANSPORT")) {
-            check(std::string(value) == "peer" || std::string(value) == "nccl",
-                  "BEHEMOTH_CUDA_TP_TRANSPORT must be peer or nccl");
-            peer_transport = std::string(value) == "peer";
+            check(std::string(value) == "peer" || std::string(value) == "peer-dma" ||
+                      std::string(value) == "nccl",
+                  "BEHEMOTH_CUDA_TP_TRANSPORT must be peer, peer-dma or nccl");
+            peer_transport = std::string(value) != "nccl";
+            peer_kernel = std::string(value) != "peer-dma";
         }
         for (int r = 0; r < tp; ++r)
             ranks.push_back(std::make_unique<Rank>(device + r, r, tp, context, max_batch));
@@ -285,7 +288,7 @@ struct TensorModel::Impl {
             if (peer_transport) {
                 peer_gather = std::make_unique<PeerAllGather>(
                     std::array<int, 2>{device, device + 1},
-                    std::array<Stream, 2>{ranks[0]->stream, ranks[1]->stream});
+                    std::array<Stream, 2>{ranks[0]->stream, ranks[1]->stream}, peer_kernel);
             } else {
                 int devices[2] = {device, device + 1};
                 ncclComm_t comms[2]{};

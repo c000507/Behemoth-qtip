@@ -16,6 +16,7 @@ class PeerAllGather {
     std::array<int, 2> devices;
     std::array<Stream, 2> streams;
     std::array<cudaEvent_t, 2> ready{}, done{};
+    bool kernel_small;
     void clear() {
         for (int r = 0; r < 2; ++r) {
             Device device(devices[r]);
@@ -28,7 +29,8 @@ class PeerAllGather {
     }
 
   public:
-    PeerAllGather(std::array<int, 2> d, std::array<Stream, 2> s) : devices(d), streams(s) {
+    PeerAllGather(std::array<int, 2> d, std::array<Stream, 2> s, bool small = true)
+        : devices(d), streams(s), kernel_small(small) {
         using glm53::gpu::checked;
         try {
             for (int r = 0; r < 2; ++r) {
@@ -66,9 +68,15 @@ class PeerAllGather {
             Device device(devices[r]);
             int other = 1 - r;
             checked(cudaStreamWaitEvent(streams[r], ready[other], 0), "wait peer producer");
-            auto *destination = static_cast<uint8_t *>(receive[r]) + other * bytes;
-            checked(cudaMemcpyAsync(destination, send[other], bytes, cudaMemcpyDeviceToDevice, streams[r]),
+            if (kernel_small && bytes <= 1024 * 1024) {
+                auto *destination = static_cast<uint8_t *>(receive[other]) + r * bytes;
+                peer_store(send[r], destination, bytes, streams[r]);
+            } else {
+                auto *destination = static_cast<uint8_t *>(receive[r]) + other * bytes;
+                checked(
+                    cudaMemcpyAsync(destination, send[other], bytes, cudaMemcpyDeviceToDevice, streams[r]),
                     "gather peer TP output");
+            }
             checked(cudaEventRecord(done[r], streams[r]), "record peer copy completion");
         }
         // Both readers must finish before either rank can reuse its send region.

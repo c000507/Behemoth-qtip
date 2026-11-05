@@ -23,11 +23,11 @@ struct Rank {
         (void)cudaStreamDestroy(stream);
     }
 };
-void test(size_t bytes) {
+void test(size_t bytes, bool kernel_small = true) {
     std::array<std::unique_ptr<Rank>, 2> ranks;
     for (int r = 0; r < 2; ++r)
         ranks[r] = std::make_unique<Rank>(r, bytes);
-    cu::PeerAllGather collective({0, 1}, {ranks[0]->stream, ranks[1]->stream});
+    cu::PeerAllGather collective({0, 1}, {ranks[0]->stream, ranks[1]->stream}, kernel_small);
     auto work = [&] {
         // Repeated buffer reuse exercises both producer and consumer dependencies.
         for (int repeat = 0; repeat < 3; ++repeat) {
@@ -99,7 +99,8 @@ void test(size_t bytes) {
     (void)cudaEventDestroy(fork);
     cg::checked(cudaSetDevice(1), "select peer event cleanup");
     (void)cudaEventDestroy(join);
-    std::cout << "PASS peer AllGather and graph replay, " << bytes << " bytes per rank\n";
+    std::cout << "PASS peer AllGather and graph replay, " << bytes
+              << " bytes per rank, small kernel=" << kernel_small << '\n';
 }
 } // namespace
 int main() {
@@ -117,6 +118,9 @@ int main() {
                 return 77;
         }
         test(56 * 1024);
+        test(224 * 1024);
+        test(4099);
+        test(56 * 1024, false);
         test(8 * 1024 * 1024);
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
