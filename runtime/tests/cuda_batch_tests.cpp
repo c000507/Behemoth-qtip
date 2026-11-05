@@ -113,8 +113,22 @@ void qtip_test(cg::Stream s, int out, int in, int tokens) {
             if (splits > in / 32)
                 continue;
             cu::qtip_prepare(w, input, work, rotated, s, tokens);
+            if (tokens == 65 && splits == 1) {
+                auto batched = read(rotated.p, size_t(tokens) * in, s);
+                for (int t = 0; t < tokens; ++t)
+                    cu::qtip_prepare(w, input.p + size_t(t) * in, work, rotated.p + size_t(t) * in, s);
+                require(batched == read(rotated.p, size_t(tokens) * in, s),
+                        "Fused input Hadamard must match per-token transform exactly");
+            }
             cu::qtip_multiply_batch(w, rotated, z, out, splits, tokens, s);
             cu::qtip_finish(w, z, output, work, rz, splits, s, tokens);
+            if (tokens == 65 && splits == 1) {
+                auto batched = read(output.p, size_t(tokens) * out, s);
+                for (int t = 0; t < tokens; ++t)
+                    cu::qtip_finish(w, z.p + size_t(t) * out, output.p + size_t(t) * out, work, rz, 1, s);
+                require(batched == read(output.p, size_t(tokens) * out, s),
+                        "Fused output Hadamard must match per-token transform exactly");
+            }
             std::cout << "QTIP " << out << 'x' << in << " tokens=" << tokens << " splits=" << splits
                       << " round_z=" << rz << ' ';
             compare(read(output.p, expected.size(), s), expected, "batch RHT/tensor product");

@@ -71,6 +71,41 @@ __global__ void cross_had(const float *x, const float *sv, B16 *out, int k, int 
     int at = r * p + i;
     out[offset + at] = b16(sum * rsqrtf(float(k * p)) * (sv ? sv[at] : 1));
 }
+// A prefill CTA computes every small-Hadamard output row for 32 columns.
+// Share the FP32 inputs across warps instead of reading them K times through L2.
+template <int K>
+__global__ void cross_had_rows(const float *x, const float *sv, B16 *out, int p, bool transpose) {
+    __shared__ float tile[K * 32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    int start = blockIdx.x * 32;
+    const int8_t *h = K == 12 ? had12 : had28;
+    size_t offset = size_t(blockIdx.y) * K * p;
+    for (int j = threadIdx.x; j < K * 32; j += blockDim.x) {
+        int column = start + j % 32;
+        tile[j] = column < p ? x[offset + (j / 32) * p + column] : 0.f;
+    }
+    __syncthreads();
+    int i = start + lane;
+    if (i >= p)
+        return;
+    for (int r = warp; r < K; r += blockDim.x / 32) {
+        float sum = 0;
+#pragma unroll
+        for (int c = 0; c < K; ++c)
+            sum += (transpose ? h[c * K + r] : h[r * K + c]) * tile[c * 32 + lane];
+        int at = r * p + i;
+        out[offset + at] = b16(sum * rsqrtf(float(K * p)) * (sv ? sv[at] : 1));
+    }
+}
+void cross_transform(const float *x, const float *sv, B16 *out, int k, int p, bool transpose, int tokens,
+                     Stream stream) {
+    if (tokens >= 32 && k == 12)
+        cross_had_rows<12><<<dim3((p + 31) / 32, tokens), 256, 0, stream>>>(x, sv, out, p, transpose);
+    else if (tokens >= 32 && k == 28)
+        cross_had_rows<28><<<dim3((p + 31) / 32, tokens), 256, 0, stream>>>(x, sv, out, p, transpose);
+    else
+        cross_had<<<dim3((p + 255) / 256, k, tokens), 256, 0, stream>>>(x, sv, out, k, p, transpose);
+}
 template <bool Split> __global__ void trellis_gemv(QtipMatrix w, const B16 *x, float *out, int stride) {
     __shared__ uint32_t table[1024];
     for (int i = threadIdx.x; i < 1024; i += blockDim.x)
@@ -235,7 +270,7 @@ void qtip_prepare(QtipMatrix w, const B16 *x, float *scratch, B16 *rotated, Stre
         throw std::runtime_error("Unsupported CUDA QTIP geometry");
     fwht<false><<<dim3(ki, tokens), 256, size_t(pi) * 4, s>>>(x, nullptr, w.su, scratch, pi, false, 1, 0,
                                                               w.in, rank_major);
-    cross_had<<<dim3((pi + 255) / 256, ki, tokens), 256, 0, s>>>(scratch, nullptr, rotated, ki, pi, true);
+    cross_transform(scratch, nullptr, rotated, ki, pi, true, tokens, s);
     launch_check();
 }
 void qtip_multiply(QtipMatrix w, const B16 *rotated, float *z, int stride, int splits, Stream s, int tokens) {
@@ -259,7 +294,7 @@ void qtip_finish(QtipMatrix w, const float *z, B16 *y, float *scratch, bool rz, 
         fwht<true><<<dim3(ko, tokens), 256, size_t(po) * 4, s>>>(nullptr, z, nullptr, scratch, po, rz, splits,
                                                                  tokens * w.out, w.out, rank_major);
     }
-    cross_had<<<dim3((po + 255) / 256, ko, tokens), 256, 0, s>>>(scratch, w.sv, y, ko, po, false);
+    cross_transform(scratch, w.sv, y, ko, po, false, tokens, s);
     launch_check();
 }
 void qtip_finish_b16(QtipMatrix w, const B16 *z, B16 *y, float *scratch, int tokens, Stream s,
@@ -268,7 +303,7 @@ void qtip_finish_b16(QtipMatrix w, const B16 *z, B16 *y, float *scratch, int tok
     fwht<false><<<dim3(ko, tokens), 256, size_t(po) * 4, s>>>(nullptr, reinterpret_cast<const float *>(z),
                                                               nullptr, scratch, po, false, 1, 0, w.out,
                                                               rank_major, true);
-    cross_had<<<dim3((po + 255) / 256, ko, tokens), 256, 0, s>>>(scratch, w.sv, y, ko, po, false);
+    cross_transform(scratch, w.sv, y, ko, po, false, tokens, s);
     launch_check();
 }
 void qtip_forward(QtipMatrix w, const B16 *x, B16 *y, float *scratch, B16 *rotated, float *z, bool rz,

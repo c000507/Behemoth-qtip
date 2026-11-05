@@ -77,6 +77,20 @@ struct ProjectionProfile {
                 (void)cudaEventDestroy(e);
     }
 };
+struct DecodeMark {
+    int device;
+    std::string name;
+    cudaEvent_t event{};
+    DecodeMark(int d, const char *n, Stream stream) : device(d), name(n) {
+        Scope scope(device);
+        checked(cudaEventCreate(&event), "create decode profile event");
+        checked(cudaEventRecord(event, stream), "record decode stage");
+    }
+    ~DecodeMark() {
+        Scope scope(device);
+        (void)cudaEventDestroy(event);
+    }
+};
 template <class T> void upload(Buffer<T> &out, const T *data, size_t n, Stream s) {
     out.ensure(n, s);
     checked(h2d(out, data, n * sizeof(T), s), "upload TP weights");
@@ -243,6 +257,9 @@ struct TensorModel::Impl {
     std::string profile_path;
     bool profile_reported = false;
     std::vector<std::unique_ptr<ProjectionProfile>> profile;
+    std::string decode_profile_path;
+    bool decode_profiled = false, record_decode = false;
+    std::vector<std::unique_ptr<DecodeMark>> decode_marks;
     std::vector<int> position;
     Pinned<int> host_ids, host_positions, host_selected, host_lengths;
     Pinned<float> host_logits;
@@ -282,6 +299,8 @@ struct TensorModel::Impl {
             graphs_enabled = std::string(value) != "0";
         if (const char *value = std::getenv("BEHEMOTH_CUDA_PROFILE_PREFILL"))
             profile_path = value;
+        if (const char *value = std::getenv("BEHEMOTH_CUDA_PROFILE_DECODE"))
+            decode_profile_path = value;
         host_ids.ensure(max_batch);
         host_positions.ensure(max_batch);
         host_selected.ensure(max_batch);
@@ -494,15 +513,26 @@ struct TensorModel::Impl {
     void forward(int batch, int sequence, int base, bool prefill, int attention_bound = 0) {
         int rows = batch * sequence;
         bool large = prefill && rows >= 128;
+        mark_decode("begin");
         each([&](Rank &r) { embedding_batch(r.embeddings, r.x, r.ids, rows, H, r.stream); });
+        mark_decode("embedding");
         for (int l = 0; l < 88; ++l) {
             each([&](Rank &r) {
                 auto &layer = r.layers[l];
                 norm_batch(r.x, layer.norm1, r.input, rows, H, 1e-5f, r.stream);
-                r.frozen(layer.weights[1], r.input, r.a.p + size_t(rows) * H, rows, large);
-                r.frozen(layer.weights[2], r.input, r.a.p + size_t(rows) * (H + KH / tp * D), rows, large);
             });
+            mark_decode("norm1");
+            each([&](Rank &r) {
+                r.frozen(r.layers[l].weights[1], r.input, r.a.p + size_t(rows) * H, rows, large);
+            });
+            mark_decode("k");
+            each([&](Rank &r) {
+                r.frozen(r.layers[l].weights[2], r.input, r.a.p + size_t(rows) * (H + KH / tp * D), rows,
+                         large);
+            });
+            mark_decode("v");
             project(l, 0, rows, false, false, false, large, 0, 1);
+            mark_decode("q");
             each([&](Rank &r) {
                 auto &layer = r.layers[l];
                 B16 *k = r.a.p + size_t(rows) * H;
@@ -527,23 +557,60 @@ struct TensorModel::Impl {
                               maximum, QH / tp, KH / tp, D, r.stream, H, r.attention_parts);
                 }
             });
+            mark_decode("attention");
             gather(size_t(rows) * (H / tp) * sizeof(B16), ncclUint8, [&](Rank &r) {
                 return std::pair<void *, void *>{r.b.p + size_t(r.rank) * rows * (H / tp), r.b.p};
             });
+            mark_decode("attention_gather");
             project(l, 3, rows, false, tp == 2, false, large, 2, 1);
+            mark_decode("o");
             each([&](Rank &r) {
                 residual(r.x, r.a, rows * H, r.stream);
                 norm_batch(r.x, r.layers[l].norm2, r.input, rows, H, 1e-5f, r.stream);
             });
+            mark_decode("norm2_residual");
             // Keep the rotated input in input; independent SU matrices are handled
             // below by preserving the unrotated normalization in a temporary view.
             bool shared = ranks[0]->layers[l].shared_su;
             project(l, 4, rows, true, false, false, large, 0, 1, !shared);
+            mark_decode("gate");
             project(l, 5, rows, true, false, shared, large, 0, 2);
+            mark_decode("up");
             each([&](Rank &r) { swiglu(r.a, r.b, rows * I, INFINITY, r.stream); });
+            mark_decode("swiglu");
             project(l, 6, rows, false, false, false, large, 1, 0);
+            mark_decode("down");
             each([&](Rank &r) { residual(r.x, r.input, rows * H, r.stream); });
+            mark_decode("residual");
         }
+    }
+    void mark_decode(const char *name) {
+        if (record_decode)
+            decode_marks.push_back(std::make_unique<DecodeMark>(ranks[0]->device, name, ranks[0]->stream));
+    }
+    void report_decode() {
+        if (!record_decode)
+            return;
+        Scope scope(ranks[0]->device);
+        json result{{"batch", active},
+                    {"tp", tp},
+                    {"captured", false},
+                    {"position", *std::max_element(position.begin(), position.end())},
+                    {"transport", peer_transport ? "peer" : "nccl"}};
+        std::map<std::string, double> totals;
+        for (size_t i = 1; i < decode_marks.size(); ++i) {
+            float ms = 0;
+            checked(cudaEventElapsedTime(&ms, decode_marks[i - 1]->event, decode_marks[i]->event),
+                    "read decode stage timing");
+            totals[decode_marks[i]->name] += ms / 1000.;
+        }
+        result["seconds"] = totals;
+        std::ofstream file(decode_profile_path);
+        file << result.dump(2) << '\n';
+        check(bool(file), "Cannot write decode profile");
+        decode_marks.clear();
+        record_decode = false;
+        decode_profiled = true;
     }
     void output(int batch, int sequence) {
         each([&](Rank &r) {
@@ -591,6 +658,7 @@ struct TensorModel::Impl {
         });
         forward(active, 1, 0, false, bound);
         output(active, 1);
+        mark_decode("output");
     }
     void graph_step(int bound) {
         auto key = std::pair{active, bound};
@@ -657,15 +725,17 @@ struct TensorModel::Impl {
         }
         reserve(active, splits, false);
         try {
+            record_decode = !decode_profile_path.empty() && !decode_profiled;
             int maximum = *std::max_element(position.begin(), position.end()) + 1;
             int bound = std::min(context, ((maximum + 127) / 128) * 128);
-            if (graphs_enabled && warmed_batches.contains(active))
+            if (graphs_enabled && warmed_batches.contains(active) && !record_decode)
                 graph_step(bound);
             else {
                 compute_step(bound);
                 warmed_batches.insert(active);
             }
             auto result = read_logits(active);
+            report_decode();
             for (auto &p : position)
                 ++p;
             return result;

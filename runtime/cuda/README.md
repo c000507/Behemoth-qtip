@@ -127,6 +127,9 @@ ignores EOS, and reports aggregate batch throughput. Its batched model execution
 does not measure HTTP scheduler throughput. Set `BEHEMOTH_CUDA_GRAPHS=0` for an
 uncaptured comparison, or `BEHEMOTH_CUDA_PROFILE_PREFILL=profile.json` to record
 projection phase timings for the first prefill group.
+`BEHEMOTH_CUDA_PROFILE_DECODE=decode.json` records stage timings for the first
+uncaptured decode step. Event instrumentation adds overhead; use it to locate
+bottlenecks and disable it for throughput measurements.
 
 NCCL defaults to shared-memory transport (`NCCL_P2P_DISABLE=1`), two channels,
 and a 1 MiB buffer after a hosted A6000 pair showed a slow peer path. Explicit
