@@ -74,6 +74,17 @@ SHA256 values, respectively:
 `d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d`.
 This finite comparison does not establish long-context model quality.
 
+The staged host AllGather also passes exact data and graph replay checks on
+US-KS-2, including an 8 MiB + 13-byte transfer through 1 MiB ring slots. Eight
+non-peer CTests pass, including NCCL and host collectives; the peer test still
+rejects this host. Full 88-layer traces at batches 1 and 8 match the NCCL
+reference exactly after 256-token prefill and 32 decode steps.
+
+For a 448 MiB payload per rank on this host, uncaptured host-staged AllGather
+takes 103 ms versus 136 ms with NCCL. Small memcpy graphs have higher host launch
+overhead, so inference keeps transfers through 1 MiB on NCCL. This is an opt-in
+alternative; it does not establish the requested full-model throughput targets.
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

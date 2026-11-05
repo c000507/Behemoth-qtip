@@ -1,3 +1,4 @@
+#include "host_allgather.hpp"
 #include "peer_allgather.hpp"
 #include <iostream>
 #include <memory>
@@ -10,6 +11,7 @@ namespace cu = behemoth::cuda_runtime;
 namespace {
 class Collective {
     std::unique_ptr<cu::PeerAllGather> peer;
+    std::unique_ptr<cu::HostAllGather> host;
     std::array<cg::Stream, 2> streams;
 #if defined(BEHEMOTH_CUDA_FAST)
     std::array<ncclComm_t, 2> comms{};
@@ -19,7 +21,12 @@ class Collective {
     }
 #endif
   public:
-    Collective(std::array<int, 2> devices, std::array<cg::Stream, 2> s, bool small, bool nccl) : streams(s) {
+    Collective(std::array<int, 2> devices, std::array<cg::Stream, 2> s, bool small, bool nccl, bool staged)
+        : streams(s) {
+        if (staged) {
+            host = std::make_unique<cu::HostAllGather>(devices, streams, 1024 * 1024);
+            return;
+        }
 #if defined(BEHEMOTH_CUDA_FAST)
         if (nccl) {
             setenv("NCCL_P2P_DISABLE", "1", 0);
@@ -43,6 +50,10 @@ class Collective {
 #endif
     }
     void run(const std::array<const void *, 2> &send, const std::array<void *, 2> &receive, size_t bytes) {
+        if (host) {
+            host->run(send, receive, bytes);
+            return;
+        }
         if (peer) {
             peer->run(send, receive, bytes);
             return;
@@ -76,13 +87,13 @@ struct Rank {
         (void)cudaStreamDestroy(stream);
     }
 };
-void test(size_t bytes, bool kernel_small = true, bool nccl_mode = false) {
+void test(size_t bytes, bool kernel_small = true, bool nccl_mode = false, bool host_mode = false) {
     std::cout << "Testing peer AllGather bytes=" << bytes << " kernel=" << kernel_small
-              << " nccl=" << nccl_mode << std::endl;
+              << " nccl=" << nccl_mode << " host=" << host_mode << std::endl;
     std::array<std::unique_ptr<Rank>, 2> ranks;
     for (int r = 0; r < 2; ++r)
         ranks[r] = std::make_unique<Rank>(r, bytes);
-    Collective collective({0, 1}, {ranks[0]->stream, ranks[1]->stream}, kernel_small, nccl_mode);
+    Collective collective({0, 1}, {ranks[0]->stream, ranks[1]->stream}, kernel_small, nccl_mode, host_mode);
     auto work = [&] {
         // Repeated buffer reuse exercises both producer and consumer dependencies.
         for (int repeat = 0; repeat < 3; ++repeat) {
@@ -170,6 +181,13 @@ int main(int argc, char **argv) {
             (status == cg::success && count < 2))
             return 77;
         cg::checked(status, "peer test GPU discovery");
+        if (argc == 2 && std::string(argv[1]) == "--host") {
+            test(56 * 1024, false, false, true);
+            test(224 * 1024, false, false, true);
+            test(4099, false, false, true);
+            test(8 * 1024 * 1024 + 13, false, false, true);
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--nccl") {
             test(56 * 1024, false, true);
             test(224 * 1024, false, true);
@@ -188,7 +206,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc != 1)
-            throw std::runtime_error("Usage: behemoth_cuda_peer_tests [--dma|--nccl]");
+            throw std::runtime_error("Usage: behemoth_cuda_peer_tests [--dma|--nccl|--host]");
         test(56 * 1024);
         test(224 * 1024);
         test(4099);

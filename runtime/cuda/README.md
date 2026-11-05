@@ -169,6 +169,13 @@ data. Such a host is rejected before model loading; use `nccl` there. The fast
 build adds `cuda_nccl_collectives` to test exact rank data and graph replay through
 NCCL. Run `behemoth_cuda_peer_tests --dma` to isolate the peer DMA path.
 
+`BEHEMOTH_CUDA_TP_TRANSPORT=host` uses copy engines for transfers larger than
+1 MiB, pipelining D2H and H2D through two 16 MiB pinned slots per sender.
+Smaller decode transfers stay on NCCL to avoid multi-device memcpy graph launch
+overhead. This path requires no GPU peer access and reserves 64 MiB of host RAM.
+`cuda_host_collectives` checks exact data, ring-slot reuse, odd tails and graph
+replay; it can also be run with `behemoth_cuda_peer_tests --host`.
+
 ## Experimental QTIP split-K benchmark
 
 The Behemoth trellis GEMV can split each input reduction across independent CTAs.

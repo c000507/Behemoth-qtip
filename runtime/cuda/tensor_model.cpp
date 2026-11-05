@@ -2,6 +2,7 @@
 #include "batch_kernels.hpp"
 #include "behemoth/qtip.hpp"
 #include "fast_prefill.hpp"
+#include "host_allgather.hpp"
 #include "peer_allgather.hpp"
 #include <algorithm>
 #include <array>
@@ -250,7 +251,9 @@ struct TensorModel::Impl {
     std::vector<std::unique_ptr<Rank>> ranks;
     Event graph_join, graph_done;
     std::unique_ptr<PeerAllGather> peer_gather;
+    std::unique_ptr<HostAllGather> host_gather;
     bool peer_transport = false;
+    bool host_transport = false;
     bool peer_kernel = true;
     std::map<std::pair<int, int>, std::unique_ptr<Graph>> graphs;
     std::set<int> warmed_batches;
@@ -277,14 +280,20 @@ struct TensorModel::Impl {
         setenv("NCCL_BUFFSIZE", "1048576", 0);
         if (const char *value = std::getenv("BEHEMOTH_CUDA_TP_TRANSPORT")) {
             check(std::string(value) == "peer" || std::string(value) == "peer-dma" ||
-                      std::string(value) == "nccl",
-                  "BEHEMOTH_CUDA_TP_TRANSPORT must be peer, peer-dma or nccl");
-            peer_transport = std::string(value) != "nccl";
+                      std::string(value) == "host" || std::string(value) == "nccl",
+                  "BEHEMOTH_CUDA_TP_TRANSPORT must be peer, peer-dma, host or nccl");
+            peer_transport = std::string(value) == "peer" || std::string(value) == "peer-dma";
+            host_transport = std::string(value) == "host";
             peer_kernel = std::string(value) != "peer-dma";
         }
         for (int r = 0; r < tp; ++r)
             ranks.push_back(std::make_unique<Rank>(device + r, r, tp, context, max_batch));
         if (tp > 1) {
+            if (host_transport) {
+                host_gather = std::make_unique<HostAllGather>(
+                    std::array<int, 2>{device, device + 1},
+                    std::array<Stream, 2>{ranks[0]->stream, ranks[1]->stream});
+            }
             if (peer_transport) {
                 peer_gather = std::make_unique<PeerAllGather>(
                     std::array<int, 2>{device, device + 1},
@@ -405,7 +414,10 @@ struct TensorModel::Impl {
     template <class F> void gather(size_t n, ncclDataType_t dtype, F pointer) {
         if (tp == 1)
             return;
-        if (peer_transport) {
+        // Small graph transfers stay on NCCL: multi-device memcpy graph launch
+        // overhead outweighs copy-engine bandwidth for decode-sized payloads.
+        size_t wire_bytes = n * (dtype == ncclFloat ? sizeof(float) : 1);
+        if (peer_transport || (host_transport && wire_bytes > 1024 * 1024)) {
             check(dtype == ncclUint8 || dtype == ncclFloat, "Unsupported peer collective datatype");
             size_t bytes = n * (dtype == ncclFloat ? sizeof(float) : 1);
             std::array<const void *, 2> send;
@@ -415,7 +427,10 @@ struct TensorModel::Impl {
                 send[r.rank] = buffers.first;
                 receive[r.rank] = buffers.second;
             });
-            peer_gather->run(send, receive, bytes);
+            if (host_transport)
+                host_gather->run(send, receive, bytes);
+            else
+                peer_gather->run(send, receive, bytes);
             return;
         }
         nc(ncclGroupStart());
@@ -606,7 +621,9 @@ struct TensorModel::Impl {
                     {"tp", tp},
                     {"captured", false},
                     {"position", *std::max_element(position.begin(), position.end())},
-                    {"transport", peer_transport ? "peer" : "nccl"}};
+                    {"transport", host_transport   ? "host"
+                                  : peer_transport ? "peer"
+                                                   : "nccl"}};
         std::map<std::string, double> totals;
         for (size_t i = 1; i < decode_marks.size(); ++i) {
             float ms = 0;
