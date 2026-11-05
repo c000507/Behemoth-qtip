@@ -13,3 +13,7 @@ Use the quantization run's token order and batch size to reproduce its layer-zer
 The JSON reports direct relative SSE and RMSE beside `proxy` and `proxy_rot_reg`. These are projection measures; `kl_qtip` in `adaptive_report.json` measures the final next-token distribution after the candidate layer and all remaining original layers. Their numerical values are not interchangeable.
 
 No full-model activation buffer is allocated. This allows a targeted audit without another 68.7 GB activation chain for a 70B model. The tool audits layer zero only; later layers require their actual incoming activations.
+
+`--measure-ntok 16384` limits the direct projection sample while retaining the full `--ntok` covariance. The report also includes trellis fingerprints and an independent FP64 decode of V's packed payload compared with its GPU reconstruction.
+
+`--balance on` tests the equivalent coordinates `W' = W D`, `H' = D^-1 H D^-1`, with `D = (diag(H) / mean_rows(W^2))^(1/4)`. Candidate weights are transformed back before measuring projection errors. This is a diagnostic ablation, not a change to the production quantizer or an export of a balanced checkpoint. Evaluate whole-layer KL before adopting it: improving V can increase Q/K errors.
