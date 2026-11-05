@@ -85,6 +85,19 @@ takes 103 ms versus 136 ms with NCCL. Small memcpy graphs have higher host launc
 overhead, so inference keeps transfers through 1 MiB on NCCL. This is an opt-in
 alternative; it does not establish the requested full-model throughput targets.
 
+Final US-KS-2 measurements at source `b5108f2`, TP2, BF16 KV and 8192/256 tokens:
+
+| Transport | Batch | Warmup runs | Decode tok/s | Prefill tok/s |
+|---|---:|---:|---:|---:|
+| Host bulk staging, NCCL small transfers | 1 | 1 | 15.05 | 245.55 |
+| Host bulk staging, NCCL small transfers | 8 | 0 | 51.53 | 242.58 |
+
+The targets remain unmet. The same host's NCCL-only candidate runs measured
+14.15/51.59 decode tok/s and 193.23/199.23 prefill tok/s at batches 1/8 with
+zero warmups. These measurements should not be compared as a code regression
+against the earlier host's working peer transport. Exact timings, warmup counts,
+environment and numerical check hashes are in the [result artifact](results/a6000-us-ks-2.json).
+
 ## Historical A100 baseline — 2026-11-04
 
 The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K

@@ -1,0 +1,181 @@
+{
+  "source_commit": "b5108f26c9fa75c7f550f08474b70a75fc5603dc",
+  "model": {
+    "repository": "cgg507/Behemoth-R1-123B-v2-QTIP-2bit",
+    "revision": "fe6b677e7436c7b817f6f15670110352e679f93c",
+    "lfs_sha256_verified": 90
+  },
+  "hardware": {
+    "gpu": "NVIDIA RTX A6000",
+    "gpu_count": 2,
+    "vram_mib_per_gpu": 49140,
+    "location": "US-KS-2",
+    "driver": "595.91.07",
+    "topology": "PIX",
+    "nvlink": false
+  },
+  "build": {
+    "cuda": "12.4.131",
+    "architecture": 86,
+    "fast_backend": true,
+    "nccl": "2.21.5",
+    "cudnn": "9.1"
+  },
+  "measurements": [
+    {
+      "transport": "nccl",
+      "source_state": "pre-commit candidate; active compute kernels validated in 5ab6794",
+      "result": {
+        "batch": 1,
+        "decode_seconds": 18.085874041,
+        "decode_step_seconds_summary": {
+          "max": 0.697838468,
+          "median": 0.066580364,
+          "min": 0.066099865,
+          "p95": 0.067238081
+        },
+        "decode_tokens_per_second": 14.154693293763827,
+        "decode_tokens_per_sequence": 256,
+        "ignore_eos": true,
+        "kv_dtype": "BF16",
+        "prefill_seconds": 42.395905232,
+        "prefill_tokens_per_second": 193.2262079361561,
+        "prompt_tokens_per_sequence": 8192,
+        "tp": 2,
+        "warmup_runs": 0
+      }
+    },
+    {
+      "transport": "nccl",
+      "source_state": "pre-commit candidate; active compute kernels validated in 5ab6794",
+      "result": {
+        "batch": 8,
+        "decode_seconds": 39.695026713,
+        "decode_step_seconds_summary": {
+          "max": 0.798853628,
+          "median": 0.150409489,
+          "min": 0.148227491,
+          "p95": 0.153397063
+        },
+        "decode_tokens_per_second": 51.59336495242328,
+        "decode_tokens_per_sequence": 256,
+        "ignore_eos": true,
+        "kv_dtype": "BF16",
+        "prefill_seconds": 328.940769398,
+        "prefill_tokens_per_second": 199.23343682796914,
+        "prompt_tokens_per_sequence": 8192,
+        "tp": 2,
+        "warmup_runs": 0
+      }
+    },
+    {
+      "transport": "host (bulk staged, small NCCL)",
+      "source_state": "b5108f2",
+      "result": {
+        "batch": 1,
+        "decode_seconds": 17.005822074,
+        "decode_step_seconds_summary": {
+          "max": 0.067247787,
+          "median": 0.066392799,
+          "min": 0.065972436,
+          "p95": 0.066809735
+        },
+        "decode_tokens_per_second": 15.053668025340295,
+        "decode_tokens_per_sequence": 256,
+        "ignore_eos": true,
+        "kv_dtype": "BF16",
+        "prefill_seconds": 33.361758391,
+        "prefill_tokens_per_second": 245.5506062956788,
+        "prompt_tokens_per_sequence": 8192,
+        "tp": 2,
+        "warmup_runs": 1
+      }
+    },
+    {
+      "transport": "host (bulk staged, small NCCL)",
+      "source_state": "b5108f2",
+      "result": {
+        "batch": 8,
+        "decode_seconds": 39.743661009,
+        "decode_step_seconds_summary": {
+          "max": 0.90890506,
+          "median": 0.150221217,
+          "min": 0.147799495,
+          "p95": 0.151764944
+        },
+        "decode_tokens_per_second": 51.53023018026014,
+        "decode_tokens_per_sequence": 256,
+        "ignore_eos": true,
+        "kv_dtype": "BF16",
+        "prefill_seconds": 270.158889248,
+        "prefill_tokens_per_second": 242.5831708977726,
+        "prompt_tokens_per_sequence": 8192,
+        "tp": 2,
+        "warmup_runs": 0
+      }
+    }
+  ],
+  "validation": {
+    "passed_ctests": [
+      "core_correctness",
+      "structured_outputs",
+      "cuda_qtip_correctness",
+      "cuda_llama_correctness",
+      "cuda_batch_correctness",
+      "cuda_host_collectives",
+      "cuda_nccl_collectives",
+      "cuda_architecture_dispatch"
+    ],
+    "peer_test_failure": "Driver advertises peer access, but both GPU stores and peer DMA leave receiving sentinel bytes unchanged. Startup validation rejects these transports.",
+    "combined_kernel_traces": [
+      {
+        "batch": 1,
+        "prompt_tokens": 256,
+        "decode_steps": 32,
+        "max_abs_logit_difference": 0.0,
+        "identical_tokens": true,
+        "identical_traces": true,
+        "sha256": [
+          "d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f",
+          "d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f"
+        ]
+      },
+      {
+        "batch": 8,
+        "prompt_tokens": 256,
+        "decode_steps": 32,
+        "max_abs_logit_difference": 0.0,
+        "identical_tokens": true,
+        "identical_traces": true,
+        "sha256": [
+          "d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d",
+          "d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d"
+        ]
+      }
+    ],
+    "host_transport_traces": [
+      {
+        "batch": 1,
+        "identical_traces": true,
+        "sha256": [
+          "d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f",
+          "d08f611db878398c554b9e90589c0a6bfd98507039f1509a2b9c146036b5c27f"
+        ]
+      },
+      {
+        "batch": 8,
+        "identical_traces": true,
+        "sha256": [
+          "d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d",
+          "d50d5143ad342112a1ed81a875ddcecc1d62d8f4a3755d195852c3db59b3b25d"
+        ]
+      }
+    ]
+  },
+  "targets_met": false,
+  "limitations": [
+    "Fixed-length greedy throughput benchmark, not a model-quality assessment.",
+    "Batch throughput measures the native model API; the HTTP server serializes requests.",
+    "No Turing or AMD execution results from this host."
+  ]
+}
