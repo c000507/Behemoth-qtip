@@ -65,6 +65,10 @@ add_executable(qtip_quant src/main.cpp)
 target_link_libraries(qtip_quant PRIVATE qtip_gpu)
 target_compile_options(qtip_quant PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall)
 
+add_executable(qtip_qkv_audit tools/qkv_audit.cpp)
+target_link_libraries(qtip_qkv_audit PRIVATE qtip_gpu)
+target_compile_options(qtip_qkv_audit PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall)
+
 add_executable(qtip_tests_cpu tests/test_cpu.cpp)
 target_link_libraries(qtip_tests_cpu PRIVATE qtip_core)
 add_executable(qtip_fp8kv_tests tests/test_fp8kv.cpp)
