@@ -10,6 +10,12 @@ struct QtipMatrix {
     int in, out;
 };
 void initialize_tables();
+void qtip_prepare(QtipMatrix, const B16 *, float *scratch, B16 *rotated, Stream, int tokens = 1,
+                  bool rank_major = false);
+void qtip_multiply(QtipMatrix, const B16 *rotated, float *z, int stride, int splits, Stream, int tokens = 1);
+void qtip_finish(QtipMatrix, const float *z, B16 *, float *scratch, bool round_z, int splits, Stream,
+                 int tokens = 1, bool rank_major = false);
+void qtip_finish_b16(QtipMatrix, const B16 *, B16 *, float *scratch, int tokens, Stream, bool rank_major);
 // z requires out * splits floats; scratch and rotated keep their original sizes.
 // Split partials are reduced before the optional BF16 rounding of the rotated output.
 void qtip_forward(QtipMatrix, const B16 *, B16 *, float *scratch, B16 *rotated, float *z, bool round_z,

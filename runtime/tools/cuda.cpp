@@ -10,9 +10,9 @@ int main(int argc, char **argv) {
         std::map<std::string, std::string> a;
         for (int i = 1; i < argc; i += 2) {
             if (std::string(argv[i]) == "--help") {
-                std::cout
-                    << "behemoth_cuda --model DIR [--prompt TEXT | --messages CHAT.json | --tokens "
-                       "TOKENS.json] [--max-tokens 64] [--context 4096] [--device 0] [--trace TRACE.json]\n";
+                std::cout << "behemoth_cuda --model DIR [--prompt TEXT | --messages CHAT.json | --tokens "
+                             "TOKENS.json] [--max-tokens 64] [--context 4096] [--device 0] [--tp 1|2] "
+                             "[--trace TRACE.json]\n";
                 return 0;
             }
             check(i + 1 < argc && a.emplace(argv[i], argv[i + 1]).second, "Missing/duplicate argument");
@@ -20,7 +20,8 @@ int main(int argc, char **argv) {
         for (const auto &[k, v] : a) {
             (void)v;
             check(k == "--model" || k == "--prompt" || k == "--messages" || k == "--tokens" ||
-                      k == "--max-tokens" || k == "--context" || k == "--device" || k == "--trace",
+                      k == "--max-tokens" || k == "--context" || k == "--device" || k == "--trace" ||
+                      k == "--tp",
                   "Unknown argument " + k);
         }
         auto number = [&](const char *key, int fallback) {
@@ -68,17 +69,21 @@ int main(int argc, char **argv) {
             check(p >= 0 && size_t(p) < ids.size(), "Invalid trace position");
         if (a.contains("--trace"))
             check(!fs::exists(a.at("--trace")), "Trace output already exists");
-        Model model(a.at("--model"), device, context);
+        Model model(a.at("--model"), device, context, number("--tp", 1));
         Vec logits;
         std::map<int, Vec> captured;
         auto start = std::chrono::steady_clock::now();
-        for (size_t t = 0; t < ids.size(); ++t) {
-            logits = model.step(ids[t]);
-            if (a.contains("--trace") &&
-                std::find(positions.begin(), positions.end(), int(t)) != positions.end())
-                captured[int(t)] = logits;
-            std::cerr << "prefill " << t + 1 << '/' << ids.size() << '\n';
-        }
+        if (!a.contains("--trace")) {
+            logits = model.prefill(ids);
+            std::cerr << "prefill " << ids.size() << '/' << ids.size() << '\n';
+        } else
+            for (size_t t = 0; t < ids.size(); ++t) {
+                logits = model.step(ids[t]);
+                if (a.contains("--trace") &&
+                    std::find(positions.begin(), positions.end(), int(t)) != positions.end())
+                    captured[int(t)] = logits;
+                std::cerr << "prefill " << t + 1 << '/' << ids.size() << '\n';
+            }
         auto decode_start = std::chrono::steady_clock::now();
         bool first = true;
         int generated = 0;
