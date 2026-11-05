@@ -49,11 +49,11 @@ static std::vector<std::vector<float>> read_hess(const std::string& path) {
 Pipeline::Pipeline(const Options& o) : o_(o), st_(o.model), cfg_(load_model_config(o.model, &st_)), cache_(st_, cfg_, 4) {
   if (o_.layer_end < 0) o_.layer_end = cfg_.layers;
   if (o_.hess_dir.empty()) o_.hess_dir = o_.work + "/hess";
-  // BF16 sources (e.g. Llama 3.3) have no FP8 K/V to preserve: default to all-QTIP, reject an
-  // explicit --kv-format fp8.
+  // BF16 sources (e.g. Llama 3.x) default to all-QTIP; an explicit --kv-format fp8 converts K/V to FP8-Dynamic
+  // (per-output-channel bf16 scale) instead of quantizing them.
   if (cfg_.bf16_source) {
-    QCHECK(!o_.kv_explicit || !o_.fp8_kv, "--kv-format fp8 requires an FP8-Dynamic source; BF16 sources use qtip");
-    o_.fp8_kv = false;
+    if (!o_.kv_explicit) o_.fp8_kv = false;
+    cfg_.convert_kv_fp8 = o_.fp8_kv;
   }
   adaptive_ = o_.mode == "adaptive";
   QCHECK(!adaptive_ || (o_.kl_metric == "lmkl" || o_.kl_metric == "mse"), "--kl-metric must be lmkl or mse");
@@ -319,8 +319,11 @@ size_t Pipeline::write_layer_file(int L, const LayerHost& LH, const char* format
   for (int li = 0; li < kNumLin; ++li) {
     std::string b = pre + kLinName[li] + ".";
     if (o_.fp8_kv && (li == LK || li == LV)) {
-      w.add(b + "weight", "F8_E4M3", {LH.out_dim[li], LH.in_dim[li]}, LH.w[li].data(), LH.w[li].size());
-      w.add(b + "weight_scale", "BF16", {LH.out_dim[li]}, LH.sc[li].data(), LH.sc[li].size() * 2);
+      const auto& w8 = LH.bf16 ? LH.kv8_w[li] : LH.w[li];
+      const auto& sc = LH.bf16 ? LH.kv8_sc[li] : LH.sc[li];
+      QCHECK(!w8.empty() && sc.size() == size_t(LH.out_dim[li]), "missing FP8 K/V");
+      w.add(b + "weight", "F8_E4M3", {LH.out_dim[li], LH.in_dim[li]}, w8.data(), w8.size());
+      w.add(b + "weight_scale", "BF16", {LH.out_dim[li]}, sc.data(), sc.size() * 2);
       continue;
     }
     if (std::string(format) == "qtip") {
@@ -482,7 +485,11 @@ std::vector<uint16_t> Pipeline::adaptive_layer_forward(const std::shared_ptr<Lay
                                                        const std::vector<Nvfp4Tensor>* nv) {
   a_eval_->upload(*LH);  // originals first (also covers FP8-preserved K/V exactly)
   for (int li = 0; li < kNumLin; ++li) {
-    if (o_.fp8_kv && (li == LK || li == LV)) continue;
+    if (o_.fp8_kv && (li == LK || li == LV)) {
+      // BF16 sources: the candidate layer carries the dequantized FP8 K/V, not the original bf16
+      if (LH->bf16) a_eval_->upload_raw(li, LH->kv8_deq[size_t(li)].data());
+      continue;
+    }
     std::vector<uint16_t> w;
     if (qtip_out) {
       const std::vector<float>& h = (*qtip_out)[size_t(li)].hatW;
@@ -767,7 +774,10 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     chosen_.quantized = o_.adaptive_next_input == "quantized";
     chosen_.w.resize(kNumLin);
     for (int li = 0; chosen_.quantized && li < kNumLin; ++li) {
-      if (o_.fp8_kv && (li == LK || li == LV)) continue;  // preserved originals
+      if (o_.fp8_kv && (li == LK || li == LV)) {  // preserved: original FP8, or dequantized FP8 of a BF16 source
+        if (LH->bf16) chosen_.w[size_t(li)] = LH->kv8_deq[size_t(li)];
+        continue;
+      }
       if (nv)
         chosen_.w[size_t(li)] = bf16_copy(nvfp4_dequantize(nvs[size_t(li)]));
       else
