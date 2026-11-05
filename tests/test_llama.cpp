@@ -155,7 +155,7 @@ static LayerFile open_layer(const fs::path& out, int L) {
   return lf;
 }
 
-static void check_output(const fs::path& out, const std::string& tag, bool nvfp4) {
+static void check_output(const fs::path& out, const std::string& tag, bool nvfp4_all, const std::vector<bool>* per_layer_nvfp4 = nullptr) {
   json config = json::parse(std::ifstream(out / "config.json"));
   EXPECT(config["model_type"] == "llama" && config["quip_params"]["K"] == 2, "%s config", tag.c_str());
   EXPECT(config["rope_scaling"].is_object() && config["rope_scaling"]["rope_type"] == "llama3" &&
@@ -168,6 +168,7 @@ static void check_output(const fs::path& out, const std::string& tag, bool nvfp4
              fs::exists(out / "model-embed.safetensors"),
          "%s assembled files", tag.c_str());
   for (int L = 0; L < kLayers; ++L) {
+    const bool nvfp4 = per_layer_nvfp4 ? (*per_layer_nvfp4)[size_t(L)] : nvfp4_all;
     auto lf = open_layer(out, L);
     const std::string pre = "model.layers." + std::to_string(L) + ".";
     for (int li = 0; li < kNumLin; ++li) {
@@ -405,6 +406,35 @@ int main(int argc, char** argv) {
     check_output(o.out, "nvfp4", true);
     json cfg = json::parse(std::ifstream(fs::path(o.out) / "config.json"));
     for (auto& f : cfg["qtip_quant"]["layer_formats"]) EXPECT(f == "nvfp4", "all layers nvfp4");
+  }
+  std::printf("[adaptive] MIXED: threshold inside the observed per-layer KL range -> some layers QTIP, some NVFP4\n");
+  {
+    auto kls = metric_values(root / "adaptive-qtip", "kl_qtip");
+    std::vector<double> sorted = kls;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT(sorted.size() == size_t(kLayers) && sorted.front() < sorted.back(), "per-layer KLs must differ to place a threshold");
+    // layers with kl > threshold become NVFP4; the midpoint of the two smallest values is robust to run-to-run noise
+    const double thr = 0.5 * (sorted[0] + sorted[1]);
+    Options o = base_options(root, "adaptive-mixed", "adaptive");
+    o.kl_threshold = thr;
+    o.logit_tile = 96;
+    Pipeline p(o);
+    p.run();
+    json cfg = json::parse(std::ifstream(fs::path(o.out) / "config.json"));
+    json rep = json::parse(std::ifstream(fs::path(o.out) / "adaptive_report.json"));
+    std::vector<bool> nv;
+    int n_nv = 0;
+    for (int L = 0; L < kLayers; ++L) {
+      const bool expect_nv = kls[size_t(L)] > thr;
+      const std::string cf = cfg["qtip_quant"]["layer_formats"][size_t(L)];
+      const std::string rf = rep["layers"][size_t(L)]["format"];
+      std::printf("  layer %d kl_qtip %.6g -> %s (report %s)\n", L, kls[size_t(L)], cf.c_str(), rf.c_str());
+      EXPECT(cf == (expect_nv ? "nvfp4" : "qtip") && rf == cf, "layer %d format must follow kl_qtip > threshold", L);
+      nv.push_back(cf == "nvfp4");
+      n_nv += cf == "nvfp4";
+    }
+    EXPECT(n_nv > 0 && n_nv < kLayers, "mixed run must contain both formats (got %d NVFP4 of %d)", n_nv, kLayers);
+    check_output(o.out, "adaptive-mixed", false, &nv);
   }
   if (keep.empty()) fs::remove_all(root);
   std::printf(g_fail ? "LLAMA TESTS FAILED (%d)\n" : "ALL LLAMA TESTS PASSED\n", g_fail);

@@ -128,6 +128,7 @@ struct Geometry {
     double theta = 500000;
     bool llama3 = true;
     bool nvfp4_layer1 = false; // mixed adaptive-style checkpoint: layer 1 projections are NVFP4
+    bool mix_linears = false;  // QTIP and NVFP4 projections interleaved inside every layer (loader probes per linear)
     std::vector<int> eos{261, 264}; // <|end_of_text|>, <|eot_id|> of the synthetic tokenizer
     bool tokenizer = true;
 };
@@ -221,13 +222,16 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
         add_bf16(w, p + "post_attention_layernorm.weight", {g.hidden}, size_t(g.hidden), gen, 1, .1f);
         const bool fp4 = g.nvfp4_layer1 && l == 1;
         layer_formats.push_back(fp4 ? "nvfp4" : "qtip");
+        int linear_index = 0;
         for (const char *name : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
                                  "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}) {
             auto [in, out] = shape_of(g, name);
+            // per-linear mix: NVFP4 for odd (layer + linear) parity, so every layer has both formats
+            const bool fp4_here = g.mix_linears ? ((l + linear_index++) & 1) != 0 : fp4;
             // large q/k and o gains make attention (and therefore RoPE) dominate the logits
             const std::string n = name;
             const float gain = n == "self_attn.q_proj" || n == "self_attn.k_proj" ? 8.f : n == "self_attn.o_proj" ? 4.f : 1.f;
-            (fp4 ? add_nvfp4 : add_qtip)(w, p + name + ".", in, out, gen, gain);
+            (fp4_here ? add_nvfp4 : add_qtip)(w, p + name + ".", in, out, gen, gain);
         }
     }
     w.write((root / "model-00000.safetensors").string());
@@ -658,6 +662,11 @@ int main(int argc, char **argv) {
         mixed.nvfp4_layer1 = true;
         mixed.layers = 3;
         compare(write_checkpoint(tmp / "llama_mixed", mixed, 2), 16, "synthetic Llama QTIP+NVFP4 (adaptive layout)");
+        Geometry per_linear;
+        per_linear.mix_linears = true;
+        per_linear.layers = 3;
+        compare(write_checkpoint(tmp / "llama_mixed_linears", per_linear, 4), 16,
+                "synthetic Llama with QTIP and NVFP4 projections mixed inside each layer");
         Geometry plain;
         plain.llama3 = false;
         plain.theta = 1000000;
