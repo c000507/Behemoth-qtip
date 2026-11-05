@@ -1,7 +1,35 @@
-# CUDA execution validation — 2026-11-04
+# CUDA execution validation
 
-This report describes baseline commit `021c434`. The subsequent opt-in split-K
-kernel and expanded split-count tests have not yet been executed on a GPU.
+## RTX A6000 fast backend — 2026-11-05
+
+Two RTX A6000s on a RunPod US-TX-1 host, driver 595.91.07, CUDA 12.4.131,
+GCC 11.4, sm_86. The fast build uses NCCL 2.21.5 and cuDNN 9.1. There is no
+NVLink; the GPUs appear as NODE in the topology report.
+
+All six CTests pass: core, structured outputs, QTIP, batched kernels, peer
+collectives, and architecture dispatch. Batched projections are checked against
+the independent CPU reference, including factors 1/12/28, split reductions,
+rotated-output rounding, rank-major layouts, aliased buffers, and partial row
+and token tiles. Native decode GQA checks cache isolation and a group of twelve
+query heads sharing each KV head. cuDNN prefill checks strided query heads,
+causal masking, and unequal sequence lengths against high-precision attention
+(relative L2 0.0018332, maximum absolute error 0.00195312 for that fixture).
+
+The two-GPU peer test checks byte-exact AllGather with 56 KiB and 8 MiB per
+rank, repeated send-buffer reuse, and three graph replays with changing pinned
+host inputs. `cudaMemcpyPeerAsync` was rejected during capture; the implemented
+UVA `cudaMemcpyAsync` path passes both uncaptured and captured checks.
+
+The complete portable build also compiles for sm_75 and sm_80. Local CPU
+regressions pass; local GPU tests skip because that workspace has no GPU.
+This does not establish Turing execution, model quality, or the requested
+20/100/500 tok/s throughput targets. Full-model fast-path measurements and
+quality comparisons are still in progress.
+
+## Historical A100 baseline — 2026-11-04
+
+The following report describes baseline commit `021c434`. At the time of this baseline report, the subsequent opt-in split-K
+kernel and expanded split-count tests had not yet been executed on a GPU.
 RunPod could not restart the existing A100 pod because its host had no free GPUs.
 Do not attribute the execution results below to the experimental kernel.
 

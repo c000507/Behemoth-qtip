@@ -45,6 +45,24 @@ execution checks. CUDA 12.9 also compiles the QTIP kernels for sm_75. The kernel
 use integer BF16 storage and FP32 arithmetic, without requiring BF16 or FP8
 tensor-core instructions. Configure ROCm and CUDA in separate build directories.
 
+The optional Ampere fast backend adds NCCL TP2, batched decode, cuBLAS prefill,
+and cuDNN causal GQA. For two RTX A6000s, configure with:
+
+```sh
+cmake -S runtime -B runtime/build-cuda-fast -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBEHEMOTH_CUDA=ON -DBEHEMOTH_CUDA_FAST=ON \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DNCCL_ROOT=/path/to/nccl -DCUDNN_ROOT=/path/to/cudnn
+cmake --build runtime/build-cuda-fast -j8
+OMP_NUM_THREADS=8 ctest --test-dir runtime/build-cuda-fast --output-on-failure
+```
+
+NCCL/cuDNN roots contain `include` and `lib`; NVIDIA Python wheel directories
+are also supported. The build fetches pinned cuDNN frontend headers. This path
+currently requires the Behemoth geometry and FP8 K/V projection weights. GLM
+continues to use its existing single-GPU backend. Bulk fast prefill requires
+sm_80 or newer; use the default build for the Turing single-GPU path.
+
 ## Generate or serve either architecture
 
 ```sh
@@ -66,8 +84,9 @@ set `--max-tokens 0`.
 
 The HTTP server provides health/models/chat completions, stop strings, seeded
 temperature/top-k/top-p sampling, usage, SSE streaming, and `reasoning_content`.
-It resets sequence state between requests. Tool calls, structured outputs,
-batching, and tensor parallelism are not implemented in this CUDA server. It
+It resets sequence state between requests. The fast build accepts `--tp 2` for
+Behemoth and uses bulk prefill. Requests are still serialized; tool calls,
+structured outputs, and a continuous batching scheduler are not implemented. It
 binds to loopback by default; use SSH forwarding to access it remotely.
 
 ## Execution and validation limits
@@ -85,8 +104,37 @@ context allocation; a 32k cache adds about 9.6 GiB. An adaptive checkpoint with
 N NVFP4 layers adds roughly 1.3 GiB per NVFP4 layer over the all-QTIP size.
 
 GLM uses the [shared GLM kernels](../../glm53/README.md), with GPU attention and
-recurrent state and streamed large weights. Both backends currently replay
-prefill one token at a time and run one request on one GPU.
+recurrent state and streamed large weights. Its prefill replays tokens in order.
+
+The fast Behemoth backend shards QTIP rows in the rotated basis and KV heads
+between GPUs. It reconstructs the global output Hadamard transform after each
+projection. FP8 K/V scales apply after FP32 accumulation. Decode uses CUDA graphs
+and tiled GQA; prefill decodes one projection at a time into a BF16 cuBLAS
+workspace and uses cuDNN attention. Batch-8 prefill groups whole sequences to
+limit live activation memory. Activations and KV remain BF16.
+
+The native model API exposes `prefill_batch` and `step_batch` for batches up to
+eight. Measure actual TP2 execution, separately timing prefill and decode, with:
+
+```sh
+runtime/build-cuda-fast/behemoth_cuda_bench \
+  --model /models/Behemoth-R1-123B-v2-QTIP-2bit --tp 2 --batch 8 \
+  --prompt-tokens 8192 --decode-tokens 256 --warmup 1 --output batch8.json
+```
+
+Use `--batch 1` for single-sequence decode. The benchmark uses fixed lengths,
+ignores EOS, and reports aggregate batch throughput. Its batched model execution
+does not measure HTTP scheduler throughput. Set `BEHEMOTH_CUDA_GRAPHS=0` for an
+uncaptured comparison, or `BEHEMOTH_CUDA_PROFILE_PREFILL=profile.json` to record
+projection phase timings for the first prefill group.
+
+NCCL defaults to shared-memory transport (`NCCL_P2P_DISABLE=1`), two channels,
+and a 1 MiB buffer after a hosted A6000 pair showed a slow peer path. Explicit
+NCCL environment settings override these defaults; measure on your topology.
+On hosts with working CUDA peer access, set
+`BEHEMOTH_CUDA_TP_TRANSPORT=peer` to use copy-engine AllGather instead. Its tests
+check exact rank data, repeated buffer reuse, and cross-device graph replay.
+The default remains `nccl` because peer-copy performance varies greatly by host.
 
 ## Experimental QTIP split-K benchmark
 
@@ -115,8 +163,9 @@ The benchmark checks output differences against the unsplit path and reports
 CSV timings for q, gate and down projections (covering the three matrix shapes).
 It includes the input and output Hadamard transforms. Repeated isolated calls
 have different cache behavior from whole-model decoding: these timings cannot
-be presented as a tokens-per-second improvement. GPU correctness and performance
-of split-K are pending; compilation is not an execution check.
+be presented as a tokens-per-second improvement. Split-K and batched kernels
+have passed GPU reference checks on RTX A6000s. Changed FP32 summation order can
+change greedy output; these checks do not establish full-model quality.
 
 Attention-score scratch space is now reserved at model load to avoid device
 allocation/free at each new sequence length. This adds `96 * context * 4` bytes
