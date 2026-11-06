@@ -141,8 +141,24 @@ def main():
         inputs = example_inputs(R, Q, P, pages)
         kwargs = {}
         if len(sys.argv) < 7 or sys.argv[6] != '0':
-            kwargs['input_output_aliases'] = {inputs[ORDER.index('cache_k')]: 1, inputs[ORDER.index('cache_v')]: 2}
-        fn = lambda *a: paged_layer(R, Q, P, *a)
+            # state tensors of a Module are the only things torch_neuronx can alias input -> output
+            class Layer(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.register_buffer('cache_k', inputs[ORDER.index('cache_k')])
+                    self.register_buffer('cache_v', inputs[ORDER.index('cache_v')])
+
+                def forward(self, *rest):
+                    a = list(rest)
+                    a.insert(ORDER.index('cache_k'), self.cache_k)
+                    a.insert(ORDER.index('cache_v'), self.cache_v)
+                    return paged_layer(R, Q, P, *a)
+            fn = Layer()
+            kwargs['input_output_aliases'] = {fn.cache_k: 1, fn.cache_v: 2}
+            kwargs['inline_weights_to_neff'] = False
+            inputs = [t for k, t in zip(ORDER, inputs) if k not in ('cache_k', 'cache_v')]
+        else:
+            fn = lambda *a: paged_layer(R, Q, P, *a)
         meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'order': ORDER}
     else:
         S = int(sys.argv[3])
