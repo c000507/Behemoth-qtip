@@ -113,23 +113,23 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
 
 
 def e4m3_to_f32(codes):
-    """E4M3FN byte -> float32 with integer/float arithmetic only (no gather). Normals are
-    built by writing the rebiased exponent and mantissa into float32 bits; subnormals are
-    m * 2^-9. The NaN code (0x7f/0xff) is not produced by the quantizer and is not handled."""
+    """E4M3FN byte -> float32 with integer/float arithmetic only (no gather, no bitcast).
+    Normals are (8 + m) * 2^(e - 10) with the power of two from an integer shift; subnormals
+    (e == 0) are m * 2^-9. The NaN code (0x7f/0xff) is not produced by the quantizer."""
     b = codes.to(torch.int32)
     e = (b >> 3) & 15
     m = b & 7
-    normal = (((e + 120) << 23) | (m << 20)).view(torch.float32)
+    normal = (8 + m).to(torch.float32) * (1 << e).to(torch.float32) * (2.0 ** -10)
     value = torch.where(e == 0, m.to(torch.float32) * (2.0 ** -9), normal)
     return value * (1.0 - 2.0 * ((b >> 7) & 1).to(torch.float32))
 
 
 def e2m1_to_f32(codes):
-    """E2M1 nibble (0..15, bit 3 = sign) -> float32 via exponent/mantissa bit construction."""
+    """E2M1 nibble (0..15, bit 3 = sign) -> float32: normals (2 + m) * 2^(e - 2), subnormal m / 2."""
     b = codes.to(torch.int32)
     e = (b >> 1) & 3
     m = b & 1
-    normal = (((e + 126) << 23) | (m << 22)).view(torch.float32)
+    normal = (2 + m).to(torch.float32) * (1 << e).to(torch.float32) * 0.25
     value = torch.where(e == 0, m.to(torch.float32) * 0.5, normal)
     return value * (1.0 - 2.0 * ((b >> 3) & 1).to(torch.float32))
 
