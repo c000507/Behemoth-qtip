@@ -79,10 +79,21 @@ StructuredOutput parse_structured(const nlohmann::ordered_json &j) {
     }
     return out;
 }
+namespace {
+ChatBackend &backend() {
+    static ChatBackend b;
+    return b;
+}
+} // namespace
+void set_chat_backend(ChatBackend b) { backend() = std::move(b); }
+const std::string &model_name() {
+    static const std::string fallback = model_id;
+    return backend().model_id.empty() ? fallback : backend().model_id;
+}
 ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *ordered) {
     if (!j.is_object())
         throw std::invalid_argument("Request must be a JSON object");
-    if (j.value("model", std::string(model_id)) != model_id)
+    if (j.value("model", model_name()) != model_name())
         throw std::invalid_argument("Unknown model");
     if (j.value("n", 1) != 1)
         throw std::invalid_argument("Only n=1 is supported");
@@ -97,20 +108,24 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
     if (!messages.is_array() || messages.empty())
         throw std::invalid_argument("messages must be a nonempty array");
     ChatRequest r;
-    r.rendered = "<s>";
-    for (const auto &m : messages) {
-        std::string role = m.at("role").get<std::string>();
-        if (!m.at("content").is_string())
-            throw std::invalid_argument("Only text message content is supported");
-        auto text = m.at("content").get<std::string>();
-        if (role == "user")
-            r.rendered += "[INST] " + text + "[/INST]";
-        else if (role == "system")
-            r.rendered += "[SYSTEM_PROMPT] " + text + "[/SYSTEM_PROMPT]";
-        else if (role == "assistant")
-            r.rendered += " " + text + "</s>";
-        else
-            throw std::invalid_argument("Only system, user and assistant roles are supported");
+    if (backend().render) {
+        r.rendered = backend().render(messages);
+    } else {
+        r.rendered = "<s>";
+        for (const auto &m : messages) {
+            std::string role = m.at("role").get<std::string>();
+            if (!m.at("content").is_string())
+                throw std::invalid_argument("Only text message content is supported");
+            auto text = m.at("content").get<std::string>();
+            if (role == "user")
+                r.rendered += "[INST] " + text + "[/INST]";
+            else if (role == "system")
+                r.rendered += "[SYSTEM_PROMPT] " + text + "[/SYSTEM_PROMPT]";
+            else if (role == "assistant")
+                r.rendered += " " + text + "</s>";
+            else
+                throw std::invalid_argument("Only system, user and assistant roles are supported");
+        }
     }
     if (j.contains("max_tokens") && j.contains("max_completion_tokens"))
         throw std::invalid_argument("Specify one output-token limit");

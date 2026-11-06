@@ -64,7 +64,7 @@ class Session : public std::enable_shared_from_this<Session> {
             {"id", completion_id()},
             {"object", "chat.completion.chunk"},
             {"created", created_},
-            {"model", model_id},
+            {"model", model_name()},
             {"choices",
              {{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(reason)}}}}};
     }
@@ -192,7 +192,7 @@ class Session : public std::enable_shared_from_this<Session> {
                         json{{"id", completion_id()},
                              {"object", "chat.completion.chunk"},
                              {"created", created_},
-                             {"model", model_id},
+                             {"model", model_name()},
                              {"choices", json::array()},
                              {"usage", usage(event)}}
                             .dump() +
@@ -204,7 +204,7 @@ class Session : public std::enable_shared_from_this<Session> {
                     {{"id", completion_id()},
                      {"object", "chat.completion"},
                      {"created", created_},
-                     {"model", model_id},
+                     {"model", model_name()},
                      {"choices",
                       {{{"index", 0},
                         {"message", {{"role", "assistant"}, {"content", output_},
@@ -262,7 +262,7 @@ class Session : public std::enable_shared_from_this<Session> {
                     respond(http::status::ok,
                             {{"object", "list"},
                              {"data",
-                              {{{"id", model_id}, {"object", "model"}, {"owned_by", "cgg507"}}}}});
+                              {{{"id", model_name()}, {"object", "model"}, {"owned_by", "cgg507"}}}}});
                     return;
                 }
             }

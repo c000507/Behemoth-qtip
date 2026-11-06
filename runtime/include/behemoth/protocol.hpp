@@ -1,9 +1,20 @@
 #pragma once
 #include "scheduler.hpp"
+#include <functional>
 #include <nlohmann/json.hpp>
 
 namespace behemoth {
 inline constexpr const char *model_id = "cgg507/Behemoth-R1-123B-v2-aqlm";
+// Model-specific request handling for backends that do not serve the Behemoth/Mistral template: the id reported
+// and accepted in "model", and the renderer turning the chat messages into the prompt text. Unset (default):
+// model_id and the Mistral [INST] template above.
+struct ChatBackend {
+    std::string model_id;
+    std::function<std::string(const nlohmann::json &messages)> render;
+};
+void set_chat_backend(ChatBackend);
+const std::string &model_name(); // the id the server reports
+
 // 400 error that names the offending request parameter (OpenAI error "param").
 struct RequestError : std::invalid_argument {
     std::string param;
