@@ -229,7 +229,7 @@ def main():
     started = time.monotonic()
     graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs))
     compile_s = time.monotonic() - started
-    device = torch.device('neuron')
+    device = xm.xla_device()
     graph = torch_neuronx.move_trace_to_device(graph, device)
     tensors = [t.to(device) for t in inputs]
     print(f'compiled one-NEFF layer in {compile_s:.1f}s; {a.steps} decode steps', flush=True)
