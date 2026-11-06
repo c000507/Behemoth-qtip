@@ -114,3 +114,17 @@ Where the time goes: decode is ~1.0 ms per layer at one row and 1.6 ms at 8 rows
 `rows x pages x 16 KB x 2` per layer), so the bucket choice (fewest rows x pages that cover the step) matters more than launch
 overhead (a one-graph 30-layer step is only 7 % faster). Prefill at long context is bound by the bf16 flash loop (score tiles
 in f32 through the vector/scalar engines), not by the fp8 projections; an NKI fused flash kernel over paged KV is the next step.
+
+### Wide decode buckets (16 / 32 rows)
+
+Per-layer decode at one row is bound by the tensor engine streaming the 126 MB/rank of weights (neuron-profile: 0.65 ms of
+~1.0 ms), so single-stream latency has little left; aggregate throughput comes from more rows per launch. Gather cost is
+rows x table pages, so the page bucket must be tight (contexts ~420 tokens, 300 new each):
+
+| bucket | ITL p50 | aggregate |
+|---|---|---|
+| 8 rows x 128 pages (before) | 46.5 ms | ~170 tok/s |
+| 16 rows x 128 pages | 75 ms | 202 tok/s |
+| 32 rows x 128 pages | 164 ms | 172 tok/s |
+| 16 rows x 32 pages | 54 ms | 275 tok/s |
+| 32 rows x 32 pages | 68 ms | 381 tok/s |
