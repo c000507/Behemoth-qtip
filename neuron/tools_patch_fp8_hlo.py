@@ -26,7 +26,8 @@ def patch(message, src, dst, counter):
             counter[0] += 1
         elif field.type == field.TYPE_MESSAGE:
             value = getattr(message, field.name)
-            if field.label == field.LABEL_REPEATED:
+            repeated = field.is_repeated if hasattr(field, 'is_repeated') else field.label == field.LABEL_REPEATED
+            if repeated:
                 for item in value:
                     if hasattr(item, 'DESCRIPTOR'):
                         patch(item, src, dst, counter)
