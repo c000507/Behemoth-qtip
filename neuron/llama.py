@@ -118,11 +118,15 @@ class LlamaRunner:
             up = bf16(self.backend.linear(proj['mlp.up_proj'], normalized, round_z_bf16=True))
             act = bf16(run(swiglu, gate, up))
             state = bf16(state + bf16(self.backend.linear(proj['mlp.down_proj'], act)))
+            if not np.isfinite(state).all():
+                raise RuntimeError(f'Nonfinite activation in layer {layer}')
         normalized = bf16(self.backend.run(rms_norm, state, self.final_norm, self.eps))
         # The output head may be BF16; the tiled projection accepts either BF16 or FP8.
         if self.progress:
             self.progress('head', self.layers, self.layers)
         scores = self.backend.dense(self.head, normalized).reshape(-1)
+        if not np.isfinite(scores).all():
+            raise RuntimeError('Nonfinite output logits')
         self.position += 1
         return scores
 
