@@ -75,41 +75,43 @@ def build_layer(model, layer, seed=5):
 
 
 def layer_graph(x, slots, cos_sin, cache_k, cache_v,
-                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None):
+                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None):
+    """One Llama decode layer. heads/kvheads are the local counts (tensor parallel shards);
+    reduce, when given, all-reduces the row-parallel o_proj and down_proj partial sums."""
     lin = _lin or (lambda h, w: h @ w.T)
+    reduce = reduce or (lambda t: t)
     scale = DIM ** -0.5
     half = DIM // 2
     h = x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm1
     h = h.to(torch.bfloat16)
-    q = lin(h, qw).float().reshape(1, HEADS, DIM)
-    k = lin(h, kw).float().reshape(1, KVHEADS, DIM)
-    v = lin(h, vw).float().reshape(1, KVHEADS, DIM)
+    q = lin(h, qw).float().reshape(1, heads, DIM)
+    k = lin(h, kw).float().reshape(1, kvheads, DIM)
+    v = lin(h, vw).float().reshape(1, kvheads, DIM)
     row = torch.index_select(cos_sin, 0, slots)  # [B, 2, half]
     def rope(t, table, heads):
         cos = table[:, 0].reshape(1, 1, half).expand(1, heads, half)
         sin = table[:, 1].reshape(1, 1, half).expand(1, heads, half)
         a, b = t[..., :half], t[..., half:]
         return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1)
-    q = rope(q, row, HEADS)
-    k = rope(k, row, KVHEADS)
-    cache_k = cache_k.index_copy(1, slots, k.reshape(1, 1, KVHEADS, DIM))
-    cache_v = cache_v.index_copy(1, slots, v.reshape(1, 1, KVHEADS, DIM))
+    q = rope(q, row, heads)
+    k = rope(k, row, kvheads)
+    cache_k = cache_k.index_copy(1, slots, k.reshape(1, 1, kvheads, DIM))
+    cache_v = cache_v.index_copy(1, slots, v.reshape(1, 1, kvheads, DIM))
     heads_out = []
-    for head in range(HEADS):
-        kh = head // (HEADS // KVHEADS)
+    for head in range(heads):
+        kh = head // (heads // kvheads)
         keys = cache_k[0, :, kh]      # [context, dim]
         values = cache_v[0, :, kh]
         scores = (q[0, head] @ keys.T) * scale
         weights = torch.softmax(scores, dim=-1)
         heads_out.append(weights @ values)
-    attn = torch.stack(heads_out).reshape(1, HEADS, DIM)
-    attn = attn.reshape(1, HEADS * DIM).to(torch.bfloat16)
-    x = x + lin(attn, ow).float()
+    attn = torch.stack(heads_out).reshape(1, heads * DIM).to(torch.bfloat16)
+    x = x + reduce(lin(attn, ow).float())
     h = x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm2
     h = h.to(torch.bfloat16)
     gate = lin(h, gw)
     act = torch.nn.functional.silu(gate).float() * lin(h, uw).float()
-    x = x + lin(act.to(torch.bfloat16), dw).float()
+    x = x + reduce(lin(act.to(torch.bfloat16), dw).float())
     return x, cache_k, cache_v
 
 
@@ -210,25 +212,31 @@ def layer_graph_fp8(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        dec(kf, ks), dec(vf, vs), ow, dec(gf, gs), dec(uf, us), dec(df, ds))
 
 
+class Fp8Weight:
+    """1-byte E4M3 weight [out, in] with a per-output-row scale, consumed by an fp8 x fp8 matmul."""
+    def __init__(self, wf, sc):
+        self.wf, self.sc = wf, sc
+
+
+def fp8_linear(h, w):
+    """Scale the activation row into E4M3 range, run the matmul on the fp8 operands directly (no
+    weight cast in the graph), then apply activation and per-row weight scales to the output.
+    Compile after retargeting F8E4M3FN -> F8E4M3 (tools_patch_fp8_hlo.py)."""
+    a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+    h8 = (h.float() / a).to(torch.float8_e4m3fn)
+    y = torch.matmul(h8, w.wf.T)
+    return (y.float() * a * w.sc.reshape(1, -1)).to(torch.bfloat16)
+
+
+def lin_fp8(h, w):
+    return fp8_linear(h, w) if isinstance(w, Fp8Weight) else h @ w.T
+
+
 def layer_graph_fp8mm(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                       kf, ks, vf, vs, gf, gs, uf, us, df, ds):
-    """FP8 x FP8 matmuls (activation scaled into E4M3 range, per-row weight scale applied to the
-    output): no weight cast in the graph, the Tensor Engine consumes the fp8 weights directly.
-    Compile after retargeting F8E4M3FN -> F8E4M3 (tools_patch_fp8_hlo.py)."""
-    def fp8_linear(h, wf, sc):
-        a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
-        h8 = (h.float() / a).to(torch.float8_e4m3fn)
-        y = torch.matmul(h8, wf.T)
-        return (y.float() * a * sc.reshape(1, -1)).to(torch.bfloat16)
-    orig_matmul = torch.matmul
-    class W:  # adapter so layer_graph's `h @ w.T` calls pick the fp8 path
-        def __init__(self, wf, sc): self.wf, self.sc = wf, sc
-        @property
-        def T(self): return self
-    def lin(h, w):
-        return fp8_linear(h, w.wf, w.sc) if isinstance(w, W) else h @ w.T
     return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw,
-                       W(kf, ks), W(vf, vs), ow, W(gf, gs), W(uf, us), W(df, ds), _lin=lin)
+                       Fp8Weight(kf, ks), Fp8Weight(vf, vs), ow, Fp8Weight(gf, gs), Fp8Weight(uf, us),
+                       Fp8Weight(df, ds), _lin=lin_fp8)
 
 
 def to_rows(dense, kind):
