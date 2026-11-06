@@ -84,7 +84,7 @@ def flash_paged(q, cache_k, cache_v, table, pos, R, Q, P, kvh, rep):
     return acc / l.unsqueeze(-1)
 
 
-def paged_layer(R, Q, P, *args, inplace=False):
+def paged_layer(R, Q, P, *args):
     import torch_xla.core.xla_model as xm
     t = dict(zip(ORDER, args))
     allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(TP))])
@@ -105,20 +105,15 @@ def paged_layer(R, Q, P, *args, inplace=False):
     page = torch.bitwise_right_shift(t['wslot'], 4)
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
     at = (page[:, None], torch.arange(kvh, dtype=torch.int64, device=x.device)[None, :], off[:, None])
-    if inplace:  # module buffers: torch_neuronx (enable_aliasing) aliases the mutated state input -> output
-        cache_k, cache_v = t['cache_k'], t['cache_v']
-        cache_k.index_put_(at, k.to(torch.bfloat16))
-        cache_v.index_put_(at, v.to(torch.bfloat16))
-    else:
-        cache_k = t['cache_k'].index_put(at, k.to(torch.bfloat16))
-        cache_v = t['cache_v'].index_put(at, v.to(torch.bfloat16))
+    cache_k = t['cache_k'].index_put(at, k.to(torch.bfloat16))
+    cache_v = t['cache_v'].index_put(at, v.to(torch.bfloat16))
     attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache_k, cache_v, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
     x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm2']).to(torch.bfloat16)
     act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
     x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds')).float())
-    return x if inplace else (x, cache_k, cache_v)
+    return x, cache_k, cache_v
 
 
 def head_graph(S, x, rows, norm, w):
@@ -158,7 +153,9 @@ def main():
                     a = list(rest)
                     a.insert(ORDER.index('cache_k'), self.cache_k)
                     a.insert(ORDER.index('cache_v'), self.cache_v)
-                    return paged_layer(R, Q, P, *a, inplace=True)
+                    x, ck, cv = paged_layer(R, Q, P, *a)
+                    self.cache_k, self.cache_v = ck, cv  # mutated buffers: enable_aliasing makes them in-place
+                    return x
             fn = Layer()
             kwargs['enable_aliasing'] = True
             kwargs['inline_weights_to_neff'] = False
