@@ -36,16 +36,16 @@ def shapes(context):
     }
 
 
-def real_layer(*args, stop_after_attention=False):
+def real_layer(*args, stop_after_attention=False, debug=None):
     import torch_xla.core.xla_model as xm
     t = dict(zip(ORDER, args))
     allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(TP))])
     w = lambda a, b: Fp8Weight(t[a], t[b])
     out = layer_graph(t['x'], t['slots'], t['cos_sin'], t['cache_k'], t['cache_v'], t['norm1'], t['norm2'],
                        w('qf', 'qs'), w('kf', 'ks'), w('vf', 'vs'), w('of', 'os'), w('gf', 'gs'), w('uf', 'us'), w('df', 'ds'),
-                       _lin=lin_fp8, heads=HEADS // TP, kvheads=KVHEADS // TP, reduce=allreduce, mask=t['mask'], stop_after_attention=stop_after_attention)
-    if stop_after_attention:  # keep the (unused) MLP parameters in the graph so the input numbering stays the same
-        keep = sum(t[k].float().reshape(-1)[0] for k in ('gf', 'gs', 'uf', 'us', 'df', 'ds'))
+                       _lin=lin_fp8, heads=HEADS // TP, kvheads=KVHEADS // TP, reduce=allreduce, mask=t['mask'], stop_after_attention=stop_after_attention, debug=debug)
+    if stop_after_attention or debug:  # keep every parameter in the graph so the input numbering stays the same
+        keep = sum(t[k].float().reshape(-1)[0] for k in ORDER[8:]) + t['norm2'].reshape(-1)[0]
         out = (out[0] + 0.0 * keep, out[1], out[2])
     return out
 
@@ -61,7 +61,8 @@ def main():
         sample.append(torch.zeros(shape, dtype=dtype) if dtype != torch.float8_e4m3fn else torch.zeros(shape).to(dtype))
     try:
         import os
-        fn = (lambda *a: real_layer(*a, stop_after_attention=True)) if os.environ.get('STOP_AFTER_ATTENTION') else real_layer
+        stage = os.environ.get('DEBUG_STAGE')  # attn | v | attnout
+        fn = (lambda *a: real_layer(*a, stop_after_attention=(stage == 'attn'), debug=stage if stage in ('v', 'attnout') else None)) if stage else real_layer
         torch_neuronx.trace(fn, tuple(sample), compiler_workdir=workdir)
     except RuntimeError as error:
         if 'neuronx-cc failed' not in str(error):

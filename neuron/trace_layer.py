@@ -75,7 +75,7 @@ def build_layer(model, layer, seed=5):
 
 
 def layer_graph(x, slots, cos_sin, cache_k, cache_v,
-                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None, mask=None, stop_after_attention=False):
+                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None, mask=None, stop_after_attention=False, debug=None):
     """One Llama decode layer. heads/kvheads are the local counts (tensor parallel shards);
     reduce, when given, all-reduces the row-parallel o_proj and down_proj partial sums; mask, when given,
     is an additive [context] float vector (0 for valid cache slots, -1e9 for the rest)."""
@@ -96,6 +96,8 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1)
     q = rope(q, row, heads)
     k = rope(k, row, kvheads)
+    if debug == 'v':  # debugging: this rank's V projection, [1, kvheads * DIM]
+        return v.reshape(1, kvheads * DIM), cache_k, cache_v
     cache_k = cache_k.index_copy(1, slots, k.reshape(1, 1, kvheads, DIM))
     cache_v = cache_v.index_copy(1, slots, v.reshape(1, 1, kvheads, DIM))
     heads_out = []
@@ -109,6 +111,8 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         weights = torch.softmax(scores, dim=-1)
         heads_out.append(weights @ values)
     attn = torch.stack(heads_out).reshape(1, heads * DIM).to(torch.bfloat16)
+    if debug == 'attnout':  # debugging: attention output before o_proj, [1, heads * DIM]
+        return attn.float(), cache_k, cache_v
     x = x + reduce(lin(attn, ow).float())
     if stop_after_attention:  # debugging: residual stream after the attention block
         return x, cache_k, cache_v

@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     // CPU reference layer at position 0 (double precision): norms, projections through the format's own reference
     // (QTIP: reference_forward with device rounding, FP8: dequantized, NVFP4: dequantized), SiLU MLP. Attention over a
     // single cached key reduces to the value vector of each head's KV group.
-    std::vector<float> reference, reference_x1, reference_fp8w_x1;
+    std::vector<float> reference, reference_x1, reference_fp8w_x1, reference_v, reference_attn;
     {
         auto project = [&](const char *proj, const std::vector<float> &in_vec) -> std::vector<float> {
             const std::string base = "model.layers." + std::to_string(layer) + "." + proj + ".";
@@ -135,6 +135,8 @@ int main(int argc, char **argv) {
         std::vector<float> attn(static_cast<size_t>(heads * dim));
         for (int hd = 0; hd < heads; ++hd)
             for (int d = 0; d < dim; ++d) attn[size_t(hd * dim + d)] = vproj[size_t((hd / group) * dim + d)];
+        reference_v = vproj;
+        reference_attn = attn;
         const auto o = project("self_attn.o_proj", attn);
         std::vector<float> x1(x.size());
         for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
@@ -213,9 +215,7 @@ int main(int argc, char **argv) {
         auto add = [&](const void *p, size_t bytes) { ri.by_position.push_back({p, bytes}); };
         add(x.data(), x.size() * 4); add(&slot, 8); add(cos_sin.data(), cos_sin.size() * 4); add(mask.data(), mask.size() * 4);
         add(cache.data(), cache.size() * 4); add(cache.data(), cache.size() * 4);
-        const bool attn_only = argc > 5 && std::string(argv[5]) == "attn";  // norm2 is pruned from the attention-only graph
-        add(norm1.data(), norm1.size() * 4);
-        if (!attn_only) add(norm2.data(), norm2.size() * 4);
+        add(norm1.data(), norm1.size() * 4); add(norm2.data(), norm2.size() * 4);
         for (const char *k : {"q", "o", "k", "v", "g", "u", "d"}) {
             const auto &s = shards[k][size_t(r)];
             add(s.w.data(), s.w.size()); add(s.scale.data(), s.scale.size() * 4);
@@ -258,7 +258,11 @@ int main(int argc, char **argv) {
             }
         }
         check(nrt_execute(model, ins, outs), "nrt_execute");
-        if (r == 0) check(nrt_tensor_read(out0, result.data(), 0, result.size() * 4), "read");
+        if (r == 0) {
+            for (uint64_t i = 0; i < info->tensor_count; ++i)
+                if (std::string(info->tensor_array[i].name) == "output0") out0_bytes = info->tensor_array[i].size;
+            check(nrt_tensor_read(out0, result.data(), 0, std::min(result.size() * 4, out0_bytes)), "read");
+        }
         sync.arrive_and_wait();
         auto t1 = std::chrono::steady_clock::now();
         for (int i = 0; i < steps; ++i) check(nrt_execute(model, ins, outs), "nrt_execute");
@@ -270,6 +274,15 @@ int main(int argc, char **argv) {
     for (int r = 0; r < TP; ++r) threads.emplace_back(worker, r);
     for (auto &t : threads) t.join();
 
+    if (argc > 5 && (std::string(argv[5]) == "v" || std::string(argv[5]) == "attnout")) {  // compare rank 0's slice
+        const auto &ref = std::string(argv[5]) == "v" ? reference_v : reference_attn;
+        const size_t n = out0_bytes / 4;
+        double a = 0, b = 0, mx = 0;
+        for (size_t i = 0; i < n; ++i) { const double d = double(result[i]) - double(ref[i]); a += d * d; b += double(ref[i]) * double(ref[i]); mx = std::max(mx, std::fabs(d)); }
+        std::printf("{\"layer\":%d,\"stage\":\"%s\",\"relative_l2\":%.4f,\"max_abs\":%.4f,\"ref_rms\":%.4f}\n", layer, argv[5], std::sqrt(a / b), mx, std::sqrt(b / double(n)));
+        nrt_close();
+        return 0;
+    }
     if (argc > 5 && std::string(argv[5]) == "attn") {  // NEFF stops after attention: compare the residual stream there
         reference = reference_x1;
         reference_fp8w = reference_fp8w_x1;
