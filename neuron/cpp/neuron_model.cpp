@@ -551,8 +551,12 @@ struct NeuronModel::Impl {
                     put(pr.table, L.table.data(), L.table.size() * 8);
                     put(pr.rows, rows.data(), rows.size() * 8);
                     const auto t_uploaded = Clock::now();
-                    for (const auto &seg : b.segs)
+                    for (size_t g = 0; g < b.segs.size(); ++g) {
+                        const auto &seg = b.segs[g];
                         check(nrt_execute(seg.model[size_t(r)], seg.in[size_t(r)], seg.out[size_t(r)]), "whole-model execute");
+                        if (r == 0 && !seg.meta.head)
+                            dump_x(b, seg.first_layer + seg.meta.L, pr.x[(g + 1) % 2]);
+                    }
                     const auto t_executed = Clock::now();
                     out[size_t(r)].resize(size_t(b.meta.S) * size_t(vocab_half));
                     check(nrt_tensor_read(pr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
@@ -598,8 +602,11 @@ struct NeuronModel::Impl {
                 put(pr.wslot, L.wslot.data(), L.wslot.size() * 8);
                 put(pr.table, L.table.data(), L.table.size() * 8);
                 const auto t_uploaded = Clock::now();
-                for (int l = 0; l < layers; ++l)
+                for (int l = 0; l < layers; ++l) {
                     check(nrt_execute(b.model[size_t(r)], pr.in[size_t(l)][size_t(l % 2)], pr.out[size_t(l)][size_t(l % 2)]), "layer execute");
+                    if (r == 0)
+                        dump_x(b, l + 1, pr.x[size_t((l + 1) % 2)]);
+                }
                 const auto t_layers = Clock::now();
                 if (r == 0) {
                     phase_upload_ms += std::chrono::duration<double, std::milli>(t_uploaded - t_start).count();
@@ -626,6 +633,17 @@ struct NeuronModel::Impl {
                 std::copy_n(out[size_t(r)].data() + i * size_t(vocab_half), count, row + first);
             }
         }
+    }
+
+    // Debugging: NEURON_DUMP_X=prefix writes rank 0's residual stream (f32 [tokens][4096]) after layers 16 and 32 (when the
+    // execution passes there) to prefix.x16 / prefix.x32, from either execution path.
+    void dump_x(const LayerBucket &b, int layers_done, const Dev &x) {
+        const char *prefix = std::getenv("NEURON_DUMP_X");
+        if (!prefix || (layers_done != 16 && layers_done != 32))
+            return;
+        std::vector<float> v(size_t(b.tokens()) * 4096);
+        check(nrt_tensor_read(x.t, v.data(), 0, v.size() * 4), "read x");
+        std::ofstream(std::string(prefix) + ".x" + std::to_string(layers_done), std::ios::binary).write(reinterpret_cast<const char *>(v.data()), std::streamsize(v.size() * 4));
     }
 
     std::span<const float> forward(const InferenceBatch &batch) {
