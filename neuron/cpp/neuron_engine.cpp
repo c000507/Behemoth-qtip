@@ -101,9 +101,10 @@ struct Engine::Impl {
     uint64_t completed = 0, tokens = 0, steps = 0, drafted_tokens = 0, accepted_drafts = 0;
     double model_seconds = 0;
     nlohmann::json last_profile;
-    // prompt-lookup speculation: BEHEMOTH_NEURON_SPEC_TOKENS drafts per request (0 disables), only in steps of at
-    // most BEHEMOTH_NEURON_SPEC_REQUESTS decode requests, matching the last BEHEMOTH_NEURON_SPEC_NGRAM tokens
-    int spec_tokens = 0, spec_requests = 4, spec_ngram = 3, max_rows = 1;
+    // prompt-lookup speculation: up to BEHEMOTH_NEURON_SPEC_TOKENS drafts per request (0 disables), only in steps of at
+    // most BEHEMOTH_NEURON_SPEC_REQUESTS decode requests and BEHEMOTH_NEURON_SPEC_ROWS rows after drafting (the bucket a
+    // verify step may grow to), matching the last BEHEMOTH_NEURON_SPEC_NGRAM tokens
+    int spec_tokens = 0, spec_requests = 4, spec_rows = 8, spec_ngram = 3, max_rows = 1;
     Drafts drafts;
     std::thread thread;
 
@@ -127,6 +128,7 @@ struct Engine::Impl {
         max_rows = model.max_decode_rows();
         spec_tokens = std::min(env_int("BEHEMOTH_NEURON_SPEC_TOKENS", 7), max_rows - 1);
         spec_requests = env_int("BEHEMOTH_NEURON_SPEC_REQUESTS", 4);
+        spec_rows = std::min(env_int("BEHEMOTH_NEURON_SPEC_ROWS", 8), max_rows);
         spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
         thread = std::thread([this] { loop(); });
     }
@@ -191,15 +193,16 @@ struct Engine::Impl {
                 step = scheduler.schedule();
                 drafts.clear();
                 if (!step.requests.empty()) {
-                    // Draft only for small decode steps: rows are the cost of a decode bucket, and a wide step already
-                    // has rows to spare on throughput, not latency.
+                    // Draft only for small decode steps, and never past spec_rows rows in total: rows are the cost of a
+                    // decode bucket, and a wide step already has rows to spare on throughput, not latency.
                     int rows = int(step.requests.size());
-                    if (spec_tokens > 0 && rows <= spec_requests)
+                    const int budget = rows <= spec_requests ? std::min(spec_tokens, (spec_rows - rows) / rows) : 0;
+                    if (budget > 0)
                         for (const auto &s : step.requests) {
                             const auto &r = scheduler.request(s.id);
-                            if (s.count != 1 || !s.sample || s.begin + 1 + size_t(spec_tokens) > max_context)
+                            if (s.count != 1 || !s.sample || s.begin + 1 + size_t(budget) > max_context)
                                 continue;
-                            auto draft = prompt_lookup(r.history, std::min(spec_tokens, max_rows - rows), spec_ngram);
+                            auto draft = prompt_lookup(r.history, budget, spec_ngram);
                             if (!draft.empty() && scheduler.reserve(s.id, s.begin + 1 + draft.size())) {
                                 rows += int(draft.size());
                                 drafts[s.id] = std::move(draft);
