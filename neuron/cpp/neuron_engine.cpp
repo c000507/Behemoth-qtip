@@ -22,29 +22,59 @@
 #include <thread>
 
 namespace behemoth {
-InferenceBatch make_inference_batch(const Scheduler &scheduler, const ScheduledBatch &batch) {
+// Speculative decoding by prompt lookup (no draft model): a decode step of a request may carry draft tokens after
+// its scheduled token; the model computes logits for the scheduled token and every draft position in one launch
+// (rows of a decode bucket). Draft i is verified when the token sampled at row i - 1 equals it; the first mismatch
+// ends the run and the token sampled there is still exact, so every accepted token is distributed as in sequential
+// decoding (greedy output is identical). Drafts come from the most recent earlier occurrence of the last `ngram`
+// tokens of the history: the tokens that followed it. Cost: the step runs a wider bucket (R = rows + drafts).
+using Drafts = std::map<uint64_t, std::vector<int>>;
+
+std::vector<int> prompt_lookup(const std::vector<int> &history, int max_draft, int ngram = 3) {
+    const size_t len = history.size();
+    for (int n = std::min<int>(ngram, int(len) - 1); n >= 1 && max_draft > 0; --n)
+        for (size_t end = len - 1; end >= size_t(n); --end) { // end: index after a candidate match (latest first, not the suffix itself)
+            const size_t start = end - size_t(n);
+            if (std::equal(history.begin() + std::ptrdiff_t(start), history.begin() + std::ptrdiff_t(end), history.end() - n)) {
+                const size_t avail = std::min<size_t>(size_t(max_draft), len - end); // the tokens that followed the match
+                return std::vector<int>(history.begin() + std::ptrdiff_t(end), history.begin() + std::ptrdiff_t(end + avail));
+            }
+        }
+    return {};
+}
+
+InferenceBatch make_inference_batch(const Scheduler &scheduler, const ScheduledBatch &batch, const Drafts &drafts = {}) {
     InferenceBatch input;
     auto &l = input.layout;
     l.physical_pages = scheduler.capacity();
     l.query_offsets = {0};
     l.table_stride = 1;
-    for (const auto &step : batch.requests)
-        l.table_stride = std::max(l.table_stride, int(ceil_div(step.begin + step.count, 16)));
+    auto draft_of = [&](uint64_t id) -> const std::vector<int> * {
+        auto it = drafts.find(id);
+        return it == drafts.end() ? nullptr : &it->second;
+    };
+    for (const auto &step : batch.requests) {
+        const auto *d = draft_of(step.id);
+        l.table_stride = std::max(l.table_stride, int(ceil_div(step.begin + step.count + (d ? d->size() : 0), 16)));
+    }
     for (const auto &step : batch.requests) {
         const auto &r = scheduler.request(step.id);
-        l.lengths.push_back(int(step.begin + step.count));
-        for (size_t i = 0; i < step.count; ++i) {
-            input.tokens.push_back(r.history[step.begin + i]);
+        const auto *d = draft_of(step.id);
+        const size_t extra = d ? d->size() : 0, count = step.count + extra;
+        l.lengths.push_back(int(step.begin + count));
+        for (size_t i = 0; i < count; ++i) {
+            input.tokens.push_back(i < step.count ? r.history[step.begin + i] : (*d)[i - step.count]);
             l.positions.push_back(int(step.begin + i));
         }
         l.query_offsets.push_back(int(input.tokens.size()));
         size_t base = l.page_table.size();
         l.page_table.resize(base + size_t(l.table_stride), -1);
-        std::copy_n(r.pages.begin(), ceil_div(step.begin + step.count, 16), l.page_table.begin() + std::ptrdiff_t(base));
-        if (step.sample) {
-            input.sample_rows.push_back(int(input.tokens.size() - 1));
-            input.sample_ids.push_back(step.id);
-        }
+        std::copy_n(r.pages.begin(), ceil_div(step.begin + count, 16), l.page_table.begin() + std::ptrdiff_t(base));
+        if (step.sample) // the scheduled token's row and every draft row
+            for (size_t i = step.count - 1; i < count; ++i) {
+                input.sample_rows.push_back(int(input.tokens.size() - count + i));
+                input.sample_ids.push_back(step.id);
+            }
     }
     return input;
 }
@@ -63,10 +93,19 @@ struct Engine::Impl {
     std::set<uint64_t> cancellations;
     std::map<uint64_t, Clock::time_point> submitted, last_token;
     std::deque<double> ttft, itl;
-    uint64_t completed = 0, tokens = 0, steps = 0;
+    uint64_t completed = 0, tokens = 0, steps = 0, drafted_tokens = 0, accepted_drafts = 0;
     double model_seconds = 0;
     nlohmann::json last_profile;
+    // prompt-lookup speculation: BEHEMOTH_NEURON_SPEC_TOKENS drafts per request (0 disables), only in steps of at
+    // most BEHEMOTH_NEURON_SPEC_REQUESTS decode requests, matching the last BEHEMOTH_NEURON_SPEC_NGRAM tokens
+    int spec_tokens = 0, spec_requests = 4, spec_ngram = 3, max_rows = 1;
+    Drafts drafts;
     std::thread thread;
+
+    static int env_int(const char *name, int fallback) {
+        const char *v = std::getenv(name);
+        return v ? std::atoi(v) : fallback;
+    }
 
     static neuron::ModelOptions neuron_options(const RuntimeOptions &o) {
         neuron::ModelOptions m;
@@ -80,6 +119,10 @@ struct Engine::Impl {
     explicit Impl(const RuntimeOptions &o)
         : model(neuron_options(o)), scheduler(model.cache_pages(), o.token_budget, o.prefill_chunk, o.scheduler, model.vocab()),
           eos(model.eos().begin(), model.eos().end()), max_context(size_t(model.max_context())) {
+        max_rows = model.max_decode_rows();
+        spec_tokens = std::min(env_int("BEHEMOTH_NEURON_SPEC_TOKENS", 7), max_rows - 1);
+        spec_requests = env_int("BEHEMOTH_NEURON_SPEC_REQUESTS", 4);
+        spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
         thread = std::thread([this] { loop(); });
     }
     ~Impl() { shutdown(); }
@@ -141,8 +184,24 @@ struct Engine::Impl {
                     forget(id);
                 }
                 step = scheduler.schedule();
-                if (!step.requests.empty())
-                    input = make_inference_batch(scheduler, step);
+                drafts.clear();
+                if (!step.requests.empty()) {
+                    // Draft only for small decode steps: rows are the cost of a decode bucket, and a wide step already
+                    // has rows to spare on throughput, not latency.
+                    int rows = int(step.requests.size());
+                    if (spec_tokens > 0 && rows <= spec_requests)
+                        for (const auto &s : step.requests) {
+                            const auto &r = scheduler.request(s.id);
+                            if (s.count != 1 || !s.sample || s.begin + 1 + size_t(spec_tokens) > max_context)
+                                continue;
+                            auto draft = prompt_lookup(r.history, std::min(spec_tokens, max_rows - rows), spec_ngram);
+                            if (!draft.empty() && scheduler.reserve(s.id, s.begin + 1 + draft.size())) {
+                                rows += int(draft.size());
+                                drafts[s.id] = std::move(draft);
+                            }
+                        }
+                    input = make_inference_batch(scheduler, step, drafts);
+                }
             }
             deliver(events);
             if (step.requests.empty()) {
@@ -155,23 +214,28 @@ struct Engine::Impl {
                 const auto start = Clock::now();
                 const auto logits = model.forward(input);
                 const size_t vocab = size_t(model.vocab());
-                std::vector<int> sampled(step.requests.size(), -1);
+                // sampled[i]: the tokens of request i's rows (scheduled token, then one per draft row), in row order
+                std::vector<std::vector<int>> sampled(step.requests.size());
                 std::vector<size_t> logits_row(step.requests.size(), 0);
                 std::vector<size_t> sampling_steps;
                 for (size_t i = 0, row = 0; i < step.requests.size(); ++i)
                     if (step.requests[i].sample) {
-                        logits_row[i] = row++;
+                        logits_row[i] = row;
+                        auto d = drafts.find(step.requests[i].id);
+                        sampled[i].assign(1 + (d == drafts.end() ? 0 : d->second.size()), -1);
+                        row += sampled[i].size();
                         sampling_steps.push_back(i);
                     }
-                // Each row is an independent pass over 128k logits with its own RNG: spread them over threads.
+                // Each request is an independent pass over its rows of 128k logits with its own RNG: spread them over threads.
                 std::exception_ptr sampling_error;
                 std::mutex error_mutex;
 #pragma omp parallel for schedule(dynamic, 1)
                 for (long k = 0; k < long(sampling_steps.size()); ++k) {
                     const size_t i = sampling_steps[size_t(k)];
                     try {
-                        sampled[i] = sample_logits(logits.subspan(logits_row[i] * vocab, vocab), scheduler.request(step.requests[i].id).sampling,
-                                                   rng.at(step.requests[i].id));
+                        for (size_t j = 0; j < sampled[i].size(); ++j)
+                            sampled[i][j] = sample_logits(logits.subspan((logits_row[i] + j) * vocab, vocab),
+                                                          scheduler.request(step.requests[i].id).sampling, rng.at(step.requests[i].id));
                     } catch (...) {
                         std::lock_guard guard(error_mutex);
                         sampling_error = std::current_exception();
@@ -182,17 +246,14 @@ struct Engine::Impl {
                 std::lock_guard lock(mutex);
                 model_seconds += std::chrono::duration<double>(Clock::now() - start).count();
                 last_profile = model.last_profile();
-                if (std::getenv("BEHEMOTH_NEURON_STEP_LOG"))
-                    std::cerr << "step rows=" << step.requests.size() << " wall_ms="
-                              << std::chrono::duration<double, std::milli>(Clock::now() - start).count() << " " << last_profile.dump() << "\n";
                 ++steps;
+                size_t step_tokens = 0, step_drafts = 0;
                 for (size_t i = 0; i < step.requests.size(); ++i) {
                     const auto &request = step.requests[i];
-                    const int token = sampled[i];
-                    scheduler.complete(request, token, token >= 0 && eos.contains(token));
-                    const auto &after = scheduler.request(request.id);
-                    if (token >= 0) {
+                    auto emit = [&](int token) {
+                        const auto &after = scheduler.request(request.id);
                         ++tokens;
+                        ++step_tokens;
                         const auto now = Clock::now();
                         const bool later = last_token.contains(request.id);
                         (later ? itl : ttft).push_back(std::chrono::duration<double, std::milli>(now - (later ? last_token.at(request.id) : submitted.at(request.id))).count());
@@ -201,12 +262,31 @@ struct Engine::Impl {
                                 samples->pop_front();
                         last_token[request.id] = now;
                         events.push_back({callbacks.at(request.id), {request.id, token, false, "", "", after.prompt_size, after.generated, after.restored}});
+                    };
+                    const int token = sampled[i].empty() ? -1 : sampled[i][0];
+                    scheduler.complete(request, token, token >= 0 && eos.contains(token));
+                    if (token >= 0)
+                        emit(token);
+                    // verified drafts: row j's token was sampled after draft j - 1; it stands when that draft matched
+                    auto d = drafts.find(request.id);
+                    if (d != drafts.end()) {
+                        step_drafts += d->second.size();
+                        for (size_t j = 1; j < sampled[i].size() && !scheduler.request(request.id).done && sampled[i][j - 1] == d->second[j - 1]; ++j) {
+                            scheduler.accept(request.id, sampled[i][j], eos.contains(sampled[i][j]));
+                            emit(sampled[i][j]);
+                            ++accepted_drafts;
+                        }
                     }
+                    const auto &after = scheduler.request(request.id);
                     if (after.done) {
                         ++completed;
                         events.push_back({callbacks.at(request.id), {request.id, -1, true, after.reason, "", after.prompt_size, after.generated, after.restored}});
                     }
                 }
+                drafted_tokens += step_drafts;
+                if (std::getenv("BEHEMOTH_NEURON_STEP_LOG"))
+                    std::cerr << "step rows=" << step.requests.size() << " drafts=" << step_drafts << " tokens=" << step_tokens << " wall_ms="
+                              << std::chrono::duration<double, std::milli>(Clock::now() - start).count() << " " << last_profile.dump() << "\n";
                 for (const auto &request : step.requests)
                     if (scheduler.request(request.id).done)
                         forget(request.id);
@@ -278,6 +358,8 @@ nlohmann::json Engine::metrics() const {
             {"completed_requests", impl_->completed},
             {"generated_tokens", impl_->tokens},
             {"steps", impl_->steps},
+            {"drafted_tokens", impl_->drafted_tokens},
+            {"accepted_drafts", impl_->accepted_drafts},
             {"model_seconds", impl_->model_seconds},
             {"ttft_ms_p50", percentile(impl_->ttft, .5)},
             {"ttft_ms_p95", percentile(impl_->ttft, .95)},

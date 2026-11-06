@@ -83,6 +83,8 @@ struct Meta {
 
 // Layer NEFF input order after torch_neuronx moved the aliased KV state to the end.
 constexpr int kInputs = 22, kKvInput = 21;
+// Continuations of up to this many tokens run as rows of a decode bucket instead of a prefill chunk.
+constexpr int kRowPathTokens = 8;
 
 struct LayerWeights {
     Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, dim] bf16
@@ -802,12 +804,10 @@ struct NeuronModel::Impl {
         const auto &lay = batch.layout;
         const int scratch = pages_total - 1;
         logits.resize(batch.sample_rows.size() * size_t(vocab_)); // every sampled row is overwritten by execute()
-        // which request samples, and which logits row it owns
-        std::vector<int> sample_index(size_t(lay.requests()), -1);
-        for (size_t s = 0, req = 0; s < batch.sample_rows.size(); ++s) {
-            while (batch.sample_rows[s] >= lay.query_offsets[req + 1]) ++req;
-            sample_index[req] = int(s);
-        }
+        // which tokens sample, and which logits row each owns (several per request when drafts are verified)
+        std::vector<int> sample_of(size_t(lay.queries()), -1);
+        for (size_t s = 0; s < batch.sample_rows.size(); ++s)
+            sample_of[size_t(batch.sample_rows[s])] = int(s);
         auto pages_needed = [&](int req) { return (lay.lengths[size_t(req)] + PAGE - 1) / PAGE; };
         auto table_row = [&](Launch &L, int slot, int req) {
             const auto &b = *L.bucket;
@@ -839,18 +839,28 @@ struct NeuronModel::Impl {
                     best = &b;
             return best;
         };
-        std::vector<int> single, multi;
-        for (int req = 0; req < lay.requests(); ++req)
-            (lay.query_offsets[size_t(req) + 1] - lay.query_offsets[size_t(req)] == 1 ? single : multi).push_back(req);
         int launches = 0, max_rows = 0, max_queries = 0;
         for (const auto &b : decode) max_rows = std::max(max_rows, b.meta.R);
         for (const auto &b : prefill) max_queries = std::max(max_queries, b.meta.Q);
-        // decode rows (one token each): all of them in one launch when a bucket fits, else in groups of the largest R
-        for (size_t at = 0; at < single.size();) {
-            size_t n = single.size() - at;
+        // Rows of the decode launches: one-token requests, and short continuations (a decode token followed by draft
+        // tokens to verify, or the tail of a chunked prompt) as one row per token. The graph scatters every row's K/V
+        // before the attention, so a request's later rows attend to its earlier rows of the same launch.
+        struct Row { int req, token_index; };
+        std::vector<Row> rows;
+        std::vector<int> multi;
+        for (int req = 0; req < lay.requests(); ++req) {
+            const int first = lay.query_offsets[size_t(req)], count = lay.query_offsets[size_t(req) + 1] - first;
+            if (count == 1 || (count <= std::min(max_rows, kRowPathTokens) && lay.positions[size_t(first)] > 0))
+                for (int i = 0; i < count; ++i) rows.push_back({req, first + i});
+            else
+                multi.push_back(req);
+        }
+        // all rows in one launch when a bucket fits, else in groups of the largest R
+        for (size_t at = 0; at < rows.size();) {
+            size_t n = rows.size() - at;
             auto pages_of = [&](size_t count) {
                 int pages = 1;
-                for (size_t i = 0; i < count; ++i) pages = std::max(pages, pages_needed(single[at + i]));
+                for (size_t i = 0; i < count; ++i) pages = std::max(pages, pages_needed(rows[at + i].req));
                 return pages;
             };
             LayerBucket *bucket = pick(decode, int(n), 1, pages_of(n));
@@ -862,14 +872,14 @@ struct NeuronModel::Impl {
             }
             auto L = fresh(*bucket);
             for (size_t i = 0; i < n; ++i) {
-                const int req = single[at + i], token_index = lay.query_offsets[size_t(req)];
+                const int req = rows[at + i].req, token_index = rows[at + i].token_index;
                 const int position = lay.positions[size_t(token_index)];
                 const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / PAGE)];
                 fill_row(L, int(i), batch.tokens[size_t(token_index)], position, page);
                 table_row(L, int(i), req);
-                if (sample_index[size_t(req)] >= 0) {
+                if (sample_of[size_t(token_index)] >= 0) {
                     L.head_rows.push_back(int(i));
-                    L.destination.push_back(sample_index[size_t(req)]);
+                    L.destination.push_back(sample_of[size_t(token_index)]);
                 }
             }
             execute(L, logits.data());
@@ -892,9 +902,9 @@ struct NeuronModel::Impl {
                     fill_row(L, i, batch.tokens[size_t(token_index)], position, page);
                 }
                 table_row(L, 0, req);
-                if (done + take == count && sample_index[size_t(req)] >= 0) {
+                if (sample_of[size_t(first + done + take - 1)] >= 0) {
                     L.head_rows.push_back(take - 1);
-                    L.destination.push_back(sample_index[size_t(req)]);
+                    L.destination.push_back(sample_of[size_t(first + done + take - 1)]);
                 }
                 execute(L, logits.data());
                 ++launches;
@@ -917,6 +927,11 @@ NeuronModel::NeuronModel(const ModelOptions &o) : impl_(std::make_unique<Impl>(o
 NeuronModel::~NeuronModel() = default;
 int NeuronModel::cache_pages() const { return impl_->pages_total - 1; }
 int NeuronModel::vocab() const { return impl_->vocab_; }
+int NeuronModel::max_decode_rows() const {
+    int r = 0;
+    for (const auto &b : impl_->decode) r = std::max(r, b.meta.R);
+    return r;
+}
 const std::vector<int> &NeuronModel::eos() const { return impl_->config.eos; }
 int NeuronModel::max_context() const {
     int p = 0;

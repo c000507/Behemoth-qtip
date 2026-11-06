@@ -73,6 +73,11 @@ class Scheduler {
     void cancel(uint64_t id);
     ScheduledBatch schedule();
     void complete(const ScheduledRequest &, int sampled_token = -1, bool eos = false);
+    // Speculative decoding support. reserve: make the request's page table cover `tokens` tokens (so draft
+    // tokens past the scheduled one have KV slots); false when the pool cannot. accept: after complete(), append
+    // a token whose K/V the model already wrote in that step (a verified draft position), advancing `cached`.
+    bool reserve(uint64_t id, size_t tokens);
+    void accept(uint64_t id, int token, bool eos = false);
     const Request &request(uint64_t id) const {
         return requests_.at(id);
     }

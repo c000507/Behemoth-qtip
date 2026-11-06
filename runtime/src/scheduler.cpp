@@ -217,15 +217,28 @@ void Scheduler::complete(const ScheduledRequest &step, int token, bool eos) {
         throw std::invalid_argument("Invalid sampled token");
     r.cached += step.count;
     r.inflight = false;
-    if (step.sample) {
-        r.history.push_back(token);
-        ++r.generated;
-        if (eos || r.generated >= r.max_new || r.history.size() >= 131072) {
-            r.done = true;
-            r.reason = eos ? "stop" : "length";
-            if (!retain_finished_)
-                pool_.release(r.pages);
-        }
+    if (step.sample)
+        accept(step.id, token, eos);
+}
+bool Scheduler::reserve(uint64_t id, size_t tokens) {
+    auto &r = requests_.at(id);
+    return !r.done && grow(r.pages, tokens);
+}
+void Scheduler::accept(uint64_t id, int token, bool eos) {
+    auto &r = requests_.at(id);
+    if (token < 0 || token >= vocab_)
+        throw std::invalid_argument("Invalid accepted token");
+    if (r.done) // cancelled while in flight
+        return;
+    if (r.cached < r.history.size()) // a verified draft: its K/V position is already in the cache
+        ++r.cached;
+    r.history.push_back(token);
+    ++r.generated;
+    if (eos || r.generated >= r.max_new || r.history.size() >= 131072) {
+        r.done = true;
+        r.reason = eos ? "stop" : "length";
+        if (!retain_finished_)
+            pool_.release(r.pages);
     }
 }
 } // namespace behemoth
