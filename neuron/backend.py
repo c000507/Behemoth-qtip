@@ -39,6 +39,19 @@ def transform_tables(width, transpose):
     raise ValueError(f'Unsupported QTIP Hadamard dimension: {width}')
 
 
+@lru_cache(maxsize=16)
+def _wide_tables(p):
+    return hadamard_indices(p)
+
+
+@lru_cache(maxsize=16)
+def _mix_matrix(factor, transpose):
+    matrix = hadamard_matrix(factor)
+    if transpose:
+        matrix = matrix.T
+    return np.ascontiguousarray(matrix, dtype=np.float32).reshape(1, -1)
+
+
 class KernelBackend:
     def __init__(self, simulate=True, projection_chunk_rows=256, progress=None, cache_kernels=True):
         if projection_chunk_rows < 1:
@@ -52,12 +65,17 @@ class KernelBackend:
         self.progress = progress
         self.index = projection_indices()
         self.fp8_lut = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32).reshape(1, 256)
+        self.nvfp4_index = (np.arange(16, dtype=np.uint32) // 2).reshape(1, 16)
+        self.nvfp4_shifts = ((np.arange(16, dtype=np.uint32) % 2) * 4).reshape(1, 16)
+        positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
+        self.nvfp4_codebook = np.concatenate((positive, -positive)).reshape(1, 16)
+        self._dense_chunks = {}
 
-    def run(self, kernel, *args):
+    def run(self, kernel, *args, resident=()):
         if self.simulate:
             return nki.simulate(kernel)(*args)
         if self.kernel_cache is not None:
-            return self.kernel_cache.run(kernel, *args)
+            return self.kernel_cache.run(kernel, *args, resident=resident)
         return kernel(*args)
 
     def transform(self, x, scale, transpose, scale_before, round_bf16):
@@ -65,22 +83,19 @@ class KernelBackend:
         for factor in (28, 12):
             p = width // factor
             if width % factor == 0 and p >= 2 and not (p & (p - 1)):
-                partners, signs = hadamard_indices(p)
+                partners, signs = _wide_tables(p)
                 # Materialize the input by tensor scaling before indexed gathers;
                 # Trn1 can otherwise return incorrect output for a loaded tile.
                 input_scale = scale if scale_before else np.ones_like(scale)
                 inner = self.run(hadamard_chunks, x.reshape(1, -1), input_scale, partners, signs,
-                                 width, factor, batch, True)
-                matrix = hadamard_matrix(factor)
-                if transpose:
-                    matrix = matrix.T
-                matrix = np.ascontiguousarray(matrix, dtype=np.float32).reshape(1, -1)
+                                 width, factor, batch, True, resident=(2, 3))
+                matrix = _mix_matrix(factor, transpose)
                 return self.run(hadamard_mix, inner, scale, matrix, width, factor, batch,
-                                scale_before, round_bf16).reshape(batch, width)
+                                scale_before, round_bf16, resident=(2,)).reshape(batch, width)
         kernel, tables = transform_tables(width, transpose)
         if scale_before:
-            return self.run(kernel, x, scale, *tables, True, round_bf16)
-        unscaled = self.run(kernel, x, np.ones_like(scale), *tables, True, False)
+            return self.run(kernel, x, scale, *tables, True, round_bf16, resident=(2, 3, 4, 5))
+        unscaled = self.run(kernel, x, np.ones_like(scale), *tables, True, False, resident=(2, 3, 4, 5))
         return self.run(scale_rows, unscaled, scale, round_bf16)
 
     def linear(self, projection, x, round_z_bf16=False):
@@ -91,7 +106,8 @@ class KernelBackend:
                 raise ValueError('QTIP input width mismatch')
             transformed = self.transform(x, projection.su, True, True, True)
             rotated = self.run(project_rotated_loop, projection.trellis, projection.lut, *self.index,
-                               transformed.reshape(1, -1), width, projection.out // 32, batch)
+                               transformed.reshape(1, -1), width, projection.out // 32, batch,
+                               resident=(0, 1, 2, 3, 4, 5))
             z = rotated.reshape(batch, projection.out)
             if round_z_bf16:
                 z = bf16(z)
@@ -100,17 +116,15 @@ class KernelBackend:
             batch, width = x.shape
             if width != projection.width:
                 raise ValueError('NVFP4 input width mismatch')
-            ix = (np.arange(16, dtype=np.uint32) // 2).reshape(1, 16)
-            shifts = ((np.arange(16, dtype=np.uint32) % 2) * 4).reshape(1, 16)
-            positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
-            codebook = np.concatenate((positive, -positive)).reshape(1, 16)
             outputs = []
             for start in range(0, projection.out, self.projection_chunk_rows):
                 stop = min(start + self.projection_chunk_rows, projection.out)
                 rows = stop - start
-                partial = self.run(nvfp4_project_loop, projection.packed[start:stop].reshape(1,-1),
-                                   projection.scales[start:stop].view(np.uint8).reshape(1,-1), bf16(x).reshape(1,-1),
-                                   ix, shifts, codebook, self.fp8_lut, projection.global_scale, width, rows, batch)
+                packed, scales = self._nvfp4_chunk(projection, start, rows)
+                partial = self.run(nvfp4_project_loop, packed, scales, bf16(x).reshape(1, -1),
+                                   self.nvfp4_index, self.nvfp4_shifts, self.nvfp4_codebook, self.fp8_lut,
+                                   projection.global_scale, width, rows, batch,
+                                   resident=(0, 1, 3, 4, 5, 6))
                 outputs.append(partial.reshape(batch, rows))
                 if self.progress:
                     self.progress(stop, projection.out)
@@ -124,14 +138,48 @@ class KernelBackend:
             for start in range(0, out, self.projection_chunk_rows):
                 stop = min(start + self.projection_chunk_rows, out)
                 rows = stop - start
-                partial = self.run(fp8fn_project_loop, projection.weights[start:stop].view(np.uint8).reshape(1,-1),
-                                   projection.scale[start:stop].reshape(1,-1), bf16(x).reshape(1,-1),
-                                   self.fp8_lut, width, rows, batch)
+                weights, scale = self._fp8_chunk(projection, start, rows)
+                partial = self.run(fp8fn_project_loop, weights, scale, bf16(x).reshape(1, -1),
+                                   self.fp8_lut, width, rows, batch, resident=(0, 1, 3))
                 outputs.append(partial.reshape(batch, rows))
                 if self.progress:
                     self.progress(stop, out)
             return np.concatenate(outputs, axis=1)
         raise TypeError('Unsupported projection')
+
+    def _nvfp4_chunk(self, projection, start, rows):
+        chunks = getattr(projection, '_nvfp4_chunks', None)
+        if chunks is None:
+            chunks = projection._nvfp4_chunks = {}
+        chunk = chunks.get((start, rows))
+        if chunk is None:
+            chunk = (projection.packed[start:start+rows].reshape(1, -1).copy(),
+                     projection.scales[start:start+rows].view(np.uint8).reshape(1, -1).copy())
+            chunks[(start, rows)] = chunk
+        return chunk
+
+    def _fp8_chunk(self, projection, start, rows):
+        chunks = getattr(projection, '_fp8_chunks', None)
+        if chunks is None:
+            chunks = projection._fp8_chunks = {}
+        chunk = chunks.get((start, rows))
+        if chunk is None:
+            chunk = (projection.weights[start:start+rows].view(np.uint8).reshape(1, -1).copy(),
+                     projection.scale[start:start+rows].reshape(1, -1).copy())
+            chunks[(start, rows)] = chunk
+        return chunk
+
+    def _dense_chunk(self, weights, start, rows):
+        chunks = self._dense_chunks.get(id(weights))
+        if chunks is None or chunks[0] is not weights:
+            chunks = (weights, {})
+            self._dense_chunks[id(weights)] = chunks
+        chunk = chunks[1].get((start, rows))
+        if chunk is None:
+            chunk = (weights[start:start+rows].reshape(1, -1).copy(),
+                     np.ones((1, rows), np.float32))
+            chunks[1][(start, rows)] = chunk
+        return chunk
 
     def dense(self, weights, x):
         """Correctness-first BF16/F32 dense projection in bounded launches."""
@@ -143,8 +191,9 @@ class KernelBackend:
         for start in range(0, out, self.projection_chunk_rows):
             stop = min(start + self.projection_chunk_rows, out)
             rows = stop - start
-            partial = self.run(fp8_project_loop, weights[start:stop].reshape(1,-1),
-                               np.ones((1,rows), np.float32), bf16(x).reshape(1,-1), width, rows, batch)
+            chunk, ones = self._dense_chunk(weights, start, rows)
+            partial = self.run(fp8_project_loop, chunk, ones, bf16(x).reshape(1, -1),
+                               width, rows, batch, resident=(0, 1))
             outputs.append(partial.reshape(batch, rows))
         return np.concatenate(outputs, axis=1)
 

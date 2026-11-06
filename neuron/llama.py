@@ -65,7 +65,7 @@ class LlamaRunner:
         self.keys = [[] for _ in range(self.layers)]
         self.values = [[] for _ in range(self.layers)]
 
-    @lru_cache(maxsize=1)
+    @lru_cache(maxsize=None)
     def layer(self, layer):
         p = f'model.layers.{layer}.'
         c = self.checkpoint
