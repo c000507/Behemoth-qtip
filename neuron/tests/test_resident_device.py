@@ -36,4 +36,17 @@ same = cache.run(fp8fn_project_loop, copy, scale, x, lut, 64, 32, 1, resident=(0
 np.testing.assert_allclose(same, first, rtol=1e-6, atol=1e-6)
 assert len(cache._entries) == 1, 'same signature must reuse the compiled kernel'
 assert len(cache._resident) == 4, 'w1, w2, the copy and the lut get one resident tensor each'
+# Persisted NEFF cache: a fresh cache over the same directory must load the
+# manifest + NEFF without recompiling and reproduce the same values.
+import tempfile
+import nki_cache
+with tempfile.TemporaryDirectory() as directory:
+    persisted = KernelCache(cache_dir=directory)
+    np.testing.assert_allclose(persisted.run(fp8fn_project_loop, w1, scale, x, lut, 64, 32, 1, resident=(0, 1, 3)),
+                               first, rtol=1e-6, atol=1e-6)
+    reloaded = KernelCache(cache_dir=directory)
+    result = reloaded.run(fp8fn_project_loop, w1, scale, x, lut, 64, 32, 1, resident=(0, 1, 3))
+    assert isinstance(reloaded._entries[tuple(reloaded._entries)[0]].compiled,
+                      nki_cache._LoadedKernel), 'second cache must load the persisted NEFF'
+    np.testing.assert_allclose(result, first, rtol=1e-6, atol=1e-6)
 print('resident tensors track per-array weights correctly')

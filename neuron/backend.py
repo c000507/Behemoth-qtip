@@ -60,7 +60,8 @@ class KernelBackend:
         self.kernel_cache = None
         if not simulate and cache_kernels:
             from nki_cache import KernelCache
-            self.kernel_cache = KernelCache()
+            import os
+            self.kernel_cache = KernelCache(os.environ.get('NEURON_KERNEL_CACHE_DIR') or None)
         self.projection_chunk_rows = projection_chunk_rows
         self.progress = progress
         self.index = projection_indices()
