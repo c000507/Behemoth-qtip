@@ -231,18 +231,24 @@ def layer_graph_fp8mm(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        W(kf, ks), W(vf, vs), ow, W(gf, gs), W(uf, us), W(df, ds), _lin=lin)
 
 
-def to_fp8_rows(dense):
-    """bf16/f32 [out, in] -> (int8 [out, in], f32 scale [out]), symmetric per-row. neuronx-cc
-    rejects F8E4M3FN on TRN1/TRN2 (NCC_EVRF051) and its unsafe-cast flag is not accepted by
-    2.26/2.28, so 1-byte resident weights use int8 here."""
+def to_rows(dense, kind):
+    """bf16/f32 [out, in] -> (1-byte weights [out, in], f32 scale [out]), symmetric per row.
+    kind 'int8': torch.int8. kind 'fp8': torch.float8_e4m3fn, rows scaled to max 224 so no code
+    reaches the exponent-15 range (Trn1/Trn2 only support IEEE-style F8E4M3; the encodings are
+    identical below 240 and tools_patch_fp8_hlo.py retargets the graph type before compiling)."""
     d = dense.float().numpy()
-    scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 127.0
-    q = np.clip(np.rint(d / scale[:, None]), -127, 127).astype(np.int8)
-    return torch.from_numpy(q), torch.from_numpy(scale.astype(np.float32))
+    if kind == 'int8':
+        scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 127.0
+        q = np.clip(np.rint(d / scale[:, None]), -127, 127).astype(np.int8)
+        return torch.from_numpy(q), torch.from_numpy(scale.astype(np.float32))
+    scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 224.0
+    q = (d / scale[:, None]).astype(ml_dtypes.float8_e4m3fn)
+    return torch.from_numpy(q.view(np.uint8)).view(torch.float8_e4m3fn), torch.from_numpy(scale.astype(np.float32))
 
 
-def build_layer_fp8(model, layer):
+def build_layer_fp8(model, layer, kind='fp8'):
     w = build_layer(model, layer)
+    to_fp8_rows = lambda dense: to_rows(dense, kind)
     kf, ks = to_fp8_rows(w['kw']); vf, vs = to_fp8_rows(w['vw'])
     gf, gs = to_fp8_rows(w['gw']); uf, us = to_fp8_rows(w['uw']); df, ds = to_fp8_rows(w['dw'])
     return {'norm1': w['norm1'], 'norm2': w['norm2'], 'qw': w['qw'], 'ow': w['ow'],
@@ -305,7 +311,7 @@ def main():
     parser.add_argument('--warmup', type=int, default=8)
     parser.add_argument('--workdir', help='compiler workdir; keeps the generated NEFF and HLO for the C++ runtime harness')
     parser.add_argument('--compile-only', action='store_true', help='stop after compiling (no device run)')
-    parser.add_argument('--weights', choices=('bf16', 'lowbit', 'fp8', 'fp8mm'), default='bf16',
+    parser.add_argument('--weights', choices=('bf16', 'lowbit', 'int8', 'fp8', 'fp8mm'), default='bf16',
                         help='bf16: host-dequantized dense weights; lowbit: packed bytes resident, decoded in-graph')
     a = parser.parse_args()
     import torch_neuronx
@@ -313,9 +319,9 @@ def main():
 
     lowbit = a.weights == 'lowbit'
     fp8mm = a.weights == 'fp8mm'
-    fp8 = a.weights in ('fp8', 'fp8mm')
+    fp8 = a.weights in ('int8', 'fp8', 'fp8mm')
     weights = (build_layer_lowbit(a.model, a.layer) if lowbit else
-               build_layer_fp8(a.model, a.layer) if fp8 else build_layer(a.model, a.layer))
+               build_layer_fp8(a.model, a.layer, 'int8' if a.weights == 'int8' else 'fp8') if fp8 else build_layer(a.model, a.layer))
     sample = {
         'x': torch.randn(1, HIDDEN),
         'slots': torch.zeros(1, dtype=torch.int64),
