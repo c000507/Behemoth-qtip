@@ -6,6 +6,7 @@
 #include <nrt/nrt.h>
 #include <nrt/nrt_experimental.h>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -39,8 +40,11 @@ int main(int argc, char **argv) {
         } else { check(nrt_add_tensor_to_tensor_set(outs, t.name, dev), "out"); out = dev; }
     }
     check(nrt_execute(m, ins, outs), "execute");
+    // the graph returns bf16 [1, 16]
+    std::vector<uint16_t> raw(16);
+    check(nrt_tensor_read(out, raw.data(), 0, 16 * 2), "read");
     std::vector<float> y(16);
-    check(nrt_tensor_read(out, y.data(), 0, 16 * 4), "read");
+    for (int n = 0; n < 16; ++n) { uint32_t b = uint32_t(raw[size_t(n)]) << 16; std::memcpy(&y[size_t(n)], &b, 4); }
     std::printf("byte  ideal(256*decode_e4m3)   device    ratio\n");
     for (int n = 0; n < 16; ++n) {
         const double ideal = 256.0 * double(decode_e4m3(kBytes[n]));
