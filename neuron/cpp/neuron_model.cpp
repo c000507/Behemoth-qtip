@@ -76,6 +76,7 @@ struct LayerBucket {
     struct Seg {
         Meta meta;
         int first_layer = 0;
+        std::vector<int> layers; // layer index bound to each of the segment's L slots
         std::array<nrt_model_t *, TP> model{};
         std::array<nrt_tensor_set_t *, TP> in{}, out{};
     };
@@ -203,18 +204,38 @@ struct NeuronModel::Impl {
             int remaining = config.layers - (head ? head->L : 0);
             LayerBucket bucket;
             while (body && remaining >= body->L) {
-                bucket.segs.push_back({*body, 0, {}, {}, {}});
+                bucket.segs.push_back({*body, 0, {}, {}, {}, {}});
                 remaining -= body->L;
             }
             if (remaining != 0 || (!head && !body))
                 continue; // layer counts do not add up (a partial-depth probe graph)
             if (head)
-                bucket.segs.push_back({*head, 0, {}, {}, {}});
+                bucket.segs.push_back({*head, 0, {}, {}, {}, {}});
             int first = 0;
             const char *shift = std::getenv("NEURON_SEG_SHIFT"); // debugging: bind later segments to layers shifted by this
             for (size_t g = 0; g < bucket.segs.size(); ++g) {
                 bucket.segs[g].first_layer = first + (g > 0 && shift ? std::atoi(shift) : 0);
+                for (int i = 0; i < bucket.segs[g].meta.L; ++i)
+                    bucket.segs[g].layers.push_back(bucket.segs[g].first_layer + i);
                 first += bucket.segs[g].meta.L;
+            }
+            if (const char *map = std::getenv("NEURON_SEG_LAYERS")) { // debugging: "0-15;16-30,30" explicit layers per segment
+                const std::string text = map;
+                size_t g = 0;
+                for (size_t at = 0; at <= text.size() && g < bucket.segs.size(); ++g) {
+                    const size_t semi = std::min(text.find(';', at), text.size());
+                    std::string part = text.substr(at, semi - at);
+                    bucket.segs[g].layers.clear();
+                    for (size_t q = 0; q <= part.size();) {
+                        const size_t comma = std::min(part.find(',', q), part.size());
+                        const std::string item = part.substr(q, comma - q);
+                        const size_t dash = item.find('-');
+                        const int lo = std::stoi(item.substr(0, dash)), hi = dash == std::string::npos ? lo : std::stoi(item.substr(dash + 1));
+                        for (int l = lo; l <= hi; ++l) bucket.segs[g].layers.push_back(l);
+                        q = comma + 1;
+                    }
+                    at = semi + 1;
+                }
             }
             bucket.meta = head ? *head : *body;
             bucket.meta.L = config.layers;
@@ -323,13 +344,6 @@ struct NeuronModel::Impl {
             for (int r = 0; r < TP; ++r) {
                 auto &lw = ranks[size_t(r)].layers[size_t(layer)];
                 const auto &s = shards[size_t(r)];
-                if (r == 0 && std::getenv("NEURON_CHECK_FP8")) { // debugging: E4M3 codes with exponent 15 (inf/nan on trn1), scale range
-                    size_t bad = 0;
-                    for (uint8_t byte : s.w) bad += (byte & 0x78) == 0x78;
-                    float lo = 1e30f, hi = 0;
-                    for (float v : s.scale) { lo = std::min(lo, std::fabs(v)); hi = std::max(hi, std::fabs(v)); if (!std::isfinite(v)) bad += 1000000; }
-                    std::fprintf(stderr, "fp8check layer %d %s: exp15 codes %zu scale [%g, %g]\n", layer, p.name, bad, double(lo), double(hi));
-                }
                 lw.w[p.slot] = alloc(r, s.w.size(), p.name);
                 lw.w[p.slot + 1] = alloc(r, s.scale.size() * 4, p.name);
                 put(lw.w[p.slot], s.w.data(), s.w.size());
@@ -349,11 +363,9 @@ struct NeuronModel::Impl {
         for (int i = 0; i < std::max(1, options.load_threads); ++i)
             pool.emplace_back([&] {
                 for (;;) {
-                    int layer = next.fetch_add(1);
+                    const int layer = next.fetch_add(1);
                     if (layer >= config.layers)
                         return;
-                    if (std::getenv("NEURON_UPLOAD_REVERSE")) // debugging: allocate the last layer's tensors first
-                        layer = config.layers - 1 - layer;
                     try {
                         upload_layer(layer);
                     } catch (...) {
@@ -410,13 +422,12 @@ struct NeuronModel::Impl {
                         by_index.push_back(&ranks[size_t(r)].head_w);
                     }
                     std::vector<const Dev *> state;
-                    for (int l = seg.first_layer; l < seg.first_layer + seg.meta.L; ++l) {
+                    for (int l : seg.layers) {
                         const auto &lw = ranks[size_t(r)].layers[size_t(l)];
                         by_index.push_back(&lw.norm1);
                         by_index.push_back(&lw.norm2);
                         for (const auto &w : lw.w) by_index.push_back(&w);
-                        const bool swap = l == config.layers - 1 && std::getenv("NEURON_DEBUG_KV_OF_PREVIOUS"); // debugging only
-                        state.push_back(swap ? &ranks[size_t(r)].layers[size_t(l - 1)].kv : &lw.kv);
+                        state.push_back(&lw.kv);
                     }
                     by_index.insert(by_index.end(), state.begin(), state.end());
                     nrt_tensor_set_t *in = nullptr, *out = nullptr;
