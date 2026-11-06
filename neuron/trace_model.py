@@ -16,7 +16,7 @@ The KV tensors are aliased input -> output (updated in place on the device).
 
 Inputs (order == ORDER), per rank:
   x [T,H] f32 residual (replicated), cos_sin [T,2,64] f32 for the tokens' absolute positions (computed on the
-  host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache_k/cache_v,
+  host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache [pages,2,kv_heads,16,128],
   norms and the seven FP8 projections with per-row scales.
 
 usage: trace_model.py WORKDIR layer|head R Q P [aliases=1]
@@ -38,7 +38,7 @@ H, HEADS, KVHEADS, D, FF, VOCAB = 4096, 32, 8, 128, 14336, 128257
 VOCAB_PAD = (VOCAB + TP - 1) // TP * TP
 PAGE = 16
 KEY_BLOCK_PAGES = 32  # G: pages per flash block (512 keys)
-ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache_k', 'cache_v', 'norm1', 'norm2',
+ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
 
@@ -48,7 +48,7 @@ def shapes(R, Q, P, pages):
     return {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache_k': ((pages, KVHEADS // TP, PAGE, D), torch.bfloat16), 'cache_v': ((pages, KVHEADS // TP, PAGE, D), torch.bfloat16),
+        'cache': ((pages, 2, KVHEADS // TP, PAGE, D), torch.bfloat16),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
@@ -57,7 +57,7 @@ def shapes(R, Q, P, pages):
     }
 
 
-def flash_paged(q, cache_k, cache_v, table, pos, R, Q, P, kvh, rep):
+def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     G = min(KEY_BLOCK_PAGES, P)
     assert P % G == 0
@@ -71,7 +71,8 @@ def flash_paged(q, cache_k, cache_v, table, pos, R, Q, P, kvh, rep):
     inblock = torch.arange(G * PAGE, dtype=torch.int64, device=dev).reshape(1, 1, 1, 1, G * PAGE)
     for b in range(P // G):
         pages = table[:, b * G:(b + 1) * G]                      # [R,G]
-        kb, vb = cache_k[pages], cache_v[pages]                  # [R,G,kvh,16,D]
+        kv = cache[pages]                                        # [R,G,2,kvh,16,D]: K and V pages in one gather
+        kb, vb = kv[:, :, 0], kv[:, :, 1]                        # [R,G,kvh,16,D]
         s = torch.einsum('rqhad,rghtd->rqhagt', q, kb).float().reshape(R, Q, kvh, rep, G * PAGE) * scale
         s = torch.where(inblock + b * G * PAGE > qpos, torch.full_like(s, neg), s)
         m_new = torch.maximum(m, s.amax(dim=-1))
@@ -104,16 +105,16 @@ def paged_layer(R, Q, P, *args):
     q, k = rope(q), rope(k)
     page = torch.bitwise_right_shift(t['wslot'], 4)
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
-    at = (page[:, None], torch.arange(kvh, dtype=torch.int64, device=x.device)[None, :], off[:, None])
-    cache_k = t['cache_k'].index_put(at, k.to(torch.bfloat16))
-    cache_v = t['cache_v'].index_put(at, v.to(torch.bfloat16))
-    attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache_k, cache_v, t['table'], t['pos'], R, Q, P, kvh, rep)
+    at = (page[:, None, None], torch.arange(2, dtype=torch.int64, device=x.device)[None, :, None],
+          torch.arange(kvh, dtype=torch.int64, device=x.device)[None, None, :], off[:, None, None])
+    cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
+    attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
     x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm2']).to(torch.bfloat16)
     act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
     x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds')).float())
-    return x, cache_k, cache_v
+    return x, cache
 
 
 LAYER_WEIGHTS = ['norm1', 'norm2', 'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
@@ -129,14 +130,15 @@ def head_graph(S, x, rows, norm, w):
 
 class FullModel(torch.nn.Module):
     """All L layers plus the final norm / lm_head half as ONE graph. Inputs: SHARED, then LAYER_WEIGHTS per layer;
-    the 2L KV tensors are module state aliased input -> output (they follow the inputs, interleaved K, V)."""
+    the L KV tensors (K and V of a layer in one [pages, 2, kv_heads, 16, 128] tensor) are module state aliased input -> output.
+    Keeping the aliased tensors at one per layer matters: a graph with 64 aliased state tensors (32 layers x separate K, V) compiled
+    to wrong results, 62 did not."""
     def __init__(self, R, Q, P, L, S, pages):
         super().__init__()
         self.R, self.Q, self.P, self.L, self.S = R, Q, P, L, S
-        shape = (pages, KVHEADS // TP, PAGE, D)
+        shape = (pages, 2, KVHEADS // TP, PAGE, D)
         for i in range(L):
-            self.register_buffer(f'ck{i}', torch.zeros(shape, dtype=torch.bfloat16))
-            self.register_buffer(f'cv{i}', torch.zeros(shape, dtype=torch.bfloat16))
+            self.register_buffer(f'kv{i}', torch.zeros(shape, dtype=torch.bfloat16))
 
     def forward(self, *args):
         shared = dict(zip(SHARED, args[:len(SHARED)]))
@@ -145,10 +147,9 @@ class FullModel(torch.nn.Module):
         for i in range(self.L):
             t = dict(zip(LAYER_WEIGHTS, per_layer[i * len(LAYER_WEIGHTS):(i + 1) * len(LAYER_WEIGHTS)]))
             t.update(x=x, cos_sin=shared['cos_sin'], pos=shared['pos'], wslot=shared['wslot'], table=shared['table'],
-                     cache_k=getattr(self, f'ck{i}'), cache_v=getattr(self, f'cv{i}'))
-            x, ck, cv = paged_layer(self.R, self.Q, self.P, *[t[k] for k in ORDER])
-            setattr(self, f'ck{i}', ck)
-            setattr(self, f'cv{i}', cv)
+                     cache=getattr(self, f'kv{i}'))
+            x, cache = paged_layer(self.R, self.Q, self.P, *[t[k] for k in ORDER])
+            setattr(self, f'kv{i}', cache)
         return head_graph(self.S, x, shared['rows'], shared['head_norm'], shared['head_w'])
 
 
@@ -188,19 +189,16 @@ def main():
             class Layer(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
-                    self.register_buffer('cache_k', inputs[ORDER.index('cache_k')])
-                    self.register_buffer('cache_v', inputs[ORDER.index('cache_v')])
+                    self.register_buffer('cache', inputs[ORDER.index('cache')])
 
                 def forward(self, *rest):
                     a = list(rest)
-                    a.insert(ORDER.index('cache_k'), self.cache_k)
-                    a.insert(ORDER.index('cache_v'), self.cache_v)
-                    x, ck, cv = paged_layer(R, Q, P, *a)
-                    self.cache_k, self.cache_v = ck, cv  # mutated buffers: enable_aliasing makes them in-place
+                    a.insert(ORDER.index('cache'), self.cache)
+                    x, self.cache = paged_layer(R, Q, P, *a)  # mutated buffer: enable_aliasing makes it in-place
                     return x
             fn = Layer()
             kwargs['enable_aliasing'] = True
-            inputs = [t for k, t in zip(ORDER, inputs) if k not in ('cache_k', 'cache_v')]
+            inputs = [t for k, t in zip(ORDER, inputs) if k != 'cache']
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
         meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'order': ORDER}

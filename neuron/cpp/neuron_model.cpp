@@ -56,11 +56,10 @@ struct Meta {
 };
 
 // Layer NEFF input order after torch_neuronx moved the aliased KV state to the end.
-constexpr int kInputs = 23;
-enum In { X, COS_SIN, POS, WSLOT, TABLE, NORM1, NORM2, QF, QS, OF, OS, KF, KS, VF, VS, GF, GS, UF, US, DF, DS, CK, CV };
+constexpr int kInputs = 22, kKvInput = 21;
 
 struct LayerWeights {
-    Dev norm1, norm2, w[14], ck, cv; // w: qf qs of os kf ks vf vs gf gs uf us df ds
+    Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, 128] bf16
 };
 
 struct RankState {
@@ -203,15 +202,15 @@ struct NeuronModel::Impl {
                         if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
                             const auto &t = info->tensor_array[i];
                             const size_t index = std::stoul(std::string(t.name).substr(5));
-                            if (index == size_t(b.full() ? 8 + 16 * b.meta.L : int(CK))) {
-                                const int pages = int(t.size / size_t(kv_local * 16 * DIM * 2));
+                            if (index == size_t(b.full() ? 8 + 16 * b.meta.L : kKvInput)) {
+                                const int pages = int(t.size / size_t(2 * kv_local * 16 * DIM * 2));
                                 if (pages_total && pages != pages_total)
                                     throw std::runtime_error("layer NEFFs disagree on the page count");
                                 pages_total = pages;
                             }
                             ++ins;
                         }
- if (ins != (b.full() ? 8 + 18 * b.meta.L : kInputs))
+ if (ins != (b.full() ? 8 + 17 * b.meta.L : kInputs))
                         throw std::runtime_error("layer NEFF has " + std::to_string(ins) + " inputs, expected " + std::to_string(kInputs));
                     auto &pr = b.rank[size_t(r)];
                     const size_t T = size_t(b.tokens());
@@ -256,17 +255,15 @@ struct NeuronModel::Impl {
             auto a = file.floats(base + "input_layernorm.weight"), b = file.floats(base + "post_attention_layernorm.weight");
             for (size_t i = 0; i < 4096; ++i) { n1[i] = a[i]; n2[i] = b[i]; }
         }
-        std::vector<uint8_t> zeros(size_t(pages_total) * size_t(kv_local) * 16 * DIM * 2, 0);
+        std::vector<uint8_t> zeros(size_t(pages_total) * 2 * size_t(kv_local) * 16 * DIM * 2, 0);
         for (int r = 0; r < TP; ++r) {
             auto &lw = ranks[size_t(r)].layers[size_t(layer)];
             lw.norm1 = alloc(r, 4096 * 4, "norm1");
             lw.norm2 = alloc(r, 4096 * 4, "norm2");
             put(lw.norm1, n1.data(), 4096 * 4);
             put(lw.norm2, n2.data(), 4096 * 4);
-            lw.ck = alloc(r, zeros.size(), "cache_k");
-            lw.cv = alloc(r, zeros.size(), "cache_v");
-            put(lw.ck, zeros.data(), zeros.size());
-            put(lw.cv, zeros.data(), zeros.size());
+            lw.kv = alloc(r, zeros.size(), "kv_cache");
+            put(lw.kv, zeros.data(), zeros.size());
         }
         for (const auto &p : projs) {
             auto shards = load_projection_shards(file, layer, p.name, config, TP, p.col);
@@ -335,7 +332,7 @@ struct NeuronModel::Impl {
 
     void build_sets() {
         // Whole-model bucket: one tensor set. Inputs: step tensors + head, then 16 tensors per layer, then the 2L KV state
-        // tensors (K, V interleaved per layer); outputs: logits, then the same KV tensors (updated in place).
+        // tensors (one K/V tensor per layer); outputs: logits, then the same KV tensors (updated in place).
         auto build_full = [&](LayerBucket &b) {
             for (int r = 0; r < TP; ++r) {
                 auto &pr = b.rank[size_t(r)];
@@ -350,10 +347,8 @@ struct NeuronModel::Impl {
                     for (const auto &w : lw.w) by_index.push_back(&w);
                 }
                 std::vector<const Dev *> state;
-                for (int l = 0; l < b.meta.L; ++l) {
-                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].ck);
-                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].cv);
-                }
+                for (int l = 0; l < b.meta.L; ++l)
+                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].kv);
                 by_index.insert(by_index.end(), state.begin(), state.end());
                 nrt_tensor_set_t *in = nullptr, *out = nullptr;
                 check(nrt_allocate_tensor_set(&in), "set");
@@ -398,7 +393,7 @@ struct NeuronModel::Impl {
                         check(nrt_allocate_tensor_set(&out), "set");
                         const Dev *by_index[kInputs] = {&pr.x[p], &pr.cos_sin, &pr.pos, &pr.wslot, &pr.table, &lw.norm1, &lw.norm2,
                                                         &lw.w[0], &lw.w[1], &lw.w[2], &lw.w[3], &lw.w[4], &lw.w[5], &lw.w[6], &lw.w[7],
-                                                        &lw.w[8], &lw.w[9], &lw.w[10], &lw.w[11], &lw.w[12], &lw.w[13], &lw.ck, &lw.cv};
+                                                        &lw.w[8], &lw.w[9], &lw.w[10], &lw.w[11], &lw.w[12], &lw.w[13], &lw.kv};
                         int extra = 0;
                         for (uint64_t i = 0; i < info->tensor_count; ++i) {
                             const auto &t = info->tensor_array[i];
@@ -411,9 +406,9 @@ struct NeuronModel::Impl {
                                 check(nrt_add_tensor_to_tensor_set(in, t.name, by_index[index]->t), "add input");
                             } else if (name == "output0") {
                                 check(nrt_add_tensor_to_tensor_set(out, t.name, pr.x[1 - p].t), "add output");
-                            } else { // extra outputs: the updated KV state, written back into the same device buffers
-                                const Dev &kv = extra++ == 0 ? lw.ck : lw.cv;
-                                if (kv.bytes != t.size)
+                            } else { // the updated KV state, written back into the same device buffer
+                                const Dev &kv = lw.kv;
+                                if (extra++ != 0 || kv.bytes != t.size)
                                     throw std::runtime_error("unexpected extra output " + name);
                                 check(nrt_add_tensor_to_tensor_set(out, t.name, kv.t), "add kv output");
                             }
