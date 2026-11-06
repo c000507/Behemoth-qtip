@@ -36,7 +36,7 @@ same = cache.run(fp8fn_project_loop, copy, scale, x, lut, 64, 32, 1, resident=(0
 np.testing.assert_allclose(same, first, rtol=1e-6, atol=1e-6)
 assert len(cache._entries) == 1, 'same signature must reuse the compiled kernel'
 state = next(iter(cache._entries.values()))
-assert len(state.resident) == 4, 'w1, w2, the copy and the lut get one resident tensor each'
+assert len(state.resident) == 5, 'w1, w2, the copy, the shared scale and the lut get one resident tensor each'
 # Persisted NEFF cache: a fresh cache over the same directory must load the
 # manifest + NEFF without recompiling and reproduce the same values.
 import tempfile
