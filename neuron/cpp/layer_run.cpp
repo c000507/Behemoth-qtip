@@ -149,9 +149,17 @@ int main(int argc, char **argv) {
 
     // Second reference: the SAME FP8 shards the device uses, but bf16 activations and double accumulation (no activation
     // quantization, no graph). Separates weight-conversion error from activation-quantization / graph error.
-    std::vector<float> reference_fp8w;
-    {
-        auto project = [&](const char *key, bool col, const std::vector<float> &in_vec) {
+    std::vector<float> reference_fp8w, reference_fp8a;
+    for (int emulate_act = 0; emulate_act < 2; ++emulate_act) {
+        auto project = [&](const char *key, bool col, const std::vector<float> &in_vec0) {
+            std::vector<float> in_vec = in_vec0;
+            double act_scale = 1.0;
+            if (emulate_act) {  // per-row absmax / 224 into E4M3, as lin_fp8 does in the graph
+                float amax = 1e-20f;
+                for (float v : in_vec0) amax = std::max(amax, std::fabs(v));
+                act_scale = double(amax) / 224.0;
+                for (size_t i = 0; i < in_vec.size(); ++i) in_vec[i] = decode_e4m3(encode_e4m3(float(double(in_vec0[i]) / act_scale)));
+            }
             const auto &sh = shards[key];
             const int out = col ? sh[0].rows * TP : sh[0].rows, inw = col ? sh[0].cols : sh[0].cols * TP;
             std::vector<double> y(static_cast<size_t>(out), 0.0);
@@ -163,7 +171,7 @@ int main(int argc, char **argv) {
                         const int xi = col ? c : r * (inw / TP) + c;
                         acc += double(decode_e4m3(q.w[size_t(row) * size_t(q.cols) + size_t(c)])) * double(float(BFloat16(in_vec[size_t(xi)])));
                     }
-                    y[size_t(col ? r * (out / TP) + row : row)] += acc * double(q.scale[size_t(row)]);
+                    y[size_t(col ? r * (out / TP) + row : row)] += acc * double(q.scale[size_t(row)]) * (emulate_act ? act_scale : 1.0);
                 }
             }
             std::vector<float> yf(y.begin(), y.end());
@@ -191,8 +199,9 @@ int main(int argc, char **argv) {
         std::vector<float> act(gate.size());
         for (size_t i = 0; i < gate.size(); ++i) act[i] = float(double(gate[i]) / (1.0 + std::exp(-double(gate[i]))) * double(up[i]));
         const auto down = project("d", false, act);
-        reference_fp8w.resize(x.size());
-        for (size_t i = 0; i < x.size(); ++i) reference_fp8w[i] = x1[i] + down[i];
+        auto &dst = emulate_act ? reference_fp8a : reference_fp8w;
+        dst.resize(x.size());
+        for (size_t i = 0; i < x.size(); ++i) dst[i] = x1[i] + down[i];
     }
 
     // inputs per rank, in trace_layer_real.ORDER
@@ -263,16 +272,18 @@ int main(int argc, char **argv) {
         num += d * d; den += double(reference[size_t(i)]) * double(reference[size_t(i)]);
         maxabs = std::max(maxabs, std::fabs(d));
     }
-    double n2 = 0, d2 = 0, n3 = 0, rn = 0;
+    double n2 = 0, d2 = 0, n3 = 0, rn = 0, n4 = 0, n5 = 0;
     for (int i = 0; i < hidden; ++i) {
+        n4 += std::pow(double(reference_fp8a[size_t(i)]) - double(reference[size_t(i)]), 2);
+        n5 += std::pow(double(result[size_t(i)]) - double(reference_fp8a[size_t(i)]), 2);
         const double a = double(reference_fp8w[size_t(i)]) - double(reference[size_t(i)]);
         const double b = double(result[size_t(i)]) - double(reference_fp8w[size_t(i)]);
         n2 += a * a; n3 += b * b; d2 += double(reference[size_t(i)]) * double(reference[size_t(i)]);
         rn += double(x[size_t(i)]) * double(x[size_t(i)]);
     }
-    std::printf("{\"layer\":%d,\"device_vs_reference\":%.4f,\"fp8_weights_vs_reference\":%.4f,\"device_vs_fp8_weights\":%.4f,"
+    std::printf("{\"layer\":%d,\"device_vs_reference\":%.4f,\"fp8_weights_vs_reference\":%.4f,\"device_vs_fp8_weights\":%.4f,\"emulated_fp8_act_vs_reference\":%.4f,\"device_vs_emulated_fp8_act\":%.4f,"
                 "\"max_abs\":%.4f,\"input_rms\":%.3f,\"output_rms\":%.3f,\"ms_per_step\":%.3f}\n",
-                layer, std::sqrt(num / den), std::sqrt(n2 / d2), std::sqrt(n3 / d2), maxabs, std::sqrt(rn / hidden),
+                layer, std::sqrt(num / den), std::sqrt(n2 / d2), std::sqrt(n3 / d2), std::sqrt(n4 / d2), std::sqrt(n5 / d2), maxabs, std::sqrt(rn / hidden),
                 std::sqrt(d2 / hidden), std::max(seconds[0], seconds[1]) / steps * 1000.0);
     nrt_close();
     return 0;
