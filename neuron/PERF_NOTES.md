@@ -81,7 +81,8 @@ FP8 shards at load, FP8 k/v re-scaled), compared with a double-precision CPU lay
 
 The device error equals a CPU emulation of FP8 weights + per-row FP8 activations (layer 31: 4.57% vs 4.57%), i.e. it is
 the cost of the FP8 path itself. The residual stream dominates these outputs; error accumulation over 32 layers, longer
-contexts (RoPE positions > 0, multi-token KV) and end-to-end token quality are NOT measured yet.
+contexts (RoPE positions > 0, multi-token KV) and end-to-end token quality are measured in the next section (whole model against
+the CUDA runtime: top-1 22 / 22, mean KL 0.02, positions to 15k).
 
 ## Server path (trn1.2xlarge, TP=2, 8B adaptive QTIP/NVFP4, cFP8, paged bf16 KV; see SERVING.md)
 

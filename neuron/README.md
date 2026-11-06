@@ -1,5 +1,8 @@
 # Experimental Neuron inference path
 
+> The tensor-parallel, device-resident serving path (paged KV, flash attention, cFP8, the server's Engine and an HTTP
+> server) is documented in [SERVING.md](SERVING.md); the text below describes the earlier single-sequence NKI runner.
+
 This directory contains a correctness-first Llama runner using NKI 0.7 kernels.
 It reads indexed Behemoth QTIP checkpoints, including per-channel FP8 and
 adaptive NVFP4 projections, and supports one sequence with GQA, RoPE (including
