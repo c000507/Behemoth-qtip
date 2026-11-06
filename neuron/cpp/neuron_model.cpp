@@ -112,6 +112,7 @@ struct NeuronModel::Impl {
     std::vector<float> logits;
     std::vector<std::unique_ptr<RankWorker>> workers;
     nlohmann::json profile = nlohmann::json::object();
+    double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
 
     explicit Impl(const ModelOptions &o) : options(o), config(ModelConfig::read(o.model / "config.json")) {
         if (config.hidden != 4096 || config.intermediate != 14336 || config.q_heads != 32 || config.kv_heads != 8 || config.dim != DIM)
@@ -436,19 +437,28 @@ struct NeuronModel::Impl {
         for (int r = 0; r < TP; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
                 auto &pr = const_cast<LayerBucket &>(b).rank[size_t(r)];
+                const auto t_start = Clock::now();
                 put(pr.x[0], L.x.data(), L.x.size() * 4);
                 put(pr.cos_sin, L.cos_sin.data(), L.cos_sin.size() * 4);
                 put(pr.pos, L.pos.data(), L.pos.size() * 8);
                 put(pr.wslot, L.wslot.data(), L.wslot.size() * 8);
                 put(pr.table, L.table.data(), L.table.size() * 8);
+                const auto t_uploaded = Clock::now();
                 for (int l = 0; l < layers; ++l)
                     check(nrt_execute(b.model[size_t(r)], pr.in[size_t(l)][size_t(l % 2)], pr.out[size_t(l)][size_t(l % 2)]), "layer execute");
+                const auto t_layers = Clock::now();
+                if (r == 0) {
+                    phase_upload_ms += std::chrono::duration<double, std::milli>(t_uploaded - t_start).count();
+                    phase_layers_ms += std::chrono::duration<double, std::milli>(t_layers - t_uploaded).count();
+                }
                 if (head) {
                     auto &hr = const_cast<HeadBucket *>(head)->rank[size_t(r)];
                     put(hr.rows, rows.data(), rows.size() * 8);
                     check(nrt_execute(head->model[size_t(r)], hr.in.at(&b)[size_t(final_parity)], hr.out[size_t(final_parity)]), "head execute");
                     out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_half));
                     check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                    if (r == 0)
+                        phase_head_ms += ms_since(t_layers);
                 }
             }));
         for (auto &j : jobs)
@@ -466,6 +476,7 @@ struct NeuronModel::Impl {
 
     std::span<const float> forward(const InferenceBatch &batch) {
         const auto t0 = Clock::now();
+        phase_upload_ms = phase_layers_ms = phase_head_ms = 0;
         const auto &lay = batch.layout;
         const int scratch = pages_total - 1;
         logits.assign(batch.sample_rows.size() * size_t(vocab_), 0.f);
@@ -559,7 +570,7 @@ struct NeuronModel::Impl {
             for (auto id : batch.sample_ids)
                 ids << id << '\n';
         }
-        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"tokens", batch.tokens.size()}};
+        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms}, {"head_ms", phase_head_ms}, {"tokens", batch.tokens.size()}};
         return logits;
     }
 };
