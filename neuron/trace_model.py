@@ -116,11 +116,53 @@ def paged_layer(R, Q, P, *args):
     return x, cache_k, cache_v
 
 
+LAYER_WEIGHTS = ['norm1', 'norm2', 'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
+SHARED = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'rows', 'head_norm', 'head_w']
+
+
 def head_graph(S, x, rows, norm, w):
     """Final RMSNorm and this rank's vocab half of lm_head for S selected rows -> logits [S, VOCAB_PAD/2]."""
     x = torch.index_select(x, 0, rows)
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm).to(torch.bfloat16)
     return (h @ w.T).float()
+
+
+class FullModel(torch.nn.Module):
+    """All L layers plus the final norm / lm_head half as ONE graph. Inputs: SHARED, then LAYER_WEIGHTS per layer;
+    the 2L KV tensors are module state aliased input -> output (they follow the inputs, interleaved K, V)."""
+    def __init__(self, R, Q, P, L, S, pages):
+        super().__init__()
+        self.R, self.Q, self.P, self.L, self.S = R, Q, P, L, S
+        shape = (pages, KVHEADS // TP, PAGE, D)
+        for i in range(L):
+            self.register_buffer(f'ck{i}', torch.zeros(shape, dtype=torch.bfloat16))
+            self.register_buffer(f'cv{i}', torch.zeros(shape, dtype=torch.bfloat16))
+
+    def forward(self, *args):
+        shared = dict(zip(SHARED, args[:len(SHARED)]))
+        per_layer = args[len(SHARED):]
+        x = shared['x']
+        for i in range(self.L):
+            t = dict(zip(LAYER_WEIGHTS, per_layer[i * len(LAYER_WEIGHTS):(i + 1) * len(LAYER_WEIGHTS)]))
+            t.update(x=x, cos_sin=shared['cos_sin'], pos=shared['pos'], wslot=shared['wslot'], table=shared['table'],
+                     cache_k=getattr(self, f'ck{i}'), cache_v=getattr(self, f'cv{i}'))
+            x, ck, cv = paged_layer(self.R, self.Q, self.P, *[t[k] for k in ORDER])
+            setattr(self, f'ck{i}', ck)
+            setattr(self, f'cv{i}', cv)
+        return head_graph(self.S, x, shared['rows'], shared['head_norm'], shared['head_w'])
+
+
+def full_model_inputs(R, Q, P, L, S):
+    s = shapes(R, Q, P, 1)
+    T = R * Q
+    out = [torch.zeros(T, H), torch.zeros(T, 2, D // 2), torch.zeros(T, dtype=torch.int64), torch.zeros(T, dtype=torch.int64),
+           torch.zeros(R, P, dtype=torch.int64), torch.zeros(S, dtype=torch.int64), torch.ones(1, H),
+           torch.zeros(VOCAB_PAD // TP, H, dtype=torch.bfloat16)]
+    for _ in range(L):
+        for k in LAYER_WEIGHTS:
+            shape, dtype = s[k]
+            out.append(torch.zeros(shape).to(dtype) if dtype == torch.float8_e4m3fn else torch.zeros(shape, dtype=dtype))
+    return out
 
 
 def example_inputs(R, Q, P, pages):
@@ -162,6 +204,13 @@ def main():
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
         meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'order': ORDER}
+    elif kind == 'model':
+        R, Q, P, L, S = (int(a) for a in sys.argv[3:8])
+        pages = int(os.environ.get('PAGES', '64'))
+        fn = FullModel(R, Q, P, L, S, pages)
+        inputs = full_model_inputs(R, Q, P, L, S)
+        kwargs = {'enable_aliasing': True}
+        meta = {'kind': 'model', 'R': R, 'Q': Q, 'P': P, 'L': L, 'S': S, 'T': R * Q}
     else:
         S = int(sys.argv[3])
         T = int(os.environ.get('HEAD_ROWS', '256'))
