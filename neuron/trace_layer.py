@@ -91,13 +91,13 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1)
     q = rope(q, row, HEADS)
     k = rope(k, row, KVHEADS)
-    cache_k = cache_k.index_copy(0, slots, k.reshape(1, KVHEADS, DIM))
-    cache_v = cache_v.index_copy(0, slots, v.reshape(1, KVHEADS, DIM))
+    cache_k = cache_k.index_copy(1, slots, k.reshape(1, 1, KVHEADS, DIM))
+    cache_v = cache_v.index_copy(1, slots, v.reshape(1, 1, KVHEADS, DIM))
     attn = torch.zeros((1, HEADS, DIM), dtype=torch.float32)
     for head in range(HEADS):
         kh = head // (HEADS // KVHEADS)
-        keys = cache_k[:, kh]      # [context, dim]
-        values = cache_v[:, kh]
+        keys = cache_k[0, :, kh]      # [context, dim]
+        values = cache_v[0, :, kh]
         scores = (q[0, head] @ keys.T) * scale
         weights = torch.softmax(scores, dim=-1)
         attn[0, head] = weights @ values
