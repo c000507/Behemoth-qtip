@@ -65,7 +65,10 @@ int main(int argc, char** argv) {
         tensors.push_back(dev);
         if (t.usage == NRT_TENSOR_USAGE_INPUT) {
             std::vector<uint8_t> fill(t.size);
-            for (size_t k = 0; k < fill.size(); ++k) fill[k] = uint8_t((k * 2654435761u) >> 24) & 0x3f;
+            // Tiny tensors are the int64 slot/position index: keep it a valid index (0). Everything
+            // else gets small bytes (finite floats, valid packed codes).
+            if (t.size > 8)
+                for (size_t k = 0; k < fill.size(); ++k) fill[k] = uint8_t((k * 2654435761u) >> 24) & 0x3f;
             check(nrt_tensor_write(dev, fill.data(), 0, fill.size()), "nrt_tensor_write");
             check(nrt_add_tensor_to_tensor_set(inputs, t.name, dev), "add input");
             in_bytes += t.size;
