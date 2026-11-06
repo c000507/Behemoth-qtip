@@ -94,12 +94,57 @@ int main(int argc, char **argv) {
     const int64_t slot = 0;
     std::vector<float> cache(static_cast<size_t>(CONTEXT) * static_cast<size_t>(kvheads) * static_cast<size_t>(dim), 0.f);
 
-    // CPU reference (QTIP-correct layer block at position 0)
+    // CPU reference layer at position 0 (double precision): norms, projections through the format's own reference
+    // (QTIP: reference_forward with device rounding, FP8: dequantized, NVFP4: dequantized), SiLU MLP. Attention over a
+    // single cached key reduces to the value vector of each head's KV group.
     std::vector<float> reference;
     {
-        Checkpoint cp(root);
-        auto yb = qtip::reference_block(cp, layer, xb);
-        for (auto v : yb) reference.push_back(float(v));
+        auto project = [&](const char *proj, const std::vector<float> &in_vec) -> std::vector<float> {
+            const std::string base = "model.layers." + std::to_string(layer) + "." + proj + ".";
+            if (file.contains(base + "weight_packed")) {
+                const auto l = qtip::load_nvfp4_linear(file, layer, proj);
+                static const float e2m1[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+                std::vector<float> y(static_cast<size_t>(l.out));
+                for (int o = 0; o < l.out; ++o) {
+                    double acc = 0;
+                    for (int i = 0; i < l.in; ++i) {
+                        const uint8_t b = l.nvfp4_packed[size_t(o) * size_t(l.in / 2) + size_t(i / 2)];
+                        acc += double(float(BFloat16(in_vec[size_t(i)]))) * double(e2m1[(i & 1) ? (b >> 4) : (b & 15)]) *
+                               double(decode_e4m3(l.nvfp4_scales[size_t(o) * size_t(l.in / 16) + size_t(i / 16)]));
+                    }
+                    y[size_t(o)] = float(acc * double(l.nvfp4_global));
+                }
+                return y;
+            }
+            const auto l = file.contains(base + "trellis") ? qtip::load_linear(file, layer, proj, &config)
+                                                            : qtip::load_fp8_linear(file, layer, proj);
+            return qtip::reference_forward(l, in_vec, true, false);
+        };
+        auto rms = [&](const std::vector<float> &v, const std::vector<float> &w) {
+            double ss = 0;
+            for (float e : v) ss += double(e) * double(e);
+            const double inv_rms = 1.0 / std::sqrt(ss / double(v.size()) + double(config.epsilon));
+            std::vector<float> o(v.size());
+            for (size_t i = 0; i < v.size(); ++i) o[i] = float(double(v[i]) * inv_rms * double(w[i]));
+            return o;
+        };
+        const auto h = rms(x, norm1);
+        project("self_attn.q_proj", h);  // q unused at position 0 (single key), kept for symmetry of the data path
+        const auto vproj = project("self_attn.v_proj", h);
+        const int heads = config.q_heads, group = heads / config.kv_heads;
+        std::vector<float> attn(static_cast<size_t>(heads * dim));
+        for (int hd = 0; hd < heads; ++hd)
+            for (int d = 0; d < dim; ++d) attn[size_t(hd * dim + d)] = vproj[size_t((hd / group) * dim + d)];
+        const auto o = project("self_attn.o_proj", attn);
+        std::vector<float> x1(x.size());
+        for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
+        const auto h2 = rms(x1, norm2);
+        const auto gate = project("mlp.gate_proj", h2), up = project("mlp.up_proj", h2);
+        std::vector<float> act(gate.size());
+        for (size_t i = 0; i < gate.size(); ++i) act[i] = float(double(gate[i]) / (1.0 + std::exp(-double(gate[i]))) * double(up[i]));
+        const auto down = project("mlp.down_proj", act);
+        reference.resize(x.size());
+        for (size_t i = 0; i < x.size(); ++i) reference[i] = x1[i] + down[i];
     }
 
     // inputs per rank, in trace_layer_real.ORDER
