@@ -211,9 +211,10 @@ struct NeuronModel::Impl {
             if (head)
                 bucket.segs.push_back({*head, 0, {}, {}, {}});
             int first = 0;
-            for (auto &seg : bucket.segs) {
-                seg.first_layer = first;
-                first += seg.meta.L;
+            const char *shift = std::getenv("NEURON_SEG_SHIFT"); // debugging: bind later segments to layers shifted by this
+            for (size_t g = 0; g < bucket.segs.size(); ++g) {
+                bucket.segs[g].first_layer = first + (g > 0 && shift ? std::atoi(shift) : 0);
+                first += bucket.segs[g].meta.L;
             }
             bucket.meta = head ? *head : *body;
             bucket.meta.L = config.layers;
@@ -589,7 +590,17 @@ struct NeuronModel::Impl {
                 }
         if (!L.head_rows.empty() && !head)
             throw std::runtime_error("no head NEFF for " + std::to_string(L.head_rows.size()) + " rows of " + std::to_string(b.tokens()));
-        const int layers = config.layers, final_parity = (b.full() ? int(b.segs.size()) : layers) % 2;
+        int layers = config.layers;
+        if (!b.full() && std::getenv("NEURON_LAYER_ORDER")) { // debugging order: its length decides the final parity
+            layers = 0;
+            std::string text = std::getenv("NEURON_LAYER_ORDER");
+            for (size_t at = 0; at < text.size();) {
+                const size_t comma = std::min(text.find(',', at), text.size()), dash = text.find('-', at);
+                layers += std::stoi(text.substr(dash + 1, comma - dash - 1)) - std::stoi(text.substr(at, dash - at)) + 1;
+                at = comma + 1;
+            }
+        }
+        const int final_parity = (b.full() ? int(b.segs.size()) : layers) % 2;
         std::vector<int64_t> rows(head ? size_t(head->meta.S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
@@ -613,10 +624,24 @@ struct NeuronModel::Impl {
                             dump_x(b, seg.first_layer + seg.meta.L, pr.x[(g + 1) % 2]);
                     }
                 } else {
-                    for (int l = 0; l < layers; ++l) {
-                        check(nrt_execute(b.model[size_t(r)], pr.in[size_t(l)][size_t(l % 2)], pr.out[size_t(l)][size_t(l % 2)]), "layer execute");
+                    std::vector<int> order(size_t(layers));
+                    for (int l = 0; l < layers; ++l) order[size_t(l)] = l;
+                    if (const char *spec = std::getenv("NEURON_LAYER_ORDER")) { // debugging: run these layer ranges, "0-15,15-30"
+                        order.clear();
+                        std::string text = spec;
+                        for (size_t at = 0; at < text.size();) {
+                            const size_t comma = std::min(text.find(',', at), text.size());
+                            const std::string part = text.substr(at, comma - at);
+                            const size_t dash = part.find('-');
+                            for (int l = std::stoi(part.substr(0, dash)); l <= std::stoi(part.substr(dash + 1)); ++l) order.push_back(l);
+                            at = comma + 1;
+                        }
+                    }
+                    for (size_t step = 0; step < order.size(); ++step) {
+                        const size_t l = size_t(order[step]), parity = step % 2;
+                        check(nrt_execute(b.model[size_t(r)], pr.in[l][parity], pr.out[l][parity]), "layer execute");
                         if (r == 0)
-                            dump_x(b, l + 1, pr.x[size_t((l + 1) % 2)]);
+                            dump_x(b, int(step) + 1, pr.x[(step + 1) % 2]);
                     }
                 }
                 const auto t_layers = Clock::now();
@@ -651,7 +676,7 @@ struct NeuronModel::Impl {
     // execution passes there) to prefix.x16 / prefix.x32, from either execution path.
     void dump_x(const LayerBucket &b, int layers_done, const Dev &x) {
         const char *prefix = std::getenv("NEURON_DUMP_X");
-        if (!prefix || (layers_done != 16 && layers_done != 32))
+        if (!prefix || (layers_done != 16 && layers_done != 32 && layers_done != 31))
             return;
         std::vector<float> v(size_t(b.tokens()) * 4096);
         check(nrt_tensor_read(x.t, v.data(), 0, v.size() * 4), "read x");
