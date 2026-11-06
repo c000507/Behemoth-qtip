@@ -1,7 +1,8 @@
 // Drives behemoth::Engine (Neuron backend) with token-id requests from a JSON file, all submitted at once so the
 // scheduler batches them, and prints every request's generated tokens as JSON.
 //   requests.json: [{"tokens":[...], "max_new":16, "temperature":0, "top_k":0, "top_p":1, "seed":0, "cancel_after":N?}]
-//   neuron_engine_cli MODEL_DIR requests.json      (env BEHEMOTH_NEURON_NEFF_DIR=bucket dir)
+//   neuron_engine_cli MODEL_DIR requests.json [sequential]   (env BEHEMOTH_NEURON_NEFF_DIR=bucket dir)
+// `sequential` runs one request at a time (batch-invariance baseline).
 #include "behemoth/engine.hpp"
 #include <chrono>
 #include <condition_variable>
@@ -28,7 +29,12 @@ int main(int argc, char **argv) {
     std::map<uint64_t, size_t> index;
     std::vector<uint64_t> ids(requests.size());
     const auto start = std::chrono::steady_clock::now();
+    const bool sequential = argc > 3 && std::string(argv[3]) == "sequential";
     for (size_t i = 0; i < requests.size(); ++i) {
+        if (sequential) { // wait for everything submitted so far
+            std::unique_lock lock(mutex);
+            cv.wait(lock, [&] { return open == requests.size() - i; });
+        }
         const auto &r = requests[i];
         SamplingOptions s;
         s.temperature = r.value("temperature", 0.f);
