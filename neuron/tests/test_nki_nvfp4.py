@@ -7,7 +7,7 @@ import numpy as np
 import neuronxcc.nki as nki
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from nki_linear import nvfp4_linear, nvfp4_pack
+from nki_linear import nvfp4_linear, nvfp4_linear_lut, nvfp4_lut, nvfp4_pack
 
 rng = np.random.default_rng(7)
 K, N, B = 256, 512, 4
@@ -29,3 +29,9 @@ rel = np.linalg.norm(y - expected) / np.linalg.norm(expected)
 print(f'relative_l2={rel:.3e}')
 assert rel < 5e-3, 'NVFP4 NKI kernel does not match the reference'
 print('NVFP4 NKI kernel matches (simulator)')
+
+y2 = nki.simulate_kernel(nvfp4_linear_lut, np.ascontiguousarray(x.T), wp, sce, sco, ex, nvfp4_lut())
+rel2 = np.linalg.norm(y2 - expected) / np.linalg.norm(expected)
+print(f'lut variant relative_l2={rel2:.3e}')
+assert rel2 < 8e-3, 'NVFP4 LUT NKI kernel does not match the reference'
+print('NVFP4 LUT NKI kernel matches (simulator)')
