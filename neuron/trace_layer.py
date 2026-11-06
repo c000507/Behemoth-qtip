@@ -202,21 +202,21 @@ def qtip_linear(x, su, sv, trellis, tlut, out, width):
 
 def layer_graph_fp8(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                     kf, ks, vf, vs, gf, gs, uf, us, df, ds):
-    """Same layer with FP8 (E4M3) weight parameters and per-row scales; the graph only casts
-    fp8 -> bf16 and scales, no bit-level decode. Tests whether the compiler/hardware treat the
-    fp8 dtype natively (1 byte/weight resident)."""
+    """Same layer with 1-byte (int8) weight parameters and per-row scales; the graph only casts
+    to bf16 and scales, no bit-level decode (1 byte/weight resident)."""
     dec = lambda f, sc: (f.to(torch.bfloat16) * sc.reshape(-1, 1).to(torch.bfloat16))
     return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw,
                        dec(kf, ks), dec(vf, vs), ow, dec(gf, gs), dec(uf, us), dec(df, ds))
 
 
 def to_fp8_rows(dense):
-    """bf16/f32 [out, in] -> (torch.float8_e4m3fn [out, in], f32 scale [out]); rows scaled to
-    max 224 so no code reaches Trn1's exponent-15 inf/NaN range."""
+    """bf16/f32 [out, in] -> (int8 [out, in], f32 scale [out]), symmetric per-row. neuronx-cc
+    rejects F8E4M3FN on TRN1/TRN2 (NCC_EVRF051) and its unsafe-cast flag is not accepted by
+    2.26/2.28, so 1-byte resident weights use int8 here."""
     d = dense.float().numpy()
-    scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 224.0
-    q = (d / scale[:, None]).astype(ml_dtypes.float8_e4m3fn)
-    return torch.from_numpy(q.view(np.uint8)).view(torch.float8_e4m3fn), torch.from_numpy(scale.astype(np.float32))
+    scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 127.0
+    q = np.clip(np.rint(d / scale[:, None]), -127, 127).astype(np.int8)
+    return torch.from_numpy(q), torch.from_numpy(scale.astype(np.float32))
 
 
 def build_layer_fp8(model, layer):
@@ -317,7 +317,7 @@ def main():
     started = time.monotonic()
     graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph_fp8 if fp8 else layer_graph, tuple(inputs),
                                 compiler_workdir=a.workdir,
-                                compiler_args=['--experimental-unsafe-fp8e4m3fn-as-fp8e4m3'] if fp8 else None)
+                                compiler_args=None)
     compile_s = time.monotonic() - started
     if a.compile_only:
         print(json.dumps({'weights': a.weights, 'resident_weight_MB': round(resident / 1e6, 1), 'compile_s': round(compile_s, 2)}))
