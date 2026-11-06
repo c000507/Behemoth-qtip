@@ -9,7 +9,7 @@ import json
 import numpy as np
 from backend import KernelBackend, bf16
 from checkpoint import Checkpoint
-from ops import rms_norm, swiglu, apply_rope, fp8_project_loop
+from ops import rms_norm, swiglu, apply_rope
 
 
 def rope_frequencies(dim, theta, scaling):
@@ -33,7 +33,8 @@ def rope_frequencies(dim, theta, scaling):
 
 
 class LlamaRunner:
-    def __init__(self, path, simulate=True):
+    def __init__(self, path, simulate=True, progress=None):
+        self.progress = progress
         self.checkpoint = Checkpoint(path)
         c = self.checkpoint.config
         generation_path = self.checkpoint.root / 'generation_config.json'
@@ -95,6 +96,8 @@ class LlamaRunner:
         state = bf16(self.embed[token:token+1])
         angle = self.freq * self.position
         for layer in range(self.layers):
+            if self.progress:
+                self.progress('layer', layer, self.layers)
             proj, norms = self.layer(layer)
             run = self.backend.run
             normalized = bf16(run(rms_norm, state, norms[0], self.eps))
@@ -117,9 +120,9 @@ class LlamaRunner:
             state = bf16(state + bf16(self.backend.linear(proj['mlp.down_proj'], act)))
         normalized = bf16(self.backend.run(rms_norm, state, self.final_norm, self.eps))
         # The output head may be BF16; the tiled projection accepts either BF16 or FP8.
-        scores = self.backend.run(fp8_project_loop, self.head.reshape(1, -1),
-                                  np.ones((1, self.vocab), np.float32), normalized.reshape(1, -1),
-                                  self.hidden, self.vocab, 1).reshape(-1)
+        if self.progress:
+            self.progress('head', self.layers, self.layers)
+        scores = self.backend.dense(self.head, normalized).reshape(-1)
         self.position += 1
         return scores
 

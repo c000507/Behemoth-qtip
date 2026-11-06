@@ -114,7 +114,7 @@ def fp8_project_loop(weights, scales, x, width: int, out_width: int, batch: int)
 
 
 @nki.jit
-def nvfp4_project_loop(packed, block_scales, x, byte_index, nibble_shift, codebook,
+def nvfp4_project_loop(packed, block_scales, x, byte_index, nibble_shift, codebook, fp8_lut,
                        global_scale: float, width: int, out_width: int, batch: int):
     """Serial NVFP4 E2M1 projection with per-16 E4M3 and global scales."""
     import nki.isa as nisa
@@ -125,6 +125,7 @@ def nvfp4_project_loop(packed, block_scales, x, byte_index, nibble_shift, codebo
     out = nl.ndarray((1, batch * out_width), dtype=nl.float32, buffer=nl.shared_hbm)
     ix = nl.load(byte_index[0:1, 0:16]); shifts = nl.load(nibble_shift[0:1, 0:16])
     lut = nl.load(codebook[0:1, 0:16])
+    fp8_table = nl.load(fp8_lut[0:1, 0:256])
     def batch_loop(b):
         def output_loop(o):
             total = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -133,7 +134,8 @@ def nvfp4_project_loop(packed, block_scales, x, byte_index, nibble_shift, codebo
                 codes = nl.bitwise_and(nl.right_shift(nl.gather_flattened(words, ix), shifts), 15)
                 weights = nl.gather_flattened(lut, codes)
                 values = nl.load(x[0:1, nl.ds(b * width + k * 16, 16)])
-                scale = nl.load(block_scales[0:1, nl.ds(o * (width // 16) + k, 1)], dtype=nl.float32)
+                scale_byte = nl.load(block_scales[0:1, nl.ds(o * (width // 16) + k, 1)], dtype=nl.uint32)
+                scale = nl.gather_flattened(fp8_table, scale_byte)
                 weights = nl.multiply(nl.multiply(weights, scale), global_scale)
                 weights = nl.copy(nl.copy(weights, dtype=nl.bfloat16), dtype=nl.float32)
                 partial = nl.sum(nl.multiply(weights, values), axis=1, keepdims=True)
@@ -142,4 +144,47 @@ def nvfp4_project_loop(packed, block_scales, x, byte_index, nibble_shift, codebo
             nl.store(out[0:1, nl.ds(b*out_width + o, 1)], total)
         nl.fori_loop(0, out_width, output_loop)
     nl.fori_loop(0, batch, batch_loop)
+    return out
+
+
+@nki.jit
+def scale_rows(x, scale, round_bf16: bool):
+    """Elementwise row scaling used after a materialized Hadamard."""
+    batch, width = x.shape
+    if scale.shape != (1, width):
+        raise ValueError("Invalid scale shape")
+    out = nl.ndarray((batch, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    factors = nl.load(scale[0:1, 0:width])
+    for row in range(batch):
+        value = nl.multiply(nl.load(x[row:row+1, 0:width]), factors)
+        if round_bf16:
+            value = nl.copy(nl.copy(value, dtype=nl.bfloat16), dtype=nl.float32)
+        nl.store(out[row:row+1, 0:width], value)
+    return out
+
+
+@nki.jit
+def fp8fn_project_loop(weights, scales, x, decode_lut, width: int, out_width: int, batch: int):
+    """E4M3FN projection using byte lookup; Trn1 native FP8 differs at exponent 15."""
+    import nki.isa as nisa
+    if width < 1 or width % 32 or weights.shape != (1, out_width * width):
+        raise ValueError('Invalid FP8FN weight shape')
+    if x.shape != (1, batch * width) or scales.shape != (1, out_width) or decode_lut.shape != (1,256):
+        raise ValueError('Invalid FP8FN projection shapes')
+    out = nl.ndarray((1, batch*out_width), dtype=nl.float32, buffer=nl.shared_hbm)
+    table = nl.load(decode_lut[0:1,0:256])
+    def batch_loop(b):
+        def output_loop(o):
+            total = nl.zeros((1,1), dtype=nl.float32, buffer=nl.sbuf)
+            def input_loop(k):
+                byte = nl.load(weights[0:1,nl.ds(o*width+k*32,32)],dtype=nl.uint32)
+                w = nl.gather_flattened(table,byte)
+                v = nl.load(x[0:1,nl.ds(b*width+k*32,32)])
+                product = nl.sum(nl.multiply(w,v),axis=1,keepdims=True)
+                nisa.tensor_tensor(dst=total,data1=total,data2=product,op=nl.add)
+            nl.fori_loop(0,width//32,input_loop)
+            scale=nl.load(scales[0:1,nl.ds(o,1)])
+            nl.store(out[0:1,nl.ds(b*out_width+o,1)],nl.multiply(total,scale))
+        nl.fori_loop(0,out_width,output_loop)
+    nl.fori_loop(0,batch,batch_loop)
     return out

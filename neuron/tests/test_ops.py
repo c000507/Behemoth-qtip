@@ -5,7 +5,7 @@ import numpy as np
 import nki
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ops import rms_norm, swiglu, apply_rope, attention_chunk, fp8_project_loop, nvfp4_project_loop
+from ops import rms_norm, swiglu, apply_rope, attention_chunk, fp8_project_loop, nvfp4_project_loop, fp8fn_project_loop
 import ml_dtypes
 
 
@@ -40,6 +40,12 @@ def main():
     got = nki.simulate(fp8_project_loop)(fw.reshape(1, -1), fs, fx.reshape(1, -1), 64, 32, 2).reshape(2, 32)
     expected = (fx @ fw.astype(np.float32).T) * fs
     np.testing.assert_allclose(got, expected, rtol=3e-5, atol=2e-6)
+    fp_lut = np.arange(256,dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32).reshape(1,256)
+    finite_codes = np.array([i for i in range(256) if i not in (127,255)],np.uint8)
+    allbytes = np.repeat(finite_codes[:,None],32,axis=1)
+    sums = nki.simulate(fp8fn_project_loop)(allbytes.reshape(1,-1),np.ones((1,254),np.float32),
+                                             np.ones((1,32),np.float32),fp_lut,32,254,1)
+    np.testing.assert_array_equal(sums.reshape(-1),fp_lut.reshape(-1)[finite_codes]*32)
     codes = rng.integers(0, 16, size=(16,64), dtype=np.uint8)
     packed = (codes[:,::2] | (codes[:,1::2] << 4)).reshape(1,-1)
     block_scales = rng.uniform(.1,1.2,size=(16,4)).astype(ml_dtypes.float8_e4m3fn)
@@ -48,8 +54,8 @@ def main():
     pos = np.array([0,.5,1,1.5,2,3,4,6],np.float32)
     lut = np.concatenate((pos,-pos)).reshape(1,16)
     global_scale = .17
-    got = nki.simulate(nvfp4_project_loop)(packed, block_scales.reshape(1,-1), fx.reshape(1,-1),
-                                            ix, shifts, lut, global_scale,64,16,2).reshape(2,16)
+    got = nki.simulate(nvfp4_project_loop)(packed, block_scales.view(np.uint8).reshape(1,-1), fx.reshape(1,-1),
+                                            ix, shifts, lut, np.arange(256,dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32).reshape(1,256), global_scale,64,16,2).reshape(2,16)
     dense = lut.reshape(-1)[codes] * np.repeat(block_scales.astype(np.float32),16,axis=1) * global_scale
     dense = dense.astype(ml_dtypes.bfloat16).astype(np.float32)
     np.testing.assert_allclose(got, fx @ dense.T, rtol=3e-5, atol=2e-6)

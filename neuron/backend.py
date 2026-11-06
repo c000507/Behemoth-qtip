@@ -8,7 +8,7 @@ import numpy as np
 import nki
 
 from checkpoint import QtipProjection, Fp8Projection, Nvfp4Projection
-from ops import attention_chunk, fp8_project_loop, nvfp4_project_loop
+from ops import attention_chunk, fp8_project_loop, nvfp4_project_loop, scale_rows, fp8fn_project_loop
 from qtip_kernel import project_rotated_loop, transform_pow2, transform_factored, hadamard_chunks, hadamard_mix
 from qtip_layout import projection_indices, hadamard_indices, factored_hadamard_indices
 
@@ -40,12 +40,25 @@ def transform_tables(width, transpose):
 
 
 class KernelBackend:
-    def __init__(self, simulate=True):
+    def __init__(self, simulate=True, projection_chunk_rows=256, progress=None, cache_kernels=True):
+        if projection_chunk_rows < 1:
+            raise ValueError('Projection chunk size must be positive')
         self.simulate = simulate
+        self.kernel_cache = None
+        if not simulate and cache_kernels:
+            from nki_cache import KernelCache
+            self.kernel_cache = KernelCache()
+        self.projection_chunk_rows = projection_chunk_rows
+        self.progress = progress
         self.index = projection_indices()
+        self.fp8_lut = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32).reshape(1, 256)
 
     def run(self, kernel, *args):
-        return nki.simulate(kernel)(*args) if self.simulate else kernel(*args)
+        if self.simulate:
+            return nki.simulate(kernel)(*args)
+        if self.kernel_cache is not None:
+            return self.kernel_cache.run(kernel, *args)
+        return kernel(*args)
 
     def transform(self, x, scale, transpose, scale_before, round_bf16):
         batch, width = x.shape
@@ -53,8 +66,11 @@ class KernelBackend:
             p = width // factor
             if width % factor == 0 and p >= 2 and not (p & (p - 1)):
                 partners, signs = hadamard_indices(p)
-                inner = self.run(hadamard_chunks, x.reshape(1, -1), scale, partners, signs,
-                                 width, factor, batch, scale_before)
+                # Materialize the input by tensor scaling before indexed gathers;
+                # Trn1 can otherwise return incorrect output for a loaded tile.
+                input_scale = scale if scale_before else np.ones_like(scale)
+                inner = self.run(hadamard_chunks, x.reshape(1, -1), input_scale, partners, signs,
+                                 width, factor, batch, True)
                 matrix = hadamard_matrix(factor)
                 if transpose:
                     matrix = matrix.T
@@ -62,7 +78,10 @@ class KernelBackend:
                 return self.run(hadamard_mix, inner, scale, matrix, width, factor, batch,
                                 scale_before, round_bf16).reshape(batch, width)
         kernel, tables = transform_tables(width, transpose)
-        return self.run(kernel, x, scale, *tables, scale_before, round_bf16)
+        if scale_before:
+            return self.run(kernel, x, scale, *tables, True, round_bf16)
+        unscaled = self.run(kernel, x, np.ones_like(scale), *tables, True, False)
+        return self.run(scale_rows, unscaled, scale, round_bf16)
 
     def linear(self, projection, x, round_z_bf16=False):
         x = np.asarray(x, dtype=np.float32)
@@ -85,18 +104,49 @@ class KernelBackend:
             shifts = ((np.arange(16, dtype=np.uint32) % 2) * 4).reshape(1, 16)
             positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
             codebook = np.concatenate((positive, -positive)).reshape(1, 16)
-            return self.run(nvfp4_project_loop, projection.packed.reshape(1,-1),
-                            projection.scales.reshape(1,-1), bf16(x).reshape(1,-1),
-                            ix, shifts, codebook, projection.global_scale, width,
-                            projection.out, batch).reshape(batch, projection.out)
+            outputs = []
+            for start in range(0, projection.out, self.projection_chunk_rows):
+                stop = min(start + self.projection_chunk_rows, projection.out)
+                rows = stop - start
+                partial = self.run(nvfp4_project_loop, projection.packed[start:stop].reshape(1,-1),
+                                   projection.scales[start:stop].view(np.uint8).reshape(1,-1), bf16(x).reshape(1,-1),
+                                   ix, shifts, codebook, self.fp8_lut, projection.global_scale, width, rows, batch)
+                outputs.append(partial.reshape(batch, rows))
+                if self.progress:
+                    self.progress(stop, projection.out)
+            return np.concatenate(outputs, axis=1)
         if isinstance(projection, Fp8Projection):
             batch, width = x.shape
             out, w = projection.weights.shape
             if width != w:
                 raise ValueError('FP8 input width mismatch')
-            return self.run(fp8_project_loop, projection.weights.reshape(1, -1), projection.scale.reshape(1, -1),
-                            bf16(x).reshape(1, -1), width, out, batch).reshape(batch, out)
+            outputs = []
+            for start in range(0, out, self.projection_chunk_rows):
+                stop = min(start + self.projection_chunk_rows, out)
+                rows = stop - start
+                partial = self.run(fp8fn_project_loop, projection.weights[start:stop].view(np.uint8).reshape(1,-1),
+                                   projection.scale[start:stop].reshape(1,-1), bf16(x).reshape(1,-1),
+                                   self.fp8_lut, width, rows, batch)
+                outputs.append(partial.reshape(batch, rows))
+                if self.progress:
+                    self.progress(stop, out)
+            return np.concatenate(outputs, axis=1)
         raise TypeError('Unsupported projection')
+
+    def dense(self, weights, x):
+        """Correctness-first BF16/F32 dense projection in bounded launches."""
+        batch, width = x.shape
+        out, weight_width = weights.shape
+        if width != weight_width:
+            raise ValueError('Dense input width mismatch')
+        outputs = []
+        for start in range(0, out, self.projection_chunk_rows):
+            stop = min(start + self.projection_chunk_rows, out)
+            rows = stop - start
+            partial = self.run(fp8_project_loop, weights[start:stop].reshape(1,-1),
+                               np.ones((1,rows), np.float32), bf16(x).reshape(1,-1), width, rows, batch)
+            outputs.append(partial.reshape(batch, rows))
+        return np.concatenate(outputs, axis=1)
 
     def attention(self, query, keys, values):
         """GQA decode for one token. keys/values are [time,kv_heads,dim]."""

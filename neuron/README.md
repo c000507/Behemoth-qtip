@@ -92,3 +92,33 @@ not validate a model checkpoint or measure performance. To repeat a check, run
 `neuron/tests/compile_model_shapes.py` with `qtip-up`, `qtip-down`, `norm`,
 `swiglu`, `had-chunks`, or `had-mix`, setting `NKI_ARTIFACTS_DIR` to an empty
 directory and `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`.
+
+## Real Anubis Mini checkpoint validation on Trn1
+
+Revision `d34522c3cf326f6e4591d3c543c5e7d5bd633724` has 34 LFS files;
+the downloaded files were checked against their SHA-256 metadata. On Trn1,
+layer 0 QTIP q_proj (4096→4096) matched the C++ reference with relative L2
+2.42e-7, and layer 0 QTIP up_proj (4096→14336) matched at 2.61e-7. Layer 0
+FP8 v_proj (4096→1024) matched an independent CPU reference at 1.79e-7, and
+layer 2 NVFP4 up_proj (4096→14336) matched at 2.68e-7. The FP8 and NVFP4
+comparisons use the checkpoint's per-channel/per-block scales and BF16 input
+and NVFP4 weight rounding. These are single-input projection checks, not a
+model-level quality evaluation.
+
+Two hardware-specific corrections were necessary. Trn1's native FP8 conversion
+interprets E4M3FN values with exponent 15 as infinities or NaNs; byte-indexed
+lookup now decodes the checkpoint format explicitly, including NVFP4 block
+scales. The power-of-two Hadamard output path also produced wrong results on
+Trn1 when the first indexed gather consumed a direct load; the backend now
+materializes input with a tensor scale and applies output scale separately.
+Direct unsupported output-transform use is rejected rather than silently
+producing incorrect results.
+
+Large FP8/NVFP4 projections are split into bounded row launches to avoid the
+runtime timeout observed on a full NVFP4 MLP projection. The experimental
+NKI 0.7.0 standalone cache (`nki_cache.py`) retains compiled kernels by input
+signature and scalar parameters. It uses private NKI interfaces and explicitly
+rejects other versions. It transfers inputs and outputs via host memory on each
+launch. On the tested real NVFP4 projection, first-run wall time including
+compilation dropped from 104 seconds to 39 seconds. Neither number is a
+steady-state model throughput measurement.

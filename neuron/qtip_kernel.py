@@ -100,11 +100,14 @@ def project_rotated(trellis, lut, word_index, next_index, shift, component_shift
 def transform_pow2(x, scale, partners, signs, scale_before: bool, round_bf16: bool):
     """Power-of-two normalized Hadamard and SU/SV scaling, for small widths.
 
-    For QTIP's input transform, scale_before=True and round_bf16=True. For
-    the output transform, both are False. Other Hadamard factors are not yet
-    supported. Accumulation and scaling here use FP32.
+    QTIP input transform uses scale_before=True and round_bf16=True. Output
+    transforms must use KernelBackend.transform, which materializes the input
+    and applies the output scale in a separate kernel on Trn1. Other Hadamard
+    factors are not supported here. Accumulation and scaling use FP32.
     """
     batch, width = x.shape
+    if not scale_before:
+        raise ValueError("Use KernelBackend.transform for output transforms on Trn1")
     if width < 2 or (width & (width - 1)) or partners.shape[1] != width:
         raise ValueError("Expected a power-of-two Hadamard width of at least 2")
     if partners.shape[0] != width.bit_length() - 1 or signs.shape != partners.shape:
@@ -210,6 +213,8 @@ def project_rotated_loop(trellis, lut, word_index, next_index, shift, component_
 def hadamard_chunks(x, scale, partners, signs, width: int, factor: int, batch: int, scale_before: bool):
     """Compute normalized power-of-two Hadamards in bounded SBUF chunks."""
     p = width // factor
+    if not scale_before:
+        raise ValueError('Chunk input must be materialized with a tensor scale on Trn1')
     if factor not in (12, 28) or width % factor or p < 2 or p & (p-1):
         raise ValueError('Invalid chunked QTIP Hadamard geometry')
     if x.shape != (1, batch * width) or scale.shape != (1, width):

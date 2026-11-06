@@ -80,7 +80,7 @@ def main():
         looped = nki.simulate(project_rotated_loop)(
             trellis.reshape(1, 512), replicated_lut, *pi, rotated.astype(np.float32).reshape(1, 192), 64, 2, 3).reshape(3, 64)
         np.testing.assert_allclose(looped, projected, rtol=1e-5, atol=1e-6)
-        y = nki.simulate(transform_pow2)(full, sv.reshape(1, 64), hi, hs, False, False)
+        y = KernelBackend().transform(full, sv.reshape(1, 64), False, False, False)
         np.testing.assert_allclose(y, read("y", np.float32).reshape(3, 64), rtol=1e-5, atol=1e-6)
         for k in (12, 28):
             n = k * 32
