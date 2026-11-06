@@ -41,9 +41,13 @@ def real_layer(*args, stop_after_attention=False):
     t = dict(zip(ORDER, args))
     allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(TP))])
     w = lambda a, b: Fp8Weight(t[a], t[b])
-    return layer_graph(t['x'], t['slots'], t['cos_sin'], t['cache_k'], t['cache_v'], t['norm1'], t['norm2'],
+    out = layer_graph(t['x'], t['slots'], t['cos_sin'], t['cache_k'], t['cache_v'], t['norm1'], t['norm2'],
                        w('qf', 'qs'), w('kf', 'ks'), w('vf', 'vs'), w('of', 'os'), w('gf', 'gs'), w('uf', 'us'), w('df', 'ds'),
                        _lin=lin_fp8, heads=HEADS // TP, kvheads=KVHEADS // TP, reduce=allreduce, mask=t['mask'], stop_after_attention=stop_after_attention)
+    if stop_after_attention:  # keep the (unused) MLP parameters in the graph so the input numbering stays the same
+        keep = sum(t[k].float().reshape(-1)[0] for k in ('gf', 'gs', 'uf', 'us', 'df', 'ds'))
+        out = (out[0] + 0.0 * keep, out[1], out[2])
+    return out
 
 
 def main():
