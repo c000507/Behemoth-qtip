@@ -38,16 +38,16 @@ def dequant_nvfp4(projection):
     dense = (lut[codes]
              * np.repeat(projection.scales.astype(np.float32), 16, axis=1)
              * projection.global_scale)
-    return torch.from_numpy(dense.astype(ml_dtypes.bfloat16).astype(np.float32))
+    return torch.from_numpy(dense.astype(ml_dtypes.bfloat16).astype(np.float32)).to(torch.bfloat16)
 
 
 def dequant_fp8(projection):
     dense = projection.weights.astype(np.float32) * projection.scale[:, None]
-    return torch.from_numpy(dense.astype(ml_dtypes.bfloat16).astype(np.float32))
+    return torch.from_numpy(dense.astype(ml_dtypes.bfloat16).astype(np.float32)).to(torch.bfloat16)
 
 
 def bf16(array):
-    return torch.from_numpy(np.asarray(array, np.float32).astype(ml_dtypes.bfloat16).astype(np.float32))
+    return torch.from_numpy(np.asarray(array, np.float32).astype(ml_dtypes.bfloat16).astype(np.float32)).to(torch.bfloat16)
 
 
 def build_layer(model, layer, seed=5):
@@ -112,46 +112,52 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
     return x, cache_k, cache_v
 
 
-def fp8_lut():
-    """256-entry E4M3FN byte -> float32 table (NaN codes map to 0). Byte lookup keeps Trn1's
-    different inf/NaN treatment of exponent 15 out of the decode."""
-    lut = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
-    lut[~np.isfinite(lut)] = 0
-    return torch.from_numpy(lut)
+def e4m3_to_f32(codes):
+    """E4M3FN byte -> float32 with integer/float arithmetic only (no gather). Normals are
+    built by writing the rebiased exponent and mantissa into float32 bits; subnormals are
+    m * 2^-9. The NaN code (0x7f/0xff) is not produced by the quantizer and is not handled."""
+    b = codes.to(torch.int32)
+    e = (b >> 3) & 15
+    m = b & 7
+    normal = (((e + 120) << 23) | (m << 20)).view(torch.float32)
+    value = torch.where(e == 0, m.to(torch.float32) * (2.0 ** -9), normal)
+    return value * (1.0 - 2.0 * ((b >> 7) & 1).to(torch.float32))
 
 
-def fp4_lut():
-    positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
-    return torch.from_numpy(np.concatenate((positive, -positive)))
+def e2m1_to_f32(codes):
+    """E2M1 nibble (0..15, bit 3 = sign) -> float32 via exponent/mantissa bit construction."""
+    b = codes.to(torch.int32)
+    e = (b >> 1) & 3
+    m = b & 1
+    normal = (((e + 126) << 23) | (m << 22)).view(torch.float32)
+    value = torch.where(e == 0, m.to(torch.float32) * 0.5, normal)
+    return value * (1.0 - 2.0 * ((b >> 3) & 1).to(torch.float32))
 
 
-def dec_fp8(codes, scale, lut8):
+def dec_fp8(codes, scale):
     """codes uint8 [out, in], scale f32 [out] -> bf16 [out, in]."""
-    dense = torch.index_select(lut8, 0, codes.reshape(-1).long()).reshape(codes.shape)
-    return (dense * scale.reshape(-1, 1)).to(torch.bfloat16)
+    return (e4m3_to_f32(codes) * scale.reshape(-1, 1)).to(torch.bfloat16)
 
 
-def dec_nvfp4(packed, scales, gscale, lut4, lut8):
+def dec_nvfp4(packed, scales, gscale):
     """packed uint8 [out, in/2] (two E2M1 per byte, low nibble first), scales uint8 E4M3
     [out, in/16], gscale f32 [1] -> bf16 [out, in]."""
     out = packed.shape[0]
-    p = packed.long()
+    p = packed.to(torch.int32)
     codes = torch.stack((p & 15, p >> 4), dim=-1).reshape(out, -1)
-    dense = torch.index_select(lut4, 0, codes.reshape(-1)).reshape(out, -1)
-    block = torch.index_select(lut8, 0, scales.reshape(-1).long()).reshape(out, -1)
-    block = block.repeat_interleave(16, dim=1) * gscale
-    return (dense * block).to(torch.bfloat16)
+    block = (e4m3_to_f32(scales) * gscale).repeat_interleave(16, dim=1)
+    return (e2m1_to_f32(codes) * block).to(torch.bfloat16)
 
 
 def layer_graph_lowbit(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
-                       kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg, lut8, lut4):
+                       kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg):
     """Same layer, but projections stay as packed bytes in device memory and are decoded
-    inside the graph each step (FP8 K/V via byte LUT, NVFP4 MLP via nibble + scale LUT)."""
-    kw = dec_fp8(kb, ks, lut8)
-    vw = dec_fp8(vb, vs, lut8)
-    gw = dec_nvfp4(gp, gs, gg, lut4, lut8)
-    uw = dec_nvfp4(up, us, ug, lut4, lut8)
-    dw = dec_nvfp4(dp, ds, dg, lut4, lut8)
+    inside the graph each step (FP8 K/V and NVFP4 MLP via integer bit arithmetic, no table gathers)."""
+    kw = dec_fp8(kb, ks)
+    vw = dec_fp8(vb, vs)
+    gw = dec_nvfp4(gp, gs, gg)
+    uw = dec_nvfp4(up, us, ug)
+    dw = dec_nvfp4(dp, ds, dg)
     return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, kw, vw, ow, gw, uw, dw)
 
 
@@ -180,7 +186,6 @@ def build_layer_lowbit(model, layer, seed=5):
         'gp': nv['g'][0], 'gs': nv['g'][1], 'gg': nv['g'][2],
         'up': nv['u'][0], 'us': nv['u'][1], 'ug': nv['u'][2],
         'dp': nv['d'][0], 'ds': nv['d'][1], 'dg': nv['d'][2],
-        'lut8': fp8_lut(), 'lut4': fp4_lut(),
     }
     return weights
 
@@ -219,14 +224,12 @@ def main():
              'norm1', 'norm2', 'qw', 'kw', 'vw', 'ow', 'gw', 'uw', 'dw']
     if lowbit:
         order = ['x', 'slots', 'cos_sin', 'cache_k', 'cache_v', 'norm1', 'norm2', 'qw', 'ow',
-                 'kb', 'ks', 'vb', 'vs', 'gp', 'gs', 'gg', 'up', 'us', 'ug', 'dp', 'ds', 'dg', 'lut8', 'lut4']
+                 'kb', 'ks', 'vb', 'vs', 'gp', 'gs', 'gg', 'up', 'us', 'ug', 'dp', 'ds', 'dg']
     inputs = [sample[k] if k in sample else weights[k] for k in order]
     # device bytes of the weight parameters as they are held resident (bf16 weights count 2 B/elem
     # on the device; the host tensors here are float32 holding bf16-rounded values and are cast
     # by the traced graph)
-    resident = sum(weights[k].numel() * (weights[k].element_size() if weights[k].dtype == torch.uint8 else 2
-                                         if k in ('kw', 'vw', 'qw', 'ow', 'gw', 'uw', 'dw') else weights[k].element_size())
-                   for k in order if k in weights)
+    resident = sum(weights[k].numel() * weights[k].element_size() for k in order if k in weights)
 
     started = time.monotonic()
     graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs),
