@@ -1,6 +1,6 @@
 """Trace the fused NVFP4 NKI projection into one NEFF for the C++ timing harness (cpp/layer_bench.cpp).
 
-usage: bench_nki_nvfp4.py WORKDIR [K] [N] [B] [arith|lut|floor]   (single core: run layer_bench with ranks=1)
+usage: bench_nki_nvfp4.py WORKDIR [K] [N] [B] [arith|lut|floor|batched]   (single core: run layer_bench with ranks=1)
 """
 from pathlib import Path
 import sys
@@ -11,7 +11,7 @@ import torch
 import torch_neuronx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from nki_linear import nvfp4_linear, nvfp4_linear_floor, nvfp4_linear_lut, nvfp4_lut, nvfp4_pack
+from nki_linear import nvfp4_linear, nvfp4_linear_batched, nvfp4_linear_floor, nvfp4_linear_lut, nvfp4_lut, nvfp4_pack
 
 workdir = sys.argv[1]
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 4096
@@ -40,5 +40,8 @@ if variant == 'floor':
 if variant == 'lut':
     inputs += (t(nvfp4_lut()),)
     f = f_lut
+if variant == 'batched':
+    inputs += (t(nvfp4_lut()),)
+    f = lambda xT, wp, sce, sco, ex, lut: nvfp4_linear_batched(xT, wp, sce, sco, ex, lut)
 torch_neuronx.trace(f, inputs, compiler_workdir=workdir)
 print('NEFF', workdir + '/graph.neff', 'weights_MB', round((wp.nbytes + sce.nbytes + sco.nbytes) / 1e6, 2))

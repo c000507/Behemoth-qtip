@@ -131,6 +131,46 @@ def nvfp4_linear_floor(xT, wp, sce, sco, ex):
     return out
 
 
+@nki.jit
+def nvfp4_linear_batched(xT, wp, sce, sco, ex, lut):
+    """Prefill / batched-decode variant (B a multiple of 128, any size): each output tile's weights are
+    decoded ONCE into SBUF (all K-tiles) and then reused by every 128-token block, so decode is amortized
+    over B tokens instead of being paid per token. SBUF holds 2 x (K/128 x 256) bf16 per partition."""
+    K, B = xT.shape
+    KT, P, HALF = wp.shape
+    N = HALF * 2
+    out = nl.ndarray((B, N), dtype=nl.float32, buffer=nl.shared_hbm)
+    ex_t = nl.load(ex)
+    lut_t = nl.load(lut)
+    for jt in nl.affine_range(HALF // NT):
+        dec_e = nl.ndarray((128, KT, NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        dec_o = nl.ndarray((128, KT, NT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for kt in nl.affine_range(KT):
+            w8 = nl.load(wp[kt, 0:128, jt * NT:(jt + 1) * NT])
+            se = nl.load(sce[kt * 8:(kt + 1) * 8, jt * NT:(jt + 1) * NT])
+            so = nl.load(sco[kt * 8:(kt + 1) * 8, jt * NT:(jt + 1) * NT])
+            se_full = nl.copy(nl.matmul(ex_t, se, transpose_x=True), dtype=nl.bfloat16)
+            so_full = nl.copy(nl.matmul(ex_t, so, transpose_x=True), dtype=nl.bfloat16)
+            v_even = nl.gather_flattened(lut_t, nl.copy(nl.bitwise_and(w8, 15), dtype=nl.uint32), dtype=nl.bfloat16)
+            v_odd = nl.gather_flattened(lut_t, nl.copy(nl.right_shift(w8, 4), dtype=nl.uint32), dtype=nl.bfloat16)
+            dec_e[0:128, kt, 0:NT] = nl.multiply(v_even, se_full, dtype=nl.bfloat16)
+            dec_o[0:128, kt, 0:NT] = nl.multiply(v_odd, so_full, dtype=nl.bfloat16)
+        for bb in nl.affine_range(B // 128):
+            acc_e = nl.zeros((128, NT), dtype=nl.float32, buffer=nl.psum)
+            acc_o = nl.zeros((128, NT), dtype=nl.float32, buffer=nl.psum)
+            for kt in nl.affine_range(KT):
+                x_t = nl.load(xT[kt * 128:(kt + 1) * 128, bb * 128:(bb + 1) * 128])
+                acc_e += nl.matmul(x_t, dec_e[0:128, kt, 0:NT], transpose_x=True)
+                acc_o += nl.matmul(x_t, dec_o[0:128, kt, 0:NT], transpose_x=True)
+            res_e = nl.copy(acc_e, dtype=nl.float32)
+            res_o = nl.copy(acc_o, dtype=nl.float32)
+            i_b = bb * 128 + nl.arange(128)[:, None]
+            i_j = nl.arange(NT)[None, :]
+            nl.store(out[i_b, 2 * (jt * NT + i_j)], value=res_e)
+            nl.store(out[i_b, 2 * (jt * NT + i_j) + 1], value=res_o)
+    return out
+
+
 def nvfp4_lut():
     """bf16 [128, 16] E2M1 value table replicated on every partition (input of nvfp4_linear_lut)."""
     import ml_dtypes

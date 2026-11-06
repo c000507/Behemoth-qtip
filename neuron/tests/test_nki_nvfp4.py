@@ -35,3 +35,13 @@ rel2 = np.linalg.norm(y2 - expected) / np.linalg.norm(expected)
 print(f'lut variant relative_l2={rel2:.3e}')
 assert rel2 < 8e-3, 'NVFP4 LUT NKI kernel does not match the reference'
 print('NVFP4 LUT NKI kernel matches (simulator)')
+
+# batched variant: B = 256 tokens, decode shared across 128-token blocks
+xb = rng.normal(0, 1, (256, K)).astype(ml_dtypes.bfloat16)
+expected_b = xb.astype(np.float32) @ dense.astype(ml_dtypes.bfloat16).astype(np.float32).T
+from nki_linear import nvfp4_linear_batched
+y3 = nki.simulate_kernel(nvfp4_linear_batched, np.ascontiguousarray(xb.T), wp, sce, sco, ex, nvfp4_lut())
+rel3 = np.linalg.norm(y3 - expected_b) / np.linalg.norm(expected_b)
+print(f'batched variant relative_l2={rel3:.3e}')
+assert rel3 < 8e-3, 'NVFP4 batched NKI kernel does not match the reference'
+print('NVFP4 batched NKI kernel matches (simulator)')
