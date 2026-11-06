@@ -1,7 +1,9 @@
 """Known-answer all-reduce graph: y = all_reduce_sum(x), replica group {0, 1}. usage: trace_allreduce_probe.py WORKDIR [dtype f32|bf16]"""
 from pathlib import Path
+import os
 import sys
 
+os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')  # otherwise the single-process trace drops the collective
 import torch
 import torch_neuronx
 import torch_xla.core.xla_model as xm

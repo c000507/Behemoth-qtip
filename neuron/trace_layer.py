@@ -15,6 +15,7 @@ runs N decode steps after warmup and reports steady-state ms/step.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -22,6 +23,10 @@ import time
 import ml_dtypes
 import numpy as np
 import torch
+
+# torch_xla drops xm.all_reduce / all_gather when it sees a single process, so a traced TP graph would contain NO
+# collective (each rank would silently return its own partial sum). Force the ops into the graph.
+os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from checkpoint import Checkpoint
