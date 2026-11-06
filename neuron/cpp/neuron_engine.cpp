@@ -166,6 +166,9 @@ struct Engine::Impl {
                 std::lock_guard lock(mutex);
                 model_seconds += std::chrono::duration<double>(Clock::now() - start).count();
                 last_profile = model.last_profile();
+                if (std::getenv("BEHEMOTH_NEURON_STEP_LOG"))
+                    std::cerr << "step rows=" << step.requests.size() << " wall_ms="
+                              << std::chrono::duration<double, std::milli>(Clock::now() - start).count() << " " << last_profile.dump() << "\n";
                 ++steps;
                 for (size_t i = 0; i < step.requests.size(); ++i) {
                     const auto &request = step.requests[i];
