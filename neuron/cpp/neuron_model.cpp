@@ -51,7 +51,7 @@ void zero(const Dev &d) {
 
 struct Meta {
     std::string kind;
-    int R = 0, Q = 0, P = 0, S = 0, T = 0;
+    int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // L > 0: whole-model graph (L layers + head, kind "model")
     std::filesystem::path neff;
 };
 
@@ -74,10 +74,12 @@ struct LayerBucket {
     std::array<nrt_model_t *, TP> model{};
     struct PerRank {
         Dev x[2], cos_sin, pos, wslot, table;
-        std::vector<std::array<nrt_tensor_set_t *, 2>> in, out; // [layer][parity]
+        std::vector<std::array<nrt_tensor_set_t *, 2>> in, out; // [layer][parity]; whole-model buckets: [0][0]
+        Dev rows, logits;                                      // whole-model buckets only
     };
     std::array<PerRank, TP> rank;
     int tokens() const { return meta.R * meta.Q; }
+    bool full() const { return meta.L > 0; }
 };
 struct HeadBucket {
     Meta meta;
@@ -126,8 +128,9 @@ struct NeuronModel::Impl {
             workers.push_back(std::make_unique<RankWorker>());
         }
         discover();
-        if (decode.empty() || prefill.empty() || heads.empty())
-            throw std::runtime_error("need decode, prefill and head NEFF buckets in " + options.neff_dir.string());
+        auto needs_head = [](const std::vector<LayerBucket> &v) { return std::any_of(v.begin(), v.end(), [](const auto &b) { return !b.full(); }); };
+        if (decode.empty() || prefill.empty() || ((needs_head(decode) || needs_head(prefill)) && heads.empty()))
+            throw std::runtime_error("need decode and prefill NEFF buckets (and head NEFFs for per-layer buckets) in " + options.neff_dir.string());
         embed_file = std::make_unique<SafeTensorFile>(o.model / "model-embed.safetensors");
         embed = embed_file->floats("model.embed_tokens.weight");
         final_norm = embed_file->floats("model.norm.weight");
@@ -152,8 +155,15 @@ struct NeuronModel::Impl {
             Meta m;
             m.kind = j.at("kind");
             m.neff = entry.path() / "graph.neff";
-            if (m.kind == "layer") {
+            if (m.kind == "layer" || m.kind == "model") {
+                if (m.kind == "model" && std::getenv("NEURON_USE_LAYERS"))
+                    continue;
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
+                if (m.kind == "model") {
+                    m.L = j.at("L"); m.S = j.at("S");
+                    if (m.L != config.layers)
+                        continue; // a partial-depth graph (compile-time probe)
+                }
                 LayerBucket b;
                 b.meta = m;
                 (m.Q == 1 ? decode : prefill).push_back(std::move(b));
@@ -164,7 +174,7 @@ struct NeuronModel::Impl {
                 heads.push_back(std::move(b));
             }
         }
-        auto by_size = [](const auto &a, const auto &b) { return a.meta.P != b.meta.P ? a.meta.P < b.meta.P : a.meta.Q < b.meta.Q; };
+        auto by_size = [](const auto &a, const auto &b) { return a.meta.P != b.meta.P ? a.meta.P < b.meta.P : a.meta.Q != b.meta.Q ? a.meta.Q < b.meta.Q : a.meta.L > b.meta.L; };
         std::sort(decode.begin(), decode.end(), by_size);
         std::sort(prefill.begin(), prefill.end(), by_size);
         std::sort(heads.begin(), heads.end(), [](const auto &a, const auto &b) { return a.meta.T != b.meta.T ? a.meta.T < b.meta.T : a.meta.S < b.meta.S; });
@@ -191,7 +201,7 @@ struct NeuronModel::Impl {
                         if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
                             const auto &t = info->tensor_array[i];
                             const size_t index = std::stoul(std::string(t.name).substr(5));
-                            if (index == CK) {
+                            if (index == size_t(b.full() ? 8 + 16 * b.meta.L : int(CK))) {
                                 const int pages = int(t.size / size_t(kv_local * 16 * DIM * 2));
                                 if (pages_total && pages != pages_total)
                                     throw std::runtime_error("layer NEFFs disagree on the page count");
@@ -199,7 +209,7 @@ struct NeuronModel::Impl {
                             }
                             ++ins;
                         }
-                    if (ins != kInputs)
+ if (ins != (b.full() ? 8 + 18 * b.meta.L : kInputs))
                         throw std::runtime_error("layer NEFF has " + std::to_string(ins) + " inputs, expected " + std::to_string(kInputs));
                     auto &pr = b.rank[size_t(r)];
                     const size_t T = size_t(b.tokens());
@@ -209,6 +219,10 @@ struct NeuronModel::Impl {
                     pr.pos = alloc(r, T * 8, "pos");
                     pr.wslot = alloc(r, T * 8, "wslot");
                     pr.table = alloc(r, size_t(b.meta.R) * size_t(b.meta.P) * 8, "table");
+                    if (b.full()) {
+                        pr.rows = alloc(r, size_t(b.meta.S) * 8, "rows");
+                        pr.logits = alloc(r, size_t(b.meta.S) * size_t(vocab_half) * 4, "logits");
+                    }
                 }));
             for (auto &j : jobs)
                 j.get();
@@ -318,7 +332,56 @@ struct NeuronModel::Impl {
     }
 
     void build_sets() {
+        // Whole-model bucket: one tensor set. Inputs: step tensors + head, then 16 tensors per layer, then the 2L KV state
+        // tensors (K, V interleaved per layer); outputs: logits, then the same KV tensors (updated in place).
+        auto build_full = [&](LayerBucket &b) {
+            for (int r = 0; r < TP; ++r) {
+                auto &pr = b.rank[size_t(r)];
+                nrt_tensor_info_array_t *info = nullptr;
+                check(nrt_get_model_tensor_info(b.model[size_t(r)], &info), "tensor info");
+                std::vector<const Dev *> by_index = {&pr.x[0], &pr.cos_sin, &pr.pos, &pr.wslot, &pr.table, &pr.rows, &ranks[size_t(r)].head_norm,
+                                                     &ranks[size_t(r)].head_w};
+                for (int l = 0; l < b.meta.L; ++l) {
+                    const auto &lw = ranks[size_t(r)].layers[size_t(l)];
+                    by_index.push_back(&lw.norm1);
+                    by_index.push_back(&lw.norm2);
+                    for (const auto &w : lw.w) by_index.push_back(&w);
+                }
+                std::vector<const Dev *> state;
+                for (int l = 0; l < b.meta.L; ++l) {
+                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].ck);
+                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].cv);
+                }
+                by_index.insert(by_index.end(), state.begin(), state.end());
+                nrt_tensor_set_t *in = nullptr, *out = nullptr;
+                check(nrt_allocate_tensor_set(&in), "set");
+                check(nrt_allocate_tensor_set(&out), "set");
+                size_t extra = 0;
+                for (uint64_t i = 0; i < info->tensor_count; ++i) {
+                    const auto &t = info->tensor_array[i];
+                    const std::string name = t.name;
+                    if (t.usage == NRT_TENSOR_USAGE_INPUT) {
+                        const size_t index = std::stoul(name.substr(5));
+                        if (index >= by_index.size() || by_index[index]->bytes != t.size)
+                            throw std::runtime_error("whole-model input " + name + " does not match the host tensor");
+                        check(nrt_add_tensor_to_tensor_set(in, t.name, by_index[index]->t), "add input");
+                    } else if (name == "output0") {
+                        check(nrt_add_tensor_to_tensor_set(out, t.name, pr.logits.t), "add output");
+                    } else {
+                        if (extra >= state.size() || state[extra]->bytes != t.size)
+                            throw std::runtime_error("whole-model output " + name + " does not match a KV tensor");
+                        check(nrt_add_tensor_to_tensor_set(out, t.name, state[extra++]->t), "add kv output");
+                    }
+                }
+                pr.in.assign(1, {in, in});
+                pr.out.assign(1, {out, out});
+            }
+        };
         auto build = [&](LayerBucket &b) {
+            if (b.full()) {
+                build_full(b);
+                return;
+            }
             for (int r = 0; r < TP; ++r) {
                 auto &pr = b.rank[size_t(r)];
                 nrt_tensor_info_array_t *info = nullptr;
@@ -370,7 +433,7 @@ struct NeuronModel::Impl {
                 }
                 for (const auto *group : {&decode, &prefill})
                     for (const auto &b : *group) {
-                        if (b.tokens() != h.meta.T)
+                        if (b.full() || b.tokens() != h.meta.T)
                             continue;
                         auto &sets = hr.in[&b];
                         for (int p = 0; p < 2; ++p) {
@@ -419,6 +482,46 @@ struct NeuronModel::Impl {
 
     void execute(Launch &L, float *dest) {
         const auto &b = *L.bucket;
+        if (b.full()) {
+            if (L.head_rows.size() > size_t(b.meta.S))
+                throw std::runtime_error("more sampled rows than the whole-model NEFF produces");
+            std::vector<int64_t> rows(size_t(b.meta.S), 0);
+            for (size_t i = 0; i < L.head_rows.size(); ++i)
+                rows[i] = L.head_rows[i];
+            std::vector<std::vector<float>> out(TP);
+            std::vector<std::future<void>> jobs;
+            for (int r = 0; r < TP; ++r)
+                jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                    auto &pr = const_cast<LayerBucket &>(b).rank[size_t(r)];
+                    const auto t_start = Clock::now();
+                    put(pr.x[0], L.x.data(), L.x.size() * 4);
+                    put(pr.cos_sin, L.cos_sin.data(), L.cos_sin.size() * 4);
+                    put(pr.pos, L.pos.data(), L.pos.size() * 8);
+                    put(pr.wslot, L.wslot.data(), L.wslot.size() * 8);
+                    put(pr.table, L.table.data(), L.table.size() * 8);
+                    put(pr.rows, rows.data(), rows.size() * 8);
+                    const auto t_uploaded = Clock::now();
+                    check(nrt_execute(b.model[size_t(r)], pr.in[0][0], pr.out[0][0]), "whole-model execute");
+                    const auto t_executed = Clock::now();
+                    out[size_t(r)].resize(size_t(b.meta.S) * size_t(vocab_half));
+                    check(nrt_tensor_read(pr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                    if (r == 0) {
+                        phase_upload_ms += std::chrono::duration<double, std::milli>(t_uploaded - t_start).count();
+                        phase_layers_ms += std::chrono::duration<double, std::milli>(t_executed - t_uploaded).count();
+                        phase_head_ms += ms_since(t_executed);
+                    }
+                }));
+            for (auto &j : jobs)
+                j.get();
+            for (size_t i = 0; i < L.head_rows.size(); ++i) {
+                float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
+                for (int r = 0; r < TP; ++r) {
+                    const size_t first = size_t(r) * size_t(vocab_half), count = std::min(size_t(vocab_) - first, size_t(vocab_half));
+                    std::copy_n(out[size_t(r)].data() + i * size_t(vocab_half), count, row + first);
+                }
+            }
+            return;
+        }
         const HeadBucket *head = nullptr;
         if (!L.head_rows.empty())
             for (const auto &h : heads)
