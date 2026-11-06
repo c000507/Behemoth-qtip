@@ -200,6 +200,33 @@ def qtip_linear(x, su, sv, trellis, tlut, out, width):
     return hadamard_pow2(z) * sv.reshape(1, -1)
 
 
+def layer_graph_fp8(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
+                    kf, ks, vf, vs, gf, gs, uf, us, df, ds):
+    """Same layer with FP8 (E4M3) weight parameters and per-row scales; the graph only casts
+    fp8 -> bf16 and scales, no bit-level decode. Tests whether the compiler/hardware treat the
+    fp8 dtype natively (1 byte/weight resident)."""
+    dec = lambda f, sc: (f.to(torch.bfloat16) * sc.reshape(-1, 1).to(torch.bfloat16))
+    return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw,
+                       dec(kf, ks), dec(vf, vs), ow, dec(gf, gs), dec(uf, us), dec(df, ds))
+
+
+def to_fp8_rows(dense):
+    """bf16/f32 [out, in] -> (torch.float8_e4m3fn [out, in], f32 scale [out]); rows scaled to
+    max 224 so no code reaches Trn1's exponent-15 inf/NaN range."""
+    d = dense.float().numpy()
+    scale = np.maximum(np.abs(d).max(axis=1), 1e-30) / 224.0
+    q = (d / scale[:, None]).astype(ml_dtypes.float8_e4m3fn)
+    return torch.from_numpy(q.view(np.uint8)).view(torch.float8_e4m3fn), torch.from_numpy(scale.astype(np.float32))
+
+
+def build_layer_fp8(model, layer):
+    w = build_layer(model, layer)
+    kf, ks = to_fp8_rows(w['kw']); vf, vs = to_fp8_rows(w['vw'])
+    gf, gs = to_fp8_rows(w['gw']); uf, us = to_fp8_rows(w['uw']); df, ds = to_fp8_rows(w['dw'])
+    return {'norm1': w['norm1'], 'norm2': w['norm2'], 'qw': w['qw'], 'ow': w['ow'],
+            'kf': kf, 'ks': ks, 'vf': vf, 'vs': vs, 'gf': gf, 'gs': gs, 'uf': uf, 'us': us, 'df': df, 'ds': ds}
+
+
 def layer_graph_lowbit(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg):
     """Same layer, but projections stay as packed bytes in device memory and are decoded
@@ -256,14 +283,16 @@ def main():
     parser.add_argument('--warmup', type=int, default=8)
     parser.add_argument('--workdir', help='compiler workdir; keeps the generated NEFF and HLO for the C++ runtime harness')
     parser.add_argument('--compile-only', action='store_true', help='stop after compiling (no device run)')
-    parser.add_argument('--weights', choices=('bf16', 'lowbit'), default='bf16',
+    parser.add_argument('--weights', choices=('bf16', 'lowbit', 'fp8'), default='bf16',
                         help='bf16: host-dequantized dense weights; lowbit: packed bytes resident, decoded in-graph')
     a = parser.parse_args()
     import torch_neuronx
     import torch_xla.core.xla_model as xm
 
     lowbit = a.weights == 'lowbit'
-    weights = build_layer_lowbit(a.model, a.layer) if lowbit else build_layer(a.model, a.layer)
+    fp8 = a.weights == 'fp8'
+    weights = (build_layer_lowbit(a.model, a.layer) if lowbit else
+               build_layer_fp8(a.model, a.layer) if fp8 else build_layer(a.model, a.layer))
     sample = {
         'x': torch.randn(1, HIDDEN),
         'slots': torch.zeros(1, dtype=torch.int64),
@@ -276,6 +305,9 @@ def main():
     if lowbit:
         order = ['x', 'slots', 'cos_sin', 'cache_k', 'cache_v', 'norm1', 'norm2', 'qw', 'ow',
                  'kb', 'ks', 'vb', 'vs', 'gp', 'gs', 'gg', 'up', 'us', 'ug', 'dp', 'ds', 'dg']
+    if fp8:
+        order = ['x', 'slots', 'cos_sin', 'cache_k', 'cache_v', 'norm1', 'norm2', 'qw', 'ow',
+                 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
     inputs = [sample[k] if k in sample else weights[k] for k in order]
     # device bytes of the weight parameters as they are held resident (bf16 weights count 2 B/elem
     # on the device; the host tensors here are float32 holding bf16-rounded values and are cast
@@ -283,7 +315,7 @@ def main():
     resident = sum(weights[k].numel() * weights[k].element_size() for k in order if k in weights)
 
     started = time.monotonic()
-    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs),
+    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph_fp8 if fp8 else layer_graph, tuple(inputs),
                                 compiler_workdir=a.workdir)
     compile_s = time.monotonic() - started
     if a.compile_only:
