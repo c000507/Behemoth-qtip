@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     // CPU reference layer at position 0 (double precision): norms, projections through the format's own reference
     // (QTIP: reference_forward with device rounding, FP8: dequantized, NVFP4: dequantized), SiLU MLP. Attention over a
     // single cached key reduces to the value vector of each head's KV group.
-    std::vector<float> reference, reference_x1, reference_fp8w_x1, reference_v, reference_attn;
+    std::vector<float> reference, reference_x1, reference_fp8w_x1, reference_v, reference_attn, reference_o_fp8w, reference_opart0;
     {
         auto project = [&](const char *proj, const std::vector<float> &in_vec) -> std::vector<float> {
             const std::string base = "model.layers." + std::to_string(layer) + "." + proj + ".";
@@ -195,6 +195,17 @@ int main(int argc, char **argv) {
         for (int hd = 0; hd < heads; ++hd)
             for (int d = 0; d < dim; ++d) attn[size_t(hd * dim + d)] = vproj[size_t((hd / group) * dim + d)];
         const auto o = project("o", false, attn);
+        if (emulate_act == 0) {
+            reference_o_fp8w = o;
+            const auto &q = shards["o"][0];
+            reference_opart0.assign(static_cast<size_t>(q.rows), 0.f);
+            for (int row = 0; row < q.rows; ++row) {
+                double acc = 0;
+                for (int c = 0; c < q.cols; ++c)
+                    acc += double(decode_e4m3(q.w[size_t(row) * size_t(q.cols) + size_t(c)])) * double(float(BFloat16(attn[size_t(c)])));
+                reference_opart0[size_t(row)] = float(acc * double(q.scale[size_t(row)]));
+            }
+        }
         std::vector<float> x1(x.size());
         for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
         if (emulate_act == 0) reference_fp8w_x1 = x1;
@@ -275,8 +286,9 @@ int main(int argc, char **argv) {
     for (int r = 0; r < TP; ++r) threads.emplace_back(worker, r);
     for (auto &t : threads) t.join();
 
-    if (argc > 5 && (std::string(argv[5]) == "v" || std::string(argv[5]) == "attnout")) {  // compare rank 0's slice
-        const auto &ref = std::string(argv[5]) == "v" ? reference_v : reference_attn;
+    if (argc > 5 && (std::string(argv[5]) == "v" || std::string(argv[5]) == "attnout" || std::string(argv[5]) == "o" || std::string(argv[5]) == "opart")) {  // compare rank 0's slice
+        const std::string st = argv[5];
+        const auto &ref = st == "v" ? reference_v : st == "attnout" ? reference_attn : st == "o" ? reference_o_fp8w : reference_opart0;
         const size_t n = out0_bytes / 4;
         double a = 0, b = 0, mx = 0;
         for (size_t i = 0; i < n; ++i) { const double d = double(result[i]) - double(ref[i]); a += d * d; b += double(ref[i]) * double(ref[i]); mx = std::max(mx, std::fabs(d)); }

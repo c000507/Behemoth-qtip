@@ -62,7 +62,7 @@ def main():
     try:
         import os
         stage = os.environ.get('DEBUG_STAGE')  # attn | v | attnout
-        fn = (lambda *a: real_layer(*a, stop_after_attention=(stage == 'attn'), debug=stage if stage in ('v', 'attnout') else None)) if stage else real_layer
+        fn = (lambda *a: real_layer(*a, stop_after_attention=(stage == 'attn'), debug=stage if stage in ('v', 'attnout', 'opart', 'o') else None)) if stage else real_layer
         torch_neuronx.trace(fn, tuple(sample), compiler_workdir=workdir)
     except RuntimeError as error:
         if 'neuronx-cc failed' not in str(error):

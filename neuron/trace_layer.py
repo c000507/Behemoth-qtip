@@ -113,6 +113,10 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
     attn = torch.stack(heads_out).reshape(1, heads * DIM).to(torch.bfloat16)
     if debug == 'attnout':  # debugging: attention output before o_proj, [1, heads * DIM]
         return attn.float(), cache_k, cache_v
+    if debug == 'opart':  # debugging: this rank's o_proj partial sum BEFORE the all-reduce, [1, hidden]
+        return lin(attn, ow).float(), cache_k, cache_v
+    if debug == 'o':  # debugging: o_proj output after the all-reduce, [1, hidden]
+        return reduce(lin(attn, ow).float()), cache_k, cache_v
     x = x + reduce(lin(attn, ow).float())
     if stop_after_attention:  # debugging: residual stream after the attention block
         return x, cache_k, cache_v
