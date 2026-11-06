@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     // CPU reference layer at position 0 (double precision): norms, projections through the format's own reference
     // (QTIP: reference_forward with device rounding, FP8: dequantized, NVFP4: dequantized), SiLU MLP. Attention over a
     // single cached key reduces to the value vector of each head's KV group.
-    std::vector<float> reference;
+    std::vector<float> reference, reference_x1, reference_fp8w_x1;
     {
         auto project = [&](const char *proj, const std::vector<float> &in_vec) -> std::vector<float> {
             const std::string base = "model.layers." + std::to_string(layer) + "." + proj + ".";
@@ -138,6 +138,7 @@ int main(int argc, char **argv) {
         const auto o = project("self_attn.o_proj", attn);
         std::vector<float> x1(x.size());
         for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
+        reference_x1 = x1;
         const auto h2 = rms(x1, norm2);
         const auto gate = project("mlp.gate_proj", h2), up = project("mlp.up_proj", h2);
         std::vector<float> act(gate.size());
@@ -194,6 +195,7 @@ int main(int argc, char **argv) {
         const auto o = project("o", false, attn);
         std::vector<float> x1(x.size());
         for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
+        if (emulate_act == 0) reference_fp8w_x1 = x1;
         const auto h2 = rms(x1, norm2);
         const auto gate = project("g", true, h2), up = project("u", true, h2);
         std::vector<float> act(gate.size());
@@ -266,6 +268,11 @@ int main(int argc, char **argv) {
     for (int r = 0; r < TP; ++r) threads.emplace_back(worker, r);
     for (auto &t : threads) t.join();
 
+    if (argc > 5 && std::string(argv[5]) == "attn") {  // NEFF stops after attention: compare the residual stream there
+        reference = reference_x1;
+        reference_fp8w = reference_fp8w_x1;
+        reference_fp8a = reference_fp8w_x1;
+    }
     double num = 0, den = 0, maxabs = 0;
     for (int i = 0; i < hidden; ++i) {
         const double d = double(result[size_t(i)]) - double(reference[size_t(i)]);

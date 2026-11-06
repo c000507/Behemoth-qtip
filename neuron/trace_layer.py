@@ -75,7 +75,7 @@ def build_layer(model, layer, seed=5):
 
 
 def layer_graph(x, slots, cos_sin, cache_k, cache_v,
-                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None, mask=None):
+                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None, mask=None, stop_after_attention=False):
     """One Llama decode layer. heads/kvheads are the local counts (tensor parallel shards);
     reduce, when given, all-reduces the row-parallel o_proj and down_proj partial sums; mask, when given,
     is an additive [context] float vector (0 for valid cache slots, -1e9 for the rest)."""
@@ -110,6 +110,8 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         heads_out.append(weights @ values)
     attn = torch.stack(heads_out).reshape(1, heads * DIM).to(torch.bfloat16)
     x = x + reduce(lin(attn, ow).float())
+    if stop_after_attention:  # debugging: residual stream after the attention block
+        return x, cache_k, cache_v
     h = x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm2
     h = h.to(torch.bfloat16)
     gate = lin(h, gw)
