@@ -80,15 +80,26 @@ See `PERF_NOTES.md` for the numbers; the checks are:
   of the same requests run one at a time, within a bucket choice; seeded requests are reproducible;
 * HTTP: chat completion, SSE streaming, 8 concurrent requests, `finish_reason: stop` on `<|eot_id|>`.
 
-## Single NEFF
+## One NEFF per step?
 
-`model` buckets compile the whole transformer, KV update and lm_head into one graph and run it with ONE `nrt_execute`
-per step (bound to the same weight and KV tensors). Measured: with 30 layers the step is 48.2 ms against 51.7 ms for
-30 per-layer launches, i.e. the launch overhead is ~7 %, the rest is device time. **A 32-layer graph returns wrong
-results** (reproducibly, with 8 or 1 rows, separate or merged K/V; 4, 8, 16, 24, 28, 30 and 31 layers match the
-per-layer path to fp8 noise), so for the 32-layer 8B the default is one layer NEFF reused for all layers; the
-`model` bucket is used automatically when its L equals the checkpoint's layer count. Each graph with 31 layers took 7-11 min and
-13 GB of host memory to compile.
+The default is **one layer NEFF reused for all 32 layers** (nothing compiled per layer; 32 launches per step plus the head).
+`trace_model.py ... model R Q P L S [body]` also compiles L layers (plus optionally the head) into ONE graph; the
+runtime chains such "segments" (`body` segments that return the residual, then a head segment or the separate head NEFF),
+so a step is 1-3 launches. Findings on this toolchain (neuronx-cc 2.26, torch-neuronx 2.9, Trn1):
+
+* The launch overhead removed is small: 30 layers, 8 rows, 128 pages take 48.2 ms as one graph against 51.7 ms as 30
+  launches (7 %); the rest is device time. A single short chat is 38 ms per token either way.
+* Graphs with 4, 8, 16, 24, 28, 30 and 31 layers, chains of 16-layer segments, and segments bound to any layers 0..30
+  (including repeated or shifted ones) match the per-layer path to fp8 noise (relative L2 of the residual 0.02-0.05).
+* **Binding layer 31 of the 8B checkpoint into any multi-layer graph gives wrong results** (residual relative error 0.6-1.6,
+  top-1 changes), whatever its position in the graph, with 1 or 8 rows, `-O1` or `-O2`, separate or merged K/V, either
+  upload order, KV tensor swapped. Its weights are sane (no E4M3 exponent-15 codes, scales in the range of the other
+  layers) and the same tensors are correct when run as a single-layer launch (the 22 oracle positions above). Not root-caused,
+  so the 32-layer 8B uses the layer NEFF; the segment path is only used when the bucket directory contains `model`
+  graphs, and each compile took 3-11 min and up to 13 GB of host memory.
+* Debug hooks for this: `NEURON_LAYERS=n` (first n layers), `NEURON_USE_LAYERS=1` (ignore model graphs),
+  `NEURON_DUMP_X=prefix` (residual after 16/31/32 layers), `NEURON_LAYER_ORDER="0-15,16-30"`,
+  `NEURON_SEG_LAYERS="0-15;16-30,30"`, `NEURON_SEG_SHIFT=n`, `NEURON_LOGITS_DUMP=file`.
 
 ## Not carried over
 
