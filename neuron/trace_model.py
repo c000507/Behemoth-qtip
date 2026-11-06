@@ -175,6 +175,7 @@ def main():
     except RuntimeError as error:
         if 'neuronx-cc failed' not in str(error):
             raise
+        print('trace-time compile error (expected FN fp8):', str(error)[-700:])
     m = Path(workdir) / 'model'
     here = Path(__file__).resolve().parent
     subprocess.run([sys.executable, str(here / 'tools_patch_fp8_hlo.py'), str(m / 'graph.hlo'), str(m / 'graph.hlo')], check=True)
