@@ -2,8 +2,8 @@
 #include <algorithm>
 
 namespace behemoth {
-Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy policy)
-    : pool_(pages), token_budget_(budget), chunk_(chunk), policy_(policy) {
+Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy policy, int vocab)
+    : pool_(pages), token_budget_(budget), chunk_(chunk), policy_(policy), vocab_(vocab) {
     if (!budget || !chunk || chunk > budget)
         throw std::invalid_argument("Invalid scheduler token budget/chunk");
     if (!policy_.prefill_interval || !policy_.max_requests)
@@ -14,7 +14,7 @@ uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, Sampling
         prompt.size() + max_new > 131072 || ceil_div(prompt.size(), 16) > size_t(pool_.capacity()))
         throw std::invalid_argument("Request exceeds context or standalone KV capacity");
     for (int t : prompt)
-        if (t < 0 || t >= 32768)
+        if (t < 0 || t >= vocab_)
             throw std::invalid_argument("Token outside vocabulary");
     Request r;
     r.id = next_id_++;
@@ -213,7 +213,7 @@ void Scheduler::complete(const ScheduledRequest &step, int token, bool eos) {
     if (!r.inflight || r.cached != step.begin || !step.count ||
         step.count > r.history.size() - r.cached)
         throw std::logic_error("Invalid step completion");
-    if (step.sample && (token < 0 || token >= 32768))
+    if (step.sample && (token < 0 || token >= vocab_))
         throw std::invalid_argument("Invalid sampled token");
     r.cached += step.count;
     r.inflight = false;

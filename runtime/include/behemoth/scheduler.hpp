@@ -56,14 +56,16 @@ class Scheduler {
     size_t token_budget_, chunk_, cursor_ = 0;
     size_t preemptions_ = 0;
     SchedulerPolicy policy_;
+    int vocab_ = 32768;
     size_t steps_since_prefill_ = 0;
     bool retain_finished_ = false;
     std::function<std::vector<int>(size_t)> reclaim_;
     bool grow(std::vector<int> &table, size_t tokens);
 
   public:
+    // `vocab`: token ids are 0 <= id < vocab (the Behemoth models have 32768; Llama 3 has 128257).
     Scheduler(int pages, size_t token_budget = 1024, size_t prefill_chunk = 256,
-              SchedulerPolicy policy = {});
+              SchedulerPolicy policy = {}, int vocab = 32768);
     const SchedulerPolicy &policy() const {
         return policy_;
     }

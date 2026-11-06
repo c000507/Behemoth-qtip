@@ -77,7 +77,7 @@ struct Engine::Impl {
         return m;
     }
     explicit Impl(const RuntimeOptions &o)
-        : model(neuron_options(o)), scheduler(model.cache_pages(), o.token_budget, o.prefill_chunk, o.scheduler),
+        : model(neuron_options(o)), scheduler(model.cache_pages(), o.token_budget, o.prefill_chunk, o.scheduler, model.vocab()),
           eos(model.eos().begin(), model.eos().end()), max_context(size_t(model.max_context())) {
         thread = std::thread([this] { loop(); });
     }
