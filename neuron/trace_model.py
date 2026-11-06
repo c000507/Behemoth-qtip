@@ -158,7 +158,6 @@ def main():
                     return x
             fn = Layer()
             kwargs['enable_aliasing'] = True
-            kwargs['inline_weights_to_neff'] = False
             inputs = [t for k, t in zip(ORDER, inputs) if k not in ('cache_k', 'cache_v')]
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
