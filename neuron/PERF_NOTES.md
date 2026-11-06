@@ -42,3 +42,20 @@ neuronx-cc 2.26, torch-neuronx 2.9. Accuracy was only checked where stated.
 - Numerics of the FP8 weight path at model level (about 4% per MLP matmul vs the NVFP4 reference).
 - Tiled/pipelined NKI matmul skeleton, then QTIP trellis decode on top of it.
 - Whole-layer / whole-model assembly and KV cache residency across steps.
+
+## Load-time QTIP -> FP8 expansion (C++, `cpp/qtip_expand.cpp`)
+The checkpoint stays QTIP; at load the host decodes the trellis, applies the Hadamard rotations and SU/SV and
+writes this rank's E4M3 row-scaled shard (max 224) for the TP FP8 graph (no extra collectives at run time).
+Measured on layer 0 of the 8B with `cpp/qtip_expand_test.cpp`, TP=2, 8 vCPU, weight-only error vs
+`reference_forward` (FP8 activations add more):
+
+| projection | split | expand (both ranks) | relative L2 |
+|---|---|---|---|
+| q_proj 4096x4096 | column | 0.39 s | 2.85% |
+| o_proj 4096x4096 | row | 0.39 s | 2.43% |
+| gate_proj 14336x4096 | column | 1.80 s | 2.70% |
+| up_proj 14336x4096 | column | 1.82 s | 2.61% |
+| down_proj 4096x14336 | row | 1.85 s | 2.69% |
+
+About 6 s per QTIP layer, so roughly 3 minutes for 32 layers at load. Resident cost is 1 byte per weight (QTIP is
+0.25), which is the price of running QTIP layers at the FP8 decode speed (0.99 ms / layer at TP=2).
