@@ -472,14 +472,11 @@ struct NeuronModel::Impl {
         }
     }
 
-    void fill_row(Launch &L, int row, int token, int position, int page_id, const int *table_row, int pages_used) {
-        const auto &b = *L.bucket;
-        const int scratch = pages_total - 1;
+    void fill_row(Launch &L, int row, int token, int position, int page_id) {
         embed_row(token, L.x.data() + size_t(row) * 4096);
         rope_row(position, L.cos_sin.data() + size_t(row) * DIM);
         L.pos[size_t(row)] = position;
         L.wslot[size_t(row)] = int64_t(page_id) * 16 + position % 16;
-        (void)table_row; (void)pages_used; (void)b; (void)scratch;
     }
 
     void execute(Launch &L, float *dest) {
@@ -592,12 +589,6 @@ struct NeuronModel::Impl {
             sample_index[req] = int(s);
         }
         auto pages_needed = [&](int req) { return (lay.lengths[size_t(req)] + 15) / 16; };
-        auto choose = [&](std::vector<LayerBucket> &set, int pages, int count) -> LayerBucket & {
-            for (auto &b : set)
-                if (b.meta.P >= pages && b.meta.Q >= count)
-                    return b;
-            throw std::runtime_error("no NEFF bucket large enough for " + std::to_string(pages) + " pages / " + std::to_string(count) + " tokens");
-        };
         auto table_row = [&](Launch &L, int slot, int req) {
             const auto &b = *L.bucket;
             for (int j = 0; j < b.meta.P; ++j) {
@@ -618,23 +609,43 @@ struct NeuronModel::Impl {
                 rope_row(0, L.cos_sin.data() + t * DIM);
             return L;
         };
-        // decode rows (one token) first, in groups of the decode bucket's R
+        // Bucket choice: the cheapest (rows x table pages, or queries x table pages) NEFF that covers the work; a
+        // whole-model bucket wins a tie with the per-layer one.
+        auto cost = [](const LayerBucket &b) { return double(b.tokens()) * double(b.meta.P) + (b.full() ? 0. : .5); };
+        auto pick = [&](std::vector<LayerBucket> &set, int need_rows, int need_queries, int pages) -> LayerBucket * {
+            LayerBucket *best = nullptr;
+            for (auto &b : set)
+                if (b.meta.R >= need_rows && b.meta.Q >= need_queries && b.meta.P >= pages && (!best || cost(b) < cost(*best)))
+                    best = &b;
+            return best;
+        };
         std::vector<int> single, multi;
         for (int req = 0; req < lay.requests(); ++req)
             (lay.query_offsets[size_t(req) + 1] - lay.query_offsets[size_t(req)] == 1 ? single : multi).push_back(req);
-        int launches = 0;
+        int launches = 0, max_rows = 0, max_queries = 0;
+        for (const auto &b : decode) max_rows = std::max(max_rows, b.meta.R);
+        for (const auto &b : prefill) max_queries = std::max(max_queries, b.meta.Q);
+        // decode rows (one token each): all of them in one launch when a bucket fits, else in groups of the largest R
         for (size_t at = 0; at < single.size();) {
-            int pages = 1;
-            const size_t group = std::min<size_t>(single.size() - at, size_t(decode.back().meta.R));
-            for (size_t i = 0; i < group; ++i) pages = std::max(pages, pages_needed(single[at + i]));
-            auto &b = choose(decode, pages, 1);
-            const size_t cap = std::min<size_t>(single.size() - at, size_t(b.meta.R));
-            auto L = fresh(b);
-            for (size_t i = 0; i < cap; ++i) {
+            size_t n = single.size() - at;
+            auto pages_of = [&](size_t count) {
+                int pages = 1;
+                for (size_t i = 0; i < count; ++i) pages = std::max(pages, pages_needed(single[at + i]));
+                return pages;
+            };
+            LayerBucket *bucket = pick(decode, int(n), 1, pages_of(n));
+            if (!bucket) {
+                n = std::min<size_t>(n, size_t(max_rows));
+                bucket = pick(decode, int(n), 1, pages_of(n));
+                if (!bucket)
+                    throw std::runtime_error("no decode NEFF bucket large enough for " + std::to_string(pages_of(n)) + " pages");
+            }
+            auto L = fresh(*bucket);
+            for (size_t i = 0; i < n; ++i) {
                 const int req = single[at + i], token_index = lay.query_offsets[size_t(req)];
                 const int position = lay.positions[size_t(token_index)];
                 const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / 16)];
-                fill_row(L, int(i), batch.tokens[size_t(token_index)], position, page, nullptr, 0);
+                fill_row(L, int(i), batch.tokens[size_t(token_index)], position, page);
                 table_row(L, int(i), req);
                 if (sample_index[size_t(req)] >= 0) {
                     L.head_rows.push_back(int(i));
@@ -643,20 +654,22 @@ struct NeuronModel::Impl {
             }
             execute(L, logits.data());
             ++launches;
-            at += cap;
+            at += n;
         }
-        // prefill chunks: one request per launch
+        // prefill chunks: one request per launch, the smallest query bucket that covers what is left of the prompt
         for (int req : multi) {
             const int first = lay.query_offsets[size_t(req)], count = lay.query_offsets[size_t(req) + 1] - first;
             for (int done = 0; done < count;) {
-                int pages = pages_needed(req);
-                auto &b = choose(prefill, pages, 1);
-                const int take = std::min(count - done, b.meta.Q);
-                auto L = fresh(b);
+                const int pages = pages_needed(req), left = count - done;
+                LayerBucket *bucket = pick(prefill, 1, std::min(left, max_queries), pages);
+                if (!bucket)
+                    throw std::runtime_error("no prefill NEFF bucket large enough for " + std::to_string(pages) + " pages");
+                const int take = std::min(left, bucket->meta.Q);
+                auto L = fresh(*bucket);
                 for (int i = 0; i < take; ++i) {
                     const int token_index = first + done + i, position = lay.positions[size_t(token_index)];
                     const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / 16)];
-                    fill_row(L, i, batch.tokens[size_t(token_index)], position, page, nullptr, 0);
+                    fill_row(L, i, batch.tokens[size_t(token_index)], position, page);
                 }
                 table_row(L, 0, req);
                 if (done + take == count && sample_index[size_t(req)] >= 0) {
@@ -667,13 +680,6 @@ struct NeuronModel::Impl {
                 ++launches;
                 done += take;
             }
-        }
-        if (const char *dump = std::getenv("NEURON_LOGITS_DUMP")) { // append the sampled rows (f32 [n][vocab]) for offline comparison
-            std::ofstream f(dump, std::ios::binary | std::ios::app);
-            f.write(reinterpret_cast<const char *>(logits.data()), std::streamsize(logits.size() * 4));
-            std::ofstream ids(std::string(dump) + ".ids", std::ios::app);
-            for (auto id : batch.sample_ids)
-                ids << id << '\n';
         }
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms}, {"head_ms", phase_head_ms}, {"tokens", batch.tokens.size()}};
         return logits;
