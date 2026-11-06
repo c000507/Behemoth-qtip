@@ -21,4 +21,12 @@ struct Fp8Shard {
 
 // tp = number of ranks, rank in [0, tp). column_parallel: shard of rows; otherwise shard of columns.
 Fp8Shard expand_qtip_to_fp8(const behemoth::qtip::HostLinear &l, int tp, int rank, bool column_parallel);
+// All tp shards of one projection, decoding the QTIP matrix only once.
+std::vector<Fp8Shard> expand_qtip_all(const behemoth::qtip::HostLinear &l, int tp, bool column_parallel);
+
+// Any projection of a layer file (QTIP trellis, FP8 weight + scale, or NVFP4 packed) as tp FP8 shards,
+// ready to bind to the tensor-parallel FP8 layer graph. FP8 and NVFP4 tensors are dequantized and
+// re-encoded with a per-row scale (max 224).
+std::vector<Fp8Shard> load_projection_shards(const behemoth::SafeTensorFile &file, int layer, const std::string &name,
+                                             const behemoth::ModelConfig &config, int tp, bool column_parallel);
 } // namespace neuron
