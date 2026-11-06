@@ -51,7 +51,8 @@ void zero(const Dev &d) {
 
 struct Meta {
     std::string kind;
-    int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // L > 0: whole-model graph (L layers + head, kind "model")
+    int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
+    bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
     std::filesystem::path neff;
 };
 
@@ -71,6 +72,14 @@ struct RankState {
 struct LayerBucket {
     Meta meta;
     std::array<nrt_model_t *, TP> model{};
+    // Whole-model buckets run as a chain of segments (one segment when the toolchain compiles all layers into one graph).
+    struct Seg {
+        Meta meta;
+        int first_layer = 0;
+        std::array<nrt_model_t *, TP> model{};
+        std::array<nrt_tensor_set_t *, TP> in{}, out{};
+    };
+    std::vector<Seg> segs;
     struct PerRank {
         Dev x[2], cos_sin, pos, wslot, table;
         std::vector<std::array<nrt_tensor_set_t *, 2>> in, out; // [layer][parity]; whole-model buckets: [0][0]
@@ -78,7 +87,7 @@ struct LayerBucket {
     };
     std::array<PerRank, TP> rank;
     int tokens() const { return meta.R * meta.Q; }
-    bool full() const { return meta.L > 0; }
+    bool full() const { return !segs.empty(); }
 };
 struct HeadBucket {
     Meta meta;
@@ -110,6 +119,7 @@ struct NeuronModel::Impl {
     std::array<RankState, TP> ranks;
     std::vector<LayerBucket> decode, prefill;
     std::vector<HeadBucket> heads;
+    std::vector<Meta> segments; // whole-model graphs found by discover(), before they are assembled into buckets
     std::vector<float> logits;
     std::vector<std::unique_ptr<RankWorker>> workers;
     nlohmann::json profile = nlohmann::json::object();
@@ -156,15 +166,14 @@ struct NeuronModel::Impl {
             Meta m;
             m.kind = j.at("kind");
             m.neff = entry.path() / "graph.neff";
-            if (m.kind == "layer" || m.kind == "model") {
-                if (m.kind == "model" && std::getenv("NEURON_USE_LAYERS"))
+            if (m.kind == "model") {
+                if (std::getenv("NEURON_USE_LAYERS"))
                     continue;
+                m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P"); m.L = j.at("L"); m.S = j.at("S");
+                m.head = j.value("head", true);
+                segments.push_back(m);
+            } else if (m.kind == "layer") {
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
-                if (m.kind == "model") {
-                    m.L = j.at("L"); m.S = j.at("S");
-                    if (m.L != config.layers)
-                        continue; // a partial-depth graph (compile-time probe)
-                }
                 LayerBucket b;
                 b.meta = m;
                 (m.Q == 1 ? decode : prefill).push_back(std::move(b));
@@ -175,6 +184,39 @@ struct NeuronModel::Impl {
                 heads.push_back(std::move(b));
             }
         }
+        // Whole-model graphs of one (R, Q, P): body segments (residual out) followed by one head segment (logits out),
+        // chained over the layers in order; used only when their layer counts add up to the checkpoint's.
+        for (const auto &head : segments) {
+            if (!head.head)
+                continue;
+            LayerBucket bucket;
+            bucket.meta = head;
+            int total = head.L;
+            std::vector<Meta> body;
+            for (const auto &m : segments)
+                if (!m.head && m.R == head.R && m.Q == head.Q && m.P == head.P)
+                    body.push_back(m);
+            std::sort(body.begin(), body.end(), [](const Meta &x, const Meta &y) { return x.L > y.L; });
+            for (const auto &m : body)
+                if (total + m.L <= config.layers) { // body segments first; a tail of the same size repeats
+                    bucket.segs.push_back({m, 0, {}, {}, {}});
+                    total += m.L;
+                }
+            while (total < config.layers && !body.empty() && total + body.front().L <= config.layers) {
+                bucket.segs.push_back({body.front(), 0, {}, {}, {}});
+                total += body.front().L;
+            }
+            if (total != config.layers)
+                continue; // a partial-depth graph (compile-time probe)
+            bucket.segs.push_back({head, 0, {}, {}, {}});
+            int first = 0;
+            for (auto &seg : bucket.segs) {
+                seg.first_layer = first;
+                first += seg.meta.L;
+            }
+            bucket.meta.L = config.layers;
+            (head.Q == 1 ? decode : prefill).push_back(std::move(bucket));
+        }
         auto by_size = [](const auto &a, const auto &b) { return a.meta.P != b.meta.P ? a.meta.P < b.meta.P : a.meta.Q != b.meta.Q ? a.meta.Q < b.meta.Q : a.meta.L > b.meta.L; };
         std::sort(decode.begin(), decode.end(), by_size);
         std::sort(prefill.begin(), prefill.end(), by_size);
@@ -184,34 +226,41 @@ struct NeuronModel::Impl {
     // Load every NEFF on both cores and create its step tensors. Tensor sets are built after the weights exist.
     void load_buckets() {
         auto load_layer = [&](LayerBucket &b) {
-            const auto neff = slurp(b.meta.neff);
+            std::vector<std::vector<char>> neffs;
+            if (b.full())
+                for (const auto &seg : b.segs) neffs.push_back(slurp(seg.meta.neff));
+            else
+                neffs.push_back(slurp(b.meta.neff));
             std::vector<std::future<void>> jobs;
             for (int r = 0; r < TP; ++r)
                 jobs.push_back(workers[size_t(r)]->submit([&, r] {
-                    check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), TP, &b.model[size_t(r)]), "nrt_load_collectives");
-                    nrt_tensor_info_array_t *info = nullptr;
-                    check(nrt_get_model_tensor_info(b.model[size_t(r)], &info), "tensor info");
-                    if (options.verbose && r == 0) {
-                        std::cerr << "layer NEFF R=" << b.meta.R << " Q=" << b.meta.Q << " P=" << b.meta.P << ":";
+                    for (size_t g = 0; g < neffs.size(); ++g) {
+                        const auto &neff = neffs[g];
+                        nrt_model_t *&handle = b.full() ? b.segs[g].model[size_t(r)] : b.model[size_t(r)];
+                        check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), TP, &handle), "nrt_load_collectives");
+                        nrt_tensor_info_array_t *info = nullptr;
+                        check(nrt_get_model_tensor_info(handle, &info), "tensor info");
+                        const Meta &m = b.full() ? b.segs[g].meta : b.meta;
+                        if (options.verbose && r == 0)
+                            std::cerr << (b.full() ? "model" : "layer") << " NEFF R=" << m.R << " Q=" << m.Q << " P=" << m.P << " L=" << (b.full() ? m.L : 1)
+                                      << " head=" << m.head << ": " << info->tensor_count << " tensors\n";
+                        const int base = b.full() ? (m.head ? 8 : 5) : 0;
+                        const int kv_index = b.full() ? base + 16 * m.L : kKvInput;
+                        int ins = 0;
                         for (uint64_t i = 0; i < info->tensor_count; ++i)
-                            std::cerr << ' ' << info->tensor_array[i].name << '(' << info->tensor_array[i].size << ')';
-                        std::cerr << '\n';
-                    }
-                    int ins = 0;
-                    for (uint64_t i = 0; i < info->tensor_count; ++i)
-                        if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
-                            const auto &t = info->tensor_array[i];
-                            const size_t index = std::stoul(std::string(t.name).substr(5));
-                            if (index == size_t(b.full() ? 8 + 16 * b.meta.L : kKvInput)) {
-                                const int pages = int(t.size / size_t(2 * kv_local * 16 * DIM * 2));
-                                if (pages_total && pages != pages_total)
-                                    throw std::runtime_error("layer NEFFs disagree on the page count");
-                                pages_total = pages;
+                            if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
+                                const auto &t = info->tensor_array[i];
+                                if (std::stoul(std::string(t.name).substr(5)) == size_t(kv_index)) {
+                                    const int pages = int(t.size / size_t(2 * kv_local * 16 * DIM * 2));
+                                    if (pages_total && pages != pages_total)
+                                        throw std::runtime_error("NEFFs disagree on the page count");
+                                    pages_total = pages;
+                                }
+                                ++ins;
                             }
-                            ++ins;
-                        }
- if (ins != (b.full() ? 8 + 17 * b.meta.L : kInputs))
-                        throw std::runtime_error("layer NEFF has " + std::to_string(ins) + " inputs, expected " + std::to_string(kInputs));
+                        if (ins != (b.full() ? base + 17 * m.L : kInputs))
+                            throw std::runtime_error("NEFF has " + std::to_string(ins) + " inputs, unexpected for its layer count");
+                    }
                     auto &pr = b.rank[size_t(r)];
                     const size_t T = size_t(b.tokens());
                     pr.x[0] = alloc(r, T * 4096 * 4, "x0");
@@ -336,42 +385,49 @@ struct NeuronModel::Impl {
         auto build_full = [&](LayerBucket &b) {
             for (int r = 0; r < TP; ++r) {
                 auto &pr = b.rank[size_t(r)];
-                nrt_tensor_info_array_t *info = nullptr;
-                check(nrt_get_model_tensor_info(b.model[size_t(r)], &info), "tensor info");
-                std::vector<const Dev *> by_index = {&pr.x[0], &pr.cos_sin, &pr.pos, &pr.wslot, &pr.table, &pr.rows, &ranks[size_t(r)].head_norm,
-                                                     &ranks[size_t(r)].head_w};
-                for (int l = 0; l < b.meta.L; ++l) {
-                    const auto &lw = ranks[size_t(r)].layers[size_t(l)];
-                    by_index.push_back(&lw.norm1);
-                    by_index.push_back(&lw.norm2);
-                    for (const auto &w : lw.w) by_index.push_back(&w);
-                }
-                std::vector<const Dev *> state;
-                for (int l = 0; l < b.meta.L; ++l)
-                    state.push_back(&ranks[size_t(r)].layers[size_t(l)].kv);
-                by_index.insert(by_index.end(), state.begin(), state.end());
-                nrt_tensor_set_t *in = nullptr, *out = nullptr;
-                check(nrt_allocate_tensor_set(&in), "set");
-                check(nrt_allocate_tensor_set(&out), "set");
-                size_t extra = 0;
-                for (uint64_t i = 0; i < info->tensor_count; ++i) {
-                    const auto &t = info->tensor_array[i];
-                    const std::string name = t.name;
-                    if (t.usage == NRT_TENSOR_USAGE_INPUT) {
-                        const size_t index = std::stoul(name.substr(5));
-                        if (index >= by_index.size() || by_index[index]->bytes != t.size)
-                            throw std::runtime_error("whole-model input " + name + " does not match the host tensor");
-                        check(nrt_add_tensor_to_tensor_set(in, t.name, by_index[index]->t), "add input");
-                    } else if (name == "output0") {
-                        check(nrt_add_tensor_to_tensor_set(out, t.name, pr.logits.t), "add output");
-                    } else {
-                        if (extra >= state.size() || state[extra]->bytes != t.size)
-                            throw std::runtime_error("whole-model output " + name + " does not match a KV tensor");
-                        check(nrt_add_tensor_to_tensor_set(out, t.name, state[extra++]->t), "add kv output");
+                for (size_t g = 0; g < b.segs.size(); ++g) {
+                    auto &seg = b.segs[g];
+                    nrt_tensor_info_array_t *info = nullptr;
+                    check(nrt_get_model_tensor_info(seg.model[size_t(r)], &info), "tensor info");
+                    // x chains through the segments: segment g reads x[g % 2] and (a body segment) writes x[(g + 1) % 2]
+                    std::vector<const Dev *> by_index = {&pr.x[g % 2], &pr.cos_sin, &pr.pos, &pr.wslot, &pr.table};
+                    if (seg.meta.head) {
+                        by_index.push_back(&pr.rows);
+                        by_index.push_back(&ranks[size_t(r)].head_norm);
+                        by_index.push_back(&ranks[size_t(r)].head_w);
                     }
+                    std::vector<const Dev *> state;
+                    for (int l = seg.first_layer; l < seg.first_layer + seg.meta.L; ++l) {
+                        const auto &lw = ranks[size_t(r)].layers[size_t(l)];
+                        by_index.push_back(&lw.norm1);
+                        by_index.push_back(&lw.norm2);
+                        for (const auto &w : lw.w) by_index.push_back(&w);
+                        state.push_back(&lw.kv);
+                    }
+                    by_index.insert(by_index.end(), state.begin(), state.end());
+                    nrt_tensor_set_t *in = nullptr, *out = nullptr;
+                    check(nrt_allocate_tensor_set(&in), "set");
+                    check(nrt_allocate_tensor_set(&out), "set");
+                    size_t extra = 0;
+                    for (uint64_t i = 0; i < info->tensor_count; ++i) {
+                        const auto &t = info->tensor_array[i];
+                        const std::string name = t.name;
+                        if (t.usage == NRT_TENSOR_USAGE_INPUT) {
+                            const size_t index = std::stoul(name.substr(5));
+                            if (index >= by_index.size() || by_index[index]->bytes != t.size)
+                                throw std::runtime_error("whole-model input " + name + " does not match the host tensor");
+                            check(nrt_add_tensor_to_tensor_set(in, t.name, by_index[index]->t), "add input");
+                        } else if (name == "output0") {
+                            check(nrt_add_tensor_to_tensor_set(out, t.name, (seg.meta.head ? pr.logits : pr.x[(g + 1) % 2]).t), "add output");
+                        } else {
+                            if (extra >= state.size() || state[extra]->bytes != t.size)
+                                throw std::runtime_error("whole-model output " + name + " does not match a KV tensor");
+                            check(nrt_add_tensor_to_tensor_set(out, t.name, state[extra++]->t), "add kv output");
+                        }
+                    }
+                    seg.in[size_t(r)] = in;
+                    seg.out[size_t(r)] = out;
                 }
-                pr.in.assign(1, {in, in});
-                pr.out.assign(1, {out, out});
             }
         };
         auto build = [&](LayerBucket &b) {
@@ -495,7 +551,8 @@ struct NeuronModel::Impl {
                     put(pr.table, L.table.data(), L.table.size() * 8);
                     put(pr.rows, rows.data(), rows.size() * 8);
                     const auto t_uploaded = Clock::now();
-                    check(nrt_execute(b.model[size_t(r)], pr.in[0][0], pr.out[0][0]), "whole-model execute");
+                    for (const auto &seg : b.segs)
+                        check(nrt_execute(seg.model[size_t(r)], seg.in[size_t(r)], seg.out[size_t(r)]), "whole-model execute");
                     const auto t_executed = Clock::now();
                     out[size_t(r)].resize(size_t(b.meta.S) * size_t(vocab_half));
                     check(nrt_tensor_read(pr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");

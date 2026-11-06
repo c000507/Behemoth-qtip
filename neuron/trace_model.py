@@ -19,7 +19,7 @@ Inputs (order == ORDER), per rank:
   host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache [pages,2,kv_heads,16,128],
   norms and the seven FP8 projections with per-row scales.
 
-usage: trace_model.py WORKDIR layer|head R Q P [aliases=1]
+usage: trace_model.py WORKDIR layer R Q P | head S | model R Q P L S [body]   (HEAD_ROWS=T for head, PAGES, NCC_FLAGS env)
 """
 import json
 import os
@@ -119,6 +119,7 @@ def paged_layer(R, Q, P, *args):
 
 LAYER_WEIGHTS = ['norm1', 'norm2', 'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
 SHARED = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'rows', 'head_norm', 'head_w']
+BODY_SHARED = SHARED[:5]  # a body segment (no head) takes only these and returns the residual stream
 
 
 def head_graph(S, x, rows, norm, w):
@@ -133,16 +134,17 @@ class FullModel(torch.nn.Module):
     the L KV tensors (K and V of a layer in one [pages, 2, kv_heads, 16, 128] tensor) are module state aliased input -> output.
     Keeping the aliased tensors at one per layer matters: a graph with 64 aliased state tensors (32 layers x separate K, V) compiled
     to wrong results, 62 did not."""
-    def __init__(self, R, Q, P, L, S, pages):
+    def __init__(self, R, Q, P, L, S, pages, head=True):
         super().__init__()
-        self.R, self.Q, self.P, self.L, self.S = R, Q, P, L, S
+        self.R, self.Q, self.P, self.L, self.S, self.head = R, Q, P, L, S, head
         shape = (pages, 2, KVHEADS // TP, PAGE, D)
         for i in range(L):
             self.register_buffer(f'kv{i}', torch.zeros(shape, dtype=torch.bfloat16))
 
     def forward(self, *args):
-        shared = dict(zip(SHARED, args[:len(SHARED)]))
-        per_layer = args[len(SHARED):]
+        names = SHARED if self.head else BODY_SHARED
+        shared = dict(zip(names, args[:len(names)]))
+        per_layer = args[len(names):]
         x = shared['x']
         for i in range(self.L):
             t = dict(zip(LAYER_WEIGHTS, per_layer[i * len(LAYER_WEIGHTS):(i + 1) * len(LAYER_WEIGHTS)]))
@@ -150,15 +152,18 @@ class FullModel(torch.nn.Module):
                      cache=getattr(self, f'kv{i}'))
             x, cache = paged_layer(self.R, self.Q, self.P, *[t[k] for k in ORDER])
             setattr(self, f'kv{i}', cache)
+        if not self.head:
+            return x
         return head_graph(self.S, x, shared['rows'], shared['head_norm'], shared['head_w'])
 
 
-def full_model_inputs(R, Q, P, L, S):
+def full_model_inputs(R, Q, P, L, S, head=True):
     s = shapes(R, Q, P, 1)
     T = R * Q
     out = [torch.zeros(T, H), torch.zeros(T, 2, D // 2), torch.zeros(T, dtype=torch.int64), torch.zeros(T, dtype=torch.int64),
-           torch.zeros(R, P, dtype=torch.int64), torch.zeros(S, dtype=torch.int64), torch.ones(1, H),
-           torch.zeros(VOCAB_PAD // TP, H, dtype=torch.bfloat16)]
+           torch.zeros(R, P, dtype=torch.int64)]
+    if head:
+        out += [torch.zeros(S, dtype=torch.int64), torch.ones(1, H), torch.zeros(VOCAB_PAD // TP, H, dtype=torch.bfloat16)]
     for _ in range(L):
         for k in LAYER_WEIGHTS:
             shape, dtype = s[k]
@@ -204,11 +209,12 @@ def main():
         meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'order': ORDER}
     elif kind == 'model':
         R, Q, P, L, S = (int(a) for a in sys.argv[3:8])
+        head = len(sys.argv) < 9 or sys.argv[8] != 'body'  # 'body': a segment without the head (residual out)
         pages = int(os.environ.get('PAGES', '64'))
-        fn = FullModel(R, Q, P, L, S, pages)
-        inputs = full_model_inputs(R, Q, P, L, S)
+        fn = FullModel(R, Q, P, L, S, pages, head)
+        inputs = full_model_inputs(R, Q, P, L, S, head)
         kwargs = {'enable_aliasing': True}
-        meta = {'kind': 'model', 'R': R, 'Q': Q, 'P': P, 'L': L, 'S': S, 'T': R * Q}
+        meta = {'kind': 'model', 'R': R, 'Q': Q, 'P': P, 'L': L, 'S': S, 'T': R * Q, 'head': head}
     else:
         S = int(sys.argv[3])
         T = int(os.environ.get('HEAD_ROWS', '256'))
