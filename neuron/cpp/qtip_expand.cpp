@@ -25,7 +25,7 @@ Fp8Shard expand_qtip_to_fp8(const qtip::HostLinear &l, int tp, int rank, bool co
     // W~ . M_in . diag(SU): row o of W~ M_in is M_in^T applied to the row, i.e. hadamard with the opposite flag.
 #pragma omp parallel
     {
-        std::vector<double> v(size_t(in));
+        std::vector<double> v(static_cast<size_t>(in));
 #pragma omp for schedule(static)
         for (int o = 0; o < out; ++o) {
             float *row = w.data() + size_t(o) * size_t(in);
@@ -37,7 +37,7 @@ Fp8Shard expand_qtip_to_fp8(const qtip::HostLinear &l, int tp, int rank, bool co
     // diag(SV) . M_out . (...): M_out acts on every column.
 #pragma omp parallel
     {
-        std::vector<double> v(size_t(out));
+        std::vector<double> v(static_cast<size_t>(out));
 #pragma omp for schedule(static)
         for (int c = 0; c < in; ++c) {
             for (int o = 0; o < out; ++o) v[size_t(o)] = double(w[size_t(o) * size_t(in) + size_t(c)]);
