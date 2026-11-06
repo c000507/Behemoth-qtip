@@ -149,6 +149,35 @@ def dec_nvfp4(packed, scales, gscale):
     return (e2m1_to_f32(codes) * block).to(torch.bfloat16)
 
 
+def dec_qtip(trellis, tlut, out, width):
+    """Decode a QTIP HYB projection to the rotated bf16 matrix W~ [out, width] inside the graph.
+
+    trellis int16 [out/32, width/32, 32, 2, 2] (checkpoint order (i0, j0, c, j1, i1)), tlut f32
+    [512, 2] (fp16 codebook values). Mirrors decode_tile() in runtime/src/qtip.cpp: each 16x16
+    tile is a 512-bit tail-biting stream of 32 words; weight pair t uses the 16-bit window at
+    bit 4t (MSB first); entry = ((s * (s + 1)) >> 6) & 1023, bit 9 negates the first value.
+    Only the 512-entry codebook lookup is a gather; word selection, windows and the tile
+    de-swizzle are shifts, rolls and permutes.
+    """
+    i0, j0 = out // 32, width // 32
+    w = (trellis.to(torch.int32) & 0xffff).permute(0, 1, 3, 4, 2)          # [i0, j0, j1, i1, 32]
+    cur = w.repeat_interleave(4, dim=-1)                                  # word i = t >> 2
+    nxt = torch.roll(w, -1, dims=-1).repeat_interleave(4, dim=-1)         # word (i + 1) & 31
+    shift = 16 - 4 * (torch.arange(128, dtype=torch.int32) % 4)
+    window = (((cur << 16) | nxt) >> shift) & 0xffff                      # [i0, j0, j1, i1, 128]
+    entry = ((window * (window + 1)) >> 6) & 1023                         # int32 wrap keeps bits 6..15
+    index = entry & 511
+    sign = 1.0 - 2.0 * (entry >> 9).to(torch.float32)
+    pair = torch.index_select(tlut, 0, index.reshape(-1)).reshape(*index.shape, 2)
+    pair = torch.stack((pair[..., 0] * sign, pair[..., 1]), dim=-1)       # [i0, j0, j1, i1, 128, 2]
+    # t = A*16 + B*4 + C*2 + D -> tile[row = D*8 + A, col = C*8 + B*2 + k]
+    pair = pair.reshape(i0, j0, 2, 2, 8, 4, 2, 2, 2)                      # (.., A, B, C, D, k)
+    tile = pair.permute(0, 1, 2, 3, 7, 4, 6, 5, 8)                        # (.., D, A, C, B, k)
+    tile = tile.reshape(i0, j0, 2, 2, 16, 16)                             # [i0, j0, j1, i1, row, col]
+    dense = tile.permute(0, 3, 4, 1, 2, 5)                                # [i0, i1, row, j0, j1, col]
+    return dense.reshape(out, width).to(torch.bfloat16)
+
+
 def layer_graph_lowbit(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg):
     """Same layer, but projections stay as packed bytes in device memory and are decoded
