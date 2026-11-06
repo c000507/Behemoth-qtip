@@ -115,6 +115,26 @@ Where the time goes: decode is ~1.0 ms per layer at one row and 1.6 ms at 8 rows
 overhead (a one-graph 30-layer step is only 7 % faster). Prefill at long context is bound by the bf16 flash loop (score tiles
 in f32 through the vector/scalar engines), not by the fp8 projections; an NKI fused flash kernel over paged KV is the next step.
 
+### 70B on trn1 (Anubis 70B QTIP, 80 layers, hidden 8192, 64/8 heads, ff 28672, vocab 128256)
+
+Weights per layer: 855.6 M (q, o 67.1 M each, k, v 16.8 M each, gate, up, down 234.9 M each). Per core at TP=2:
+
+| resident form | per layer | 80 layers | note |
+|---|---|---|---|
+| FP8 shards (today's load path) | 428 MiB | 33.4 GiB | does not fit the 16 GiB HBM (a layer-truncated run is possible, below) |
+| QTIP trellis as stored (2 bit + SU/SV + tlut) | 107 MiB | 8.6 GiB | fits with lm_head (1 GiB bf16 / 0.5 GiB E4M3) and KV (2.6 GiB for 1024 pages x 80 layers bf16; 1.3 GiB as FP8 K/V): 12-13 GiB per core |
+| FP8 shards at TP=8 (trn1.32xlarge) | 107 MiB | 8.6 GiB | fits; each core then streams 107 MiB of weights per layer, like the 8B at TP=2 today (~1 ms/layer: ~80-100 ms/token plus the cross-chip all-reduces; not run) |
+
+Decoding the trellis in the graph is the only way to run the 70B on this instance, and the earlier kernels bound its speed:
+the plain-XLA QTIP decode was 56-100 ms per 8B layer (one 2048 x 4096 shard 165 ms), the NKI NVFP4 decode reaches ~4.6 G
+weights/s per core (0.9 ms for a 4096 x 1024 slice), and the Vector/GPSIMD ceiling for bit-unpack + lookup is ~4-5 G
+weights/s per core. A 70B layer has 428 M weights per rank: ~90-100 ms per layer, ~7-8 s per decode token with every weight
+decoded every step (both cores in parallel). Decode only amortizes over tokens per step, so a chunked prefill (256 tokens per
+launch) and wide batches would be usable, single-stream decode would not. Host RAM is not the limit: the loader expands one
+layer at a time (3.4 GiB f32 per 70B layer, 4 layers in flight on the 8-vCPU host) and 21 GiB of trellis data streams from disk.
+
+What was verified on this instance with the real Anubis 70B checkpoint: see "70B truncated run" below.
+
 ### Wide decode buckets (16 / 32 rows)
 
 Per-layer decode at one row is bound by the tensor engine streaming the 126 MB/rank of weights (neuron-profile: 0.65 ms of

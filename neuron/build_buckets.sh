@@ -1,8 +1,10 @@
 #!/bin/bash
-# Compiles the standard NEFF bucket set for the 8B on a trn1.2xlarge into OUT/<name>/{graph.neff,meta.json}.
+# Compiles the standard NEFF bucket set into OUT/<name>/{graph.neff,meta.json}.
 #   neuron/build_buckets.sh OUT [PAGES=2049]
+#   env: MODEL=/path/to/checkpoint (geometry; default Llama 3.1 8B), TP (default 2), HEAD_FP8=1 (E4M3 lm_head heads)
 # Buckets: dec{R}_{P} (R decode rows x P table pages), pre{Q}_{P} (Q-token prefill chunk), head{T} (final norm + lm_head).
-# The runtime picks the cheapest bucket covering a step, so short chats use dec1_32 and 14k contexts dec1_1024.
+# The runtime picks the cheapest bucket covering a step, so short chats use dec1_32 and 14k contexts dec1_1024; decode
+# buckets with R > 1 also verify speculative drafts of a single request (R = 1 + drafts).
 set -e
 OUT=${1:?output directory}; export PAGES=${2:-2049}
 HERE=$(cd "$(dirname "$0")" && pwd)

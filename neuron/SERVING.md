@@ -101,11 +101,51 @@ so a step is 1-3 launches. Findings on this toolchain (neuronx-cc 2.26, torch-ne
   `NEURON_DUMP_X=prefix` (residual after 16/31/32 layers), `NEURON_LAYER_ORDER="0-15,16-30"`,
   `NEURON_SEG_LAYERS="0-15;16-30,30"`, `NEURON_SEG_SHIFT=n`, `NEURON_LOGITS_DUMP=file`.
 
+## Model geometry and tensor parallelism
+
+`trace_model.py` takes the geometry (hidden, heads, kv heads, head dim, intermediate, vocab) from a checkpoint's
+`config.json` (`MODEL=/path/to/checkpoint` or `CONFIG=config.json`; the default is Llama 3.1 8B) and the TP degree from
+`TP` (default 2), and writes both into every `meta.json`. The runtime takes TP and the geometry from the buckets,
+compares them with the checkpoint and refuses a bucket directory traced for another geometry or a mixed TP (buckets
+from before this field are taken as 8B / TP=2). Sharding: q/k/v/gate/up column-parallel (`heads`, `kv_heads` and
+`intermediate` must divide by TP; `kv_heads < TP` would need K/V replication and is refused), o/down row-parallel with an
+all-reduce, lm_head by vocabulary rows padded to a multiple of TP, embeddings on the host. Every rank runs the same NEFF
+(`nrt_load_collectives(..., rank, TP)`); TP > 2 (several chips, `NEURON_RT_ROOT_COMM_ID` on the shared host) is
+implemented in the same code path but has only been run at TP=2 on the 2-core instance. The load report prints the
+per-core footprint (`weights + KV`), e.g. the 8B: 4.3 GiB weights + 2.1 GiB KV for 2048 pages.
+
+Formats: every projection of a layer is expanded to a row-scaled E4M3 shard at load (`qtip_expand.cpp`): QTIP trellis
+(decoded, Hadamard and SU/SV folded in, any `2^p / 12*2^p / 28*2^p` dimension the quantizer accepts), NVFP4 packed
+(`weight_packed/weight_scale/weight_global_scale`), FP8 (`weight` + per-row scale), mixed per layer (the adaptive
+checkpoints choose per layer). The checkpoint's `kv_format` does not matter: K/V are produced by the graph in bf16.
+
+**70B on a trn1.2xlarge (Anubis 70B: 80 layers, hidden 8192, 64/8 heads, ff 28672).** The geometry traces and compiles
+(dec1_32 layer 34 s, pre64_32 99 s, heads 2 min) and the loader handles its QTIP layers, but the FP8 expansion needs 428 MiB
+per layer per rank, 34 GiB per core for 80 layers: more than the 16 GiB HBM, so only a layer-truncated 70B (`NEURON_LAYERS=n`)
+runs on this instance. The checkpoint itself is 2 bits/weight: ~107 MiB per layer per rank, 8.6 GiB for 80 layers, plus the
+lm_head (1 GiB bf16, 0.5 GiB E4M3) and KV (2.6 GiB per core for 1024 pages = 16k tokens), 12-13 GiB per core: it fits only
+with the trellis kept resident and decoded in the graph. See `PERF_NOTES.md` ("70B") for what that costs on this hardware
+and for the TP=8 FP8 alternative.
+
+## Speculative decoding (prompt lookup)
+
+A decode step of a request may carry up to `BEHEMOTH_NEURON_SPEC_TOKENS` (default 7, 0 disables) draft tokens after its
+scheduled token: the tokens that followed the most recent earlier occurrence of the last `BEHEMOTH_NEURON_SPEC_NGRAM` (3)
+tokens of the history (prompt + output). The model runs the request's tokens as rows of ONE decode bucket (the graph scatters
+every row's K/V before the attention, so row i attends to rows < i of the same launch) and returns logits for every row;
+the engine samples each row and accepts draft i when row i - 1 sampled exactly it, stopping at the first mismatch. The token
+sampled at the mismatching row is still exact, so the accepted sequence is distributed as in sequential decoding (greedy
+output is identical; seeded sampling consumes the RNG differently). `Scheduler::reserve` allocates the pages the draft
+positions need and `Scheduler::accept` advances a request by an already-computed token. Only steps with at most
+`BEHEMOTH_NEURON_SPEC_REQUESTS` (4) decode requests draft, since rows are what a decode bucket costs and a wide step has none
+to spare. Continuations of up to 8 tokens (draft verification, the tail of a chunked prompt) use the row path; prompts still
+start in prefill buckets. The step log prints `drafts=` and `tokens=` per step, `/metrics` has `drafted_tokens` and
+`accepted_drafts`.
+
 ## Not carried over
 
 * Prefix cache (KV save/restore) and structured outputs: `Engine::submit` rejects a constraint instead of ignoring it.
 * FP8 K/V (the GPU server's KV format): this backend keeps bf16 K/V; FP8 K/V would double the pool and halve the gather.
-* Model geometry: the graphs are traced for Llama 3.1 8B (hidden 4096, 32/8 heads); the C++ checks this and refuses others.
 * The numerics of a bucket are not bit-identical to another bucket's (different fusion in neuronx-cc, fp8 rounding
   amplifies it, ~6-8 % relative logit difference between the 1-row and 8-row decode graphs), so greedy text can diverge
   late between requests served by different buckets; quality against the oracle is the same.

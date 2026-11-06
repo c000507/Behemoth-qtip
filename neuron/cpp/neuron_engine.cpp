@@ -32,14 +32,19 @@ using Drafts = std::map<uint64_t, std::vector<int>>;
 
 std::vector<int> prompt_lookup(const std::vector<int> &history, int max_draft, int ngram = 3) {
     const size_t len = history.size();
-    for (int n = std::min<int>(ngram, int(len) - 1); n >= 1 && max_draft > 0; --n)
-        for (size_t end = len - 1; end >= size_t(n); --end) { // end: index after a candidate match (latest first, not the suffix itself)
+    for (int n = std::min<int>(ngram, int(len) - 1); n >= 1 && max_draft > 0; --n) {
+        size_t best_end = 0, best_avail = 0; // the latest match with a full-length draft, else the longest draft
+        for (size_t end = len - 1; end >= size_t(n) && best_avail < size_t(max_draft); --end) { // end: index after a match (not the suffix itself)
             const size_t start = end - size_t(n);
-            if (std::equal(history.begin() + std::ptrdiff_t(start), history.begin() + std::ptrdiff_t(end), history.end() - n)) {
-                const size_t avail = std::min<size_t>(size_t(max_draft), len - end); // the tokens that followed the match
-                return std::vector<int>(history.begin() + std::ptrdiff_t(end), history.begin() + std::ptrdiff_t(end + avail));
+            const size_t avail = std::min<size_t>(size_t(max_draft), len - end); // the tokens that followed the match
+            if (avail > best_avail && std::equal(history.begin() + std::ptrdiff_t(start), history.begin() + std::ptrdiff_t(end), history.end() - n)) {
+                best_end = end;
+                best_avail = avail;
             }
         }
+        if (best_avail)
+            return std::vector<int>(history.begin() + std::ptrdiff_t(best_end), history.begin() + std::ptrdiff_t(best_end + best_avail));
+    }
     return {};
 }
 
