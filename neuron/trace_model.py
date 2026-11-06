@@ -225,8 +225,8 @@ def main():
     m = Path(workdir) / 'model'
     here = Path(__file__).resolve().parent
     subprocess.run([sys.executable, str(here / 'tools_patch_fp8_hlo.py'), str(m / 'graph.hlo'), str(m / 'graph.hlo')], check=True)
-    subprocess.run(['neuronx-cc', 'compile', 'model', '--framework', 'XLA', '--target', 'trn1', '--output', 'graph.neff'],
-                   cwd=workdir, check=True)
+    subprocess.run(['neuronx-cc', 'compile', 'model', '--framework', 'XLA', '--target', 'trn1', '--output', 'graph.neff'] +
+                   os.environ.get('NCC_FLAGS', '').split(), cwd=workdir, check=True)
     meta['neff'] = str(Path(workdir) / 'graph.neff')
     Path(workdir, 'meta.json').write_text(json.dumps(meta))
     print(json.dumps(meta))
