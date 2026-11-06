@@ -213,7 +213,9 @@ int main(int argc, char **argv) {
         auto add = [&](const void *p, size_t bytes) { ri.by_position.push_back({p, bytes}); };
         add(x.data(), x.size() * 4); add(&slot, 8); add(cos_sin.data(), cos_sin.size() * 4); add(mask.data(), mask.size() * 4);
         add(cache.data(), cache.size() * 4); add(cache.data(), cache.size() * 4);
-        add(norm1.data(), norm1.size() * 4); add(norm2.data(), norm2.size() * 4);
+        const bool attn_only = argc > 5 && std::string(argv[5]) == "attn";  // norm2 is pruned from the attention-only graph
+        add(norm1.data(), norm1.size() * 4);
+        if (!attn_only) add(norm2.data(), norm2.size() * 4);
         for (const char *k : {"q", "o", "k", "v", "g", "u", "d"}) {
             const auto &s = shards[k][size_t(r)];
             add(s.w.data(), s.w.size()); add(s.scale.data(), s.scale.size() * 4);
