@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
     std::vector<nlohmann::json> out(requests.size());
     std::map<uint64_t, size_t> index;
     std::vector<uint64_t> ids(requests.size());
+    std::vector<std::chrono::steady_clock::time_point> submitted(requests.size());
     const auto start = std::chrono::steady_clock::now();
     const bool sequential = argc > 3 && std::string(argv[3]) == "sequential";
     for (size_t i = 0; i < requests.size(); ++i) {
@@ -43,9 +44,15 @@ int main(int argc, char **argv) {
         s.seed = r.value("seed", uint64_t(0));
         out[i] = {{"tokens", nlohmann::json::array()}};
         std::lock_guard lock(mutex);
+        submitted[i] = std::chrono::steady_clock::now();
         ids[i] = engine.submit(r.at("tokens").get<std::vector<int>>(), r.value("max_new", size_t(16)), s, [&, i](const GenerationEvent &e) {
             std::lock_guard lock(mutex);
-            if (e.token >= 0) out[i]["tokens"].push_back(e.token);
+            if (e.token >= 0) {
+                if (out[i]["tokens"].empty())
+                    out[i]["first_token_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitted[i]).count();
+                out[i]["tokens"].push_back(e.token);
+                out[i]["last_token_ms"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitted[i]).count();
+            }
             if (e.done) {
                 out[i]["finish"] = e.reason;
                 if (!e.error.empty()) out[i]["error"] = e.error;
