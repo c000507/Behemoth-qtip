@@ -68,31 +68,31 @@ int main(int argc, char **argv) {
     std::cout << "weights loaded/expanded in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s\n";
 
     auto norm = [&](const std::string &n) {
-        std::vector<float> v(size_t(hidden));
+        std::vector<float> v(static_cast<size_t>(hidden));
         auto view = file.floats("model.layers." + std::to_string(layer) + "." + n + ".weight");
         for (int i = 0; i < hidden; ++i) v[size_t(i)] = view[size_t(i)];
         return v;
     };
     const auto norm1 = norm("input_layernorm"), norm2 = norm("post_attention_layernorm");
 
-    std::vector<float> x(size_t(hidden));
-    std::vector<BFloat16> xb(size_t(hidden));
+    std::vector<float> x(static_cast<size_t>(hidden));
+    std::vector<BFloat16> xb(static_cast<size_t>(hidden));
     for (int i = 0; i < hidden; ++i) { xb[size_t(i)] = BFloat16(.5f * std::sin(float(i) * .071f)); x[size_t(i)] = float(xb[size_t(i)]); }
 
     const int half = dim / 2;
-    std::vector<float> inv(size_t(half));
+    std::vector<float> inv(static_cast<size_t>(half));
     if (config.rope_llama3) inv = llama3_inv_freq(dim, config.theta, config.rope);
     else for (int d = 0; d < half; ++d) inv[size_t(d)] = float(std::pow(double(config.theta), -2.0 * d / dim));
-    std::vector<float> cos_sin(size_t(CONTEXT) * 2 * size_t(half));
+    std::vector<float> cos_sin(static_cast<size_t>(CONTEXT) * 2 * size_t(half));
     for (int p = 0; p < CONTEXT; ++p)
         for (int d = 0; d < half; ++d) {
             cos_sin[(size_t(p) * 2 + 0) * size_t(half) + size_t(d)] = std::cos(float(p) * inv[size_t(d)]);
             cos_sin[(size_t(p) * 2 + 1) * size_t(half) + size_t(d)] = std::sin(float(p) * inv[size_t(d)]);
         }
-    std::vector<float> mask(size_t(CONTEXT), -1e9f);
+    std::vector<float> mask(static_cast<size_t>(CONTEXT), -1e9f);
     mask[0] = 0;
     const int64_t slot = 0;
-    std::vector<float> cache(size_t(CONTEXT) * size_t(kvheads) * size_t(dim), 0.f);
+    std::vector<float> cache(static_cast<size_t>(CONTEXT) * static_cast<size_t>(kvheads) * static_cast<size_t>(dim), 0.f);
 
     // CPU reference (QTIP-correct layer block at position 0)
     std::vector<float> reference;
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     std::vector<char> neff((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
     std::barrier<> sync(TP);
-    std::vector<float> result(size_t(hidden));
+    std::vector<float> result(static_cast<size_t>(hidden));
     std::vector<double> seconds(TP, 0);
     auto worker = [&](int r) {
         nrt_model_t *model = nullptr;
