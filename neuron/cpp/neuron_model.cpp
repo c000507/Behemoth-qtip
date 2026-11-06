@@ -119,6 +119,8 @@ struct NeuronModel::Impl {
     explicit Impl(const ModelOptions &o) : options(o), config(ModelConfig::read(o.model / "config.json")) {
         if (config.hidden != 4096 || config.intermediate != 14336 || config.q_heads != 32 || config.kv_heads != 8 || config.dim != DIM)
             throw std::runtime_error("the Neuron graphs are traced for the Llama 3.1 8B geometry (trace_model.py constants)");
+        if (const char *n = std::getenv("NEURON_LAYERS")) // debugging: run only the first n layers (and whole-model NEFFs traced with L=n)
+            config.layers = std::min(config.layers, std::atoi(n));
         vocab_ = config.vocab;
         vocab_half = (vocab_ + TP - 1) / TP;
         kv_local = config.kv_heads / TP;
