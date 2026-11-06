@@ -1,6 +1,6 @@
 """Trace the fused NVFP4 NKI projection into one NEFF for the C++ timing harness (cpp/layer_bench.cpp).
 
-usage: bench_nki_nvfp4.py WORKDIR [K] [N] [B] [arith|lut]   (single core: run layer_bench with ranks=1)
+usage: bench_nki_nvfp4.py WORKDIR [K] [N] [B] [arith|lut|floor]   (single core: run layer_bench with ranks=1)
 """
 from pathlib import Path
 import sys
@@ -11,7 +11,7 @@ import torch
 import torch_neuronx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from nki_linear import nvfp4_linear, nvfp4_linear_lut, nvfp4_lut, nvfp4_pack
+from nki_linear import nvfp4_linear, nvfp4_linear_floor, nvfp4_linear_lut, nvfp4_lut, nvfp4_pack
 
 workdir = sys.argv[1]
 K = int(sys.argv[2]) if len(sys.argv) > 2 else 4096
@@ -35,6 +35,8 @@ def f_lut(xT, wp, sce, sco, ex, lut):
 
 
 inputs = (torch.randn(K, B).to(torch.bfloat16), t(wp), t(sce), t(sco), t(ex))
+if variant == 'floor':
+    f = lambda xT, wp, sce, sco, ex: nvfp4_linear_floor(xT, wp, sce, sco, ex)
 if variant == 'lut':
     inputs += (t(nvfp4_lut()),)
     f = f_lut

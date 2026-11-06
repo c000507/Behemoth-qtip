@@ -98,6 +98,39 @@ def nvfp4_linear_lut(xT, wp, sce, sco, ex, lut):
     return out
 
 
+@nki.jit
+def nvfp4_linear_floor(xT, wp, sce, sco, ex):
+    """TIMING FLOOR ONLY (numerically meaningless): same loads, scale expansion and matmuls as
+    nvfp4_linear_lut, but the nibble decode is a plain dtype copy. Separates decode cost from
+    DMA/matmul/scale cost when profiling."""
+    K, B = xT.shape
+    KT, P, HALF = wp.shape
+    N = HALF * 2
+    out = nl.ndarray((B, N), dtype=nl.float32, buffer=nl.shared_hbm)
+    ex_t = nl.load(ex)
+    for jt in nl.affine_range(HALF // NT):
+        acc_e = nl.zeros((B, NT), dtype=nl.float32, buffer=nl.psum)
+        acc_o = nl.zeros((B, NT), dtype=nl.float32, buffer=nl.psum)
+        for kt in nl.affine_range(KT):
+            x_t = nl.load(xT[kt * 128:(kt + 1) * 128, 0:B])
+            w8 = nl.load(wp[kt, 0:128, jt * NT:(jt + 1) * NT])
+            se = nl.load(sce[kt * 8:(kt + 1) * 8, jt * NT:(jt + 1) * NT])
+            so = nl.load(sco[kt * 8:(kt + 1) * 8, jt * NT:(jt + 1) * NT])
+            se_full = nl.copy(nl.matmul(ex_t, se, transpose_x=True), dtype=nl.bfloat16)
+            so_full = nl.copy(nl.matmul(ex_t, so, transpose_x=True), dtype=nl.bfloat16)
+            w_even = nl.multiply(nl.copy(w8, dtype=nl.bfloat16), se_full, dtype=nl.bfloat16)
+            w_odd = nl.multiply(nl.copy(w8, dtype=nl.bfloat16), so_full, dtype=nl.bfloat16)
+            acc_e += nl.matmul(x_t, w_even, transpose_x=True)
+            acc_o += nl.matmul(x_t, w_odd, transpose_x=True)
+        res_e = nl.copy(acc_e, dtype=nl.float32)
+        res_o = nl.copy(acc_o, dtype=nl.float32)
+        i_b = nl.arange(B)[:, None]
+        i_j = nl.arange(NT)[None, :]
+        nl.store(out[i_b, 2 * (jt * NT + i_j)], value=res_e)
+        nl.store(out[i_b, 2 * (jt * NT + i_j) + 1], value=res_o)
+    return out
+
+
 def nvfp4_lut():
     """bf16 [128, 16] E2M1 value table replicated on every partition (input of nvfp4_linear_lut)."""
     import ml_dtypes
