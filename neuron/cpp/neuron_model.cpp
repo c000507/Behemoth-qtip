@@ -84,7 +84,9 @@ struct HeadBucket {
     std::array<nrt_model_t *, TP> model{};
     struct PerRank {
         Dev rows, logits;
-        std::array<nrt_tensor_set_t *, 2> in{}, out{}; // by parity of the residual buffer holding the final x
+        // by the layer bucket whose residual buffer feeds the head, then by parity of the buffer holding the final x
+        std::map<const LayerBucket *, std::array<nrt_tensor_set_t *, 2>> in;
+        std::array<nrt_tensor_set_t *, 2> out{};
     };
     std::array<PerRank, TP> rank;
 };
@@ -357,28 +359,28 @@ struct NeuronModel::Impl {
         };
         for (auto &b : decode) build(b);
         for (auto &b : prefill) build(b);
-        // head sets: input0 x (any layer bucket's x buffers of the same T), rows, norm, w -> logits.
-        for (auto &h : heads) {
-            const LayerBucket *lb = nullptr;
-            for (const auto *group : {&decode, &prefill})
-                for (const auto &b : *group)
-                    if (b.tokens() == h.meta.T)
-                        lb = &b;
-            if (!lb)
-                throw std::runtime_error("no layer bucket with " + std::to_string(h.meta.T) + " tokens for a head NEFF");
+        // head sets: input0 = the residual buffer of each layer bucket with the same token count, rows, norm, w -> logits.
+        for (auto &h : heads)
             for (int r = 0; r < TP; ++r) {
                 auto &hr = h.rank[size_t(r)];
                 for (int p = 0; p < 2; ++p) {
-                    check(nrt_allocate_tensor_set(&hr.in[size_t(p)]), "set");
                     check(nrt_allocate_tensor_set(&hr.out[size_t(p)]), "set");
-                    check(nrt_add_tensor_to_tensor_set(hr.in[size_t(p)], "input0", lb->rank[size_t(r)].x[p].t), "head in");
-                    check(nrt_add_tensor_to_tensor_set(hr.in[size_t(p)], "input1", hr.rows.t), "head in");
-                    check(nrt_add_tensor_to_tensor_set(hr.in[size_t(p)], "input2", ranks[size_t(r)].head_norm.t), "head in");
-                    check(nrt_add_tensor_to_tensor_set(hr.in[size_t(p)], "input3", ranks[size_t(r)].head_w.t), "head in");
                     check(nrt_add_tensor_to_tensor_set(hr.out[size_t(p)], "output0", hr.logits.t), "head out");
                 }
+                for (const auto *group : {&decode, &prefill})
+                    for (const auto &b : *group) {
+                        if (b.tokens() != h.meta.T)
+                            continue;
+                        auto &sets = hr.in[&b];
+                        for (int p = 0; p < 2; ++p) {
+                            check(nrt_allocate_tensor_set(&sets[size_t(p)]), "set");
+                            check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input0", b.rank[size_t(r)].x[p].t), "head in");
+                            check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input1", hr.rows.t), "head in");
+                            check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input2", ranks[size_t(r)].head_norm.t), "head in");
+                            check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input3", ranks[size_t(r)].head_w.t), "head in");
+                        }
+                    }
             }
-        }
     }
 
     // ---- per-step host data for one launch of a layer bucket ----------------------------------------------------
@@ -444,7 +446,7 @@ struct NeuronModel::Impl {
                 if (head) {
                     auto &hr = const_cast<HeadBucket *>(head)->rank[size_t(r)];
                     put(hr.rows, rows.data(), rows.size() * 8);
-                    check(nrt_execute(head->model[size_t(r)], hr.in[size_t(final_parity)], hr.out[size_t(final_parity)]), "head execute");
+                    check(nrt_execute(head->model[size_t(r)], hr.in.at(&b)[size_t(final_parity)], hr.out[size_t(final_parity)]), "head execute");
                     out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_half));
                     check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
                 }
