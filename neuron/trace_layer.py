@@ -75,9 +75,10 @@ def build_layer(model, layer, seed=5):
 
 
 def layer_graph(x, slots, cos_sin, cache_k, cache_v,
-                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None):
+                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None, heads=HEADS, kvheads=KVHEADS, reduce=None, mask=None):
     """One Llama decode layer. heads/kvheads are the local counts (tensor parallel shards);
-    reduce, when given, all-reduces the row-parallel o_proj and down_proj partial sums."""
+    reduce, when given, all-reduces the row-parallel o_proj and down_proj partial sums; mask, when given,
+    is an additive [context] float vector (0 for valid cache slots, -1e9 for the rest)."""
     lin = _lin or (lambda h, w: h @ w.T)
     reduce = reduce or (lambda t: t)
     scale = DIM ** -0.5
@@ -103,6 +104,8 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         keys = cache_k[0, :, kh]      # [context, dim]
         values = cache_v[0, :, kh]
         scores = (q[0, head] @ keys.T) * scale
+        if mask is not None:
+            scores = scores + mask
         weights = torch.softmax(scores, dim=-1)
         heads_out.append(weights @ values)
     attn = torch.stack(heads_out).reshape(1, heads * DIM).to(torch.bfloat16)
