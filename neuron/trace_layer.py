@@ -111,6 +111,79 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
     return x, cache_k, cache_v
 
 
+def fp8_lut():
+    """256-entry E4M3FN byte -> float32 table (NaN codes map to 0). Byte lookup keeps Trn1's
+    different inf/NaN treatment of exponent 15 out of the decode."""
+    lut = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+    lut[~np.isfinite(lut)] = 0
+    return torch.from_numpy(lut)
+
+
+def fp4_lut():
+    positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
+    return torch.from_numpy(np.concatenate((positive, -positive)))
+
+
+def dec_fp8(codes, scale, lut8):
+    """codes uint8 [out, in], scale f32 [out] -> bf16 [out, in]."""
+    dense = torch.index_select(lut8, 0, codes.reshape(-1).long()).reshape(codes.shape)
+    return (dense * scale.reshape(-1, 1)).to(torch.bfloat16)
+
+
+def dec_nvfp4(packed, scales, gscale, lut4, lut8):
+    """packed uint8 [out, in/2] (two E2M1 per byte, low nibble first), scales uint8 E4M3
+    [out, in/16], gscale f32 [1] -> bf16 [out, in]."""
+    out = packed.shape[0]
+    p = packed.long()
+    codes = torch.stack((p & 15, p >> 4), dim=-1).reshape(out, -1)
+    dense = torch.index_select(lut4, 0, codes.reshape(-1)).reshape(out, -1)
+    block = torch.index_select(lut8, 0, scales.reshape(-1).long()).reshape(out, -1)
+    block = block.repeat_interleave(16, dim=1) * gscale
+    return (dense * block).to(torch.bfloat16)
+
+
+def layer_graph_lowbit(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
+                       kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg, lut8, lut4):
+    """Same layer, but projections stay as packed bytes in device memory and are decoded
+    inside the graph each step (FP8 K/V via byte LUT, NVFP4 MLP via nibble + scale LUT)."""
+    kw = dec_fp8(kb, ks, lut8)
+    vw = dec_fp8(vb, vs, lut8)
+    gw = dec_nvfp4(gp, gs, gg, lut4, lut8)
+    uw = dec_nvfp4(up, us, ug, lut4, lut8)
+    dw = dec_nvfp4(dp, ds, dg, lut4, lut8)
+    return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, kw, vw, ow, gw, uw, dw)
+
+
+def build_layer_lowbit(model, layer, seed=5):
+    """Raw packed tensors for the low-bit graph (uint8 views; no host dequantization)."""
+    cp = Checkpoint(model)
+    rng = np.random.default_rng(seed)
+    u8 = lambda a: torch.from_numpy(np.ascontiguousarray(a).view(np.uint8))
+    f32 = lambda a: torch.from_numpy(np.asarray(a, np.float32))
+    kv = cp.projection(layer, 'self_attn.k_proj', HIDDEN, KVHEADS * DIM)
+    vv = cp.projection(layer, 'self_attn.v_proj', HIDDEN, KVHEADS * DIM)
+    nv = {}
+    for tag, name, w, o in (('g', 'mlp.gate_proj', HIDDEN, INTERMEDIATE), ('u', 'mlp.up_proj', HIDDEN, INTERMEDIATE),
+                            ('d', 'mlp.down_proj', INTERMEDIATE, HIDDEN)):
+        pr = cp.projection(layer, name, w, o)
+        if not hasattr(pr, 'packed'):
+            raise SystemExit(f'layer {layer} {name} is not NVFP4; pick a layer from 2-7,9,10')
+        nv[tag] = (u8(pr.packed), u8(pr.scales), f32([pr.global_scale]))
+    q = cp.projection(layer, 'self_attn.q_proj', HIDDEN, HIDDEN)
+    weights = {
+        'norm1': torch.from_numpy(cp.tensor(f'model.layers.{layer}.input_layernorm.weight').astype(np.float32).reshape(1, -1)),
+        'norm2': torch.from_numpy(cp.tensor(f'model.layers.{layer}.post_attention_layernorm.weight').astype(np.float32).reshape(1, -1)),
+        'qw': dequant_nvfp4(q) if hasattr(q, 'packed') else bf16(rng.normal(0, .02, (HIDDEN, HIDDEN))),
+        'ow': bf16(rng.normal(0, .02, (HIDDEN, HIDDEN))),
+        'kb': u8(kv.weights), 'ks': f32(kv.scale), 'vb': u8(vv.weights), 'vs': f32(vv.scale),
+        'gp': nv['g'][0], 'gs': nv['g'][1], 'gg': nv['g'][2],
+        'up': nv['u'][0], 'us': nv['u'][1], 'ug': nv['u'][2],
+        'dp': nv['d'][0], 'ds': nv['d'][1], 'dg': nv['d'][2],
+        'lut8': fp8_lut(), 'lut4': fp4_lut(),
+    }
+    return weights
+
+
 def cos_sin_tables(context, theta=500000.0):
     inv = theta ** (-torch.arange(0, DIM, 2, dtype=torch.float32) / DIM)
     angle = torch.arange(context, dtype=torch.float32)[:, None] * inv[None, :]
@@ -124,11 +197,14 @@ def main():
     parser.add_argument('--context', type=int, default=128)
     parser.add_argument('--steps', type=int, default=64)
     parser.add_argument('--warmup', type=int, default=8)
+    parser.add_argument('--weights', choices=('bf16', 'lowbit'), default='bf16',
+                        help='bf16: host-dequantized dense weights; lowbit: packed bytes resident, decoded in-graph')
     a = parser.parse_args()
     import torch_neuronx
     import torch_xla.core.xla_model as xm
 
-    weights = build_layer(a.model, a.layer)
+    lowbit = a.weights == 'lowbit'
+    weights = build_layer_lowbit(a.model, a.layer) if lowbit else build_layer(a.model, a.layer)
     sample = {
         'x': torch.randn(1, HIDDEN),
         'slots': torch.zeros(1, dtype=torch.int64),
@@ -138,10 +214,19 @@ def main():
     }
     order = ['x', 'slots', 'cos_sin', 'cache_k', 'cache_v',
              'norm1', 'norm2', 'qw', 'kw', 'vw', 'ow', 'gw', 'uw', 'dw']
+    if lowbit:
+        order = ['x', 'slots', 'cos_sin', 'cache_k', 'cache_v', 'norm1', 'norm2', 'qw', 'ow',
+                 'kb', 'ks', 'vb', 'vs', 'gp', 'gs', 'gg', 'up', 'us', 'ug', 'dp', 'ds', 'dg', 'lut8', 'lut4']
     inputs = [sample[k] if k in sample else weights[k] for k in order]
+    # device bytes of the weight parameters as they are held resident (bf16 weights count 2 B/elem
+    # on the device; the host tensors here are float32 holding bf16-rounded values and are cast
+    # by the traced graph)
+    resident = sum(weights[k].numel() * (weights[k].element_size() if weights[k].dtype == torch.uint8 else 2
+                                         if k in ('kw', 'vw', 'qw', 'ow', 'gw', 'uw', 'dw') else weights[k].element_size())
+                   for k in order if k in weights)
 
     started = time.monotonic()
-    graph = torch_neuronx.trace(layer_graph, tuple(inputs))
+    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs))
     compile_s = time.monotonic() - started
     device = torch.device('neuron')
     graph = torch_neuronx.move_trace_to_device(graph, device)
@@ -161,7 +246,7 @@ def main():
         x, cache_k, cache_v = step(tensors, (a.warmup + i) % a.context)
         xm.mark_step()
     elapsed = time.monotonic() - started
-    print(json.dumps({'compile_s': round(compile_s, 2), 'steps': a.steps,
+    print(json.dumps({'weights': a.weights, 'resident_weight_MB': round(resident / 1e6, 1), 'compile_s': round(compile_s, 2), 'steps': a.steps,
                       'steady_ms_per_step': round(elapsed / a.steps * 1000, 2),
                       'steady_tokens_per_s': round(a.steps / elapsed, 2)}))
 
