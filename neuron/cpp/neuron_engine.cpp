@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -155,14 +156,29 @@ struct Engine::Impl {
                 const auto logits = model.forward(input);
                 const size_t vocab = size_t(model.vocab());
                 std::vector<int> sampled(step.requests.size(), -1);
-                size_t row = 0;
-                for (size_t i = 0; i < step.requests.size(); ++i) {
-                    const auto &request = step.requests[i];
-                    if (!request.sample)
-                        continue;
-                    sampled[i] = sample_logits(logits.subspan(row * vocab, vocab), scheduler.request(request.id).sampling, rng.at(request.id));
-                    ++row;
+                std::vector<size_t> logits_row(step.requests.size(), 0);
+                std::vector<size_t> sampling_steps;
+                for (size_t i = 0, row = 0; i < step.requests.size(); ++i)
+                    if (step.requests[i].sample) {
+                        logits_row[i] = row++;
+                        sampling_steps.push_back(i);
+                    }
+                // Each row is an independent pass over 128k logits with its own RNG: spread them over threads.
+                std::exception_ptr sampling_error;
+                std::mutex error_mutex;
+#pragma omp parallel for schedule(dynamic, 1)
+                for (long k = 0; k < long(sampling_steps.size()); ++k) {
+                    const size_t i = sampling_steps[size_t(k)];
+                    try {
+                        sampled[i] = sample_logits(logits.subspan(logits_row[i] * vocab, vocab), scheduler.request(step.requests[i].id).sampling,
+                                                   rng.at(step.requests[i].id));
+                    } catch (...) {
+                        std::lock_guard guard(error_mutex);
+                        sampling_error = std::current_exception();
+                    }
                 }
+                if (sampling_error)
+                    std::rethrow_exception(sampling_error);
                 std::lock_guard lock(mutex);
                 model_seconds += std::chrono::duration<double>(Clock::now() - start).count();
                 last_profile = model.last_profile();

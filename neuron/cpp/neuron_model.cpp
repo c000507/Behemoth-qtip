@@ -709,7 +709,7 @@ struct NeuronModel::Impl {
         phase_upload_ms = phase_layers_ms = phase_head_ms = 0;
         const auto &lay = batch.layout;
         const int scratch = pages_total - 1;
-        logits.assign(batch.sample_rows.size() * size_t(vocab_), 0.f);
+        logits.resize(batch.sample_rows.size() * size_t(vocab_)); // every sampled row is overwritten by execute()
         // which request samples, and which logits row it owns
         std::vector<int> sample_index(size_t(lay.requests()), -1);
         for (size_t s = 0, req = 0; s < batch.sample_rows.size(); ++s) {
