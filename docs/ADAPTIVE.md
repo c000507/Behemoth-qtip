@@ -20,11 +20,22 @@ qtip_quant --mode adaptive --tokens calibration/tokens.i32 \
 | `--kl-tokens N` | 512 | probe document length (tokens) for the metric |
 | `--adaptive-next-input original\|quantized` | original | source of the next layer's input activations |
 
+| `--nvfp4-layers LIST` | (off) | force these layers (`1,2,5-7`) to NVFP4, all others to QTIP; see below |
+
 All other flags (`--kv-format`, `--sigma-reg`, `--vit-batch`, `--layers`, resume behavior) are shared
 with the classic pipeline. K/V projections follow `--kv-format` exactly as before (default: source FP8
 preserved, in both QTIP and NVFP4 layers). With a BF16 source, `--kv-format fp8` converts k/v to FP8-Dynamic
 (E4M3 + per-row BF16 scale) first; they then stay FP8 in both QTIP and NVFP4 layers, and the candidate layer's KL
 evaluation uses the dequantized FP8 k/v (not the original bf16), so `lmkl` reflects the written checkpoint.
+
+## Forced layer sets (`--nvfp4-layers`)
+
+With `--nvfp4-layers LIST` no layer is decided by a metric: listed layers skip the QTIP pass and the probe and
+are quantized as NVFP4 (honouring `--nvfp4-calibrate` / `--nvfp4-scale-search`); unlisted layers are
+quantized as QTIP with no probe/metric and never fall back. `--kl-threshold`, `--kl-metric` and
+`--nvfp4-compare` are ignored. `config.json:layer_formats` records the formats; in `adaptive_report.json`
+each layer has `adaptive.forced = true` with null `kl_*` values, plus a top-level `forced_nvfp4_layers`.
+Use it to build a checkpoint from an externally measured sensitivity ranking.
 
 ## Per-layer flow
 

@@ -604,6 +604,7 @@ void Pipeline::adaptive_report_write_locked() {
   report_["threshold"] = o_.kl_threshold;
   report_["kl_tokens"] = o_.kl_tokens;
   report_["next_input"] = o_.adaptive_next_input;
+  if (!o_.nvfp4_layers.empty()) report_["forced_nvfp4_layers"] = std::vector<int>(o_.nvfp4_layers.begin(), o_.nvfp4_layers.end());
   report_["nvfp4"] = {{"calibrate", o_.nvfp4_calibrate}, {"scale_search", o_.nvfp4_scale_search}};
   report_["kv_format"] = o_.fp8_kv ? "fp8" : "qtip";
   report_["layers"] = layers;
@@ -639,8 +640,12 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
   if (Hs.empty() && fs::exists(hess_path(L))) Hs = read_hess(hess_path(L));  // resumed / seeded work dir
   // the NVFP4 fallback needs the Hessians after the QTIP pass consumed them: keep a copy (~1 GB at Llama-8B size)
   std::vector<std::vector<float>> Hnv;
+  // forced mode (--nvfp4-layers): listed layers are NVFP4 without a QTIP pass, the others QTIP without a probe/metric
+  const bool forced = !o_.nvfp4_layers.empty();
+  const bool force_nv = forced && o_.nvfp4_layers.count(L) != 0;
   if (o_.nvfp4_calibrate || o_.nvfp4_scale_search) Hnv = Hs;
-  auto outs = run_qtip_groups(L, std::move(Hs), LH, qo, jl);
+  std::vector<LinearOut> outs;
+  if (!force_nv) outs = run_qtip_groups(L, std::move(Hs), LH, qo, jl);
   double t_qtip = now_s() - t_layer;
   // 2) metric vs the original layer on the probe document
   eval_runners_create(dev);
@@ -650,10 +655,11 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     a_orig_->upload(*LH);
     a_orig_->forward(y_orig.data(), 1, nullptr);
   }
-  auto y_qtip = adaptive_layer_forward(LH, &outs, nullptr);
+  std::vector<uint16_t> y_qtip;
+  if (!forced || (!force_nv && o_.adaptive_next_input == "quantized")) y_qtip = adaptive_layer_forward(LH, &outs, nullptr);
   std::vector<float> fresh_teacher;
   const std::vector<float>* logits_orig = nullptr;
-  if (o_.kl_metric == "lmkl") {
+  if (o_.kl_metric == "lmkl" && !forced) {
     if (o_.cache_teacher_logits && o_.adaptive_next_input == "original") {
       if (teacher_logits_.empty()) teacher_logits_ = adaptive_logits(L, y_orig);
       logits_orig = &teacher_logits_;
@@ -666,10 +672,15 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     if (o_.kl_metric == "mse") return nmse_layer(y_q, y_orig);
     return kl_mean_token(*logits_orig, adaptive_logits(L, y_q));
   };
-  double m_qtip = metric_of(y_qtip);
-  logf("adaptive layer %d: metric %s qtip %.6g (threshold %.6g)", L, o_.kl_metric.c_str(), m_qtip, o_.kl_threshold);
-  // 3) NVFP4 fallback when the QTIP layer exceeds the threshold
-  bool nv = m_qtip > o_.kl_threshold;
+  double m_qtip = -1;
+  if (!forced) {
+    m_qtip = metric_of(y_qtip);
+    logf("adaptive layer %d: metric %s qtip %.6g (threshold %.6g)", L, o_.kl_metric.c_str(), m_qtip, o_.kl_threshold);
+  } else {
+    logf("adaptive layer %d: forced %s (--nvfp4-layers), no metric", L, force_nv ? "nvfp4" : "qtip");
+  }
+  // 3) NVFP4 fallback when the QTIP layer exceeds the threshold (or the layer is forced)
+  bool nv = forced ? force_nv : m_qtip > o_.kl_threshold;
   std::vector<Nvfp4Tensor> nvs(kNumLin);
   std::vector<uint16_t> y_nv;
   double m_nv = -1;
@@ -727,7 +738,7 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
       return res;
     };
     double t_nv0 = now_s();
-    if (o_.nvfp4_compare) {
+    if (o_.nvfp4_compare && !forced) {
       json variants = json::object();
       for (auto [name, cal, srch] : {std::tuple<const char*, bool, bool>{"naive", false, false}, {"scale_search", false, true},
                                      {"calibrated", true, false}, {"calibrated_scale_search", true, true}}) {
@@ -746,10 +757,14 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
     nv_info["scale_search"] = o_.nvfp4_scale_search;
     nv_info["quantize_seconds"] = now_s() - t_nv0;
     HIP_CHECK(hipStreamDestroy(ns));
-    y_nv = adaptive_layer_forward(LH, nullptr, &nvs);
-    m_nv = metric_of(y_nv);
-    logf("adaptive layer %d: metric %s nvfp4 %.6g (qtip %.6g exceeded threshold %.6g)", L, o_.kl_metric.c_str(), m_nv,
-         m_qtip, o_.kl_threshold);
+    if (!forced) {
+      y_nv = adaptive_layer_forward(LH, nullptr, &nvs);
+      m_nv = metric_of(y_nv);
+      logf("adaptive layer %d: metric %s nvfp4 %.6g (qtip %.6g exceeded threshold %.6g)", L, o_.kl_metric.c_str(), m_nv,
+           m_qtip, o_.kl_threshold);
+    } else if (o_.adaptive_next_input == "quantized") {
+      y_nv = adaptive_layer_forward(LH, nullptr, &nvs);
+    }
   }
   const char* format = nv ? "nvfp4" : "qtip";
   const std::vector<uint16_t>& y_chosen = nv ? y_nv : y_qtip;
@@ -760,8 +775,9 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
        bytes / 1e6);
   jl["adaptive"] = {{"metric", o_.kl_metric},
                     {"threshold", o_.kl_threshold},
-                    {o_.kl_metric == "mse" ? "mse_qtip" : "kl_qtip", m_qtip},
-                    {o_.kl_metric == "mse" ? "mse_nvfp4" : "kl_nvfp4", nv ? json(m_nv) : json(nullptr)},
+                    {o_.kl_metric == "mse" ? "mse_qtip" : "kl_qtip", forced ? json(nullptr) : json(m_qtip)},
+                    {o_.kl_metric == "mse" ? "mse_nvfp4" : "kl_nvfp4", nv && !forced ? json(m_nv) : json(nullptr)},
+                    {"forced", forced},
                     {"qtip_seconds", t_qtip},
                     {"eval_seconds", secs - t_qtip}};
   if (nv) jl["adaptive"]["nvfp4"] = nv_info;

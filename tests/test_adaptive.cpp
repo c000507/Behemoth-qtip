@@ -267,6 +267,35 @@ static json run_case(const std::string& tag, double threshold, const char* metri
   return report;
 }
 
+// --nvfp4-layers: layer 1 forced to NVFP4, layers 0 and 2 forced QTIP, no metric
+static void test_forced_layers() {
+  std::printf("[forced] --nvfp4-layers 1\n");
+  const std::string tag = "forced";
+  fs::path root = fs::path("/tmp/opencode") / "adaptive-test" / tag;
+  fs::remove_all(root);
+  fs::create_directories(root);
+  build_model(root / "model");
+  write_tokens(root / "tokens.i32", 8);
+  Options o = base_options(tag, 0.0, "lmkl", "original");
+  o.nvfp4_layers = {1};
+  {
+    Pipeline p(o);
+    p.run();
+  }
+  json report = json::parse(std::ifstream(fs::path(o.out) / "adaptive_report.json"));
+  json config = json::parse(std::ifstream(fs::path(o.out) / "config.json"));
+  EXPECT(report["layers"].size() == kLayers, "forced report layer count");
+  for (int L = 0; L < kLayers; ++L) {
+    const char* want = L == 1 ? "nvfp4" : "qtip";
+    EXPECT(config["qtip_quant"]["layer_formats"][size_t(L)] == want, "forced L%d config format", L);
+    EXPECT(report["layers"][size_t(L)]["format"] == want, "forced L%d report format", L);
+    EXPECT(report["layers"][size_t(L)]["adaptive"]["forced"] == true, "forced L%d marked forced", L);
+    auto lf = open_layer(o.out, L);
+    std::string b = "model.layers." + std::to_string(L) + ".self_attn.o_proj.";
+    EXPECT(lf.has(b + (L == 1 ? "weight_packed" : "trellis")), "forced L%d o_proj tensors", L);
+  }
+}
+
 // pure host checks of the NVFP4 codec
 static void test_nvfp4_codec() {
   std::printf("[nvfp4 codec] round trip and geometry\n");
@@ -315,6 +344,7 @@ int main(int argc, char** argv) {
   test_nvfp4_codec();
   // all-QTIP: threshold so large the metric never exceeds it
   run_case("qtip", 1e30, "lmkl", "original");
+  test_forced_layers();
   // all-NVFP4: threshold 0 and a strictly positive KL forces every layer to fall back
   auto cached = run_case("nvfp4", 0.0, "lmkl", "original");
   auto uncached = run_case("nvfp4-uncached", 0.0, "lmkl", "original", false);

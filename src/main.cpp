@@ -40,6 +40,7 @@ static void usage() {
       "  --adaptive-next-input original|quantized  source of the next layer's input activations\n"
       "  --nvfp4-calibrate on|off   Hessian-aware LDLQ rounding of NVFP4 fallback layers (default on)\n"
       "  --nvfp4-scale-search on|off  per-16-block E4M3 scale search for NVFP4 layers (default on)\n"
+      "  --nvfp4-layers LIST  force these layers (e.g. 1,2,5-7) to NVFP4 and the rest to QTIP; no probe/metric, no threshold\n"
       "  --nvfp4-compare      also evaluate naive / search-only / calibrated NVFP4 and record their metrics\n"
       "                      (default original: Hessians/KL use original-model activations, as the\n"
       "                      classic pipeline; quantized: chain flows through the chosen layers)\n");
@@ -86,6 +87,18 @@ static Options parse(int argc, char** argv) {
       QCHECK(v == "on" || v == "off", a + " expects on|off");
       (a == "--nvfp4-calibrate" ? o.nvfp4_calibrate : o.nvfp4_scale_search) = v == "on";
     } else if (a == "--nvfp4-compare") o.nvfp4_compare = true;
+    else if (a == "--nvfp4-layers") {
+      std::stringstream ss(next());
+      std::string t;
+      while (std::getline(ss, t, ',')) {
+        if (t.empty()) continue;
+        auto d = t.find('-');
+        int lo = std::stoi(t.substr(0, d)), hi = d == std::string::npos ? lo : std::stoi(t.substr(d + 1));
+        QCHECK(lo >= 0 && hi >= lo, "--nvfp4-layers expects N or A-B items, comma separated");
+        for (int l = lo; l <= hi; ++l) o.nvfp4_layers.insert(l);
+      }
+      QCHECK(!o.nvfp4_layers.empty(), "--nvfp4-layers is empty");
+    }
     else if (a == "--layers") {
       std::string v = next();
       auto c = v.find(':');

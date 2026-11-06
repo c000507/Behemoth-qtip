@@ -48,6 +48,7 @@ struct Options {
   std::string adaptive_next_input = "original";  // original | quantized
   bool nvfp4_calibrate = true;             // Hessian-aware (LDLQ-style) rounding of NVFP4 fallback layers
   bool nvfp4_scale_search = true;          // per-16-block E4M3 scale search for NVFP4 fallback layers
+  std::set<int> nvfp4_layers;              // --nvfp4-layers: force these layers to NVFP4 (QTIP elsewhere), no probe/metric
   bool nvfp4_compare = false;              // also measure the naive / search-only / calibrated variants (report only)
   long logit_tile = 0;                     // lm_head vocab rows per logits GEMM (0 = auto, ~256 MB fp32 tile)
   bool cache_teacher_logits = true;        // original-input chaining has the same teacher at every layer
