@@ -32,9 +32,9 @@ HEADS, KVHEADS, DIM, HIDDEN, INTERMEDIATE = 32, 8, 128, 4096, 14336
 def dequant_nvfp4(projection):
     positive = np.array([0, .5, 1, 1.5, 2, 3, 4, 6], np.float32)
     lut = np.concatenate((positive, -positive))
-    codes = np.empty(projection.packed.shape + (projection.width,), np.uint8)
-    codes[..., 0::2] = projection.packed & 15
-    codes[..., 1::2] = projection.packed >> 4
+    codes = np.empty((projection.packed.shape[0], projection.width), np.uint8)
+    codes[:, 0::2] = projection.packed & 15
+    codes[:, 1::2] = projection.packed >> 4
     dense = (lut[codes]
              * np.repeat(projection.scales.astype(np.float32), 16, axis=1)
              * projection.global_scale)
