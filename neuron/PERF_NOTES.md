@@ -15,8 +15,15 @@ neuronx-cc 2.26, torch-neuronx 2.9. Accuracy was only checked where stated.
 | FP8/NVFP4 packed, table-lookup decode in XLA | 243 MB | 56 |
 | FP8/NVFP4 packed, bit-arithmetic decode in XLA | 175 MB | 100 |
 
-**TP=2 (both NeuronCores), FP8 x FP8:** 0.99 ms / layer (126 MB per rank), all-reduce after o_proj and down_proj.
-**Prefill, TP=2, FP8:** 128 tok 1.24 ms, 512 tok 2.78 ms, 2048 tok 11.76 ms per layer (attention materializes T x T).
+**TP=2 (both NeuronCores), FP8 x FP8, real all-reduce after o_proj and down_proj:** about 1.04 ms / layer for decode
+(real layers 0-31 of the 8B, 1.02-1.07 ms; 126 MB of weights per rank).
+**Prefill, TP=2, FP8 projections (q/o still bf16 placeholders in this graph):** 128 tok 1.32 ms, 512 tok 3.13 ms,
+2048 tok 12.77 ms per layer (attention materializes T x T); about 409 ms for a 2048-token prompt over 32 layers.
+
+> Correction: TP numbers measured before commit "Force collectives into traced TP graphs" were invalid. `torch_xla`
+> drops `xm.all_reduce` / `xm.all_gather` when it sees one process, so those graphs contained no collective at all and
+> each rank returned its own partial sum (known-answer probe: ranks sending 1 and 2 got 1 and 2). Set
+> `XLA_ALWAYS_ALLREDUCE=1` (trace_layer.py now does) and verify with `cpp/allreduce_probe.cpp` (both ranks must read 3).
 
 ## Facts about the toolchain
 - Trn1/Trn2 reject `F8E4M3FN` (`NCC_EVRF051`); the flag the message suggests is not accepted by 2.26/2.28.
@@ -59,3 +66,19 @@ Measured on layer 0 of the 8B with `cpp/qtip_expand_test.cpp`, TP=2, 8 vCPU, wei
 
 About 6 s per QTIP layer, so roughly 3 minutes for 32 layers at load. Resident cost is 1 byte per weight (QTIP is
 0.25), which is the price of running QTIP layers at the FP8 decode speed (0.99 ms / layer at TP=2).
+
+## Real-layer check (C++, `cpp/layer_run.cpp`, TP=2, one decode step at position 0)
+Real weights of the 8B bound to the corrected TP graph (`trace_layer_real.py`; QTIP and NVFP4 expanded/re-encoded to
+FP8 shards at load, FP8 k/v re-scaled), compared with a double-precision CPU layer (per-format reference forward):
+
+| layer | MLP / attention format | relative L2 vs CPU reference | ms / step |
+|---|---|---|---|
+| 0 | QTIP | 0.27% | 1.05 |
+| 2 | NVFP4 MLP, QTIP attention | 1.0% | 1.03 |
+| 5 | NVFP4 MLP | 1.4% | 1.07 |
+| 12 | QTIP | 1.9% | 1.02 |
+| 31 | QTIP | 4.6% | 1.04 |
+
+The device error equals a CPU emulation of FP8 weights + per-row FP8 activations (layer 31: 4.57% vs 4.57%), i.e. it is
+the cost of the FP8 path itself. The residual stream dominates these outputs; error accumulation over 32 layers, longer
+contexts (RoPE positions > 0, multi-token KV) and end-to-end token quality are NOT measured yet.
