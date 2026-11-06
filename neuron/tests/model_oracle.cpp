@@ -156,19 +156,17 @@ int main(int argc, char **argv) {
             for (auto *vec : {&q, &k, &v})
                 for (float &value : *vec)
                     value = bf(value);
-            auto rotary = [&](std::vector<float> &x, int row_width) {
-                for (int r = 0; r < int(x.size()) / row_width; ++r)
-                    for (int d = 0; d < row_width / 2; ++d) {
-                        const float a = x[size_t(r) * row_width + d],
-                                    b = x[size_t(r) * row_width + row_width / 2 + d];
-                        x[size_t(r) * row_width + d] =
-                            bf(double(a) * cos[size_t(d)] - double(b) * sin[size_t(d)]);
-                        x[size_t(r) * row_width + row_width / 2 + d] =
-                            bf(double(b) * cos[size_t(d)] + double(a) * sin[size_t(d)]);
+            auto rotary = [&](std::vector<float> &x, int rows) {
+                for (int r = 0; r < rows; ++r)
+                    for (int d = 0; d < dim / 2; ++d) {
+                        float &a = x[size_t(r) * dim + d], &b = x[size_t(r) * dim + dim / 2 + d];
+                        const float ca = a, cb = b;
+                        a = bf(double(ca) * cos[size_t(d)] - double(cb) * sin[size_t(d)]);
+                        b = bf(double(cb) * cos[size_t(d)] + double(ca) * sin[size_t(d)]);
                     }
             };
-            rotary(q, q_width);
-            rotary(k, kv_width);
+            rotary(q, heads);
+            rotary(k, kvheads);
             LayerCache &lc = cache[size_t(layer)];
             const int time = int(lc.k.size()) / size_t(kv_width);
             lc.k.resize(lc.k.size() + kv_width);
