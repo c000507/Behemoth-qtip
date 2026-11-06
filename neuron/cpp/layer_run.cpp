@@ -147,6 +147,54 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < x.size(); ++i) reference[i] = x1[i] + down[i];
     }
 
+    // Second reference: the SAME FP8 shards the device uses, but bf16 activations and double accumulation (no activation
+    // quantization, no graph). Separates weight-conversion error from activation-quantization / graph error.
+    std::vector<float> reference_fp8w;
+    {
+        auto project = [&](const char *key, bool col, const std::vector<float> &in_vec) {
+            const auto &sh = shards[key];
+            const int out = col ? sh[0].rows * TP : sh[0].rows, inw = col ? sh[0].cols : sh[0].cols * TP;
+            std::vector<double> y(static_cast<size_t>(out), 0.0);
+            for (int r = 0; r < TP; ++r) {
+                const auto &q = sh[size_t(r)];
+                for (int row = 0; row < q.rows; ++row) {
+                    double acc = 0;
+                    for (int c = 0; c < q.cols; ++c) {
+                        const int xi = col ? c : r * (inw / TP) + c;
+                        acc += double(decode_e4m3(q.w[size_t(row) * size_t(q.cols) + size_t(c)])) * double(float(BFloat16(in_vec[size_t(xi)])));
+                    }
+                    y[size_t(col ? r * (out / TP) + row : row)] += acc * double(q.scale[size_t(row)]);
+                }
+            }
+            std::vector<float> yf(y.begin(), y.end());
+            return yf;
+        };
+        auto rms = [&](const std::vector<float> &v, const std::vector<float> &w) {
+            double ss = 0;
+            for (float e : v) ss += double(e) * double(e);
+            const double inv_rms = 1.0 / std::sqrt(ss / double(v.size()) + double(config.epsilon));
+            std::vector<float> o(v.size());
+            for (size_t i = 0; i < v.size(); ++i) o[i] = float(double(v[i]) * inv_rms * double(w[i]));
+            return o;
+        };
+        const auto h = rms(x, norm1);
+        const auto vproj = project("v", true, h);
+        const int heads = config.q_heads, group = heads / config.kv_heads;
+        std::vector<float> attn(static_cast<size_t>(heads * dim));
+        for (int hd = 0; hd < heads; ++hd)
+            for (int d = 0; d < dim; ++d) attn[size_t(hd * dim + d)] = vproj[size_t((hd / group) * dim + d)];
+        const auto o = project("o", false, attn);
+        std::vector<float> x1(x.size());
+        for (size_t i = 0; i < x.size(); ++i) x1[i] = x[i] + o[i];
+        const auto h2 = rms(x1, norm2);
+        const auto gate = project("g", true, h2), up = project("u", true, h2);
+        std::vector<float> act(gate.size());
+        for (size_t i = 0; i < gate.size(); ++i) act[i] = float(double(gate[i]) / (1.0 + std::exp(-double(gate[i]))) * double(up[i]));
+        const auto down = project("d", false, act);
+        reference_fp8w.resize(x.size());
+        for (size_t i = 0; i < x.size(); ++i) reference_fp8w[i] = x1[i] + down[i];
+    }
+
     // inputs per rank, in trace_layer_real.ORDER
     std::vector<RankInputs> ranks(TP);
     for (int r = 0; r < TP; ++r) {
@@ -215,8 +263,17 @@ int main(int argc, char **argv) {
         num += d * d; den += double(reference[size_t(i)]) * double(reference[size_t(i)]);
         maxabs = std::max(maxabs, std::fabs(d));
     }
-    std::printf("{\"layer\":%d,\"device_vs_reference_block_relative_l2\":%.4f,\"max_abs\":%.4f,\"ms_per_step\":%.3f}\n",
-                layer, std::sqrt(num / den), maxabs, std::max(seconds[0], seconds[1]) / steps * 1000.0);
+    double n2 = 0, d2 = 0, n3 = 0, rn = 0;
+    for (int i = 0; i < hidden; ++i) {
+        const double a = double(reference_fp8w[size_t(i)]) - double(reference[size_t(i)]);
+        const double b = double(result[size_t(i)]) - double(reference_fp8w[size_t(i)]);
+        n2 += a * a; n3 += b * b; d2 += double(reference[size_t(i)]) * double(reference[size_t(i)]);
+        rn += double(x[size_t(i)]) * double(x[size_t(i)]);
+    }
+    std::printf("{\"layer\":%d,\"device_vs_reference\":%.4f,\"fp8_weights_vs_reference\":%.4f,\"device_vs_fp8_weights\":%.4f,"
+                "\"max_abs\":%.4f,\"input_rms\":%.3f,\"output_rms\":%.3f,\"ms_per_step\":%.3f}\n",
+                layer, std::sqrt(num / den), std::sqrt(n2 / d2), std::sqrt(n3 / d2), maxabs, std::sqrt(rn / hidden),
+                std::sqrt(d2 / hidden), std::max(seconds[0], seconds[1]) / steps * 1000.0);
     nrt_close();
     return 0;
 }
