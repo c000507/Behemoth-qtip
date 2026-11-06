@@ -50,7 +50,8 @@ int main(int argc, char **argv) {
                 out[i]["finish"] = e.reason;
                 if (!e.error.empty()) out[i]["error"] = e.error;
                 out[i]["prompt_tokens"] = e.prompt_tokens;
-                if (--open == 0) cv.notify_all();
+                --open;
+                cv.notify_all();
             }
         });
     }
