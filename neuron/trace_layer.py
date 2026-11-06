@@ -178,6 +178,28 @@ def dec_qtip(trellis, tlut, out, width):
     return dense.reshape(out, width).to(torch.bfloat16)
 
 
+def hadamard_pow2(x):
+    """Natural-order fast Walsh-Hadamard transform over the last dim (power of two), scaled by
+    1/sqrt(n); butterfly stages are reshapes + add/sub, no gathers."""
+    n = x.shape[-1]
+    v = x.reshape(-1, n)
+    batch = v.shape[0]
+    stride = 1
+    while stride < n:
+        v = v.reshape(batch, n // (2 * stride), 2, stride)
+        v = torch.stack((v[:, :, 0] + v[:, :, 1], v[:, :, 0] - v[:, :, 1]), dim=2).reshape(batch, n)
+        stride *= 2
+    return (v * (n ** -0.5)).reshape(x.shape)
+
+
+def qtip_linear(x, su, sv, trellis, tlut, out, width):
+    """y = SV * H(W~ (H(SU * x))) for power-of-two in/out widths; W~ decoded from the packed
+    trellis in-graph. Mirrors reference_forward(device_rounding=true, round_z_bf16=false)."""
+    u = hadamard_pow2(x.float() * su.reshape(1, -1)).to(torch.bfloat16)
+    z = (u @ dec_qtip(trellis, tlut, out, width).T).float()
+    return hadamard_pow2(z) * sv.reshape(1, -1)
+
+
 def layer_graph_lowbit(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        kb, ks, vb, vs, gp, gs, gg, up, us, ug, dp, ds, dg):
     """Same layer, but projections stay as packed bytes in device memory and are decoded
