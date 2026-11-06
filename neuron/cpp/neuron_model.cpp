@@ -323,6 +323,13 @@ struct NeuronModel::Impl {
             for (int r = 0; r < TP; ++r) {
                 auto &lw = ranks[size_t(r)].layers[size_t(layer)];
                 const auto &s = shards[size_t(r)];
+                if (r == 0 && std::getenv("NEURON_CHECK_FP8")) { // debugging: E4M3 codes with exponent 15 (inf/nan on trn1), scale range
+                    size_t bad = 0;
+                    for (uint8_t byte : s.w) bad += (byte & 0x78) == 0x78;
+                    float lo = 1e30f, hi = 0;
+                    for (float v : s.scale) { lo = std::min(lo, std::fabs(v)); hi = std::max(hi, std::fabs(v)); if (!std::isfinite(v)) bad += 1000000; }
+                    std::fprintf(stderr, "fp8check layer %d %s: exp15 codes %zu scale [%g, %g]\n", layer, p.name, bad, double(lo), double(hi));
+                }
                 lw.w[p.slot] = alloc(r, s.w.size(), p.name);
                 lw.w[p.slot + 1] = alloc(r, s.scale.size() * 4, p.name);
                 put(lw.w[p.slot], s.w.data(), s.w.size());
