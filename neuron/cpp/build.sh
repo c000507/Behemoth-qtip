@@ -13,7 +13,7 @@ g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_model.cpp" -o "$OUT/neuron_model.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_engine.cpp" -o "$OUT/neuron_engine.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_engine_cli.cpp" -o "$OUT/neuron_engine_cli.o" &
 for f in $CORE; do g++ $FLAGS -c "$f" -o "$OUT/$(basename "$f" .cpp).o" & done
-wait
+for job in $(jobs -p); do wait "$job" || { echo "compile failed"; exit 1; }; done   # a failed job must not leave a stale .o linked
 g++ $FLAGS "$OUT"/*.o $LIBS -o "$OUT/neuron_engine_cli"
 echo built "$OUT/neuron_engine_cli"
 
@@ -24,7 +24,7 @@ if [ -n "$SERVER" ]; then
   SRV="$R/src/server.cpp $R/src/reasoning.cpp $R/src/protocol.cpp $R/src/sorted_layout.cpp $R/src/reference_block.cpp $R/src/prefix_cache.cpp $R/src/gbnf.cpp $R/src/json_schema.cpp $R/src/constraint.cpp $ROOT/glm53/src/tokenizer.cpp $ROOT/glm53/src/config.cpp $ROOT/neuron/cpp/llama_text.cpp"
   SFLAGS="$FLAGS -I$ROOT/glm53/include -I$ROOT/third_party -DBOOST_ERROR_CODE_HEADER_ONLY"
   for f in $SRV; do g++ $SFLAGS -c "$f" -o "$OUT/srv/$(basename "$f" .cpp).o" & done
-  wait
+  for job in $(jobs -p); do wait "$job" || { echo "compile failed"; exit 1; }; done
   g++ $SFLAGS "$OUT/srv"/*.o "$OUT/qtip_expand.o" "$OUT/neuron_model.o" "$OUT/neuron_engine.o" \
       $(for f in $CORE; do echo "$OUT/$(basename "$f" .cpp).o"; done) $LIBS -lpcre2-8 -o "$OUT/neuron_server"
   echo built "$OUT/neuron_server"

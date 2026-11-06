@@ -670,7 +670,7 @@ struct NeuronModel::Impl {
             std::vector<int64_t> rows(size_t(b.meta.S), 0);
             for (size_t i = 0; i < L.head_rows.size(); ++i)
                 rows[i] = L.head_rows[i];
-            std::vector<std::vector<float>> out(size_t(tp));
+            std::vector<std::vector<float>> out(static_cast<size_t>(tp));
             std::vector<std::future<void>> jobs;
             for (int r = 0; r < tp; ++r)
                 jobs.push_back(workers[size_t(r)]->submit([&, r] {
@@ -726,7 +726,7 @@ struct NeuronModel::Impl {
         std::vector<int64_t> rows(head ? size_t(head->meta.S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
-        std::vector<std::vector<float>> out(size_t(tp));
+        std::vector<std::vector<float>> out(static_cast<size_t>(tp));
         std::vector<std::future<void>> jobs;
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
