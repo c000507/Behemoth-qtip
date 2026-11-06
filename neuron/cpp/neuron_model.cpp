@@ -342,9 +342,11 @@ struct NeuronModel::Impl {
         for (int i = 0; i < std::max(1, options.load_threads); ++i)
             pool.emplace_back([&] {
                 for (;;) {
-                    const int layer = next.fetch_add(1);
+                    int layer = next.fetch_add(1);
                     if (layer >= config.layers)
                         return;
+                    if (std::getenv("NEURON_UPLOAD_REVERSE")) // debugging: allocate the last layer's tensors first
+                        layer = config.layers - 1 - layer;
                     try {
                         upload_layer(layer);
                     } catch (...) {
