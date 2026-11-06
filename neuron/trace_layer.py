@@ -75,14 +75,15 @@ def build_layer(model, layer, seed=5):
 
 
 def layer_graph(x, slots, cos_sin, cache_k, cache_v,
-                norm1, norm2, qw, kw, vw, ow, gw, uw, dw):
+                norm1, norm2, qw, kw, vw, ow, gw, uw, dw, _lin=None):
+    lin = _lin or (lambda h, w: h @ w.T)
     scale = DIM ** -0.5
     half = DIM // 2
     h = x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm1
     h = h.to(torch.bfloat16)
-    q = (h @ qw.T).float().reshape(1, HEADS, DIM)
-    k = (h @ kw.T).float().reshape(1, KVHEADS, DIM)
-    v = (h @ vw.T).float().reshape(1, KVHEADS, DIM)
+    q = lin(h, qw).float().reshape(1, HEADS, DIM)
+    k = lin(h, kw).float().reshape(1, KVHEADS, DIM)
+    v = lin(h, vw).float().reshape(1, KVHEADS, DIM)
     row = torch.index_select(cos_sin, 0, slots)  # [B, 2, half]
     def rope(t, table, heads):
         cos = table[:, 0].reshape(1, 1, half).expand(1, heads, half)
@@ -103,12 +104,12 @@ def layer_graph(x, slots, cos_sin, cache_k, cache_v,
         heads_out.append(weights @ values)
     attn = torch.stack(heads_out).reshape(1, HEADS, DIM)
     attn = attn.reshape(1, HEADS * DIM).to(torch.bfloat16)
-    x = x + (attn @ ow.T).float()
+    x = x + lin(attn, ow).float()
     h = x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm2
     h = h.to(torch.bfloat16)
-    gate = h @ gw.T
-    act = torch.nn.functional.silu(gate).float() * (h @ uw.T).float()
-    x = x + (act.to(torch.bfloat16) @ dw.T).float()
+    gate = lin(h, gw)
+    act = torch.nn.functional.silu(gate).float() * lin(h, uw).float()
+    x = x + lin(act.to(torch.bfloat16), dw).float()
     return x, cache_k, cache_v
 
 
@@ -209,6 +210,27 @@ def layer_graph_fp8(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
                        dec(kf, ks), dec(vf, vs), ow, dec(gf, gs), dec(uf, us), dec(df, ds))
 
 
+def layer_graph_fp8mm(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
+                      kf, ks, vf, vs, gf, gs, uf, us, df, ds):
+    """FP8 x FP8 matmuls (activation scaled into E4M3 range, per-row weight scale applied to the
+    output): no weight cast in the graph, the Tensor Engine consumes the fp8 weights directly.
+    Compile after retargeting F8E4M3FN -> F8E4M3 (tools_patch_fp8_hlo.py)."""
+    def fp8_linear(h, wf, sc):
+        a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        h8 = (h.float() / a).to(torch.float8_e4m3fn)
+        y = torch.matmul(h8, wf.T)
+        return (y.float() * a * sc.reshape(1, -1)).to(torch.bfloat16)
+    orig_matmul = torch.matmul
+    class W:  # adapter so layer_graph's `h @ w.T` calls pick the fp8 path
+        def __init__(self, wf, sc): self.wf, self.sc = wf, sc
+        @property
+        def T(self): return self
+    def lin(h, w):
+        return fp8_linear(h, w.wf, w.sc) if isinstance(w, W) else h @ w.T
+    return layer_graph(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw,
+                       W(kf, ks), W(vf, vs), ow, W(gf, gs), W(uf, us), W(df, ds), _lin=lin)
+
+
 def to_fp8_rows(dense):
     """bf16/f32 [out, in] -> (int8 [out, in], f32 scale [out]), symmetric per-row. neuronx-cc
     rejects F8E4M3FN on TRN1/TRN2 (NCC_EVRF051) and its unsafe-cast flag is not accepted by
@@ -283,14 +305,15 @@ def main():
     parser.add_argument('--warmup', type=int, default=8)
     parser.add_argument('--workdir', help='compiler workdir; keeps the generated NEFF and HLO for the C++ runtime harness')
     parser.add_argument('--compile-only', action='store_true', help='stop after compiling (no device run)')
-    parser.add_argument('--weights', choices=('bf16', 'lowbit', 'fp8'), default='bf16',
+    parser.add_argument('--weights', choices=('bf16', 'lowbit', 'fp8', 'fp8mm'), default='bf16',
                         help='bf16: host-dequantized dense weights; lowbit: packed bytes resident, decoded in-graph')
     a = parser.parse_args()
     import torch_neuronx
     import torch_xla.core.xla_model as xm
 
     lowbit = a.weights == 'lowbit'
-    fp8 = a.weights == 'fp8'
+    fp8mm = a.weights == 'fp8mm'
+    fp8 = a.weights in ('fp8', 'fp8mm')
     weights = (build_layer_lowbit(a.model, a.layer) if lowbit else
                build_layer_fp8(a.model, a.layer) if fp8 else build_layer(a.model, a.layer))
     sample = {
@@ -315,7 +338,7 @@ def main():
     resident = sum(weights[k].numel() * weights[k].element_size() for k in order if k in weights)
 
     started = time.monotonic()
-    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph_fp8 if fp8 else layer_graph, tuple(inputs),
+    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph_fp8mm if fp8mm else layer_graph_fp8 if fp8 else layer_graph, tuple(inputs),
                                 compiler_workdir=a.workdir,
                                 compiler_args=None)
     compile_s = time.monotonic() - started
