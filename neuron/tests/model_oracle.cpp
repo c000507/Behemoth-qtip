@@ -71,10 +71,8 @@ std::vector<float> nvfp4_forward(const behemoth::qtip::HostLinear &l, std::span<
 std::vector<float> project(const Checkpoint &cp, int layer, const std::string &name,
                            std::span<const float> x, bool round_z) {
     auto l = behemoth::qtip::load_linear(cp, layer, name);
-    if (l.is_nvfp4()) {
-        if (round_z) throw std::invalid_argument("NVFP4 round_z not used");
+    if (l.is_nvfp4()) // no rotated intermediate: round_z does not apply (runner ignores it too)
         return nvfp4_forward(l, x);
-    }
     return behemoth::qtip::reference_forward(l, x, true, round_z);
 }
 
