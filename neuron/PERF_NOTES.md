@@ -128,3 +128,8 @@ rows x table pages, so the page bucket must be tight (contexts ~420 tokens, 300 
 | 32 rows x 128 pages | 164 ms | 172 tok/s |
 | 16 rows x 32 pages | 54 ms | 275 tok/s |
 | 32 rows x 32 pages | 68 ms | 381 tok/s |
+
+Host side of a 32-row step was 15 ms of 74 (sampling 32 rows of 128k logits one after another, plus zero-filling the 16 MB logits
+buffer). Sampling now runs rows in parallel (OpenMP) and the buffer is not zeroed: step wall 74 -> 61 ms, ITL p50 59.5 ms,
+~446 tok/s at 32 concurrent requests. What is left is device time: layers 52 ms (1.6 ms/layer, tensor engine 0.82 ms active,
+scalar engine 0.97 ms), head 4 ms. `BEHEMOTH_NEURON_STEP_LOG=1` prints every step's profile.
