@@ -181,6 +181,33 @@ def dec_qtip(trellis, tlut, out, width):
     return dense.reshape(out, width).to(torch.bfloat16)
 
 
+def qtip_decode_pairs(trellis, tlut, out, width):
+    """Decoded codebook pairs in tile order: [i0, j0, j1, i1, A, B, C, D, k] (A:8 B:4 C:2 D:2 k:2),
+    where weight (row, col) = (i0*32 + i1*16 + D*8 + A, j0*32 + j1*16 + C*8 + B*2 + k). The tile
+    de-swizzle is left to the contraction (see qtip_matvec): no transpose of the big tensor."""
+    i0, j0 = out // 32, width // 32
+    w = (trellis.to(torch.int32) & 0xffff).permute(0, 1, 3, 4, 2)
+    cur = w.repeat_interleave(4, dim=-1)
+    nxt = torch.roll(w, -1, dims=-1).repeat_interleave(4, dim=-1)
+    shift = 16 - 4 * (torch.arange(128, dtype=torch.int32) % 4)
+    window = (((cur << 16) | nxt) >> shift) & 0xffff
+    entry = ((window * (window + 1)) >> 6) & 1023
+    sign = 1.0 - 2.0 * (entry >> 9).to(torch.float32)
+    pair = torch.index_select(tlut, 0, (entry & 511).reshape(-1)).reshape(*entry.shape, 2)
+    pair = torch.stack((pair[..., 0] * sign, pair[..., 1]), dim=-1)
+    return pair.reshape(i0, j0, 2, 2, 8, 4, 2, 2, 2).to(torch.bfloat16)
+
+
+def qtip_matvec(u, trellis, tlut, out, width):
+    """z[t, row] = sum_col W~[row, col] u[t, col] with W~ decoded in-graph; u [T, width] bf16.
+    One einsum contracts the tile axes directly against u laid out in tile order, so the
+    de-swizzled matrix is never formed (and the Neuron compiler never sees a 9-axis transpose)."""
+    pairs = qtip_decode_pairs(trellis, tlut, out, width)
+    ut = u.reshape(u.shape[0], width // 32, 2, 2, 4, 2)                      # (t, j0, j1, C, B, k)
+    z = torch.einsum('tjxcbk,ijxyabcdk->tiyda', ut, pairs)                    # (t, i0, i1, D, A)
+    return z.reshape(u.shape[0], out).float()
+
+
 def hadamard_pow2(x):
     """Natural-order fast Walsh-Hadamard transform over the last dim (power of two), scaled by
     1/sqrt(n); butterfly stages are reshapes + add/sub, no gathers."""

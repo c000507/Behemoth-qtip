@@ -39,3 +39,12 @@ got = dec_qtip(torch.from_numpy(trellis), torch.from_numpy(tlut), out, width).fl
 want = torch.from_numpy(expected).to(torch.bfloat16).float().numpy()
 assert np.array_equal(got, want), f'max diff {np.abs(got - want).max()}'
 print('QTIP graph decode matches decode_tile()')
+
+# the einsum matvec (no weight de-swizzle) must agree with the dense decode
+from trace_layer import qtip_matvec
+u = torch.from_numpy(rng.normal(0, 1, (3, width)).astype(np.float32)).to(torch.bfloat16)
+dense = dec_qtip(torch.from_numpy(trellis), torch.from_numpy(tlut), out, width).float()
+want_z = (u.float() @ dense.T).numpy()
+got_z = qtip_matvec(u, torch.from_numpy(trellis), torch.from_numpy(tlut), out, width).numpy()
+assert np.abs(got_z - want_z).max() < 1e-3 * np.abs(want_z).max(), 'qtip_matvec differs from the dense decode'
+print('qtip_matvec matches the dense decode')

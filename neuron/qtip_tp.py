@@ -21,7 +21,7 @@ import re
 import numpy as np
 import torch
 
-from trace_layer import dec_qtip
+from trace_layer import dec_qtip, qtip_matvec
 
 
 @lru_cache(maxsize=2)
@@ -64,7 +64,7 @@ def hadamard(x, n, factors, transpose):
 def col_local(x, su, trellis, tlut, out_local, width, factors):
     """z_local [T, out_local]; x is the full (replicated) activation [T, width]."""
     u = hadamard(x.float() * su.reshape(1, -1), width, factors, True).to(torch.bfloat16)
-    return (u @ dec_qtip(trellis, tlut, out_local, width).T).float()
+    return qtip_matvec(u, trellis, tlut, out_local, width)
 
 
 def col_finish(z, sv, out, factors, local_idx):
@@ -78,7 +78,7 @@ def row_local(x_full, su, trellis, tlut, out, in_local, width, factors, local_id
     """z_partial [T, out]; x_full [T, width] is the all-gathered input; trellis shards the input columns."""
     u = hadamard(x_full.float() * su.reshape(1, -1), width, factors, True).to(torch.bfloat16)
     u_local = torch.index_select(u, -1, local_idx)
-    return (u_local @ dec_qtip(trellis, tlut, out, in_local).T).float()
+    return qtip_matvec(u_local, trellis, tlut, out, in_local)
 
 
 def row_finish(z, sv, out, factors):
