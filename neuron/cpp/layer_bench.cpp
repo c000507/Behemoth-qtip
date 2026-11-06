@@ -62,7 +62,8 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
         const bool is_input = t.usage == NRT_TENSOR_USAGE_INPUT;
         if (is_input) {
             std::vector<uint8_t> fill(t.size);
-            if (t.size > 8)
+            // int64 tensors (dtype 8) are indices/positions: keep them zero so gathers stay in bounds.
+            if (t.size > 8 && int(t.dtype) != 8)
                 for (size_t k = 0; k < fill.size(); ++k) fill[k] = uint8_t((k * 2654435761u + rank) >> 24) & 0x3f;
             check(nrt_tensor_write(dev, fill.data(), 0, fill.size()), "nrt_tensor_write", rank);
             check(nrt_add_tensor_to_tensor_set(inputs, t.name, dev), "add input", rank);
