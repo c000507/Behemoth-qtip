@@ -8,7 +8,7 @@ import numpy as np
 import nki
 
 from checkpoint import QtipProjection, Fp8Projection, Nvfp4Projection
-from ops import attention_chunk, fp8_project_loop, nvfp4_project_loop, scale_rows, fp8fn_project_loop
+from ops import attention_chunk, fp8_project_loop, nvfp4_project_loop, scale_rows, fp8fn_project_loop, gqa_attention_tile
 from qtip_kernel import project_rotated_loop, transform_pow2, transform_factored, hadamard_chunks, hadamard_mix
 from qtip_layout import projection_indices, hadamard_indices, factored_hadamard_indices
 
@@ -198,7 +198,12 @@ class KernelBackend:
         return np.concatenate(outputs, axis=1)
 
     def attention(self, query, keys, values):
-        """GQA decode for one token. keys/values are [time,kv_heads,dim]."""
+        """GQA decode for one token. keys/values are [time,kv_heads,dim].
+
+        All heads of one 128-token tile run in a single kernel launch; the
+        tail tile is zero-padded with a -inf mask so every context length up
+        to 128 reuses one compiled signature.
+        """
         qheads, dim = query.shape
         if keys.ndim != 3 or values.shape != keys.shape or keys.shape[0] < 1 or keys.shape[2] != dim:
             raise ValueError('Invalid KV cache')
@@ -206,20 +211,26 @@ class KernelBackend:
         if qheads % kvheads or dim > 128:
             raise ValueError('Invalid GQA head geometry')
         result = np.empty_like(query, dtype=np.float32)
-        for h in range(qheads):
-            kh = h // (qheads // kvheads)
-            total_m, total_l = -np.inf, 0.0
-            numerator = np.zeros(dim, np.float64)
-            for start in range(0, keys.shape[0], 128):
-                k = np.ascontiguousarray(keys[start:start+128, kh, :], dtype=np.float32)
-                v = np.ascontiguousarray(values[start:start+128, kh, :], dtype=np.float32)
-                mask = np.zeros((1, len(k)), np.float32)
-                stats = self.run(attention_chunk, query[h:h+1], k, v, mask, dim ** -0.5)[0]
-                m, den = float(stats[dim]), float(stats[dim+1])
-                next_m = max(total_m, m)
-                a, b = np.exp(total_m - next_m), np.exp(m - next_m)
-                numerator = numerator * a + stats[:dim].astype(np.float64) * b
-                total_l = total_l * a + den * b
-                total_m = next_m
-            result[h] = numerator / total_l
+        numerators = np.zeros((qheads, dim), np.float64)
+        total_m = np.full(qheads, -np.inf)
+        total_l = np.zeros(qheads)
+        tile = 128
+        for start in range(0, keys.shape[0], tile):
+            count = min(tile, keys.shape[0] - start)
+            kpad = np.zeros((tile, kvheads * dim), np.float32)
+            vpad = np.zeros((tile, kvheads * dim), np.float32)
+            kpad[:count] = np.ascontiguousarray(keys[start:start+count]).reshape(count, -1)
+            vpad[:count] = np.ascontiguousarray(values[start:start+count]).reshape(count, -1)
+            mask = np.zeros((1, tile), np.float32)
+            mask[0, count:] = -np.inf
+            stats = self.run(gqa_attention_tile, np.ascontiguousarray(query), kpad, vpad,
+                             mask, dim ** -0.5)
+            for h in range(qheads):
+                m, den = float(stats[h, dim]), float(stats[h, dim+1])
+                next_m = max(total_m[h], m)
+                a, b = np.exp(total_m[h] - next_m), np.exp(m - next_m)
+                numerators[h] = numerators[h] * a + stats[h, :dim].astype(np.float64) * b
+                total_l[h] = total_l[h] * a + den * b
+                total_m[h] = next_m
+        result[:] = numerators / total_l[:, None]
         return result

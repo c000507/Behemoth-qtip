@@ -84,6 +84,43 @@ def attention_chunk(q, keys, values, additive_mask, inv_sqrt_dim: float):
 
 
 @nki.jit
+def gqa_attention_tile(q, keys, values, mask, inv_sqrt_dim: float):
+    """Fused single-token GQA attention over one zero-padded cache tile.
+
+    q is [heads, dim]; keys/values are [tile, kv_heads*dim] with zero padding
+    beyond the real tokens; mask is [1, tile] additive (0 real, -inf padding).
+    Every head is processed in one launch so decode dispatches drop from one
+    per head to one per 128-token tile. Returns [heads, dim+2]: per-head output
+    plus the online-softmax maximum and denominator in the last two columns.
+    """
+    heads, dim = q.shape
+    tile, kv_width = keys.shape
+    kvheads = kv_width // dim
+    if dim < 1 or dim > 128 or tile < 1 or tile > 128 or kvheads < 1 or heads % kvheads:
+        raise ValueError("Invalid fused GQA geometry")
+    if values.shape != keys.shape or mask.shape != (1, tile) or kv_width % dim:
+        raise ValueError("Invalid fused GQA tile shapes")
+    group = heads // kvheads
+    out = nl.ndarray((heads, dim + 2), dtype=nl.float32, buffer=nl.shared_hbm)
+    for h in range(heads):
+        kh = h // group
+        query = nl.broadcast_to(nl.load(q[h:h+1, 0:dim]), (tile, dim))
+        ktile = nl.load(keys[0:tile, kh*dim:kh*dim+dim])
+        scores_col = nl.sum(nl.multiply(query, ktile), axis=1, keepdims=True)
+        scores = nl.add(nl.multiply(nl.copy(nl.transpose(scores_col)), inv_sqrt_dim),
+                        nl.load(mask[0:1, 0:tile]))
+        maximum = nl.max(scores, axis=1, keepdims=True)
+        weights = nl.exp(nl.subtract(scores, maximum))
+        denom = nl.sum(weights, axis=1, keepdims=True)
+        vtile = nl.copy(nl.transpose(nl.load(values[0:tile, kh*dim:kh*dim+dim])))
+        numer_col = nl.sum(nl.multiply(vtile, nl.broadcast_to(weights, (dim, tile))), axis=1, keepdims=True)
+        nl.store(out[h:h+1, 0:dim], nl.copy(nl.transpose(numer_col)))
+        nl.store(out[h:h+1, dim:dim+1], maximum)
+        nl.store(out[h:h+1, dim+1:dim+2], denom)
+    return out
+
+
+@nki.jit
 def fp8_project_loop(weights, scales, x, width: int, out_width: int, batch: int):
     """Serial, tiled E4M3 weight-only projection on already-rounded inputs.
 
