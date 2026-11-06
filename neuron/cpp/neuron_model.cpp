@@ -415,7 +415,8 @@ struct NeuronModel::Impl {
                         by_index.push_back(&lw.norm1);
                         by_index.push_back(&lw.norm2);
                         for (const auto &w : lw.w) by_index.push_back(&w);
-                        state.push_back(&lw.kv);
+                        const bool swap = l == config.layers - 1 && std::getenv("NEURON_DEBUG_KV_OF_PREVIOUS"); // debugging only
+                        state.push_back(swap ? &ranks[size_t(r)].layers[size_t(l - 1)].kv : &lw.kv);
                     }
                     by_index.insert(by_index.end(), state.begin(), state.end());
                     nrt_tensor_set_t *in = nullptr, *out = nullptr;
