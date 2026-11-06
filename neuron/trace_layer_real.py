@@ -45,7 +45,7 @@ def real_layer(*args, stop_after_attention=False, debug=None):
                        w('qf', 'qs'), w('kf', 'ks'), w('vf', 'vs'), w('of', 'os'), w('gf', 'gs'), w('uf', 'us'), w('df', 'ds'),
                        _lin=lin_fp8, heads=HEADS // TP, kvheads=KVHEADS // TP, reduce=allreduce, mask=t['mask'], stop_after_attention=stop_after_attention, debug=debug)
     if stop_after_attention or debug:  # keep every parameter in the graph so the input numbering stays the same
-        keep = sum(t[k].float().reshape(-1)[0] for k in ORDER[8:]) + t['norm2'].reshape(-1)[0]
+        keep = sum(t[k].float().reshape(-1)[0] for k in ORDER if k not in ('x', 'cache_k', 'cache_v'))
         out = (out[0] + 0.0 * keep, out[1], out[2])
     return out
 

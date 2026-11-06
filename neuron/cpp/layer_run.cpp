@@ -227,6 +227,7 @@ int main(int argc, char **argv) {
     check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
     std::barrier<> sync(TP);
     std::vector<float> result(static_cast<size_t>(hidden));
+    size_t out0_bytes = 0;
     std::vector<double> seconds(TP, 0);
     auto worker = [&](int r) {
         nrt_model_t *model = nullptr;
