@@ -316,7 +316,8 @@ def main():
 
     started = time.monotonic()
     graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph_fp8 if fp8 else layer_graph, tuple(inputs),
-                                compiler_workdir=a.workdir)
+                                compiler_workdir=a.workdir,
+                                compiler_args=['--experimental-unsafe-fp8e4m3fn-as-fp8e4m3'] if fp8 else None)
     compile_s = time.monotonic() - started
     if a.compile_only:
         print(json.dumps({'weights': a.weights, 'resident_weight_MB': round(resident / 1e6, 1), 'compile_s': round(compile_s, 2)}))
