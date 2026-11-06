@@ -63,11 +63,12 @@ def flash_paged(q, cache_k, cache_v, table, pos, R, Q, P, kvh, rep):
     assert P % G == 0
     scale = D ** -0.5
     neg = -1e30
-    m = torch.full((R, Q, kvh, rep), neg)
-    l = torch.zeros(R, Q, kvh, rep)
-    acc = torch.zeros(R, Q, kvh, rep, D)
+    dev = q.device
+    m = torch.full((R, Q, kvh, rep), neg, device=dev)
+    l = torch.zeros(R, Q, kvh, rep, device=dev)
+    acc = torch.zeros(R, Q, kvh, rep, D, device=dev)
     qpos = pos.reshape(R, Q, 1, 1, 1)
-    inblock = torch.arange(G * PAGE, dtype=torch.int64).reshape(1, 1, 1, 1, G * PAGE)
+    inblock = torch.arange(G * PAGE, dtype=torch.int64, device=dev).reshape(1, 1, 1, 1, G * PAGE)
     for b in range(P // G):
         pages = table[:, b * G:(b + 1) * G]                      # [R,G]
         kb, vb = cache_k[pages], cache_v[pages]                  # [R,G,kvh,16,D]
@@ -103,7 +104,7 @@ def paged_layer(R, Q, P, *args):
     q, k = rope(q), rope(k)
     page = torch.bitwise_right_shift(t['wslot'], 4)
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
-    at = (page[:, None], torch.arange(kvh, dtype=torch.int64)[None, :], off[:, None])
+    at = (page[:, None], torch.arange(kvh, dtype=torch.int64, device=x.device)[None, :], off[:, None])
     cache_k = t['cache_k'].index_put(at, k.to(torch.bfloat16))
     cache_v = t['cache_v'].index_put(at, v.to(torch.bfloat16))
     attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache_k, cache_v, t['table'], t['pos'], R, Q, P, kvh, rep)
