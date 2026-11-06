@@ -424,9 +424,16 @@ struct NeuronModel::Impl {
                     std::vector<const Dev *> state;
                     for (int l : seg.layers) {
                         const auto &lw = ranks[size_t(r)].layers[size_t(l)];
-                        by_index.push_back(&lw.norm1);
-                        by_index.push_back(&lw.norm2);
-                        for (const auto &w : lw.w) by_index.push_back(&w);
+                        // debugging: NEURON_DEBUG_SWAP=norms|attn|mlp takes that group of layer 31 from layer 30
+                        const char *swap = std::getenv("NEURON_DEBUG_SWAP");
+                        const auto &o = ranks[size_t(r)].layers[size_t(l == 31 && swap ? 30 : l)];
+                        const std::string group = swap ? swap : "";
+                        by_index.push_back(l == 31 && group.find("norms") != std::string::npos ? &o.norm1 : &lw.norm1);
+                        by_index.push_back(l == 31 && group.find("norms") != std::string::npos ? &o.norm2 : &lw.norm2);
+                        for (int w = 0; w < 14; ++w) {
+                            const bool attn = w < 8, take = l == 31 && group.find(attn ? "attn" : "mlp") != std::string::npos;
+                            by_index.push_back(take ? &o.w[w] : &lw.w[w]);
+                        }
                         state.push_back(&lw.kv);
                     }
                     by_index.insert(by_index.end(), state.begin(), state.end());
