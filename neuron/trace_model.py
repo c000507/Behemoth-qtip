@@ -1,25 +1,32 @@
-"""Server-contract Llama graphs for NeuronCore-v2 (trn1), tensor parallel TP=2, all projections cFP8.
+"""Server-contract Llama graphs for NeuronCore-v2 (trn1), tensor parallel, all projections cFP8.
 
-One NEFF per (R, Q, P) bucket serves EVERY layer: the 32 layers differ only in the weight and KV tensors bound
+One NEFF per (R, Q, P) bucket serves EVERY layer: the layers differ only in the weight and KV tensors bound
 to it at run time (cpp/neuron_model.cpp), so there is no per-layer compilation.
 
   decode  : R requests x Q=1 token each (R padded with scratch requests)
   prefill : R=1 request x Q-token chunk (chunked prefill, the chunk attends to its own earlier chunks too)
 
 Paged KV, exactly the server's layout (runtime/include/behemoth/attention.hpp): per layer and K/V one tensor
-[pages, kv_heads_local, 16, 128], page_tokens = 16, a request owns pages listed in its page table row. The
+[pages, kv_heads_local, 16, D], page_tokens = 16, a request owns pages listed in its page table row. The
 graph scatters the T new K/V rows to flat slots (page * 16 + offset), then attends over the request's pages in
 key blocks of G pages with a running (max, sum, accumulator) -- flash-attention online softmax -- so no
 [queries x context] score matrix is ever materialised. Key position j of the table is valid for a query at
 absolute position p iff j <= p (causal and length mask in one compare), so the block loop needs no lengths.
 The KV tensors are aliased input -> output (updated in place on the device).
 
+Geometry (hidden, heads, kv heads, head dim, intermediate, vocab) comes from the checkpoint's config.json
+(MODEL=/path/to/checkpoint or CONFIG=/path/config.json; default: Llama 3.1 8B) and TP from the TP env (default 2);
+every meta.json records it and the runtime refuses a bucket directory traced for another geometry or TP.
+Sharding: q/k/v/gate/up column-parallel (heads and kv heads divided over the ranks, so kv_heads % TP == 0),
+o/down row-parallel with an all-reduce, lm_head by vocabulary rows padded to a multiple of TP.
+
 Inputs (order == ORDER), per rank:
-  x [T,H] f32 residual (replicated), cos_sin [T,2,64] f32 for the tokens' absolute positions (computed on the
-  host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache [pages,2,kv_heads,16,128],
+  x [T,H] f32 residual (replicated), cos_sin [T,2,D/2] f32 for the tokens' absolute positions (computed on the
+  host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache [pages,2,kv_heads,16,D],
   norms and the seven FP8 projections with per-row scales.
 
-usage: trace_model.py WORKDIR layer R Q P | head S | model R Q P L S [body]   (HEAD_ROWS=T for head, PAGES, NCC_FLAGS env)
+usage: trace_model.py WORKDIR layer R Q P | head S | model R Q P L S [body]
+       env: MODEL / CONFIG (geometry), TP, PAGES, HEAD_ROWS=T (head), HEAD_FP8=1 (E4M3 lm_head with per-row scale), NCC_FLAGS
 """
 import json
 import os
@@ -33,22 +40,56 @@ os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trace_layer import Fp8Weight, lin_fp8
 
-TP = 2
-H, HEADS, KVHEADS, D, FF, VOCAB = 4096, 32, 8, 128, 14336, 128257
-VOCAB_PAD = (VOCAB + TP - 1) // TP * TP
+LLAMA_8B = {'hidden': 4096, 'heads': 32, 'kv_heads': 8, 'head_dim': 128, 'intermediate': 14336, 'vocab': 128257, 'layers': 32}
+
+
+class Geometry:
+    """Model geometry plus the tensor-parallel degree; the module-level `g` is set by main() (or by a test) before tracing."""
+    def __init__(self, d, tp):
+        self.H, self.HEADS, self.KVHEADS, self.D = d['hidden'], d['heads'], d['kv_heads'], d['head_dim']
+        self.FF, self.VOCAB, self.LAYERS, self.TP = d['intermediate'], d['vocab'], d['layers'], tp
+        if self.HEADS % self.KVHEADS or self.HEADS % tp or self.KVHEADS % tp or self.FF % tp or self.D % 2:
+            raise ValueError(f'geometry {d} is not shardable over TP={tp} (heads, kv heads and intermediate must divide; kv_heads < TP would need K/V replication)')
+        self.VOCAB_PAD = (self.VOCAB + tp - 1) // tp * tp
+
+    def meta(self):
+        return {'hidden': self.H, 'heads': self.HEADS, 'kv_heads': self.KVHEADS, 'head_dim': self.D, 'intermediate': self.FF,
+                'vocab': self.VOCAB, 'layers': self.LAYERS, 'tp': self.TP, 'page': PAGE}
+
+    @staticmethod
+    def from_config(path, tp):
+        c = json.loads(Path(path).read_text())
+        heads = int(c['num_attention_heads'])
+        return Geometry({'hidden': int(c['hidden_size']), 'heads': heads, 'kv_heads': int(c.get('num_key_value_heads', heads)),
+                         'head_dim': int(c.get('head_dim') or c['hidden_size'] // heads), 'intermediate': int(c['intermediate_size']),
+                         'vocab': int(c['vocab_size']), 'layers': int(c['num_hidden_layers'])}, tp)
+
+
+def geometry_from_env():
+    tp = int(os.environ.get('TP', '2'))
+    if os.environ.get('CONFIG'):
+        return Geometry.from_config(os.environ['CONFIG'], tp)
+    if os.environ.get('MODEL'):
+        return Geometry.from_config(Path(os.environ['MODEL']) / 'config.json', tp)
+    return Geometry(LLAMA_8B, tp)
+
+
+g = Geometry(LLAMA_8B, 2)
 PAGE = 16
 KEY_BLOCK_PAGES = 32  # G: pages per flash block (512 keys)
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
+HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 
 
 def shapes(R, Q, P, pages):
-    T, q, kv, ff, f8 = R * Q, HEADS * D // TP, KVHEADS * D // TP, FF // TP, torch.float8_e4m3fn
+    H, D, f8 = g.H, g.D, torch.float8_e4m3fn
+    T, q, kv, ff = R * Q, g.HEADS * D // g.TP, g.KVHEADS * D // g.TP, g.FF // g.TP
     return {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache': ((pages, 2, KVHEADS // TP, PAGE, D), torch.bfloat16),
+        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.bfloat16),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
@@ -61,6 +102,7 @@ def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     G = min(KEY_BLOCK_PAGES, P)
     assert P % G == 0
+    D = g.D
     scale = D ** -0.5
     neg = -1e30
     dev = q.device
@@ -88,8 +130,8 @@ def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
 def paged_layer(R, Q, P, *args):
     import torch_xla.core.xla_model as xm
     t = dict(zip(ORDER, args))
-    allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(TP))])
-    heads, kvh = HEADS // TP, KVHEADS // TP
+    allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(g.TP))])
+    D, heads, kvh = g.D, g.HEADS // g.TP, g.KVHEADS // g.TP
     rep, T, half = heads // kvh, R * Q, D // 2
     w = lambda a, b: Fp8Weight(t[a], t[b])
     x = t['x']
@@ -122,22 +164,28 @@ SHARED = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'rows', 'head_norm', 'head_w'
 BODY_SHARED = SHARED[:5]  # a body segment (no head) takes only these and returns the residual stream
 
 
-def head_graph(S, x, rows, norm, w):
-    """Final RMSNorm and this rank's vocab half of lm_head for S selected rows -> logits [S, VOCAB_PAD/2]."""
+def head_graph(S, x, rows, norm, w, ws=None):
+    """Final RMSNorm and this rank's vocab slice of lm_head for S selected rows -> logits [S, VOCAB_PAD/TP] f32.
+    bf16 lm_head (w [V/TP, H]) or, with ws, an E4M3 lm_head with a per-row scale: the activation is scaled per row into
+    E4M3 like the layer projections, the matmul runs fp8 x fp8 and the f32 result is rescaled (not rounded to bf16)."""
     x = torch.index_select(x, 0, rows)
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm).to(torch.bfloat16)
-    return (h @ w.T).float()
+    if ws is None:
+        return (h @ w.T).float()
+    a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+    h8 = (h.float() / a).to(torch.float8_e4m3fn)
+    return torch.matmul(h8, w.T).float() * a * ws.reshape(1, -1)
 
 
 class FullModel(torch.nn.Module):
-    """All L layers plus the final norm / lm_head half as ONE graph. Inputs: SHARED, then LAYER_WEIGHTS per layer;
-    the L KV tensors (K and V of a layer in one [pages, 2, kv_heads, 16, 128] tensor) are module state aliased input -> output.
+    """All L layers plus the final norm / lm_head slice as ONE graph. Inputs: SHARED, then LAYER_WEIGHTS per layer;
+    the L KV tensors (K and V of a layer in one [pages, 2, kv_heads, 16, D] tensor) are module state aliased input -> output.
     Keeping the aliased tensors at one per layer matters: a graph with 64 aliased state tensors (32 layers x separate K, V) compiled
     to wrong results, 62 did not."""
     def __init__(self, R, Q, P, L, S, pages, head=True):
         super().__init__()
         self.R, self.Q, self.P, self.L, self.S, self.head = R, Q, P, L, S, head
-        shape = (pages, 2, KVHEADS // TP, PAGE, D)
+        shape = (pages, 2, g.KVHEADS // g.TP, PAGE, g.D)
         for i in range(L):
             self.register_buffer(f'kv{i}', torch.zeros(shape, dtype=torch.bfloat16))
 
@@ -160,10 +208,10 @@ class FullModel(torch.nn.Module):
 def full_model_inputs(R, Q, P, L, S, head=True):
     s = shapes(R, Q, P, 1)
     T = R * Q
-    out = [torch.zeros(T, H), torch.zeros(T, 2, D // 2), torch.zeros(T, dtype=torch.int64), torch.zeros(T, dtype=torch.int64),
+    out = [torch.zeros(T, g.H), torch.zeros(T, 2, g.D // 2), torch.zeros(T, dtype=torch.int64), torch.zeros(T, dtype=torch.int64),
            torch.zeros(R, P, dtype=torch.int64)]
     if head:
-        out += [torch.zeros(S, dtype=torch.int64), torch.ones(1, H), torch.zeros(VOCAB_PAD // TP, H, dtype=torch.bfloat16)]
+        out += [torch.zeros(S, dtype=torch.int64), torch.ones(1, g.H), torch.zeros(g.VOCAB_PAD // g.TP, g.H, dtype=torch.bfloat16)]
     for _ in range(L):
         for k in LAYER_WEIGHTS:
             shape, dtype = s[k]
@@ -181,9 +229,11 @@ def example_inputs(R, Q, P, pages):
 
 
 def main():
+    global g
     workdir, kind = sys.argv[1], sys.argv[2]
+    g = geometry_from_env()
+    print('geometry', json.dumps(g.meta()))
     import torch_neuronx
-    aliases = True
     if kind == 'layer':
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
         pages = int(os.environ.get('PAGES', '64'))
@@ -206,7 +256,7 @@ def main():
             inputs = [t for k, t in zip(ORDER, inputs) if k != 'cache']
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
-        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'order': ORDER}
+        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': ORDER}
     elif kind == 'model':
         R, Q, P, L, S = (int(a) for a in sys.argv[3:8])
         head = len(sys.argv) < 9 or sys.argv[8] != 'body'  # 'body': a segment without the head (residual out)
@@ -214,14 +264,22 @@ def main():
         fn = FullModel(R, Q, P, L, S, pages, head)
         inputs = full_model_inputs(R, Q, P, L, S, head)
         kwargs = {'enable_aliasing': True}
-        meta = {'kind': 'model', 'R': R, 'Q': Q, 'P': P, 'L': L, 'S': S, 'T': R * Q, 'head': head}
+        meta = {'kind': 'model', 'R': R, 'Q': Q, 'P': P, 'L': L, 'S': S, 'T': R * Q, 'pages': pages, 'head': head}
     else:
         S = int(sys.argv[3])
         T = int(os.environ.get('HEAD_ROWS', '256'))
-        inputs = [torch.zeros(T, H), torch.zeros(S, dtype=torch.int64), torch.ones(1, H), torch.zeros(VOCAB_PAD // TP, H, dtype=torch.bfloat16)]
+        fp8 = os.environ.get('HEAD_FP8', '0') == '1'
+        rows = g.VOCAB_PAD // g.TP
+        inputs = [torch.zeros(T, g.H), torch.zeros(S, dtype=torch.int64), torch.ones(1, g.H)]
         kwargs = {}
-        fn = lambda x, rows, norm, w: head_graph(S, x, rows, norm, w)
-        meta = {'kind': 'head', 'S': S, 'T': T, 'order': HEAD_ORDER}
+        if fp8:
+            inputs += [torch.zeros(rows, g.H).to(torch.float8_e4m3fn), torch.ones(rows)]
+            fn = lambda x, rows_, norm, wf, ws: head_graph(S, x, rows_, norm, wf, ws)
+        else:
+            inputs += [torch.zeros(rows, g.H, dtype=torch.bfloat16)]
+            fn = lambda x, rows_, norm, w: head_graph(S, x, rows_, norm, w)
+        meta = {'kind': 'head', 'S': S, 'T': T, 'fp8': fp8, 'order': HEAD_FP8_ORDER if fp8 else HEAD_ORDER}
+    meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
     except RuntimeError as error:

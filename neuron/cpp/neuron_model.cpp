@@ -21,7 +21,7 @@ using namespace behemoth;
 
 namespace neuron {
 namespace {
-constexpr int TP = 2, DIM = 128;
+constexpr int PAGE = 16; // tokens per KV page (the server's AttentionLayout)
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -49,10 +49,35 @@ void zero(const Dev &d) {
         put(d, z.data(), std::min(z.size(), d.bytes - off), off);
 }
 
+// The geometry a NEFF was traced for (meta.json "geometry", trace_model.py). Buckets without it are from the
+// first generator version, which only produced Llama 3.1 8B graphs at TP=2.
+struct Geometry {
+    int hidden = 4096, heads = 32, kv_heads = 8, dim = 128, intermediate = 14336, vocab = 128257, layers = 32, tp = 2;
+    static Geometry of(const ModelConfig &c, int tp) {
+        return {c.hidden, c.q_heads, c.kv_heads, c.dim, c.intermediate, c.vocab, c.layers, tp};
+    }
+    static Geometry parse(const nlohmann::json &j) {
+        Geometry g;
+        g.hidden = j.at("hidden"); g.heads = j.at("heads"); g.kv_heads = j.at("kv_heads"); g.dim = j.at("head_dim");
+        g.intermediate = j.at("intermediate"); g.vocab = j.at("vocab"); g.layers = j.value("layers", 0); g.tp = j.at("tp");
+        return g;
+    }
+    bool operator==(const Geometry &o) const { // layer count is not a graph property (one layer NEFF serves all layers)
+        return hidden == o.hidden && heads == o.heads && kv_heads == o.kv_heads && dim == o.dim && intermediate == o.intermediate &&
+               vocab == o.vocab && tp == o.tp;
+    }
+    std::string str() const {
+        return "hidden " + std::to_string(hidden) + " heads " + std::to_string(heads) + "/" + std::to_string(kv_heads) + " dim " +
+               std::to_string(dim) + " ff " + std::to_string(intermediate) + " vocab " + std::to_string(vocab) + " TP " + std::to_string(tp);
+    }
+};
+
 struct Meta {
     std::string kind;
     int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
     bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
+    bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
+    Geometry geometry;
     std::filesystem::path neff;
 };
 
@@ -60,25 +85,25 @@ struct Meta {
 constexpr int kInputs = 22, kKvInput = 21;
 
 struct LayerWeights {
-    Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, 128] bf16
+    Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, dim] bf16
 };
 
 struct RankState {
     int core = 0;
     std::vector<LayerWeights> layers;
-    Dev head_w, head_norm;
+    Dev head_w, head_norm, head_ws; // head_w: bf16 rows, or E4M3 rows + head_ws scales when an fp8 head NEFF is loaded
 };
 
 struct LayerBucket {
     Meta meta;
-    std::array<nrt_model_t *, TP> model{};
+    std::vector<nrt_model_t *> model; // [rank]
     // Whole-model buckets run as a chain of segments (one segment when the toolchain compiles all layers into one graph).
     struct Seg {
         Meta meta;
         int first_layer = 0;
         std::vector<int> layers; // layer index bound to each of the segment's L slots
-        std::array<nrt_model_t *, TP> model{};
-        std::array<nrt_tensor_set_t *, TP> in{}, out{};
+        std::vector<nrt_model_t *> model;
+        std::vector<nrt_tensor_set_t *> in, out; // [rank]
     };
     std::vector<Seg> segs;
     struct PerRank {
@@ -86,21 +111,21 @@ struct LayerBucket {
         std::vector<std::array<nrt_tensor_set_t *, 2>> in, out; // [layer][parity]; whole-model buckets: [0][0]
         Dev rows, logits;                                      // whole-model buckets only
     };
-    std::array<PerRank, TP> rank;
+    std::vector<PerRank> rank;
     int tokens() const { return meta.R * meta.Q; }
     bool full() const { return !segs.empty(); }
     bool in_graph_head() const { return full() && segs.back().meta.head; }
 };
 struct HeadBucket {
     Meta meta;
-    std::array<nrt_model_t *, TP> model{};
+    std::vector<nrt_model_t *> model;
     struct PerRank {
         Dev rows, logits;
         // by the layer bucket whose residual buffer feeds the head, then by parity of the buffer holding the final x
         std::map<const LayerBucket *, std::array<nrt_tensor_set_t *, 2>> in;
         std::array<nrt_tensor_set_t *, 2> out{};
     };
-    std::array<PerRank, TP> rank;
+    std::vector<PerRank> rank;
 };
 
 std::vector<char> slurp(const std::filesystem::path &p) {
@@ -117,8 +142,10 @@ struct NeuronModel::Impl {
     std::unique_ptr<SafeTensorFile> embed_file;
     FloatTensorView embed, final_norm;
     std::vector<float> inv_freq;
-    int vocab_ = 0, vocab_half = 0, pages_total = 0, kv_local = 0;
-    std::array<RankState, TP> ranks;
+    int tp = 0, hidden = 0, dim = 0;                           // from the NEFF geometry (checked against config.json)
+    int vocab_ = 0, vocab_shard = 0, pages_total = 0, kv_local = 0; // vocab_shard: lm_head rows per rank (vocab padded to TP)
+    bool head_fp8 = false;                                     // the head NEFFs take E4M3 lm_head rows
+    std::vector<RankState> ranks;
     std::vector<LayerBucket> decode, prefill;
     std::vector<HeadBucket> heads;
     std::vector<Meta> segments; // whole-model graphs found by discover(), before they are assembled into buckets
@@ -126,36 +153,49 @@ struct NeuronModel::Impl {
     std::vector<std::unique_ptr<RankWorker>> workers;
     nlohmann::json profile = nlohmann::json::object();
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
+    size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
 
     explicit Impl(const ModelOptions &o) : options(o), config(ModelConfig::read(o.model / "config.json")) {
-        if (config.hidden != 4096 || config.intermediate != 14336 || config.q_heads != 32 || config.kv_heads != 8 || config.dim != DIM)
-            throw std::runtime_error("the Neuron graphs are traced for the Llama 3.1 8B geometry (trace_model.py constants)");
         if (const char *n = std::getenv("NEURON_LAYERS")) // debugging: run only the first n layers (and whole-model NEFFs traced with L=n)
             config.layers = std::min(config.layers, std::atoi(n));
         vocab_ = config.vocab;
-        vocab_half = (vocab_ + TP - 1) / TP;
-        kv_local = config.kv_heads / TP;
-        check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
-        for (int r = 0; r < TP; ++r) {
-            ranks[size_t(r)].core = r;
-            workers.push_back(std::make_unique<RankWorker>());
-        }
+        hidden = config.hidden;
+        dim = config.dim;
         discover();
         auto needs_head = [](const std::vector<LayerBucket> &v) { return std::any_of(v.begin(), v.end(), [](const auto &b) { return !b.in_graph_head(); }); };
         if (decode.empty() || prefill.empty() || ((needs_head(decode) || needs_head(prefill)) && heads.empty()))
             throw std::runtime_error("need decode and prefill NEFF buckets (and head NEFFs for per-layer buckets) in " + options.neff_dir.string());
+        vocab_shard = (vocab_ + tp - 1) / tp;
+        kv_local = config.kv_heads / tp;
+        check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
+        ranks.resize(size_t(tp));
+        for (int r = 0; r < tp; ++r) {
+            ranks[size_t(r)].core = r;
+            workers.push_back(std::make_unique<RankWorker>());
+        }
         embed_file = std::make_unique<SafeTensorFile>(o.model / "model-embed.safetensors");
         embed = embed_file->floats("model.embed_tokens.weight");
         final_norm = embed_file->floats("model.norm.weight");
         if (config.rope_llama3)
-            inv_freq = llama3_inv_freq(DIM, config.theta, config.rope);
+            inv_freq = llama3_inv_freq(dim, config.theta, config.rope);
         else {
-            inv_freq.resize(DIM / 2);
-            for (int d = 0; d < DIM / 2; ++d)
-                inv_freq[size_t(d)] = float(std::pow(double(config.theta), -2.0 * d / DIM));
+            inv_freq.resize(size_t(dim / 2));
+            for (int d = 0; d < dim / 2; ++d)
+                inv_freq[size_t(d)] = float(std::pow(double(config.theta), -2.0 * d / dim));
         }
         load_buckets();
         load_weights();
+    }
+
+    // Every bucket must have been traced for this checkpoint's geometry and one common TP; the TP decides the ranks.
+    void accept(const Meta &m) {
+        if (!tp)
+            tp = m.geometry.tp;
+        if (m.geometry.tp != tp)
+            throw std::runtime_error("NEFF buckets in " + options.neff_dir.string() + " were traced for different TP degrees");
+        if (!(m.geometry == Geometry::of(config, tp)))
+            throw std::runtime_error("NEFF " + m.neff.string() + " was traced for " + m.geometry.str() + ", the checkpoint is " +
+                                     Geometry::of(config, tp).str() + " (retrace with MODEL=" + options.model.string() + ")");
     }
 
     void discover() {
@@ -168,24 +208,35 @@ struct NeuronModel::Impl {
             Meta m;
             m.kind = j.at("kind");
             m.neff = entry.path() / "graph.neff";
+            if (j.contains("geometry"))
+                m.geometry = Geometry::parse(j.at("geometry"));
             if (m.kind == "model") {
                 if (std::getenv("NEURON_USE_LAYERS"))
                     continue;
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P"); m.L = j.at("L"); m.S = j.at("S");
                 m.head = j.value("head", true);
+                accept(m);
                 segments.push_back(m);
             } else if (m.kind == "layer") {
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
+                accept(m);
                 LayerBucket b;
                 b.meta = m;
                 (m.Q == 1 ? decode : prefill).push_back(std::move(b));
             } else {
                 m.S = j.at("S"); m.T = j.at("T");
+                m.fp8 = j.value("fp8", false);
+                accept(m);
+                if (!heads.empty() && heads.front().meta.fp8 != m.fp8)
+                    throw std::runtime_error("head NEFFs mix bf16 and fp8 lm_head formats");
+                head_fp8 = m.fp8;
                 HeadBucket b;
                 b.meta = m;
                 heads.push_back(std::move(b));
             }
         }
+        if (!tp)
+            throw std::runtime_error("no NEFF buckets (meta.json + graph.neff directories) in " + options.neff_dir.string());
         // Whole-model graphs of one (R, Q, P): body segments (residual out), optionally ending in one head segment (logits
         // out), chained over the layers in order. Used when their layer counts add up to the checkpoint's; without a head
         // segment the separate head NEFF of the same token count produces the logits.
@@ -248,6 +299,8 @@ struct NeuronModel::Impl {
         std::sort(heads.begin(), heads.end(), [](const auto &a, const auto &b) { return a.meta.T != b.meta.T ? a.meta.T < b.meta.T : a.meta.S < b.meta.S; });
     }
 
+    size_t kv_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * size_t(dim) * 2; }
+
     // Load every NEFF on both cores and create its step tensors. Tensor sets are built after the weights exist.
     void load_buckets() {
         auto load_layer = [&](LayerBucket &b) {
@@ -256,13 +309,20 @@ struct NeuronModel::Impl {
                 for (const auto &seg : b.segs) neffs.push_back(slurp(seg.meta.neff));
             else
                 neffs.push_back(slurp(b.meta.neff));
+            b.model.resize(size_t(tp));
+            b.rank.resize(size_t(tp));
+            for (auto &seg : b.segs) {
+                seg.model.resize(size_t(tp));
+                seg.in.resize(size_t(tp));
+                seg.out.resize(size_t(tp));
+            }
             std::vector<std::future<void>> jobs;
-            for (int r = 0; r < TP; ++r)
+            for (int r = 0; r < tp; ++r)
                 jobs.push_back(workers[size_t(r)]->submit([&, r] {
                     for (size_t g = 0; g < neffs.size(); ++g) {
                         const auto &neff = neffs[g];
                         nrt_model_t *&handle = b.full() ? b.segs[g].model[size_t(r)] : b.model[size_t(r)];
-                        check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), TP, &handle), "nrt_load_collectives");
+                        check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), uint32_t(tp), &handle), "nrt_load_collectives");
                         nrt_tensor_info_array_t *info = nullptr;
                         check(nrt_get_model_tensor_info(handle, &info), "tensor info");
                         const Meta &m = b.full() ? b.segs[g].meta : b.meta;
@@ -276,7 +336,7 @@ struct NeuronModel::Impl {
                             if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
                                 const auto &t = info->tensor_array[i];
                                 if (std::stoul(std::string(t.name).substr(5)) == size_t(kv_index)) {
-                                    const int pages = int(t.size / size_t(2 * kv_local * 16 * DIM * 2));
+                                    const int pages = int(t.size / size_t(2 * kv_local * PAGE * dim * 2));
                                     if (pages_total && pages != pages_total)
                                         throw std::runtime_error("NEFFs disagree on the page count");
                                     pages_total = pages;
@@ -288,15 +348,15 @@ struct NeuronModel::Impl {
                     }
                     auto &pr = b.rank[size_t(r)];
                     const size_t T = size_t(b.tokens());
-                    pr.x[0] = alloc(r, T * 4096 * 4, "x0");
-                    pr.x[1] = alloc(r, T * 4096 * 4, "x1");
-                    pr.cos_sin = alloc(r, T * 2 * (DIM / 2) * 4, "cos_sin");
+                    pr.x[0] = alloc(r, T * size_t(hidden) * 4, "x0");
+                    pr.x[1] = alloc(r, T * size_t(hidden) * 4, "x1");
+                    pr.cos_sin = alloc(r, T * size_t(dim) * 4, "cos_sin");
                     pr.pos = alloc(r, T * 8, "pos");
                     pr.wslot = alloc(r, T * 8, "wslot");
                     pr.table = alloc(r, size_t(b.meta.R) * size_t(b.meta.P) * 8, "table");
                     if (b.in_graph_head()) {
                         pr.rows = alloc(r, size_t(b.meta.S) * 8, "rows");
-                        pr.logits = alloc(r, size_t(b.meta.S) * size_t(vocab_half) * 4, "logits");
+                        pr.logits = alloc(r, size_t(b.meta.S) * size_t(vocab_shard) * 4, "logits");
                     }
                 }));
             for (auto &j : jobs)
@@ -306,10 +366,12 @@ struct NeuronModel::Impl {
         for (auto &b : prefill) load_layer(b);
         for (auto &h : heads) {
             const auto neff = slurp(h.meta.neff);
-            for (int r = 0; r < TP; ++r) {
+            h.model.resize(size_t(tp));
+            h.rank.resize(size_t(tp));
+            for (int r = 0; r < tp; ++r) {
                 check(nrt_load(neff.data(), neff.size(), r, 1, &h.model[size_t(r)]), "nrt_load head");
                 h.rank[size_t(r)].rows = alloc(r, size_t(h.meta.S) * 8, "rows");
-                h.rank[size_t(r)].logits = alloc(r, size_t(h.meta.S) * size_t(vocab_half) * 4, "logits");
+                h.rank[size_t(r)].logits = alloc(r, size_t(h.meta.S) * size_t(vocab_shard) * 4, "logits");
             }
         }
         if (!pages_total)
@@ -324,24 +386,25 @@ struct NeuronModel::Impl {
         const P projs[] = {{"self_attn.q_proj", true, 0}, {"self_attn.o_proj", false, 2}, {"self_attn.k_proj", true, 4},
                            {"self_attn.v_proj", true, 6}, {"mlp.gate_proj", true, 8}, {"mlp.up_proj", true, 10}, {"mlp.down_proj", false, 12}};
         const std::string base = "model.layers." + std::to_string(layer) + ".";
-        std::vector<float> n1(4096), n2(4096);
+        const size_t H = size_t(hidden);
+        std::vector<float> n1(H), n2(H);
         {
             auto a = file.floats(base + "input_layernorm.weight"), b = file.floats(base + "post_attention_layernorm.weight");
-            for (size_t i = 0; i < 4096; ++i) { n1[i] = a[i]; n2[i] = b[i]; }
+            for (size_t i = 0; i < H; ++i) { n1[i] = a[i]; n2[i] = b[i]; }
         }
-        std::vector<uint8_t> zeros(size_t(pages_total) * 2 * size_t(kv_local) * 16 * DIM * 2, 0);
-        for (int r = 0; r < TP; ++r) {
+        std::vector<uint8_t> zeros(kv_bytes(), 0);
+        for (int r = 0; r < tp; ++r) {
             auto &lw = ranks[size_t(r)].layers[size_t(layer)];
-            lw.norm1 = alloc(r, 4096 * 4, "norm1");
-            lw.norm2 = alloc(r, 4096 * 4, "norm2");
-            put(lw.norm1, n1.data(), 4096 * 4);
-            put(lw.norm2, n2.data(), 4096 * 4);
+            lw.norm1 = alloc(r, H * 4, "norm1");
+            lw.norm2 = alloc(r, H * 4, "norm2");
+            put(lw.norm1, n1.data(), H * 4);
+            put(lw.norm2, n2.data(), H * 4);
             lw.kv = alloc(r, zeros.size(), "kv_cache");
             put(lw.kv, zeros.data(), zeros.size());
         }
         for (const auto &p : projs) {
-            auto shards = load_projection_shards(file, layer, p.name, config, TP, p.col);
-            for (int r = 0; r < TP; ++r) {
+            auto shards = load_projection_shards(file, layer, p.name, config, tp, p.col);
+            for (int r = 0; r < tp; ++r) {
                 auto &lw = ranks[size_t(r)].layers[size_t(layer)];
                 const auto &s = shards[size_t(r)];
                 lw.w[p.slot] = alloc(r, s.w.size(), p.name);
@@ -384,31 +447,57 @@ struct NeuronModel::Impl {
             t.join();
         if (failure)
             std::rethrow_exception(failure);
-        // lm_head halves (bf16, rows padded to an even vocabulary) and the final norm
-        const auto head = embed_file->bytes("lm_head.weight");
-        std::vector<float> norm(4096);
-        for (size_t i = 0; i < 4096; ++i)
+        // lm_head shards (rows padded to a multiple of TP; bf16 as stored, or E4M3 + row scale for fp8 head NEFFs) and the final norm
+        const size_t H = size_t(hidden);
+        std::vector<float> norm(H);
+        for (size_t i = 0; i < H; ++i)
             norm[i] = final_norm[i];
-        for (int r = 0; r < TP; ++r) {
+        const auto head_bytes = embed_file->bytes("lm_head.weight");
+        const auto head_floats = embed_file->floats("lm_head.weight");
+        for (int r = 0; r < tp; ++r) {
             auto &rs = ranks[size_t(r)];
-            rs.head_w = alloc(r, size_t(vocab_half) * 4096 * 2, "lm_head");
-            rs.head_norm = alloc(r, 4096 * 4, "final_norm");
-            put(rs.head_norm, norm.data(), 4096 * 4);
-            const size_t first = size_t(r) * size_t(vocab_half), last = std::min(size_t(vocab_), first + size_t(vocab_half));
-            zero(rs.head_w);
-            if (last > first)
-                put(rs.head_w, head.data() + first * 4096 * 2, (last - first) * 4096 * 2);
+            rs.head_norm = alloc(r, H * 4, "final_norm");
+            put(rs.head_norm, norm.data(), H * 4);
+            const size_t first = size_t(r) * size_t(vocab_shard), last = std::min(size_t(vocab_), first + size_t(vocab_shard));
+            const size_t rows = last > first ? last - first : 0;
+            if (head_fp8) {
+                std::vector<float> w(rows * H);
+                for (size_t i = 0; i < w.size(); ++i)
+                    w[i] = head_floats[first * H + i];
+                const Fp8Shard s = quantize_rows(w.data(), int(rows), hidden);
+                rs.head_w = alloc(r, size_t(vocab_shard) * H, "lm_head");
+                rs.head_ws = alloc(r, size_t(vocab_shard) * 4, "lm_head_scale");
+                zero(rs.head_w);
+                zero(rs.head_ws);
+                if (rows) {
+                    put(rs.head_w, s.w.data(), s.w.size());
+                    put(rs.head_ws, s.scale.data(), s.scale.size() * 4);
+                }
+            } else {
+                rs.head_w = alloc(r, size_t(vocab_shard) * H * 2, "lm_head");
+                zero(rs.head_w);
+                if (rows)
+                    put(rs.head_w, head_bytes.data() + first * H * 2, rows * H * 2);
+            }
         }
+        for (const auto &lw : ranks[0].layers) {
+            weight_bytes_rank += lw.norm1.bytes + lw.norm2.bytes;
+            for (const auto &w : lw.w) weight_bytes_rank += w.bytes;
+            kv_bytes_rank += lw.kv.bytes;
+        }
+        weight_bytes_rank += ranks[0].head_w.bytes + ranks[0].head_ws.bytes + ranks[0].head_norm.bytes;
         build_sets();
         if (options.verbose)
-            std::cerr << "model resident on " << TP << " NeuronCores in " << ms_since(t0) / 1e3 << " s, " << pages_total - 1 << " KV pages\n";
+            std::cerr << "model resident on " << tp << " NeuronCores in " << ms_since(t0) / 1e3 << " s, " << pages_total - 1 << " KV pages; per core "
+                      << weight_bytes_rank / double(1 << 30) << " GiB weights + " << kv_bytes_rank / double(1 << 30) << " GiB KV ("
+                      << Geometry::of(config, tp).str() << ", " << config.layers << " layers)\n";
     }
 
     void build_sets() {
         // Whole-model bucket: one tensor set. Inputs: step tensors + head, then 16 tensors per layer, then the 2L KV state
         // tensors (one K/V tensor per layer); outputs: logits, then the same KV tensors (updated in place).
         auto build_full = [&](LayerBucket &b) {
-            for (int r = 0; r < TP; ++r) {
+            for (int r = 0; r < tp; ++r) {
                 auto &pr = b.rank[size_t(r)];
                 for (size_t g = 0; g < b.segs.size(); ++g) {
                     auto &seg = b.segs[g];
@@ -460,7 +549,7 @@ struct NeuronModel::Impl {
                 build_full(b);
                 return;
             }
-            for (int r = 0; r < TP; ++r) {
+            for (int r = 0; r < tp; ++r) {
                 auto &pr = b.rank[size_t(r)];
                 nrt_tensor_info_array_t *info = nullptr;
                 check(nrt_get_model_tensor_info(b.model[size_t(r)], &info), "tensor info");
@@ -501,9 +590,9 @@ struct NeuronModel::Impl {
         };
         for (auto &b : decode) build(b);
         for (auto &b : prefill) build(b);
-        // head sets: input0 = the residual buffer of each layer bucket with the same token count, rows, norm, w -> logits.
+        // head sets: input0 = the residual buffer of each layer bucket with the same token count, rows, norm, w (, scale) -> logits.
         for (auto &h : heads)
-            for (int r = 0; r < TP; ++r) {
+            for (int r = 0; r < tp; ++r) {
                 auto &hr = h.rank[size_t(r)];
                 for (int p = 0; p < 2; ++p) {
                     check(nrt_allocate_tensor_set(&hr.out[size_t(p)]), "set");
@@ -520,6 +609,8 @@ struct NeuronModel::Impl {
                             check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input1", hr.rows.t), "head in");
                             check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input2", ranks[size_t(r)].head_norm.t), "head in");
                             check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input3", ranks[size_t(r)].head_w.t), "head in");
+                            if (h.meta.fp8)
+                                check(nrt_add_tensor_to_tensor_set(sets[size_t(p)], "input4", ranks[size_t(r)].head_ws.t), "head in");
                         }
                     }
             }
@@ -537,22 +628,36 @@ struct NeuronModel::Impl {
     void embed_row(int token, float *out) const {
         if (token < 0 || token >= vocab_)
             throw std::runtime_error("token outside the vocabulary");
-        for (size_t i = 0; i < 4096; ++i)
-            out[i] = embed[size_t(token) * 4096 + i];
+        for (size_t i = 0; i < size_t(hidden); ++i)
+            out[i] = embed[size_t(token) * size_t(hidden) + i];
     }
-    void rope_row(int position, float *out) const { // [cos x64, sin x64] from fp64 angles, any position
-        for (int d = 0; d < DIM / 2; ++d) {
+    void rope_row(int position, float *out) const { // [cos x dim/2, sin x dim/2] from fp64 angles, any position
+        for (int d = 0; d < dim / 2; ++d) {
             const double angle = double(position) * double(inv_freq[size_t(d)]);
             out[d] = float(std::cos(angle));
-            out[DIM / 2 + d] = float(std::sin(angle));
+            out[dim / 2 + d] = float(std::sin(angle));
         }
     }
 
     void fill_row(Launch &L, int row, int token, int position, int page_id) {
-        embed_row(token, L.x.data() + size_t(row) * 4096);
-        rope_row(position, L.cos_sin.data() + size_t(row) * DIM);
+        embed_row(token, L.x.data() + size_t(row) * size_t(hidden));
+        rope_row(position, L.cos_sin.data() + size_t(row) * size_t(dim));
         L.pos[size_t(row)] = position;
-        L.wslot[size_t(row)] = int64_t(page_id) * 16 + position % 16;
+        L.wslot[size_t(row)] = int64_t(page_id) * PAGE + position % PAGE;
+    }
+
+    // Merge the ranks' vocab slices of the sampled rows into dest.
+    void gather_logits(const Launch &L, const std::vector<std::vector<float>> &out, float *dest) const {
+        for (size_t i = 0; i < L.head_rows.size(); ++i) {
+            float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
+            for (int r = 0; r < tp; ++r) {
+                const size_t first = size_t(r) * size_t(vocab_shard);
+                if (first >= size_t(vocab_))
+                    continue;
+                const size_t count = std::min(size_t(vocab_) - first, size_t(vocab_shard));
+                std::copy_n(out[size_t(r)].data() + i * size_t(vocab_shard), count, row + first);
+            }
+        }
     }
 
     void execute(Launch &L, float *dest) {
@@ -563,9 +668,9 @@ struct NeuronModel::Impl {
             std::vector<int64_t> rows(size_t(b.meta.S), 0);
             for (size_t i = 0; i < L.head_rows.size(); ++i)
                 rows[i] = L.head_rows[i];
-            std::vector<std::vector<float>> out(TP);
+            std::vector<std::vector<float>> out(size_t(tp));
             std::vector<std::future<void>> jobs;
-            for (int r = 0; r < TP; ++r)
+            for (int r = 0; r < tp; ++r)
                 jobs.push_back(workers[size_t(r)]->submit([&, r] {
                     auto &pr = const_cast<LayerBucket &>(b).rank[size_t(r)];
                     const auto t_start = Clock::now();
@@ -583,7 +688,7 @@ struct NeuronModel::Impl {
                             dump_x(b, seg.first_layer + seg.meta.L, pr.x[(g + 1) % 2]);
                     }
                     const auto t_executed = Clock::now();
-                    out[size_t(r)].resize(size_t(b.meta.S) * size_t(vocab_half));
+                    out[size_t(r)].resize(size_t(b.meta.S) * size_t(vocab_shard));
                     check(nrt_tensor_read(pr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
                     if (r == 0) {
                         phase_upload_ms += std::chrono::duration<double, std::milli>(t_uploaded - t_start).count();
@@ -593,13 +698,7 @@ struct NeuronModel::Impl {
                 }));
             for (auto &j : jobs)
                 j.get();
-            for (size_t i = 0; i < L.head_rows.size(); ++i) {
-                float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
-                for (int r = 0; r < TP; ++r) {
-                    const size_t first = size_t(r) * size_t(vocab_half), count = std::min(size_t(vocab_) - first, size_t(vocab_half));
-                    std::copy_n(out[size_t(r)].data() + i * size_t(vocab_half), count, row + first);
-                }
-            }
+            gather_logits(L, out, dest);
             return;
         }
         const HeadBucket *head = nullptr;
@@ -625,9 +724,9 @@ struct NeuronModel::Impl {
         std::vector<int64_t> rows(head ? size_t(head->meta.S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
-        std::vector<std::vector<float>> out(TP);
+        std::vector<std::vector<float>> out(size_t(tp));
         std::vector<std::future<void>> jobs;
-        for (int r = 0; r < TP; ++r)
+        for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
                 auto &pr = const_cast<LayerBucket &>(b).rank[size_t(r)];
                 const auto t_start = Clock::now();
@@ -674,7 +773,7 @@ struct NeuronModel::Impl {
                     auto &hr = const_cast<HeadBucket *>(head)->rank[size_t(r)];
                     put(hr.rows, rows.data(), rows.size() * 8);
                     check(nrt_execute(head->model[size_t(r)], hr.in.at(&b)[size_t(final_parity)], hr.out[size_t(final_parity)]), "head execute");
-                    out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_half));
+                    out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_shard));
                     check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
                     if (r == 0)
                         phase_head_ms += ms_since(t_layers);
@@ -682,24 +781,17 @@ struct NeuronModel::Impl {
             }));
         for (auto &j : jobs)
             j.get();
-        if (!head)
-            return;
-        for (size_t i = 0; i < L.head_rows.size(); ++i) {
-            float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
-            for (int r = 0; r < TP; ++r) {
-                const size_t first = size_t(r) * size_t(vocab_half), count = std::min(size_t(vocab_) - first, size_t(vocab_half));
-                std::copy_n(out[size_t(r)].data() + i * size_t(vocab_half), count, row + first);
-            }
-        }
+        if (head)
+            gather_logits(L, out, dest);
     }
 
-    // Debugging: NEURON_DUMP_X=prefix writes rank 0's residual stream (f32 [tokens][4096]) after layers 16 and 32 (when the
+    // Debugging: NEURON_DUMP_X=prefix writes rank 0's residual stream (f32 [tokens][hidden]) after layers 16 and 32 (when the
     // execution passes there) to prefix.x16 / prefix.x32, from either execution path.
     void dump_x(const LayerBucket &b, int layers_done, const Dev &x) {
         const char *prefix = std::getenv("NEURON_DUMP_X");
         if (!prefix || (layers_done != 16 && layers_done != 32 && layers_done != 31))
             return;
-        std::vector<float> v(size_t(b.tokens()) * 4096);
+        std::vector<float> v(size_t(b.tokens()) * size_t(hidden));
         check(nrt_tensor_read(x.t, v.data(), 0, v.size() * 4), "read x");
         std::ofstream(std::string(prefix) + ".x" + std::to_string(layers_done), std::ios::binary).write(reinterpret_cast<const char *>(v.data()), std::streamsize(v.size() * 4));
     }
@@ -716,7 +808,7 @@ struct NeuronModel::Impl {
             while (batch.sample_rows[s] >= lay.query_offsets[req + 1]) ++req;
             sample_index[req] = int(s);
         }
-        auto pages_needed = [&](int req) { return (lay.lengths[size_t(req)] + 15) / 16; };
+        auto pages_needed = [&](int req) { return (lay.lengths[size_t(req)] + PAGE - 1) / PAGE; };
         auto table_row = [&](Launch &L, int slot, int req) {
             const auto &b = *L.bucket;
             for (int j = 0; j < b.meta.P; ++j) {
@@ -728,13 +820,13 @@ struct NeuronModel::Impl {
             Launch L;
             L.bucket = &b;
             const size_t T = size_t(b.tokens());
-            L.x.assign(T * 4096, 0.f);
-            L.cos_sin.assign(T * DIM, 0.f);
+            L.x.assign(T * size_t(hidden), 0.f);
+            L.cos_sin.assign(T * size_t(dim), 0.f);
             L.pos.assign(T, 0);
-            L.wslot.assign(T, int64_t(scratch) * 16);
+            L.wslot.assign(T, int64_t(scratch) * PAGE);
             L.table.assign(size_t(b.meta.R) * size_t(b.meta.P), scratch);
             for (size_t t = 0; t < T; ++t)
-                rope_row(0, L.cos_sin.data() + t * DIM);
+                rope_row(0, L.cos_sin.data() + t * size_t(dim));
             return L;
         };
         // Bucket choice: the cheapest (rows x table pages, or queries x table pages) NEFF that covers the work; a
@@ -772,7 +864,7 @@ struct NeuronModel::Impl {
             for (size_t i = 0; i < n; ++i) {
                 const int req = single[at + i], token_index = lay.query_offsets[size_t(req)];
                 const int position = lay.positions[size_t(token_index)];
-                const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / 16)];
+                const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / PAGE)];
                 fill_row(L, int(i), batch.tokens[size_t(token_index)], position, page);
                 table_row(L, int(i), req);
                 if (sample_index[size_t(req)] >= 0) {
@@ -796,7 +888,7 @@ struct NeuronModel::Impl {
                 auto L = fresh(*bucket);
                 for (int i = 0; i < take; ++i) {
                     const int token_index = first + done + i, position = lay.positions[size_t(token_index)];
-                    const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / 16)];
+                    const int page = lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(position / PAGE)];
                     fill_row(L, i, batch.tokens[size_t(token_index)], position, page);
                 }
                 table_row(L, 0, req);
@@ -829,7 +921,7 @@ const std::vector<int> &NeuronModel::eos() const { return impl_->config.eos; }
 int NeuronModel::max_context() const {
     int p = 0;
     for (const auto &b : impl_->decode) p = std::max(p, b.meta.P);
-    return std::min(p * 16, impl_->config.max_context);
+    return std::min(p * PAGE, impl_->config.max_context);
 }
 std::span<const float> NeuronModel::forward(const InferenceBatch &b) { return impl_->forward(b); }
 nlohmann::json NeuronModel::last_profile() const { return impl_->profile; }

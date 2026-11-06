@@ -12,7 +12,7 @@ constexpr float kFp8Max = 224.0f; // Trn1/Trn2 only support IEEE-style E4M3 (exp
 }
 
 // Quantize rows [r0, r1) x columns [c0, c1) of a dense [out][in] matrix to row-scaled E4M3.
-static Fp8Shard quantize_slice(const std::vector<float> &w, int in, int r0, int r1, int c0, int c1) {
+static Fp8Shard quantize_slice(const float *w, int in, int r0, int r1, int c0, int c1) {
     Fp8Shard s;
     s.rows = r1 - r0;
     s.cols = c1 - c0;
@@ -20,7 +20,7 @@ static Fp8Shard quantize_slice(const std::vector<float> &w, int in, int r0, int 
     s.scale.resize(size_t(s.rows));
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < s.rows; ++r) {
-        const float *src = w.data() + size_t(r0 + r) * size_t(in) + size_t(c0);
+        const float *src = w + size_t(r0 + r) * size_t(in) + size_t(c0);
         float amax = 0;
         for (int c = 0; c < s.cols; ++c) amax = std::max(amax, std::fabs(src[c]));
         const float scale = amax > 0 ? amax / kFp8Max : 1.0f;
@@ -37,10 +37,12 @@ static std::vector<Fp8Shard> slices(const std::vector<float> &w, int out, int in
     for (int rank = 0; rank < tp; ++rank) {
         const int r0 = column_parallel ? rank * (out / tp) : 0, r1 = column_parallel ? r0 + out / tp : out;
         const int c0 = column_parallel ? 0 : rank * (in / tp), c1 = column_parallel ? in : c0 + in / tp;
-        shards.push_back(quantize_slice(w, in, r0, r1, c0, c1));
+        shards.push_back(quantize_slice(w.data(), in, r0, r1, c0, c1));
     }
     return shards;
 }
+
+Fp8Shard quantize_rows(const float *w, int rows, int cols) { return quantize_slice(w, cols, 0, rows, 0, cols); }
 
 static std::vector<float> effective_qtip(const qtip::HostLinear &l) {
     const int out = l.out, in = l.in;
