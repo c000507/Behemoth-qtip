@@ -88,6 +88,7 @@ struct LayerBucket {
     std::array<PerRank, TP> rank;
     int tokens() const { return meta.R * meta.Q; }
     bool full() const { return !segs.empty(); }
+    bool in_graph_head() const { return full() && segs.back().meta.head; }
 };
 struct HeadBucket {
     Meta meta;
@@ -139,7 +140,7 @@ struct NeuronModel::Impl {
             workers.push_back(std::make_unique<RankWorker>());
         }
         discover();
-        auto needs_head = [](const std::vector<LayerBucket> &v) { return std::any_of(v.begin(), v.end(), [](const auto &b) { return !b.full(); }); };
+        auto needs_head = [](const std::vector<LayerBucket> &v) { return std::any_of(v.begin(), v.end(), [](const auto &b) { return !b.in_graph_head(); }); };
         if (decode.empty() || prefill.empty() || ((needs_head(decode) || needs_head(prefill)) && heads.empty()))
             throw std::runtime_error("need decode and prefill NEFF buckets (and head NEFFs for per-layer buckets) in " + options.neff_dir.string());
         embed_file = std::make_unique<SafeTensorFile>(o.model / "model-embed.safetensors");
@@ -184,38 +185,40 @@ struct NeuronModel::Impl {
                 heads.push_back(std::move(b));
             }
         }
-        // Whole-model graphs of one (R, Q, P): body segments (residual out) followed by one head segment (logits out),
-        // chained over the layers in order; used only when their layer counts add up to the checkpoint's.
-        for (const auto &head : segments) {
-            if (!head.head)
-                continue;
-            LayerBucket bucket;
-            bucket.meta = head;
-            int total = head.L;
-            std::vector<Meta> body;
-            for (const auto &m : segments)
-                if (!m.head && m.R == head.R && m.Q == head.Q && m.P == head.P)
-                    body.push_back(m);
-            std::sort(body.begin(), body.end(), [](const Meta &x, const Meta &y) { return x.L > y.L; });
-            for (const auto &m : body)
-                if (total + m.L <= config.layers) { // body segments first; a tail of the same size repeats
-                    bucket.segs.push_back({m, 0, {}, {}, {}});
-                    total += m.L;
-                }
-            while (total < config.layers && !body.empty() && total + body.front().L <= config.layers) {
-                bucket.segs.push_back({body.front(), 0, {}, {}, {}});
-                total += body.front().L;
+        // Whole-model graphs of one (R, Q, P): body segments (residual out), optionally ending in one head segment (logits
+        // out), chained over the layers in order. Used when their layer counts add up to the checkpoint's; without a head
+        // segment the separate head NEFF of the same token count produces the logits.
+        std::map<std::array<int, 3>, std::vector<Meta>> groups;
+        for (const auto &m : segments)
+            groups[{m.R, m.Q, m.P}].push_back(m);
+        for (auto &[key, metas] : groups) {
+            const Meta *head = nullptr;
+            const Meta *body = nullptr;
+            for (const auto &m : metas) {
+                if (m.head)
+                    head = &m;
+                else if (!body || m.L > body->L)
+                    body = &m;
             }
-            if (total != config.layers)
-                continue; // a partial-depth graph (compile-time probe)
-            bucket.segs.push_back({head, 0, {}, {}, {}});
+            int remaining = config.layers - (head ? head->L : 0);
+            LayerBucket bucket;
+            while (body && remaining >= body->L) {
+                bucket.segs.push_back({*body, 0, {}, {}, {}});
+                remaining -= body->L;
+            }
+            if (remaining != 0 || (!head && !body))
+                continue; // layer counts do not add up (a partial-depth probe graph)
+            if (head)
+                bucket.segs.push_back({*head, 0, {}, {}, {}});
             int first = 0;
             for (auto &seg : bucket.segs) {
                 seg.first_layer = first;
                 first += seg.meta.L;
             }
+            bucket.meta = head ? *head : *body;
             bucket.meta.L = config.layers;
-            (head.Q == 1 ? decode : prefill).push_back(std::move(bucket));
+            bucket.meta.head = head != nullptr;
+            (bucket.meta.Q == 1 ? decode : prefill).push_back(std::move(bucket));
         }
         auto by_size = [](const auto &a, const auto &b) { return a.meta.P != b.meta.P ? a.meta.P < b.meta.P : a.meta.Q != b.meta.Q ? a.meta.Q < b.meta.Q : a.meta.L > b.meta.L; };
         std::sort(decode.begin(), decode.end(), by_size);
@@ -269,7 +272,7 @@ struct NeuronModel::Impl {
                     pr.pos = alloc(r, T * 8, "pos");
                     pr.wslot = alloc(r, T * 8, "wslot");
                     pr.table = alloc(r, size_t(b.meta.R) * size_t(b.meta.P) * 8, "table");
-                    if (b.full()) {
+                    if (b.in_graph_head()) {
                         pr.rows = alloc(r, size_t(b.meta.S) * 8, "rows");
                         pr.logits = alloc(r, size_t(b.meta.S) * size_t(vocab_half) * 4, "logits");
                     }
@@ -486,7 +489,7 @@ struct NeuronModel::Impl {
                 }
                 for (const auto *group : {&decode, &prefill})
                     for (const auto &b : *group) {
-                        if (b.full() || b.tokens() != h.meta.T)
+                        if (b.in_graph_head() || b.tokens() != h.meta.T)
                             continue;
                         auto &sets = hr.in[&b];
                         for (int p = 0; p < 2; ++p) {
@@ -532,7 +535,7 @@ struct NeuronModel::Impl {
 
     void execute(Launch &L, float *dest) {
         const auto &b = *L.bucket;
-        if (b.full()) {
+        if (b.in_graph_head()) {
             if (L.head_rows.size() > size_t(b.meta.S))
                 throw std::runtime_error("more sampled rows than the whole-model NEFF produces");
             std::vector<int64_t> rows(size_t(b.meta.S), 0);
@@ -586,7 +589,7 @@ struct NeuronModel::Impl {
                 }
         if (!L.head_rows.empty() && !head)
             throw std::runtime_error("no head NEFF for " + std::to_string(L.head_rows.size()) + " rows of " + std::to_string(b.tokens()));
-        const int layers = config.layers, final_parity = layers % 2;
+        const int layers = config.layers, final_parity = (b.full() ? int(b.segs.size()) : layers) % 2;
         std::vector<int64_t> rows(head ? size_t(head->meta.S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
@@ -602,10 +605,19 @@ struct NeuronModel::Impl {
                 put(pr.wslot, L.wslot.data(), L.wslot.size() * 8);
                 put(pr.table, L.table.data(), L.table.size() * 8);
                 const auto t_uploaded = Clock::now();
-                for (int l = 0; l < layers; ++l) {
-                    check(nrt_execute(b.model[size_t(r)], pr.in[size_t(l)][size_t(l % 2)], pr.out[size_t(l)][size_t(l % 2)]), "layer execute");
-                    if (r == 0)
-                        dump_x(b, l + 1, pr.x[size_t((l + 1) % 2)]);
+                if (b.full()) {
+                    for (size_t g = 0; g < b.segs.size(); ++g) {
+                        const auto &seg = b.segs[g];
+                        check(nrt_execute(seg.model[size_t(r)], seg.in[size_t(r)], seg.out[size_t(r)]), "segment execute");
+                        if (r == 0)
+                            dump_x(b, seg.first_layer + seg.meta.L, pr.x[(g + 1) % 2]);
+                    }
+                } else {
+                    for (int l = 0; l < layers; ++l) {
+                        check(nrt_execute(b.model[size_t(r)], pr.in[size_t(l)][size_t(l % 2)], pr.out[size_t(l)][size_t(l % 2)]), "layer execute");
+                        if (r == 0)
+                            dump_x(b, l + 1, pr.x[size_t((l + 1) % 2)]);
+                    }
                 }
                 const auto t_layers = Clock::now();
                 if (r == 0) {
