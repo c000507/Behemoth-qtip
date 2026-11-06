@@ -624,7 +624,7 @@ struct NeuronModel::Impl {
                             dump_x(b, seg.first_layer + seg.meta.L, pr.x[(g + 1) % 2]);
                     }
                 } else {
-                    std::vector<int> order(size_t(layers));
+                    std::vector<int> order(static_cast<size_t>(layers));
                     for (int l = 0; l < layers; ++l) order[size_t(l)] = l;
                     if (const char *spec = std::getenv("NEURON_LAYER_ORDER")) { // debugging: run these layer ranges, "0-15,15-30"
                         order.clear();
