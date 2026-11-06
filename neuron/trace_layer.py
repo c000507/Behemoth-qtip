@@ -198,6 +198,8 @@ def main():
     parser.add_argument('--context', type=int, default=128)
     parser.add_argument('--steps', type=int, default=64)
     parser.add_argument('--warmup', type=int, default=8)
+    parser.add_argument('--workdir', help='compiler workdir; keeps the generated NEFF and HLO for the C++ runtime harness')
+    parser.add_argument('--compile-only', action='store_true', help='stop after compiling (no device run)')
     parser.add_argument('--weights', choices=('bf16', 'lowbit'), default='bf16',
                         help='bf16: host-dequantized dense weights; lowbit: packed bytes resident, decoded in-graph')
     a = parser.parse_args()
@@ -227,10 +229,14 @@ def main():
                    for k in order if k in weights)
 
     started = time.monotonic()
-    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs))
+    graph = torch_neuronx.trace(layer_graph_lowbit if lowbit else layer_graph, tuple(inputs),
+                                compiler_workdir=a.workdir)
     compile_s = time.monotonic() - started
+    if a.compile_only:
+        print(json.dumps({'weights': a.weights, 'resident_weight_MB': round(resident / 1e6, 1), 'compile_s': round(compile_s, 2)}))
+        return
     device = xm.xla_device()
-    graph = torch_neuronx.move_trace_to_device(graph, device)
+    graph = torch_neuronx.move_trace_to_device(graph, 0)
     tensors = [t.to(device) for t in inputs]
     print(f'compiled one-NEFF layer in {compile_s:.1f}s; {a.steps} decode steps', flush=True)
 
