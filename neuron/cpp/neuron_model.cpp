@@ -676,6 +676,13 @@ struct NeuronModel::Impl {
                 done += take;
             }
         }
+        if (const char *dump = std::getenv("NEURON_LOGITS_DUMP")) { // append the sampled rows (f32 [n][vocab]) for offline comparison
+            std::ofstream f(dump, std::ios::binary | std::ios::app);
+            f.write(reinterpret_cast<const char *>(logits.data()), std::streamsize(logits.size() * 4));
+            std::ofstream ids(std::string(dump) + ".ids", std::ios::app);
+            for (auto id : batch.sample_ids)
+                ids << id << '\n';
+        }
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms}, {"head_ms", phase_head_ms}, {"tokens", batch.tokens.size()}};
         return logits;
     }
