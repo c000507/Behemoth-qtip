@@ -82,3 +82,34 @@ FP8 shards at load, FP8 k/v re-scaled), compared with a double-precision CPU lay
 The device error equals a CPU emulation of FP8 weights + per-row FP8 activations (layer 31: 4.57% vs 4.57%), i.e. it is
 the cost of the FP8 path itself. The residual stream dominates these outputs; error accumulation over 32 layers, longer
 contexts (RoPE positions > 0, multi-token KV) and end-to-end token quality are NOT measured yet.
+
+## Server path (trn1.2xlarge, TP=2, 8B adaptive QTIP/NVFP4, cFP8, paged bf16 KV; see SERVING.md)
+
+Measured through `behemoth::Engine` / `neuron_server`, end to end (embedding on the host, 32 layer launches, head, host sampling).
+
+| | |
+|---|---|
+| model resident (weights expand + upload) | 85 s |
+| decode, 1 request, ctx 100 (graph `1x1x32`) | 38 ms/token (26 tok/s); layers 32 ms, head 2.5 ms |
+| decode, 1 request, ctx 1.5k / 6k / 14k | 42 / 57 / 74 ms/token |
+| decode, 4 / 8 concurrent requests (300-token prompts) | ITL 44 / 46.5 ms, ~90 / ~170 tok/s aggregate |
+| prefill, 256-token chunks, ctx <= 2k | 3.3-3.4k tok/s (77 ms per 256) |
+| prefill 4096 / 8192 / 14000-token prompt | 1.9 s / 4.4 s / 10.5 s (2.2k / 1.9k / 1.3k tok/s): attention grows with context |
+| scheduler oversubscription (6 x 6000-token prompts + 400 new in a 32k-token pool) | 8 preemptions, all 6 complete, pool fully freed |
+
+Accuracy against the CUDA runtime on the same checkpoint (teacher-forced logits, KL over the oracle's top-256):
+
+| positions | top-1 agree | mean KL | worst KL |
+|---|---|---|---|
+| 13 positions 5 .. 1699 (around the 255/256/257 chunk edge and the 16-token page edges) | 13 / 13 | 0.020 | 0.124 (pos 255) |
+| 9 positions 2047 .. 14999 (past the llama3 original 8192 context) | 9 / 9 | 0.018 | 0.100 (pos 2047) |
+
+Batch behaviour: 13 concurrent requests (mixed lengths 6..1200 tokens, seeded sampling, one cancelled after 5 tokens) return the
+same tokens as the same requests run one at a time when served by the same graphs; seeded requests reproduce. Different graphs
+(1-, 4-, 8-row decode, 64- vs 256-token prefill) differ in fp8 rounding (~6-8 % relative logit difference between two
+compilations of the same math), so greedy text can diverge late between requests that land in different buckets.
+
+Where the time goes: decode is ~1.0 ms per layer at one row and 1.6 ms at 8 rows x 128 pages (the paged gather moves
+`rows x pages x 16 KB x 2` per layer), so the bucket choice (fewest rows x pages that cover the step) matters more than launch
+overhead (a one-graph 30-layer step is only 7 % faster). Prefill at long context is bound by the bf16 flash loop (score tiles
+in f32 through the vector/scalar engines), not by the fp8 projections; an NKI fused flash kernel over paged KV is the next step.
