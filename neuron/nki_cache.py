@@ -75,7 +75,7 @@ def _must_alias_suffix():
 
 
 class _KernelState:
-    __slots__ = ('compiled', 'build_result', 'model', 'inputs', 'outputs')
+    __slots__ = ('compiled', 'build_result', 'model', 'inputs', 'outputs', 'resident')
 
     def __init__(self, compiled, build_result):
         self.compiled = compiled
@@ -83,6 +83,9 @@ class _KernelState:
         self.model = None
         self.inputs = {}
         self.outputs = {}
+        # Resident tensors are per NEFF model: device buffers created for one
+        # loaded kernel are never passed to another model's execution.
+        self.resident = {}
 
 
 class KernelCache:
@@ -90,10 +93,6 @@ class KernelCache:
         if version('nki').split('+')[0] != '0.7.0':
             raise RuntimeError('Compiled-kernel cache requires NKI 0.7.0; use cache_kernels=False on other versions')
         self._entries = {}
-        # Resident weight tensors shared across kernel signatures, keyed by the
-        # identity of the (kept-alive) numpy source array. Without this, layers
-        # sharing one signature would overwrite each other's device weights.
-        self._resident = {}
         self._temp = tempfile.TemporaryDirectory(prefix='behemoth-neuron-cache-')
         self._dir = Path(cache_dir).resolve() if cache_dir else None
         if self._dir:
@@ -182,12 +181,12 @@ class KernelCache:
             if not isinstance(value, np.ndarray):
                 continue
             if index in resident:
-                stored = self._resident.get(id(value))
+                stored = state.resident.get(id(value))
                 if stored is not None and stored[0].shape == value.shape and stored[0].dtype == value.dtype:
                     tensors[name] = stored[1]
                     continue
                 tensor = NrtpyTensor.from_numpy(np.ascontiguousarray(value), name=name, core_id=0)
-                self._resident[id(value)] = (value, tensor)
+                state.resident[id(value)] = (value, tensor)
                 tensors[name] = tensor
                 continue
             stored = state.inputs.get(name)
