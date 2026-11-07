@@ -319,3 +319,19 @@ The profile of a decode layer showed every projection streaming weights at ~145 
 weights were stored [out, in], so the contraction axis (in) was strided in HBM. Storing them [in, out] (trace_model.py WT=1; the runtime
 transposes the shards at upload and reads meta.wt) gives, single stream, ctx 300, async 8, no speculation: 38.0 -> 30.0 ms/token (-21 %), layers
 25.0 -> 17.5 ms. Oracle on the 7 positions <= 500: top-1 7/7, mean KL 0.0158 (the plain-layout graphs: 6/7, 0.0216). build_buckets.sh now defaults to WT=1.
+
+### Decode attention blocks (DECODE_BLOCK_PAGES=256) and the full result so far
+
+The long-context decode layer (dec1_1024 profile) was ~32 flash blocks, each a `gather` (~30 us) and a `dot` (~25 us, tensor engine 3 us busy):
+serial small ops, not bandwidth. For Q = 1 the score row is tiny (16 heads x 16k keys f32 = 1 MB), so decode now uses 256-page blocks
+(trace_model.py DECODE_BLOCK_PAGES, default 256; prefill keeps 32). 14k context, single stream: 66.0 -> 43.0 ms/token (a single 1024-page block: 44.0).
+First same-history decode steps differ from the 32-page blocks by 3.7 % / 4.7 % relative L2 (fp8-level noise).
+
+Full set (transposed FP8 weights + 256-page decode blocks + async depth 8, no speculation, `build_buckets.sh` defaults), 8B on trn1.2xlarge:
+
+| | before this round | now |
+|---|---|---|
+| single stream, ctx 300 | 41.8 ms/token | 30.0 ms/token |
+| single stream, ctx 14k | 73.3 ms/token | 43.0 ms/token |
+| 32 concurrent, 41-token prompts | ITL 62.8 ms, 366-446 tok/s | ITL 42.1 ms, 633 tok/s |
+| 14k-token prefill | 9.6-10.2 s | 9.64 s (unchanged) |
