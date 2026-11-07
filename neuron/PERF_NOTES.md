@@ -306,3 +306,9 @@ variants per bucket), retraced dec1_32 / pre64_32, first three oracle positions:
 Compressed 8B (24 compressed + 8 expanded layers, pre64_128 / dec1_128 / pre64_32 / dec1_32 graphs), 13 oracle positions 5 .. 1699:
 top-1 13/13, mean KL(top-256) 0.0057 (worst 0.030 at pos 256), versus ~0.02 for the FP8-expanded path (the compressed layers skip the FP8 weight rounding).
 The 256-token compressed prefill graph does not compile in practice (neuronx-cc walrus_driver used 24 GB for 50 min in anti_dependency_analyzer); use 64-token chunks.
+
+Compressed 8B end to end through neuron_server / neuron_engine_cli (24 compressed + 8 expanded layers, greedy): chat answer coherent
+(Rayleigh scattering, 60 tokens). Single request 575 ms/token (1.7 tok/s): layers 570 ms = 24 x ~22 ms compressed (GpSimd codebook
+gather) + 8 expanded; the "62 ms wall per layer" in an earlier note was wrong. Implicit async execution does not change it.
+Rows per step (dec1_32 / dec8_32 / dec32_32, 41-token prompts, 12 new tokens): 1 row 575 ms (1.7 tok/s), 8 rows 654 ms (12.2 tok/s),
+32 rows 966 ms (33 tok/s). The decode is shared across rows within a 128-token block, so batching amortises it.
