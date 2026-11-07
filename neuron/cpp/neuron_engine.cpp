@@ -105,6 +105,12 @@ struct Engine::Impl {
     // most BEHEMOTH_NEURON_SPEC_REQUESTS decode requests and BEHEMOTH_NEURON_SPEC_ROWS rows after drafting (the bucket a
     // verify step may grow to), matching the last BEHEMOTH_NEURON_SPEC_NGRAM tokens
     int spec_tokens = 0, spec_requests = 4, spec_rows = 8, spec_ngram = 3, max_rows = 1;
+    // Adaptive: a verify step costs about spec_page_cost ms per draft row and table page of the bucket it lands in (the
+    // paged K/V gather, measured 0.006-0.013 on the 8B), on top of a plain step (plain_step_ms, running mean). A request
+    // drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats that
+    // overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers.
+    double spec_page_cost = 0.01, plain_step_ms = 40;
+    std::map<uint64_t, double> acceptance;
     Drafts drafts;
     std::thread thread;
 
@@ -130,6 +136,8 @@ struct Engine::Impl {
         spec_requests = env_int("BEHEMOTH_NEURON_SPEC_REQUESTS", 4);
         spec_rows = std::min(env_int("BEHEMOTH_NEURON_SPEC_ROWS", 8), max_rows);
         spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
+        if (const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_PAGE_COST"))
+            spec_page_cost = std::atof(v);
         thread = std::thread([this] { loop(); });
     }
     ~Impl() { shutdown(); }
@@ -159,6 +167,7 @@ struct Engine::Impl {
         rng.erase(id);
         submitted.erase(id);
         last_token.erase(id);
+        acceptance.erase(id);
     }
 
     void loop() {
@@ -202,6 +211,12 @@ struct Engine::Impl {
                             const auto &r = scheduler.request(s.id);
                             if (s.count != 1 || !s.sample || s.begin + 1 + size_t(budget) > max_context)
                                 continue;
+                            double &alpha = acceptance.try_emplace(s.id, 1.0).first->second;
+                            const double overhead = spec_page_cost * budget * model.decode_bucket_pages(int(ceil_div(s.begin + 1 + size_t(budget), size_t(16))));
+                            if (alpha * plain_step_ms < overhead) { // not worth a verify step now; recover slowly to retry
+                                alpha = std::min(1.0, alpha + 0.05);
+                                continue;
+                            }
                             auto draft = prompt_lookup(r.history, budget, spec_ngram);
                             if (!draft.empty() && scheduler.reserve(s.id, s.begin + 1 + draft.size())) {
                                 rows += int(draft.size());
@@ -279,11 +294,15 @@ struct Engine::Impl {
                     auto d = drafts.find(request.id);
                     if (d != drafts.end()) {
                         step_drafts += d->second.size();
+                        size_t accepted = 0;
                         for (size_t j = 1; j < sampled[i].size() && !scheduler.request(request.id).done && sampled[i][j - 1] == d->second[j - 1]; ++j) {
                             scheduler.accept(request.id, sampled[i][j], eos.contains(sampled[i][j]));
                             emit(sampled[i][j]);
-                            ++accepted_drafts;
+                            ++accepted;
                         }
+                        accepted_drafts += accepted;
+                        if (auto a = acceptance.find(request.id); a != acceptance.end())
+                            a->second = 0.7 * a->second + 0.3 * double(accepted);
                     }
                     const auto &after = scheduler.request(request.id);
                     if (after.done) {
@@ -292,6 +311,8 @@ struct Engine::Impl {
                     }
                 }
                 drafted_tokens += step_drafts;
+                if (!step_drafts && step.requests.size() == 1 && step.requests[0].count == 1) // a plain single decode step
+                    plain_step_ms = 0.9 * plain_step_ms + 0.1 * std::chrono::duration<double, std::milli>(Clock::now() - start).count();
                 if (std::getenv("BEHEMOTH_NEURON_STEP_LOG"))
                     std::cerr << "step rows=" << step.requests.size() << " drafts=" << step_drafts << " tokens=" << step_tokens << " wall_ms="
                               << std::chrono::duration<double, std::milli>(Clock::now() - start).count() << " " << last_profile.dump() << "\n";

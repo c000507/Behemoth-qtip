@@ -115,6 +115,52 @@ Where the time goes: decode is ~1.0 ms per layer at one row and 1.6 ms at 8 rows
 overhead (a one-graph 30-layer step is only 7 % faster). Prefill at long context is bound by the bf16 flash loop (score tiles
 in f32 through the vector/scalar engines), not by the fp8 projections; an NKI fused flash kernel over paged KV is the next step.
 
+### Single-stream decode (one request)
+
+Measured through `neuron_engine_cli` with `BEHEMOTH_NEURON_STEP_LOG=1` (ctx = prompt of 300 tokens, `dec1_32` / `dec8_32`
+buckets, 60 new tokens; ms/token = wall time of the decode steps / tokens emitted):
+
+| | ms/token | per step |
+|---|---|---|
+| ctx 300, no drafts | 42.1 | layers 38.9 (1.22 ms/layer incl. launch), head 2.5, host ~0.6 |
+| ctx 1.5k, no drafts | 57.8 | layers 44.4 (`dec1_128`) |
+| ctx 14k, no drafts | see table below | `dec1_1024` |
+
+Where the 42 ms go: 32 x `nrt_execute` of the layer NEFF at ~1.0 ms device time each plus ~0.1-0.2 ms launch gap (the
+one-graph experiment in SERVING.md removed 7 % = ~0.12 ms per launch), the head 2.5 ms, host (embedding, RoPE rows, logits
+read-back, sampling) under 1 ms. The per-layer device time at one row is the tensor engine streaming the 126 MB/rank of E4M3
+weights: neuron-profile showed 0.65 ms PE-active per layer with 27.7k PE instructions for 110 MB of HBM reads, i.e. ~4 KB of
+weight per instruction, ~128 weight bytes per cycle at 1.4 GHz = ~180 GB/s per core, which is the PE array's moving-operand
+rate (one 128-element column per cycle; Trn1 runs FP8 at the BF16 rate, no double rate). At M=1 that rate is the same whether
+the weight is the stationary or the moving operand, so fusing q/k/v and gate/up or an NKI matmul cannot cut the ~0.65 ms floor,
+only the ~0.35 ms of non-overlapped scalar/DMA work around it; the only way past it is to not stream every weight per token
+(speculative decoding below, or spreading the matvec over the vector/GPSIMD engines as well, not attempted). This analysis
+of the instruction count is from the earlier profile, not re-profiled here.
+
+**E4M3 lm_head** (`HEAD_FP8=1` head buckets; the runtime quantizes the lm_head rows per row at load, max 224): the head
+launch goes from 2.5 to 2.1 ms although it reads half the bytes (262 instead of 525 MB per rank), which is what the element
+rate above predicts: at one row the PE consumes 128 weight elements per cycle in either dtype (525 MB bf16 and 262 MB E4M3 are
+both 1.46 ms of streaming), so FP8 buys HBM bytes and capacity, not time. Accuracy against the CUDA oracle: 13/13 top-1 and
+mean KL 0.021 at the short positions, 8/9 top-1 (position 8191 flips at a near tie, KL 0.012) and mean KL 0.020 at the long
+ones, against 22/22 and 0.019-0.020 with the bf16 head. Kept optional (bf16 heads stay the default); a bucket directory must
+use one head format throughout (the runtime refuses a mix, since lm_head is uploaded in one format).
+
+**Prompt-lookup speculative decoding** (SERVING.md "Speculative decoding"): the draft rows run in the `dec8_32` bucket, whose
+layer costs ~1.4-1.5 ms instead of ~1.2 ms (8 rows x 32 pages gathered), so a verify step costs ~15 % more than a plain step
+and emits 1 + accepted tokens. Measured while NEFF compiles ran on the host (absolute numbers ~10 % high; relative ones hold):
+
+| prompt (300 tokens), 60 new tokens | drafts / step | accepted | ms/step | ms/token | greedy output |
+|---|---|---|---|---|---|
+| free-form continuation, no drafts | 0 | - | 48.9 | 48.9 | reference |
+| free-form, up to 3 drafts | 60 over 47 steps | 12 (20 %) | 53.9 | 42.9 | diverges at token 9 (dec8 vs dec1 bucket numerics, see below) |
+| free-form, up to 7 drafts | 122 over 45 steps | 14 (11 %) | 56.1 | 42.8 | same divergence |
+| text that repeats its prompt, no drafts | 0 | - | 47.6 | 47.6 | reference |
+| repeating text, up to 3 drafts | 51 over 18 steps | 41 (80 %) | 60.8 | 18.6 | identical to the reference for all 60 tokens |
+
+The free-form divergence is the known 6-8 % relative logit difference between two compilations of the same math (the
+1-row and 8-row graphs), not the acceptance logic: the repeating prompt, where every step verifies 3 drafts, reproduces the
+sequential output exactly. Clean numbers (no concurrent compiles; ctx 1.5k and 14k; 32 concurrent) follow below.
+
 ### 70B on trn1 (Anubis 70B QTIP, 80 layers, hidden 8192, 64/8 heads, ff 28672, vocab 128256)
 
 Weights per layer: 855.6 M (q, o 67.1 M each, k, v 16.8 M each, gate, up, down 234.9 M each). Per core at TP=2:
@@ -133,7 +179,14 @@ decoded every step (both cores in parallel). Decode only amortizes over tokens p
 launch) and wide batches would be usable, single-stream decode would not. Host RAM is not the limit: the loader expands one
 layer at a time (3.4 GiB f32 per 70B layer, 4 layers in flight on the 8-vCPU host) and 21 GiB of trellis data streams from disk.
 
-What was verified on this instance with the real Anubis 70B checkpoint: see "70B truncated run" below.
+**70B truncated run (verified on this instance, real Anubis 70B checkpoint, `NEURON_LAYERS=8`).** Buckets traced with
+`MODEL=/home/ubuntu/models/anubis-70b` (dec1_32, pre64_32, head1, head64; PAGES=1025): the loader expands the 70B QTIP layers
+(Hadamard sizes 8192 and 28672 = 7 x 4096) and the model is resident in 124 s: 4.17 GiB weights per core for 8 layers plus the
+bf16 lm_head (1.0 GiB) + 0.25 GiB KV. A one-row decode step over the 8 layers takes 28-29 ms of layer time, 3.5 ms per 70B layer
+(2.9x the 8B's 1.2 ms for 3.4x the weights: still the weight stream), and the head 4.7 ms; extrapolated to 80 layers that would be
+~285 ms/token at TP=2 if the FP8 weights fit. 8B buckets against the 70B checkpoint are refused ("NEFF ... was traced for
+hidden 4096 heads 32/8 ... the checkpoint is hidden 8192 heads 64/8 ... retrace with MODEL=..."). The numerics of the truncated
+model were not checked (an 8-layer prefix has no oracle); the expansion code is the one the 8B passes the CUDA oracle with.
 
 ### Wide decode buckets (16 / 32 rows)
 

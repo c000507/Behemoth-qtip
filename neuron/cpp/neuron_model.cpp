@@ -932,6 +932,12 @@ int NeuronModel::max_decode_rows() const {
     for (const auto &b : impl_->decode) r = std::max(r, b.meta.R);
     return r;
 }
+int NeuronModel::decode_bucket_pages(int pages) const {
+    int best = 0;
+    for (const auto &b : impl_->decode)
+        if (b.meta.P >= pages && (!best || b.meta.P < best)) best = b.meta.P;
+    return best;
+}
 const std::vector<int> &NeuronModel::eos() const { return impl_->config.eos; }
 int NeuronModel::max_context() const {
     int p = 0;

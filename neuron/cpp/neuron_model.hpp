@@ -27,7 +27,8 @@ class NeuronModel {
     ~NeuronModel();
     int cache_pages() const;  // usable KV pages (one more is kept as scratch for padding rows)
     int vocab() const;
-    int max_decode_rows() const; // largest R of the decode buckets (rows a step can verify at once)
+    int max_decode_rows() const;          // largest R of the decode buckets (rows a step can verify at once)
+    int decode_bucket_pages(int pages) const; // table pages of the smallest decode bucket covering `pages` (0: none)
     const std::vector<int> &eos() const;
     int max_context() const;
     // Logits of batch.sample_rows in order: [n_sample][vocab] (valid until the next call).
