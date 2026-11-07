@@ -449,7 +449,7 @@ struct NeuronModel::Impl {
 
     void upload_layer(int layer) {
         char name[64];
-        std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer);
+        std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + (std::getenv("NEURON_LAYER_OFFSET") ? std::atoi(std::getenv("NEURON_LAYER_OFFSET")) : 0)); // debugging: load checkpoint layer N + offset as layer N
         SafeTensorFile file(options.model / name);
         struct P { const char *name; bool col; int slot; };
         const P projs[] = {{"self_attn.q_proj", true, 0}, {"self_attn.o_proj", false, 2}, {"self_attn.k_proj", true, 4},
@@ -523,7 +523,7 @@ struct NeuronModel::Impl {
                            {"mlp.up_proj", true, FF, H}, {"mlp.down_proj", false, H, FF}};
         for (int layer = 0; layer < config.layers; ++layer) {
             char name[64];
-            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer);
+            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + (std::getenv("NEURON_LAYER_OFFSET") ? std::atoi(std::getenv("NEURON_LAYER_OFFSET")) : 0)); // debugging: load checkpoint layer N + offset as layer N
             SafeTensorFile file(options.model / name);
             bool all = true;
             for (const auto &p : projs) {
@@ -863,6 +863,10 @@ struct NeuronModel::Impl {
             throw std::runtime_error("token outside the vocabulary");
         for (size_t i = 0; i < size_t(hidden); ++i)
             out[i] = embed[size_t(token) * size_t(hidden) + i];
+        if (const char *file = std::getenv("NEURON_X_IN")) { // debugging: replace the embedding row by f32 [hidden] from this file
+            std::ifstream in(file, std::ios::binary);
+            in.read(reinterpret_cast<char *>(out), std::streamsize(size_t(hidden) * 4));
+        }
     }
     void rope_row(int position, float *out) const { // [cos x dim/2, sin x dim/2] from fp64 angles, any position
         for (int d = 0; d < dim / 2; ++d) {
