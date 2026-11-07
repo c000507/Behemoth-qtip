@@ -237,3 +237,43 @@ Host side of a 32-row step was 15 ms of 74 (sampling 32 rows of 128k logits one 
 buffer). Sampling now runs rows in parallel (OpenMP) and the buffer is not zeroed: step wall 74 -> 61 ms, ITL p50 59.5 ms,
 ~446 tok/s at 32 concurrent requests. What is left is device time: layers 52 ms (1.6 ms/layer, tensor engine 0.82 ms active,
 scalar engine 0.97 ms), head 4 ms. `BEHEMOTH_NEURON_STEP_LOG=1` prints every step's profile.
+
+## Compressed QTIP (trellis resident, decoded in the graph; SERVING.md "Compressed QTIP layers")
+
+Design question: (1) decode a tile into SBUF and feed the Tensor Engine (fused), (2) decode a whole layer into an HBM
+scratch buffer per step and reuse the FP8 graph, or (3) a per-layer hybrid with FP8-expanded layers in the spare HBM. Measured
+first (one NeuronCore, `cpp/layer_bench.cpp`, `tests/bench_qtip_nki.py`, the 70B gate shard at TP=2: 14336 x 8192 = 117 M
+weights, 29.4 MB of trellis words):
+
+| kernel (`qtip_nki.py`) | ms / step | G weights/s/core |
+|---|---|---|
+| fused decode + matmul, T = 1 | 22.6 | 5.2 |
+| fused decode + matmul, T = 128 tokens (one decode shared by the 128 rows) | 30.1 | 3.9 (0.24 ms per token) |
+| decode to HBM bf16 only (option 2's first half, no matmul) | 22.0 | 5.3 |
+
+`neuron-profile` of the T = 1 kernel: GpSimd 18.4 ms of 20.6 ms active (the 896 `GATHER` instructions: 17.95 ms), Vector
+2.1 ms (all the uint32 shift / multiply / mask work), Tensor 0.7 ms, DMA negligible. The codebook lookup (one GpSimd gather per
+pair of weights, 1024-entry bf16x2 table, ~3.4 cycles per lookup per GpSimd core) is the whole cost; everything else overlaps.
+Things that did not help: writing the gathered pairs through a strided destination vs contiguous slices (same speed, the
+latter kept because the matmul view absorbs the interleave for free), `nisa.local_gather` (returns one value per partition
+of a 16-partition group for every index, so only 1/16 of its output is usable here: slower), a 16-bit table (the index must be
+uint32). A 65536-entry table indexed by the raw window would remove the s(s+1) arithmetic but needs 256 KB per partition
+(SBUF is 192 KB) and the arithmetic is not the bottleneck anyway. Decoding to HBM costs the same as fusing, so option (2)
+would only add the scratch traffic and a second launch: the fused kernel is used, (3) is the `auto` policy on top of it.
+
+Two hardware facts found on the way (the simulator does not model either): `nisa.scalar_tensor_tensor` rounds a uint32
+product through fp32 (the low bits of s(s+1) are lost; `nisa.tensor_tensor` multiplies exactly), and `torch_xla` drops
+`xm.all_gather` from a single-process trace (the HLO has no all-gather at all; `XLA_ALWAYS_ALLREDUCE` only keeps all_reduce),
+so the compressed graph gathers with an all-reduce of zero-padded slices.
+
+Correctness: the kernel matches the numpy mirror of `qtip::decode_rows_bf16` on the simulator (2e-7) and, on the device, the C++
+reference decode of real layers (8B layer 0 q_proj, layer 12 down_proj with the ragged 7168-wide input group; 70B layer 0 q_proj,
+layer 40 gate_proj, layer 79 down_proj, both ranks, 8 and 200 tokens): relative L2 1.2-2.0e-7, i.e. f32 accumulation order only;
+the numpy mirror itself is bit-exact against `cpp/qtip_decode_dump.cpp` rows of the 8B and 70B.
+
+**FP8 weight layout (side finding, both paths).** The FP8 projections stream weights at ~145 GB/s (gate dot 29.4 MB in 201 us in
+the layer profile) against a 410 GB/s HBM. A single-projection microbenchmark of the 8B gate shard at M = 1 (`fp8 x fp8`,
+one core, 200 steps incl. launch): weight stored `[out, in]` and multiplied as `h @ w.T` (today) 0.270 ms; stored pre-transposed
+`[in, out]` and multiplied as `h @ w` 0.219 ms. The transposed form sits at the PE element-rate floor (29.4 M elements / 128 per
+cycle / 1.4 GHz = 0.16 ms + launch), the current layout pays ~25 % on top of it for the strided [128 in x 512 out] tile DMA.
+Not changed here (it touches the default fast path's upload and graph); worth ~0.1 ms of the ~1.0 ms 8B decode layer.

@@ -969,7 +969,18 @@ struct NeuronModel::Impl {
     // execution passes there) to prefix.x16 / prefix.x32, from either execution path.
     void dump_x(const LayerBucket &b, int layers_done, const Dev &x) {
         const char *prefix = std::getenv("NEURON_DUMP_X");
-        if (!prefix || (layers_done != 16 && layers_done != 32 && layers_done != 31))
+        if (!prefix)
+            return;
+        bool wanted = layers_done == 16 || layers_done == 32 || layers_done == 31;
+        if (const char *list = std::getenv("NEURON_DUMP_LAYERS")) { // "1,2,8": also after these many layers
+            wanted = false;
+            for (std::string text = list; !text.empty();) {
+                const size_t comma = std::min(text.find(','), text.size());
+                wanted = wanted || std::stoi(text.substr(0, comma)) == layers_done;
+                text = comma < text.size() ? text.substr(comma + 1) : "";
+            }
+        }
+        if (!wanted)
             return;
         std::vector<float> v(size_t(b.tokens()) * size_t(hidden));
         check(nrt_tensor_read(x.t, v.data(), 0, v.size() * 4), "read x");
