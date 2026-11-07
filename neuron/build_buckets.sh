@@ -9,6 +9,7 @@ set -e
 OUT=${1:?output directory}; export PAGES=${2:-2049}
 HERE=$(cd "$(dirname "$0")" && pwd)
 export PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:/opt/aws/neuron/bin:$PATH NEURON_PLATFORM_TARGET_OVERRIDE=trn1
+export ATTN_DEC=${ATTN_DEC:-nki}  # decode graphs of up to 8 rows and 128+ pages use the NKI decode attention kernel (nki_decode.py); ATTN_DEC=xla for the torch-op loop
 export WT=${WT:-1}  # transposed FP8 projections [in, out]: 21 % faster single-stream decode than [out, in] (PERF_NOTES); WT=0 for the old layout
 mkdir -p "$OUT"
 build() { n=$1; shift; [ -f "$OUT/$n/graph.neff" ] || { (cd "$OUT" && python "$HERE/trace_model.py" "$OUT/$n" "$@" > "$n.log" 2>&1); }; }

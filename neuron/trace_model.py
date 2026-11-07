@@ -89,6 +89,7 @@ KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 128))  # G: pages per fl
 ATTN = os.environ.get('ATTN', 'nki')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages; 'xla': torch-op flash loop
 ATTN_DEC = os.environ.get('ATTN_DEC', 'xla')  # 'nki': decode (Q = 1, bf16 cache, up to ATTN_DEC_ROWS rows) runs nki_decode.decode_attention
 ATTN_DEC_ROWS = int(os.environ.get('ATTN_DEC_ROWS', 8))
+ATTN_DEC_MIN_PAGES = int(os.environ.get('ATTN_DEC_MIN_PAGES', 128))  # below this the kernel (padded to 64 pages) is no faster than the torch-op loop
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
@@ -233,7 +234,7 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     if ATTN == 'nki' and R == 1 and Q % 128 == 0:
         return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
-    if ATTN_DEC == 'nki' and Q == 1 and cscale is None and R <= ATTN_DEC_ROWS:
+    if ATTN_DEC == 'nki' and Q == 1 and cscale is None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
         return flash_decode_nki(q, cache, table, pos, R, P, kvh, rep)
     if cscale is not None and KVATT == 'fp8':
         return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)

@@ -58,7 +58,9 @@ Per layer and rank: RMSNorm, q/k/v (column-parallel) -> RoPE -> KV scatter -> pa
   neuronxcc's own `flash_fwd` NKI kernel over the gathered pages (`ATTN=nki`, the default; `ATTN=xla` keeps the torch-op loop): XLA gathers the
   request's pages, permutes K to `[kv_heads, D, keys]` and V to `[kv_heads, keys, D]` and builds the paged causal / length mask once as the kernel's
   `logit_bias` (`key_position <= query_position`), so no per-request lengths are needed and chunked prefill over paged KV needs no dense layout.
-  Q = 64 chunks and multi-row decode use the torch-op loop.
+  Q = 64 chunks use the torch-op loop. Decode (Q = 1) uses 256-page blocks of the torch-op loop, or, for graphs of up to 8 rows and 128+ pages built with `ATTN_DEC=nki`
+  (the build_buckets.sh default), the NKI kernel in `nki_decode.py`: indirect-DMA page gather, PE transposes of K, all 16 query rows of a request in one score tile, fused softmax / PV
+  (14k-context decode 43 -> 39 ms/token; 8 requests at 1.5k context ITL 45.9 -> 39.0 ms).
 * **Extended positions.** cos/sin rows are computed on the host in fp64 for each token's absolute position with the
   checkpoint's llama3 rope scaling, so any position up to the NEFF's page table (16k here, more buckets for more) works.
 
