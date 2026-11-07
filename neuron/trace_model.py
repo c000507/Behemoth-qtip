@@ -112,7 +112,7 @@ def shapes(R, Q, P, pages):
     s = {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.uint8 if KV8 else torch.bfloat16),
+        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.float8_e4m3fn if KV8 else torch.bfloat16),
         'cscale': ((pages, 2, g.KVHEADS // g.TP, PAGE), torch.float32),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
@@ -150,7 +150,7 @@ def flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep):
     D, keys = g.D, P * PAGE
     kv = cache[table[0]]                                                       # [P, 2, kvh, 16, D]
     if cscale is not None:                                                     # FP8 cache: dequantise the gathered pages
-        kv = (kv.view(torch.float8_e4m3fn).float() * cscale[table[0]].unsqueeze(-1)).to(torch.bfloat16)
+        kv = (kv.float() * cscale[table[0]].unsqueeze(-1)).to(torch.bfloat16)
     k = kv[:, 0].permute(1, 3, 0, 2).reshape(1, kvh, D, keys)                  # K^T
     v = kv[:, 1].permute(1, 0, 2, 3).reshape(1, kvh, keys, D)
     qt = q.reshape(Q, kvh * rep, D).permute(1, 2, 0).reshape(1, kvh * rep, D, Q)  # heads are kv-head major
@@ -182,7 +182,7 @@ def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
         pages = table[:, b * G:(b + 1) * G]                                              # [R,G]
         kv = cache[pages]                                                                # [R,G,2,kvh,16,D] E4M3 bytes
         sc = cscale[pages]                                                               # [R,G,2,kvh,16]
-        k8, v8 = kv[:, :, 0].view(f8), kv[:, :, 1].view(f8)
+        k8, v8 = kv[:, :, 0], kv[:, :, 1]
         ksc = sc[:, :, 0].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
         vsc = sc[:, :, 1].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
         s = torch.einsum('rqhad,rghtd->rqhagt', q8, k8).float() * qa.unsqueeze(-1) * ksc
@@ -270,7 +270,7 @@ def paged_layer(R, Q, P, *args):
     if KV8:
         kk = torch.stack((k, v), dim=1)                                                  # [T,2,kvh,D] f32
         sc = torch.amax(torch.abs(kk), dim=-1).clamp(min=1e-20) / 224.0                  # one scale per (token, K|V, kv head)
-        k8 = (kk / sc.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
+        k8 = (kk / sc.unsqueeze(-1)).to(torch.float8_e4m3fn)
         cache = t['cache'].index_put(at, k8)
         cscale = t['cscale'].index_put(at, sc)
     else:
