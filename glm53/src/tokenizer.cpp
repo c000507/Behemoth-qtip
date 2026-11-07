@@ -269,7 +269,18 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
     auto parsed =
         minja::Parser::parse(source.get<std::string>(),
                              {.trim_blocks = true, .lstrip_blocks = true, .keep_trailing_newline = false});
-    return parsed->render(minja::Context::make(minja::Value(inputs)));
+    auto context = minja::Context::make(minja::Value(inputs));
+    // and HF's strftime_now(format) itself, for templates that call it directly (Mistral Small 3.x)
+    context->set("strftime_now", minja::Value::callable([](const std::shared_ptr<minja::Context> &, minja::ArgumentsValue &args) {
+        check(args.args.size() == 1 && args.args[0].is_string(), "strftime_now takes one format string");
+        char buffer[128];
+        std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        const size_t n = std::strftime(buffer, sizeof buffer, args.args[0].get<std::string>().c_str(), &local);
+        return minja::Value(std::string(buffer, n));
+    }));
+    return parsed->render(context);
 }
 json Tokenizer::summary() const {
     return {{"model", "byte-level BPE"},
