@@ -105,7 +105,7 @@ def decode_attention(qt, cache, idxk, idxv, bias, mask):
             pt_ps = nisa.nc_transpose(p[:, nl.ds(c * 128, 128)])                       # [128, 16]
             pt_sb[:, nl.ds(c * ROWS, ROWS)] = nl.copy(pt_ps, dtype=nl.bfloat16)
         acc[...] = nl.multiply(acc, alpha)
-        for h in nl.affine_range(KVH):
+        for h in nl.sequential_range(KVH):
             pv_ps = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.psum)
             for t in nl.affine_range(8):
                 pv_ps += nl.matmul(pt_sb[:, nl.ds(t * ROWS, ROWS)], vraw[:, nl.ds(h * 1024 + t * 128, 128)], transpose_x=True)
