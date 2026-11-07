@@ -11,6 +11,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 export PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:/opt/aws/neuron/bin:$PATH NEURON_PLATFORM_TARGET_OVERRIDE=trn1
 export ATTN_DEC=${ATTN_DEC:-nki}  # decode graphs of up to 8 rows and 128+ pages use the NKI decode attention kernel (nki_decode.py); ATTN_DEC=xla for the torch-op loop
 export WT=${WT:-1}  # transposed FP8 projections [in, out]: 21 % faster single-stream decode than [out, in] (PERF_NOTES); WT=0 for the old layout
+export MLP=${MLP:-nki}  # decode MLP through nki_mlp.mlp_fp8_tiled (tiled weight layout, ~15 % faster 24B decode); MLP=xla for the compiler's MLP
+export KV=${KV:-fp8}  # E4M3 KV cache + per-token scales: half the KV HBM, NKI fp8 decode kernel (8B ctx 14k 35.0 vs 38.9 ms/token); KV=bf16 for the bf16 cache
+export UNSAFE_FP8FNCAST=1  # the NKI kernels take float8_e4m3fn tensors (all codes <= 224, where e4m3fn and e4m3 agree)
 mkdir -p "$OUT"
 build() { n=$1; shift; [ -f "$OUT/$n/graph.neff" ] || { (cd "$OUT" && python "$HERE/trace_model.py" "$OUT/$n" "$@" > "$n.log" 2>&1); }; }
 for spec in "dec1_32 1 1 32" "dec1_128 1 1 128" "dec1_512 1 1 512" "dec1_1024 1 1 1024" "dec4_128 4 1 128" "dec4_512 4 1 512" \
