@@ -3,6 +3,7 @@
 //   requests.json: [{"tokens":[...], "max_new":16, "temperature":0, "top_k":0, "top_p":1, "seed":0, "cancel_after":N?}]
 //   neuron_engine_cli MODEL_DIR requests.json [sequential]   (env BEHEMOTH_NEURON_NEFF_DIR=bucket dir)
 // `sequential` runs one request at a time (batch-invariance baseline).
+#include <cstdlib>
 #include "behemoth/engine.hpp"
 #include <chrono>
 #include <condition_variable>
@@ -18,7 +19,7 @@ int main(int argc, char **argv) {
     RuntimeOptions options;
     options.model = argv[1];
     options.token_budget = 1024;
-    options.prefill_chunk = 256;
+    options.prefill_chunk = std::getenv("BEHEMOTH_PREFILL_CHUNK") ? size_t(std::atoi(std::getenv("BEHEMOTH_PREFILL_CHUNK"))) : 256; // 1: every prompt token is a single-row step
     std::ifstream f(argv[2]);
     const auto requests = nlohmann::json::parse(f);
     Engine engine(options);
