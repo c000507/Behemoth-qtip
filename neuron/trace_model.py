@@ -85,7 +85,8 @@ def geometry_from_env():
 
 g = Geometry(LLAMA_8B, 2)
 PAGE = 16
-KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 32))  # G: pages per flash block (512 keys)
+KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 32))  # G: pages per flash block for prefill (512 keys)
+DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
 # compressed QTIP layer: per QTIP projection words / codebook / SU / SV (q, o, gate, up, down), k/v FP8 as above
@@ -135,7 +136,7 @@ def layer_order():
 
 def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
-    G = min(KEY_BLOCK_PAGES, P)
+    G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
     assert P % G == 0
     D = g.D
     scale = D ** -0.5
