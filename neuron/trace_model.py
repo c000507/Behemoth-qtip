@@ -86,6 +86,7 @@ def geometry_from_env():
 g = Geometry(LLAMA_8B, 2)
 PAGE = 16
 KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 128))  # G: pages per flash block for prefill (2048 keys; 32 was 6 % slower on a 14k prompt)
+ATTN = os.environ.get('ATTN', 'xla')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
@@ -134,8 +135,27 @@ def layer_order():
     return ORDER_QTIP if WEIGHTS == 'qtip' else ORDER
 
 
+def flash_paged_nki(q, cache, table, pos, Q, P, kvh, rep):
+    """The same attention for one request (R = 1) through neuronxcc's flash_fwd kernel (fused scale / mask / online softmax / PV).
+    The kernel wants dense K^T [kvh, D, keys] and V [kvh, keys, D] and a [Q, keys] additive mask, so the pages are gathered and permuted
+    here; key j of the table is valid for the query at position p iff j <= p, as in flash_paged."""
+    from neuronxcc.nki.kernels.attention import FlashConfig, flash_fwd
+    D, keys = g.D, P * PAGE
+    kv = cache[table[0]]                                                       # [P, 2, kvh, 16, D]
+    k = kv[:, 0].permute(1, 3, 0, 2).reshape(1, kvh, D, keys)                  # K^T
+    v = kv[:, 1].permute(1, 0, 2, 3).reshape(1, kvh, keys, D)
+    qt = q.reshape(Q, kvh * rep, D).permute(1, 2, 0).reshape(1, kvh * rep, D, Q)  # heads are kv-head major
+    kpos = torch.arange(keys, dtype=torch.int64, device=q.device)
+    bias = torch.where(kpos[None, :] <= pos[:, None], 0., -30000.).to(torch.bfloat16).reshape(1, 1, Q, keys)
+    config = FlashConfig(seq_tile_size=min(2048, keys), training=False)
+    o = flash_fwd[1, kvh](qt, k, v, None, logit_bias=bias, use_causal_mask=False, mixed_precision=True, config=config)  # [1, heads, Q, D]
+    return o.float().permute(0, 2, 1, 3).reshape(1, Q, kvh, rep, D)
+
+
 def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
+    if ATTN == 'nki' and R == 1 and Q % 128 == 0:
+        return flash_paged_nki(q, cache, table, pos, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
     assert P % G == 0
     D = g.D
