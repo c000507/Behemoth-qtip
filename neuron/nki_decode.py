@@ -167,7 +167,6 @@ def decode_attention_fp8(qt, cache, idxk, idxv, bias, mask, ksc, vsc):
     i1, _ = nl.mgrid[:128, :1]
     _, jf = nl.mgrid[:128, :2048]
     rowmask = nl.load(mask)
-    as8 = (lambda t: t.view(nl.float8_e4m3)) if cache.dtype == nl.uint8 else (lambda t: t)
     for r in nl.affine_range(R):
         qp = nl.zeros((128, KVH * ROWS), dtype=nl.bfloat16, buffer=nl.sbuf)
         tabk = nl.ndarray((128, KVH * G), dtype=nl.int32, buffer=nl.sbuf)
@@ -185,7 +184,12 @@ def decode_attention_fp8(qt, cache, idxk, idxv, bias, mask, ksc, vsc):
             for h in nl.affine_range(KVH):
                 nisa.dma_copy(src=cache[tabk[i1, h * G + g], jf], dst=kraw[:, nl.ds(h * 2048, 2048)])
                 nisa.dma_copy(src=cache[tabv[i1, h * G + g], jf], dst=vraw[:, nl.ds(h * 2048, 2048)])
-            k8, v8 = as8(kraw), as8(vraw)
+            if cache.dtype == nl.uint8:
+                k8 = kraw.view(nl.float8_e4m3)
+                v8 = vraw.view(nl.float8_e4m3)
+            else:
+                k8 = kraw
+                v8 = vraw
             ksc_t = nl.load(ksc[r, g])
             vsc_t = nl.load(vsc[r, g])
             bias_t = nl.load(bias[r, g])
