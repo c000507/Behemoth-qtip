@@ -164,41 +164,42 @@ def flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep):
 def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """Flash loop over an FP8 cache with the GPU runtime's attention semantics (runtime/src/attention.cpp): q is quantised per (query, head) row,
     scores = (q8 . k8) q_scale k_scale / sqrt(D), probabilities are weighted by the V scale of their token, quantised per row and block to E4M3
-    (the softmax sum uses the unweighted p) and multiplied with the E4M3 V pages; both matmuls run fp8 x fp8 on the tensor engine."""
+    (the softmax sum uses the unweighted p) and multiplied with the E4M3 V pages; both matmuls run fp8 x fp8 (torch.matmul, as the projections do:
+    einsum on fp8 operands keeps an fp8 result). Layout [R, kvh, Q, rep, keys]."""
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
     assert P % G == 0
     D = g.D
     scale = D ** -0.5
     neg, f8, dev = -1e30, torch.float8_e4m3fn, q.device
-    qf = q.float()
-    qa = torch.amax(torch.abs(qf), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0       # [R,Q,kvh,rep,1]
-    q8 = (qf / qa).to(f8)
-    m = torch.full((R, Q, kvh, rep), neg, device=dev)
-    l = torch.zeros(R, Q, kvh, rep, device=dev)
-    acc = torch.zeros(R, Q, kvh, rep, D, device=dev)
-    qpos = pos.reshape(R, Q, 1, 1, 1)
+    qf = q.float().permute(0, 2, 1, 3, 4)                                                # [R,kvh,Q,rep,D]
+    qa = torch.amax(torch.abs(qf), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0        # [R,kvh,Q,rep,1]
+    q8 = (qf / qa).to(f8).reshape(R, kvh, Q * rep, D)
+    m = torch.full((R, kvh, Q, rep), neg, device=dev)
+    l = torch.zeros(R, kvh, Q, rep, device=dev)
+    acc = torch.zeros(R, kvh, Q, rep, D, device=dev)
+    qpos = pos.reshape(R, 1, Q, 1, 1)
     inblock = torch.arange(G * PAGE, dtype=torch.int64, device=dev).reshape(1, 1, 1, 1, G * PAGE)
     for b in range(P // G):
         pages = table[:, b * G:(b + 1) * G]                                              # [R,G]
-        kv = cache[pages]                                                                # [R,G,2,kvh,16,D] E4M3 bytes
+        kv = cache[pages]                                                                # [R,G,2,kvh,16,D] E4M3
         sc = cscale[pages]                                                               # [R,G,2,kvh,16]
-        k8, v8 = kv[:, :, 0], kv[:, :, 1]
-        ksc = sc[:, :, 0].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
-        vsc = sc[:, :, 1].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
-        s = torch.einsum('rqhad,rghtd->rqhagt', q8, k8).float() * qa.unsqueeze(-1) * ksc
-        s = s.reshape(R, Q, kvh, rep, G * PAGE) * scale
+        k8 = kv[:, :, 0].permute(0, 2, 1, 3, 4).reshape(R, kvh, G * PAGE, D)
+        v8 = kv[:, :, 1].permute(0, 2, 1, 3, 4).reshape(R, kvh, G * PAGE, D)
+        ksc = sc[:, :, 0].permute(0, 2, 1, 3).reshape(R, kvh, 1, 1, G * PAGE)
+        vsc = sc[:, :, 1].permute(0, 2, 1, 3).reshape(R, kvh, 1, 1, G * PAGE)
+        s = torch.matmul(q8, k8.transpose(-1, -2)).float().reshape(R, kvh, Q, rep, G * PAGE) * qa * ksc * scale
         s = torch.where(inblock + b * G * PAGE > qpos, torch.full_like(s, neg), s)
         m_new = torch.maximum(m, s.amax(dim=-1))
         p = torch.exp(s - m_new.unsqueeze(-1))
         corr = torch.exp(m - m_new)
         l = l * corr + p.sum(dim=-1)
-        pw = p.reshape(R, Q, kvh, rep, G, PAGE) * vsc
-        ps = (torch.amax(pw, dim=(-2, -1)) / 224.0).clamp(min=1e-30)                     # [R,Q,kvh,rep]
-        p8 = (pw / ps.unsqueeze(-1).unsqueeze(-1)).to(f8)
-        pv = torch.einsum('rqhagt,rghtd->rqhad', p8, v8).float() * ps.unsqueeze(-1)
+        pw = p * vsc
+        ps = (torch.amax(pw, dim=-1, keepdim=True) / 224.0).clamp(min=1e-30)             # [R,kvh,Q,rep,1]
+        p8 = (pw / ps).to(f8).reshape(R, kvh, Q * rep, G * PAGE)
+        pv = torch.matmul(p8, v8).float().reshape(R, kvh, Q, rep, D) * ps
         acc = acc * corr.unsqueeze(-1) + pv
         m = m_new
-    return acc / l.unsqueeze(-1)
+    return (acc / l.unsqueeze(-1)).permute(0, 2, 1, 3, 4)
 
 
 def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
