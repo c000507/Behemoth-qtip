@@ -86,7 +86,7 @@ def geometry_from_env():
 g = Geometry(LLAMA_8B, 2)
 PAGE = 16
 KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 128))  # G: pages per flash block for prefill (2048 keys; 32 was 6 % slower on a 14k prompt)
-ATTN = os.environ.get('ATTN', 'xla')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages
+ATTN = os.environ.get('ATTN', 'nki')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages; 'xla': torch-op flash loop
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
