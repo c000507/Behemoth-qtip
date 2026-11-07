@@ -380,3 +380,22 @@ per weight as the format needs) so they cannot beat ~190 G weights/s either; wha
 fewer launches (the 32-layer single graph is blocked by the layer-31 anomaly), and fewer KV bytes at long context (FP8 K/V).
 NKI DMA micro-benchmark caveat: PyTorch/XLA lazy tensors execute only the last of N queued identical calls, so any "N calls / elapsed" timing outside
 the kernel measured launch overhead; time with in-kernel loops or neuron-profile.
+
+### FP8 KV cache and the NKI decode attention kernel
+
+**FP8 K/V cache** (`KV=fp8`, runtime reads `meta.kv`): the cache is E4M3 pages `[pages, 2, kv_heads, 16, 128]` plus one f32 scale per (token, K|V, kv head)
+`[pages, 2, kv_heads, 16]`, the GPU runtime's format (runtime/src/attention.cpp), both held as aliased float8 / f32 state buffers (dtype views are not
+supported on XLA tensors). Written with a per-vector amax/224 scale. Per core 1.03 GiB instead of 2.0 GiB for 2048 pages, so the pool can double.
+Attention reads it through the bf16 loop after dequantising the gathered pages (`KVATT=deq`, the default): oracle (short positions) 7/7 top-1, mean KL 0.011
+(bf16 cache: 0.0158 on the same positions); long oracle 7/9 (the same two near ties) mean KL 0.0258 (bf16 cache 0.019). Speed with the XLA gather:
+ctx 300 27.1 ms/token (bf16 cache 30.0), ctx 14k 49.9 ms (bf16 cache 43.0): the dequantise pass costs more than the halved gather saves at long context.
+The GPU-style fp8 x fp8 attention (`KVATT=fp8`: q, P and the pages as E4M3, scores / PV through torch.matmul on 4D batched operands) gives non-finite logits on trn1;
+the same math is finite and within 5.5 % of a dequantised reference on CPU, so the device's handling of batched fp8 dots is the suspect (einsum on fp8 operands
+also keeps an fp8 result). Off by default.
+
+**NKI decode attention** (`neuron/nki_decode.py`, `ATTN_DEC=nki`, single request, one query token, bf16 cache): indirect-DMA page gather (half page of one kv head per
+partition), PE transposes of K, all 16 query rows (4 kv heads x 4) in one score tile through zero-padded q tiles, fused mask / online softmax / PV with
+head-row masks. Isolated kernel vs float32 reference: rel err 8e-4 (128 random pages). Profile of the kernel NEFF at 1024 pages (34.7 MB of KV):
+302 us total, DMA 254 us (137 GB/s), tensor 100 us, scalar 121 us, vector 72 us (about 0.5 ms for the torch-op loop at the same size).
+In the layer graph: oracle with every prompt token run as a single-row step through the kernel: 7/7 top-1, mean KL 0.0080; decode ctx 300 30.5 ms/token
+(same as XLA, the kernel pads to 64 pages), ctx 14k 39.0 ms/token (XLA loop 43.0). Not yet: batched decode (R > 1), the FP8 cache (would halve the DMA that bounds the kernel).
