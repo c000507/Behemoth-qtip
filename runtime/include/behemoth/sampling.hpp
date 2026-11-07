@@ -5,6 +5,14 @@
 namespace behemoth {
 void validate_sampling(const SamplingOptions &);
 int sample_logits(std::span<const float>, const SamplingOptions &, std::mt19937_64 &);
+// Whether the options ask for any logit processing (penalties, logit_bias, min_p with temperature > 0).
+bool has_logit_processing(const SamplingOptions &);
+// Applies repetition / frequency / presence penalties, logit_bias and min_p to `logits` in place. history: the request's
+// tokens (prompt then generated); prompt_size: its prompt length; extra: tokens after history (speculative draft rows).
+// Repetition penalty looks at prompt and output, frequency / presence at the output only (vLLM); penalty_range > 0
+// limits all three to the most recent tokens. min_p masks with -1e30 (finite: sample_logits rejects non-finite logits).
+void apply_logit_processing(std::span<float> logits, const SamplingOptions &, std::span<const int> history, size_t prompt_size,
+                            std::span<const int> extra = {});
 // Split-vocabulary overload: the token id space is the concatenation
 // low ++ high (the two ranks' lm_head halves stay in device order; no host
 // interleave copy is needed). Produces identical tokens to the contiguous

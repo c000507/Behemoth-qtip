@@ -95,9 +95,67 @@ template <class Value> void full_order(size_t n, Value value, std::vector<size_t
 }
 } // namespace
 void validate_sampling(const SamplingOptions &p) {
-    if (!std::isfinite(p.temperature) || p.temperature < 0 || p.top_k < 0 || p.top_k > 32768 ||
+    if (!std::isfinite(p.temperature) || p.temperature < 0 || p.top_k < 0 || p.top_k > (1 << 24) ||
         !std::isfinite(p.top_p) || p.top_p <= 0 || p.top_p > 1)
         throw std::invalid_argument("Invalid sampling parameters");
+    if (!std::isfinite(p.repetition_penalty) || p.repetition_penalty <= 0 || p.repetition_penalty > 10)
+        throw std::invalid_argument("repetition_penalty must be in (0, 10]");
+    if (!std::isfinite(p.frequency_penalty) || std::abs(p.frequency_penalty) > 2 || !std::isfinite(p.presence_penalty) ||
+        std::abs(p.presence_penalty) > 2)
+        throw std::invalid_argument("frequency_penalty and presence_penalty must be in [-2, 2]");
+    if (!std::isfinite(p.min_p) || p.min_p < 0 || p.min_p > 1)
+        throw std::invalid_argument("min_p must be in [0, 1]");
+    if (p.penalty_range < 0)
+        throw std::invalid_argument("repetition_penalty_range must be >= 0");
+    if (p.logit_bias.size() > 1024)
+        throw std::invalid_argument("At most 1024 logit_bias entries are supported");
+    for (const auto &[id, bias] : p.logit_bias)
+        if (id < 0 || !std::isfinite(bias) || std::abs(bias) > 100)
+            throw std::invalid_argument("logit_bias needs token ids >= 0 and biases in [-100, 100]");
+}
+bool has_logit_processing(const SamplingOptions &p) {
+    return p.repetition_penalty != 1 || p.frequency_penalty != 0 || p.presence_penalty != 0 || !p.logit_bias.empty() ||
+           (p.min_p > 0 && p.temperature > 0);
+}
+void apply_logit_processing(std::span<float> logits, const SamplingOptions &p, std::span<const int> history, size_t prompt_size,
+                            std::span<const int> extra) {
+    const size_t total = history.size() + extra.size(), n = logits.size();
+    const size_t begin = p.penalty_range > 0 && size_t(p.penalty_range) < total ? total - size_t(p.penalty_range) : 0;
+    auto token = [&](size_t i) { return i < history.size() ? history[i] : extra[i - history.size()]; };
+    if (p.repetition_penalty != 1 || p.frequency_penalty != 0 || p.presence_penalty != 0) {
+        thread_local std::vector<int> counts; // generated-token counts, -1: seen only in the prompt (or not at all: 0)
+        thread_local std::vector<int> touched;
+        counts.assign(n, 0);
+        touched.clear();
+        for (size_t i = begin; i < total; ++i) {
+            const int t = token(i);
+            if (t < 0 || size_t(t) >= n)
+                continue;
+            if (!counts[size_t(t)])
+                touched.push_back(t);
+            if (i >= prompt_size)
+                counts[size_t(t)] = std::max(counts[size_t(t)], 0) + 1;
+            else if (!counts[size_t(t)])
+                counts[size_t(t)] = -1;
+        }
+        for (int t : touched) {
+            float &l = logits[size_t(t)];
+            if (p.repetition_penalty != 1)
+                l = l > 0 ? l / p.repetition_penalty : l * p.repetition_penalty;
+            if (const int c = counts[size_t(t)]; c > 0)
+                l -= p.frequency_penalty * float(c) + p.presence_penalty;
+        }
+    }
+    for (const auto &[id, bias] : p.logit_bias)
+        if (size_t(id) < n)
+            logits[size_t(id)] += bias;
+    if (p.min_p > 0 && p.temperature > 0) { // p_i / p_max = exp((l_i - l_max) / T) >= min_p
+        const float m = *std::max_element(logits.begin(), logits.end());
+        const float threshold = m + p.temperature * std::log(p.min_p);
+        for (float &l : logits)
+            if (l < threshold)
+                l = -1e30f;
+    }
 }
 int sample_logits(std::span<const float> logits, const SamplingOptions &p, std::mt19937_64 &rng) {
     return sample_logits(logits, {}, p, rng);

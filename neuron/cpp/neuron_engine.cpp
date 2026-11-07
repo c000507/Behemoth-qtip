@@ -406,9 +406,22 @@ struct Engine::Impl {
                 for (long k = 0; k < long(sampling_steps.size()); ++k) {
                     const size_t i = sampling_steps[size_t(k)];
                     try {
-                        for (size_t j = 0; j < sampled[i].size(); ++j)
-                            sampled[i][j] = sample_logits(logits.subspan((logits_row[i] + j) * vocab, vocab),
-                                                          scheduler.request(step.requests[i].id).sampling, rng.at(step.requests[i].id));
+                        const auto &req = scheduler.request(step.requests[i].id);
+                        const bool process = has_logit_processing(req.sampling);
+                        thread_local std::vector<float> processed;
+                        auto d = drafts.find(step.requests[i].id);
+                        for (size_t j = 0; j < sampled[i].size(); ++j) {
+                            auto row = logits.subspan((logits_row[i] + j) * vocab, vocab);
+                            if (process) { // penalties see the tokens before this row: history, then drafts 0 .. j - 1
+                                processed.assign(row.begin(), row.end());
+                                std::span<const int> extra;
+                                if (d != drafts.end())
+                                    extra = std::span<const int>(d->second.data(), j);
+                                apply_logit_processing(processed, req.sampling, req.history, req.prompt_size, extra);
+                                row = processed;
+                            }
+                            sampled[i][j] = sample_logits(row, req.sampling, rng.at(step.requests[i].id));
+                        }
                     } catch (...) {
                         std::lock_guard guard(error_mutex);
                         sampling_error = std::current_exception();

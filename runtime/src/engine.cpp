@@ -746,6 +746,8 @@ Engine::~Engine() = default;
 uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOptions options,
                         GenerationCallback callback, std::shared_ptr<TokenConstraint> constraint) {
     validate_sampling(options);
+    if (has_logit_processing(options)) // implemented by the Neuron engine only (neuron/cpp/neuron_engine.cpp)
+        throw std::invalid_argument("repetition / frequency / presence penalties, min_p and logit_bias are not supported by the GPU backend");
     if (!callback)
         throw std::invalid_argument("Missing generation callback");
     if (!max_new)

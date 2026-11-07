@@ -1,4 +1,6 @@
 #pragma once
+#include <vector>
+#include <utility>
 #include "cache.hpp"
 #include <deque>
 #include <functional>
@@ -12,6 +14,13 @@ struct SamplingOptions {
     int top_k = 0;
     float top_p = 1;
     uint64_t seed = 0;
+    // Logit processing before temperature / top-k / top-p (sampling.hpp apply_logit_processing; vLLM / OpenAI semantics):
+    float repetition_penalty = 1; // > 1: every token seen in the window (prompt + output) has its logit divided (> 0) or multiplied (< 0)
+    float frequency_penalty = 0;  // minus this x the token's count among the generated tokens
+    float presence_penalty = 0;   // minus this once if the token was generated
+    float min_p = 0;              // drop tokens whose probability (after temperature) is below min_p x the top one
+    int penalty_range = 0;        // window of most recent tokens the penalties look at (0: the whole sequence)
+    std::vector<std::pair<int, float>> logit_bias; // added to the logit of the token id
 };
 struct Request {
     uint64_t id{};

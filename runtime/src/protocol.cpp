@@ -97,12 +97,8 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
         throw std::invalid_argument("Unknown model");
     if (j.value("n", 1) != 1)
         throw std::invalid_argument("Only n=1 is supported");
-    for (const char *key : {"tools", "tool_choice", "functions", "function_call",
-                            "logprobs", "logit_bias"})
+    for (const char *key : {"tools", "tool_choice", "functions", "function_call", "logprobs"})
         if (j.contains(key))
-            throw std::invalid_argument(std::string("Unsupported parameter: ") + key);
-    for (const char *key : {"presence_penalty", "frequency_penalty"})
-        if (j.value(key, 0.f) != 0)
             throw std::invalid_argument(std::string("Unsupported parameter: ") + key);
     auto messages = j.at("messages");
     if (!messages.is_array() || messages.empty())
@@ -141,6 +137,26 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
     r.sampling.temperature = j.value("temperature", 0.f);
     r.sampling.top_k = j.value("top_k", 0);
     r.sampling.top_p = j.value("top_p", 1.f);
+    r.sampling.repetition_penalty = j.value("repetition_penalty", 1.f);
+    r.sampling.frequency_penalty = j.value("frequency_penalty", 0.f);
+    r.sampling.presence_penalty = j.value("presence_penalty", 0.f);
+    r.sampling.min_p = j.value("min_p", 0.f);
+    r.sampling.penalty_range = j.value("repetition_penalty_range", j.value("repeat_last_n", 0));
+    if (j.contains("logit_bias") && !j.at("logit_bias").is_null()) {
+        if (!j.at("logit_bias").is_object())
+            throw std::invalid_argument("logit_bias must map token ids to biases");
+        for (auto it = j.at("logit_bias").begin(); it != j.at("logit_bias").end(); ++it) {
+            size_t used = 0;
+            int id = -1;
+            try {
+                id = std::stoi(it.key(), &used);
+            } catch (...) {
+            }
+            if (used != it.key().size() || !it.value().is_number())
+                throw std::invalid_argument("logit_bias keys must be token ids and values numbers");
+            r.sampling.logit_bias.push_back({id, it.value().get<float>()});
+        }
+    }
     // Without an explicit seed every request draws a fresh one; a fixed default made
     // regenerations of the same prompt return the identical sample.
     r.sampling.seed = j.contains("seed") ? j.at("seed").get<uint64_t>()

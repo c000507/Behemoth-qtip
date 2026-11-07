@@ -282,7 +282,12 @@ class Session : public std::enable_shared_from_this<Session> {
                 diagnostic_ = {{"tokens", prompt}, {"prompt_tokens", prompt.size()},
                     {"rendered_prompt", request.rendered}, {"request", json::parse(req.body())},
                     {"sampling", {{"seed", request.sampling.seed}, {"temperature", request.sampling.temperature},
-                                  {"top_k", request.sampling.top_k}, {"top_p", request.sampling.top_p}}},
+                                  {"top_k", request.sampling.top_k}, {"top_p", request.sampling.top_p},
+                                  {"min_p", request.sampling.min_p}, {"repetition_penalty", request.sampling.repetition_penalty},
+                                  {"frequency_penalty", request.sampling.frequency_penalty},
+                                  {"presence_penalty", request.sampling.presence_penalty},
+                                  {"repetition_penalty_range", request.sampling.penalty_range},
+                                  {"logit_bias_entries", request.sampling.logit_bias.size()}}},
                     {"producer", "behemoth_server exact delivered token IDs"}};
             }
             streaming_ = request.stream;
