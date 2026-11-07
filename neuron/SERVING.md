@@ -53,11 +53,12 @@ Per layer and rank: RMSNorm, q/k/v (column-parallel) -> RoPE -> KV scatter -> pa
   page tables (`AttentionLayout`), K and V of a page in one tensor so a page gather is one DMA and each layer has a
   single aliased state tensor. The graph scatters the step's K/V to flat slots (`page * 16 + offset`), updated in place
   on the device (`enable_aliasing`). Page `pages-1` is a scratch page for padding rows.
-* **Flash attention.** Keys are processed in blocks of 32 pages (512 keys) with running max / sum / accumulator (online
-  softmax); the `[queries x context]` score matrix is never formed, and causal + length masking is one compare
-  `key_position <= query_position` per block, so no per-request lengths are needed. This is the flash algorithm written in
-  torch ops and compiled by neuronx-cc; the NKI `flash_fwd` kernel needs a dense `q_len == k_len` layout and was not used
-  because chunked prefill over paged KV has neither.
+* **Flash attention.** Decode (Q = 1) is a flash loop written in torch ops and compiled by neuronx-cc: 256-page key blocks (the score row of one token
+  is tiny, so a few big blocks beat many small serial ones) with running max / sum / accumulator. Prefill chunks (R = 1, Q a multiple of 128) run
+  neuronxcc's own `flash_fwd` NKI kernel over the gathered pages (`ATTN=nki`, the default; `ATTN=xla` keeps the torch-op loop): XLA gathers the
+  request's pages, permutes K to `[kv_heads, D, keys]` and V to `[kv_heads, keys, D]` and builds the paged causal / length mask once as the kernel's
+  `logit_bias` (`key_position <= query_position`), so no per-request lengths are needed and chunked prefill over paged KV needs no dense layout.
+  Q = 64 chunks and multi-row decode use the torch-op loop.
 * **Extended positions.** cos/sin rows are computed on the host in fp64 for each token's absolute position with the
   checkpoint's llama3 rope scaling, so any position up to the NEFF's page table (16k here, more buckets for more) works.
 

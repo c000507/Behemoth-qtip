@@ -352,3 +352,16 @@ the CUDA side, 0.064 and 0.049 on ours. HTTP: chat, SSE stream, 400 on an over-c
 | 32 concurrent: ITL / aggregate | 62 ms / 425-446 tok/s | 42.2 ms / 630 tok/s |
 | 14k prefill | 10.5 s | 8.8 s |
 (speculative decoding, which lowers ctx-300 free text to ~35 ms before these changes, was off in these runs.)
+
+### NKI flash attention for prefill (ATTN=nki)
+
+The profile of a 14k prefill chunk showed the torch-op flash loop bound by elementwise score passes (exp / max / mask on f32 tiles), not by gather.
+neuronxcc's `flash_fwd` accepts GQA and an additive `logit_bias` of shape (1, 1, Q, keys), so the paged causal mask goes in as the bias and XLA only gathers,
+permutes K / V and builds the mask. 14k-token prompt: 8.8 -> 5.4 s (pre256 graphs at 128 / 512 / 1024 pages), 4.93 s with 256- and 768-page graphs added
+(2.8k tok/s, was 1.3k at the start of the speed work). Oracle on the final set (wtg): 13/13 top-1 (short, mean KL 0.0097) and 9/9 (long, mean KL 0.0189);
+an earlier set with a subset of the NKI graphs gave 12/13 and 8/9 with near-tie misses (gaps 0.02-0.06) and the same KL level. HTTP smoke: chat, SSE,
+400 on an over-context prompt, 8 concurrent: all good.
+
+NKI indirect-DMA page gather (block per SBUF partition, as in nki/_pre_prod_kernels/gather_block_cache.py) works on trn1 and is exact, but measured
+throughput was erratic in micro-benchmarks (9-90 GB/s depending on row size and structure); the kernel therefore keeps the XLA gather. Decode
+(Q = 1) stays on the torch-op loop: flash_fwd needs 128-row query tiles, which would waste the tensor engine on one token.
