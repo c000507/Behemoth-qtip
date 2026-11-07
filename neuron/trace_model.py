@@ -95,7 +95,8 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
-KV8 = os.environ.get('KV', 'bf16') == 'fp8'  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
+KV8 = os.environ.get('KV', 'bf16') == 'fp8'
+KVATT = os.environ.get('KVATT', 'fp8')  # KV=fp8 attention: 'fp8' (fp8 x fp8 matmuls, GPU semantics) or 'deq' (dequantise the gathered pages, bf16 loop)  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
 if KV8:
     ORDER.insert(ORDER.index('cache') + 1, 'cscale')
     ORDER_QTIP.insert(ORDER_QTIP.index('cache') + 1, 'cscale')
@@ -206,7 +207,7 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     if ATTN == 'nki' and R == 1 and Q % 128 == 0:
         return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
-    if cscale is not None:
+    if cscale is not None and KVATT == 'fp8':
         return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
     assert P % G == 0
@@ -222,6 +223,8 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     for b in range(P // G):
         pages = table[:, b * G:(b + 1) * G]                      # [R,G]
         kv = cache[pages]                                        # [R,G,2,kvh,16,D]: K and V pages in one gather
+        if cscale is not None:                                   # FP8 cache read by the bf16 loop: dequantise
+            kv = (kv.float() * cscale[pages].unsqueeze(-1)).to(torch.bfloat16)
         kb, vb = kv[:, :, 0], kv[:, :, 1]                        # [R,G,kvh,16,D]
         s = torch.einsum('rqhad,rghtd->rqhagt', q, kb).float().reshape(R, Q, kvh, rep, G * PAGE) * scale
         s = torch.where(inblock + b * G * PAGE > qpos, torch.full_like(s, neg), s)
