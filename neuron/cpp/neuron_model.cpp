@@ -172,6 +172,7 @@ struct NeuronModel::Impl {
     std::vector<float> inv_freq;
     int tp = 0, hidden = 0, dim = 0;                           // from the NEFF geometry (checked against config.json)
     int vocab_ = 0, vocab_shard = 0, pages_total = 0, kv_local = 0; // vocab_shard: lm_head rows per rank (vocab padded to TP)
+    bool head_transposed = false;                              // the head NEFFs take lm_head as [H][V/TP] (WT=1)
     bool head_fp8 = false;                                     // the head NEFFs take E4M3 lm_head rows
     std::vector<RankState> ranks;
     std::vector<LayerBucket> decode, prefill;
@@ -198,6 +199,9 @@ struct NeuronModel::Impl {
             throw std::runtime_error("need decode and prefill NEFF buckets (and head NEFFs for per-layer buckets) in " + options.neff_dir.string());
         vocab_shard = (vocab_ + tp - 1) / tp;
         kv_local = config.kv_heads / tp;
+        // Implicit async execution (launches return before the device finishes; the logits read synchronises): hides the per-layer
+        // launch gap, 10 % on single-stream decode and more with wide batches. A value set by the caller wins.
+        setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "8", 0);
         check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
         ranks.resize(size_t(tp));
         for (int r = 0; r < tp; ++r) {
@@ -281,10 +285,12 @@ struct NeuronModel::Impl {
             } else {
                 m.S = j.at("S"); m.T = j.at("T");
                 m.fp8 = j.value("fp8", false);
+                m.wt = j.value("wt", false);
                 accept(m);
-                if (!heads.empty() && heads.front().meta.fp8 != m.fp8)
-                    throw std::runtime_error("head NEFFs mix bf16 and fp8 lm_head formats");
+                if (!heads.empty() && (heads.front().meta.fp8 != m.fp8 || heads.front().meta.wt != m.wt))
+                    throw std::runtime_error("head NEFFs mix bf16 / fp8 or transposed / plain lm_head formats");
                 head_fp8 = m.fp8;
+                head_transposed = m.wt;
                 HeadBucket b;
                 b.meta = m;
                 heads.push_back(std::move(b));
@@ -639,13 +645,27 @@ struct NeuronModel::Impl {
                 zero(rs.head_w);
                 zero(rs.head_ws);
                 if (rows) {
-                    put(rs.head_w, s.w.data(), s.w.size());
+                    if (head_transposed) {
+                        std::vector<uint8_t> t(size_t(vocab_shard) * H);
+                        for (size_t i = 0; i < rows; ++i)
+                            for (size_t j = 0; j < H; ++j)
+                                t[j * size_t(vocab_shard) + i] = s.w[i * H + j];
+                        put(rs.head_w, t.data(), t.size());
+                    } else
+                        put(rs.head_w, s.w.data(), s.w.size());
                     put(rs.head_ws, s.scale.data(), s.scale.size() * 4);
                 }
             } else {
                 rs.head_w = alloc(r, size_t(vocab_shard) * H * 2, "lm_head");
                 zero(rs.head_w);
-                if (rows)
+                if (rows && head_transposed) {
+                    std::vector<uint16_t> t(size_t(vocab_shard) * H);
+                    const uint16_t *src = reinterpret_cast<const uint16_t *>(head_bytes.data()) + first * H;
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < H; ++j)
+                            t[j * size_t(vocab_shard) + i] = src[i * H + j];
+                    put(rs.head_w, t.data(), t.size() * 2);
+                } else if (rows)
                     put(rs.head_w, head_bytes.data() + first * H * 2, rows * H * 2);
             }
         }
