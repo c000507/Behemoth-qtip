@@ -207,10 +207,12 @@ def paged_layer(R, Q, P, *args):
         # needs no all-gather of its input
         zg = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['gsu'], H), t['gw'], t['gl'])
         zu = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['usu'], H), t['uw'], t['ul'])
-        sel2 = torch.cat((t['sel_ff'], t['sel_ff'] + FF))                      # [gate (FF) | up (FF)]: this rank's slices
-        z = qtip_graph.gather_tp(torch.cat((zg, zu), dim=-1), sel2, 2 * FF, allreduce, g.TP).reshape(T, 2, FF)
-        gate = qtip_graph.finish(z[:, 0], t['gsv'], FF)
-        up = qtip_graph.finish(z[:, 1], t['usv'], FF)
+        # gather_tp lays the ranks out one after the other, so gather [gate | up] of each rank as one block and split after
+        ff_local = FF // g.TP
+        sel2 = 2 * t['sel_ff'][:1] + torch.arange(2 * ff_local, dtype=torch.int64, device=x.device)  # rank * 2 * ff_local + j
+        z = qtip_graph.gather_tp(torch.cat((zg, zu), dim=-1), sel2, 2 * FF, allreduce, g.TP).reshape(T, g.TP, 2, ff_local)
+        gate = qtip_graph.finish(z[:, :, 0].reshape(T, FF), t['gsv'], FF)
+        up = qtip_graph.finish(z[:, :, 1].reshape(T, FF), t['usv'], FF)
         act = torch.nn.functional.silu(gate) * up
         u = torch.index_select(qtip_graph.rotate_in(act, t['dsu'], FF), -1, t['sel_ff'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)
