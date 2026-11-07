@@ -89,7 +89,7 @@ Fp8Shard expand_qtip_to_fp8(const qtip::HostLinear &l, int tp, int rank, bool co
 
 std::vector<Fp8Shard> load_projection_shards(const SafeTensorFile &file, int layer, const std::string &name,
                                              const ModelConfig &config, int tp, bool column_parallel) {
-    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    const std::string base = "model.layers." + std::to_string(layer + layer_offset()) + "." + name + ".";
     if (file.contains(base + "trellis"))
         return expand_qtip_all(qtip::load_linear(file, layer, name, &config), tp, column_parallel);
     if (file.contains(base + "weight_packed")) {
@@ -120,7 +120,7 @@ std::vector<Fp8Shard> load_projection_shards(const SafeTensorFile &file, int lay
 }
 
 bool is_qtip_projection(const SafeTensorFile &file, int layer, const std::string &name) {
-    return file.contains("model.layers." + std::to_string(layer) + "." + name + ".trellis");
+    return file.contains("model.layers." + std::to_string(layer + layer_offset()) + "." + name + ".trellis");
 }
 
 namespace {

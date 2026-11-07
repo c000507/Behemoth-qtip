@@ -449,12 +449,12 @@ struct NeuronModel::Impl {
 
     void upload_layer(int layer) {
         char name[64];
-        std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + (std::getenv("NEURON_LAYER_OFFSET") ? std::atoi(std::getenv("NEURON_LAYER_OFFSET")) : 0)); // debugging: load checkpoint layer N + offset as layer N
+        std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
         SafeTensorFile file(options.model / name);
         struct P { const char *name; bool col; int slot; };
         const P projs[] = {{"self_attn.q_proj", true, 0}, {"self_attn.o_proj", false, 2}, {"self_attn.k_proj", true, 4},
                            {"self_attn.v_proj", true, 6}, {"mlp.gate_proj", true, 8}, {"mlp.up_proj", true, 10}, {"mlp.down_proj", false, 12}};
-        const std::string base = "model.layers." + std::to_string(layer) + ".";
+        const std::string base = "model.layers." + std::to_string(layer + layer_offset()) + ".";
         const size_t H = size_t(hidden);
         std::vector<float> n1(H), n2(H);
         {
@@ -523,7 +523,7 @@ struct NeuronModel::Impl {
                            {"mlp.up_proj", true, FF, H}, {"mlp.down_proj", false, H, FF}};
         for (int layer = 0; layer < config.layers; ++layer) {
             char name[64];
-            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + (std::getenv("NEURON_LAYER_OFFSET") ? std::atoi(std::getenv("NEURON_LAYER_OFFSET")) : 0)); // debugging: load checkpoint layer N + offset as layer N
+            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
             SafeTensorFile file(options.model / name);
             bool all = true;
             for (const auto &p : projs) {

@@ -8,11 +8,15 @@
 // what the tensor-parallel FP8 layer graph (trace_layer_tp.py) consumes, so QTIP layers need no extra
 // collectives at run time. Column-parallel projections keep a block of output rows, row-parallel ones a
 // block of input columns.
+#include <cstdlib>
 #include "behemoth/qtip.hpp"
 #include <cstdint>
 #include <vector>
 
 namespace neuron {
+// Debugging (NEURON_LAYER_OFFSET): checkpoint layer N + offset is loaded as layer N.
+inline int layer_offset() { return std::getenv("NEURON_LAYER_OFFSET") ? std::atoi(std::getenv("NEURON_LAYER_OFFSET")) : 0; }
+
 struct Fp8Shard {
     int rows = 0, cols = 0;
     std::vector<uint8_t> w;     // [rows][cols] E4M3 bytes (|value| <= 224)
