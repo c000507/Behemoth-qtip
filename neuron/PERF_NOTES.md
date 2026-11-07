@@ -297,3 +297,9 @@ the 70B compressed footprint is 8.6 GiB trellis + 0.66 GiB FP8 k/v + 1 GiB bf16 
 Next steps: find that defect, then retrace the qtip buckets (q8/q70 chain on the instance: `chain8.sh`), rerun `qtest.sh BUCKETS compressed`, `q70run.sh`,
 profile the host-side per-launch overhead, and re-run the default FP8 oracle / 32-concurrent check (the default path was not
 modified except for name-based input binding; its 2-position smoke check gave top-1 2/2, KL 0.004 after the change).
+
+**Update: the end-to-end defect was found and fixed.** The gate|up all-gather gathered each rank's `[gate | up]` block with a mask built for a
+`[gate (all ranks) | up (all ranks)]` layout, so rank 0's up slice got its gate values and rank 1's gate slice its up values (gather_tp lays ranks out
+one after the other). Zero rows hid it (z = 0), which is why padding rows matched while real tokens blew up, and the q / o probes never touched
+it. trace_model.py now gathers `[gate | up]` per rank and splits after the gather. Compressed 8B (24 compressed + 8 expanded layers; both NEFF
+variants per bucket), retraced dec1_32 / pre64_32, first three oracle positions: top-1 3/3, mean KL(top-256) 0.0029 (pos 5 / 17 / 100).
