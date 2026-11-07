@@ -104,6 +104,94 @@ def make_mlp(NB=1024, dge=None):
 mlp_fp8 = make_mlp()
 
 
+# ---- tiled weight layout --------------------------------------------------------------------------------------------------------------------
+# A projection W [K, N] (contraction axis first) stored so that every 128-partition DMA tile is one contiguous 512 KB block whose partition
+# rows are 4 KB: block (kb, nb) holds rows kb * 512 .. + 512 and columns nb * 1024 .. + 1024, partition p row = W[kb*512 + j*128 + p,
+# nb*1024 : +1024] for j = 0..3 concatenated.  Flat index (((kb * NBL + nb) * 128 + p) * 4 + j) * 1024 + c, NBL = N / 1024; the tensor is
+# [K / 512 * NBL * 128, 4096].  Wider SBUF rows stream faster (the 4 KB rows of a 4096-wide tile reached 254 GB/s, 1 KB rows ~205), while each
+# tile still feeds only 2 PSUM banks (4 K-subtiles x 2 x 512 columns), so DMA and matmuls of consecutive blocks overlap.
+TK, TN = 512, 1024
+
+
+def tile_weight(w):
+    """numpy [K, N] -> tiled [K / 512 * N / 1024 * 128, 4096] (same dtype)."""
+    K, N = w.shape
+    return np.ascontiguousarray(w.reshape(K // TK, 4, 128, N // TN, TN).transpose(0, 3, 2, 1, 4)).reshape(K // TK * (N // TN) * 128, 4 * TN)
+
+
+def make_mlp_tiled(dge=None):
+    @nki.jit
+    def mlp(h8T, ha, gt, gs, ut, us, dt, ds):
+        """h8T [H, T] E4M3, ha [T, 1]; gt / ut tiled [H, FF] E4M3, gs / us [1, FF]; dt tiled [FF, H], ds [1, H] -> y [T, H] f32 (partial)."""
+        H, T = h8T.shape
+        FF = gs.shape[1]
+        KT, FT = H // 128, FF // 128
+        y = nl.ndarray((T, H), dtype=nl.float32, buffer=nl.shared_hbm)
+        hx = nl.ndarray((128, KT * T), dtype=h8T.dtype, buffer=nl.sbuf)
+        for kt in nl.affine_range(KT):
+            hx[:, nl.ds(kt * T, T)] = nl.load(h8T[nl.ds(kt * 128, 128), :])
+        hs = nl.load(ha)
+        # one f32 [T, FF] buffer (FF = 16384 per rank for Cydonia: 64 KB of a partition's 192 KB): the gate pass stores
+        # gate, the up pass overwrites it with silu(gate) * up and keeps each block's |act| max
+        NBL = FF // TN
+        act = nl.ndarray((T, FF), dtype=nl.float32, buffer=nl.sbuf)
+        mx = nl.ndarray((T, NBL), dtype=nl.float32, buffer=nl.sbuf)
+        for W, S, second in ((gt, gs, False), (ut, us, True)):                        # Python-level: two projection passes
+            for nb in nl.affine_range(NBL):
+                a0 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
+                a1 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
+                for kb in nl.sequential_range(H // TK):
+                    if dge is None:
+                        wt = _f8(nl.load(W[nl.ds((kb * NBL + nb) * 128, 128), :]), W.dtype)
+                    else:
+                        raw = nl.ndarray((128, 4 * TN), dtype=W.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(src=W[nl.ds((kb * NBL + nb) * 128, 128), :], dst=raw, dge_mode=dge)
+                        wt = _f8(raw, W.dtype)
+                    for jj in nl.static_range(4):
+                        xk = _f8(hx[:, nl.ds((kb * 4 + jj) * T, T)], h8T.dtype)
+                        a0 += nl.matmul(xk, wt[:, nl.ds(jj * TN, NC)], transpose_x=True)
+                        a1 += nl.matmul(xk, wt[:, nl.ds(jj * TN + NC, NC)], transpose_x=True)
+                sc = nl.broadcast_to(nl.load(S[0:1, nl.ds(nb * TN, TN)]), shape=(T, TN))
+                for c, acc in ((0, a0), (NC, a1)):
+                    v = nl.multiply(nl.multiply(acc, hs), sc[:, nl.ds(c, NC)])
+                    if second:
+                        act[:, nl.ds(nb * TN + c, NC)] = nl.multiply(nl.silu(act[:, nl.ds(nb * TN + c, NC)]), v)
+                    else:
+                        act[:, nl.ds(nb * TN + c, NC)] = v
+                if second:
+                    mx[:, nl.ds(nb, 1)] = nisa.tensor_reduce(np.max, nl.abs(act[:, nl.ds(nb * TN, TN)]), axis=(1,), dtype=nl.float32)
+        aa = nl.maximum(nl.multiply(nisa.tensor_reduce(np.max, mx, axis=(1,), dtype=nl.float32), 1.0 / 224.0), 1e-20)   # [T, 1]
+        ra = nl.reciprocal(aa)
+        a8 = nl.ndarray((T, FF), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        for nb in nl.affine_range(NBL):
+            a8[:, nl.ds(nb * TN, TN)] = nl.multiply(act[:, nl.ds(nb * TN, TN)], ra, dtype=nl.float8_e4m3)
+        ax = nl.ndarray((128, FT * T), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        for ft in nl.affine_range(FT):
+            ax[:, nl.ds(ft * T, T)] = nl.copy(nisa.nc_transpose(a8[:, nl.ds(ft * 128, 128)]), dtype=nl.float8_e4m3)
+        NBD = H // TN
+        for nb in nl.affine_range(NBD):
+            d0 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
+            d1 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
+            for kb in nl.sequential_range(FF // TK):
+                if dge is None:
+                    wd = _f8(nl.load(dt[nl.ds((kb * NBD + nb) * 128, 128), :]), dt.dtype)
+                else:
+                    rawd = nl.ndarray((128, 4 * TN), dtype=dt.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(src=dt[nl.ds((kb * NBD + nb) * 128, 128), :], dst=rawd, dge_mode=dge)
+                    wd = _f8(rawd, dt.dtype)
+                for jj in nl.static_range(4):
+                    d0 += nl.matmul(ax[:, nl.ds((kb * 4 + jj) * T, T)], wd[:, nl.ds(jj * TN, NC)], transpose_x=True)
+                    d1 += nl.matmul(ax[:, nl.ds((kb * 4 + jj) * T, T)], wd[:, nl.ds(jj * TN + NC, NC)], transpose_x=True)
+            dsc = nl.broadcast_to(nl.load(ds[0:1, nl.ds(nb * TN, TN)]), shape=(T, TN))
+            nl.store(y[:, nl.ds(nb * TN, NC)], nl.multiply(nl.multiply(d0, aa), dsc[:, 0:NC]))
+            nl.store(y[:, nl.ds(nb * TN + NC, NC)], nl.multiply(nl.multiply(d1, aa), dsc[:, NC:TN]))
+        return y
+    return mlp
+
+
+mlp_fp8_tiled = make_mlp_tiled()
+
+
 def mlp_reference(h, gf, gs, uf, us, df, ds):
     """numpy f32 reference with fp8_linear's activation quantisation. h [T, H] f32; weights as float32 values of the E4M3 codes."""
     import ml_dtypes

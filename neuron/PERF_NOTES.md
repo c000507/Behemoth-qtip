@@ -440,3 +440,15 @@ the larger lever (up to ~15 %).
 runtime multiplies) and a QTIP-hfized llama config with layer_formats all nvfp4; checkpoint.cpp skips the Hadamard-size check when no layer
 is QTIP. Cydonia-24B-v4.3 (Mistral Small 3.x: hidden 5120, 32 / 8 heads, head_dim 128, ff 32768, vocab 131072, 40 layers) on trn1.2xlarge
 TP = 2: per core 10.99 GiB FP8 weights + 2.50 GiB KV (2048 pages), load ~170 s, 71 ms/token single stream (ctx ~400), coherent output.
+
+**NKI MLP (weights moving, tiled layout).** `nki_mlp.mlp_fp8_tiled`: gate / up / down with the activation stationary and every weight tile
+streaming through the PE; weights stored by the runtime at upload in `tile_weight`'s layout (partition rows of 4 x 1 KB = 4 KB contiguous,
+4 K-subtiles per DMA, 2 PSUM banks per pass) when the layer NEFFs say `mlp: tiled` (trace_model `MLP=nki`, needs WT=1 and UNSAFE_FP8FNCAST=1;
+steps wider than MLP_ROWS untile in the graph). One f32 activation buffer (SBUF: FF = 16384 per rank for 24B). Profiles (one rank):
+8B 385 us (XLA MLP ~470), 24B 1041 us at 1 row / 986 us at 8 rows (255 GB/s). Untiled variants: 1 KB rows ~205 GB/s, dge_mode.none helps
+only with 1 KB rows. 8B end to end (bf16 KV): oracle 13/13 top-1, mean KL 0.0091; ctx 300 27.9 ms/token (30.1), ctx 14k 36.0 (38.9).
+
+**Prefix cache on Neuron.** neuron_engine.cpp uses the GPU engine's PrefixCache and scheduler hooks with synchronous copies between steps
+(NeuronModel::kv_save / kv_restore: per layer and rank, runs of consecutive pages per nrt transfer, FP8 scales included). 8B, 7678-token
+prompt: 7.71 s cold, 1.57 s repeated (7677 cached, device-tier hit, identical greedy output), follow-up turn 1.90 s (7717 cached, host-tier
+restore of 486 pages in 205 ms). Host tier capped at BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8); BEHEMOTH_NEURON_PREFIX_CACHE=0 disables.

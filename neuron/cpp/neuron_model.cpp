@@ -11,7 +11,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -79,6 +81,7 @@ struct Meta {
     bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
     bool kv8 = false;                             // kind "layer": FP8 KV cache (E4M3 bytes + f32 scale per K|V, token, head), trace_model.py KV=fp8
     bool wt = false;                              // kind "layer": FP8 projections stored transposed [in][out] (trace_model.py WT=1)
+    bool mlp_tiled = false;                       // kind "layer": gate / up / down in nki_mlp.tile_weight's layout (trace_model.py MLP=nki)
     std::string weights = "fp8";                  // kind "layer": "fp8" (seven E4M3 shards) or "qtip" (q/o/gate/up/down trellis resident)
     std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
     Geometry geometry;
@@ -189,7 +192,8 @@ struct NeuronModel::Impl {
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
     size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
     bool kv8 = false, kv8_seen = false;                                // FP8 KV cache: cache bytes + a scale tensor per layer (meta.kv)
-    bool weights_transposed = false, wt_seen = false;                  // FP8 NEFFs take [in][out] projections (meta.wt, all alike)
+    bool weights_transposed = false, wt_seen = false;
+    bool mlp_tiled = false, mlp_seen = false;                          // FP8 NEFFs take tiled gate / up / down (meta.mlp, all alike)                  // FP8 NEFFs take [in][out] projections (meta.wt, all alike)
     std::vector<bool> compressed;                                      // per layer: QTIP projections resident as trellis (decide_modes)
     int n_compressed = 0;
 
@@ -267,7 +271,12 @@ struct NeuronModel::Impl {
                     throw std::runtime_error("layer NEFFs mix FP8 and bf16 KV caches");
                 kv8 = m.kv8;
                 kv8_seen = true;
+                m.mlp_tiled = j.value("mlp", std::string("plain")) == "tiled";
                 if (m.weights == "fp8") {
+                    if (mlp_seen && mlp_tiled != m.mlp_tiled)
+                        throw std::runtime_error("FP8 layer NEFFs in " + options.neff_dir.string() + " mix tiled (MLP=nki) and plain MLP weights");
+                    mlp_tiled = m.mlp_tiled;
+                    mlp_seen = true;
                     if (wt_seen && weights_transposed != m.wt)
                         throw std::runtime_error("FP8 layer NEFFs in " + options.neff_dir.string() + " mix transposed (WT=1) and plain weights");
                     weights_transposed = m.wt;
@@ -373,6 +382,55 @@ struct NeuronModel::Impl {
 
     size_t kv_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * size_t(dim) * (kv8 ? 1 : 2); }
     size_t kv_scale_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * 4; }
+    // Prefix cache: one host page holds this 16-token page's K/V (and FP8 scales) of every layer of every rank,
+    // laid out [rank][layer][K/V bytes | scales]. Runs of consecutive device pages move in one transfer per layer and tensor.
+    size_t kv_page_stride() const { return 2 * size_t(kv_local) * PAGE * size_t(dim) * (kv8 ? 1 : 2); }
+    size_t kv_scale_page_stride() const { return kv8 ? 2 * size_t(kv_local) * PAGE * 4 : 0; }
+    size_t kv_page_rank_bytes() const { return size_t(config.layers) * (kv_page_stride() + kv_scale_page_stride()); }
+    void kv_copy(std::span<const int> device, std::span<const int> host, std::byte *arena, bool save) {
+        if (device.size() != host.size())
+            throw std::invalid_argument("kv copy: page lists differ in length");
+        for (int p : device)
+            if (p < 0 || p >= pages_total - 1)
+                throw std::invalid_argument("kv copy: page outside the pool");
+        const size_t rank_bytes = kv_page_rank_bytes(), page_bytes = rank_bytes * size_t(tp);
+        std::vector<std::pair<size_t, size_t>> runs; // [begin, end) into device: consecutive page ids
+        for (size_t i = 0; i < device.size();) {
+            size_t j = i + 1;
+            while (j < device.size() && device[j] == device[j - 1] + 1)
+                ++j;
+            runs.push_back({i, j});
+            i = j;
+        }
+        std::vector<std::future<void>> jobs;
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                std::vector<std::byte> buf;
+                for (int l = 0; l < config.layers; ++l) {
+                    const auto &lw = ranks[size_t(r)].layers[size_t(l)];
+                    const size_t base = size_t(r) * rank_bytes + size_t(l) * (kv_page_stride() + kv_scale_page_stride());
+                    for (int which = 0; which < (kv8 ? 2 : 1); ++which) {
+                        const Dev &t = which ? lw.ks : lw.kv;
+                        const size_t stride = which ? kv_scale_page_stride() : kv_page_stride(), sub = which ? kv_page_stride() : 0;
+                        for (auto [a, b] : runs) {
+                            const size_t n = b - a;
+                            buf.resize(n * stride);
+                            if (save) {
+                                check(nrt_tensor_read(t.t, buf.data(), size_t(device[a]) * stride, n * stride), "kv save");
+                                for (size_t k = 0; k < n; ++k)
+                                    std::memcpy(arena + size_t(host[a + k]) * page_bytes + base + sub, buf.data() + k * stride, stride);
+                            } else {
+                                for (size_t k = 0; k < n; ++k)
+                                    std::memcpy(buf.data() + k * stride, arena + size_t(host[a + k]) * page_bytes + base + sub, stride);
+                                check(nrt_tensor_write(t.t, buf.data(), size_t(device[a]) * stride, n * stride), "kv restore");
+                            }
+                        }
+                    }
+                }
+            }));
+        for (auto &j : jobs)
+            j.get();
+    }
 
     // Load every NEFF on both cores and create its step tensors. Tensor sets are built after the weights exist.
     void load_buckets() {
@@ -520,6 +578,20 @@ struct NeuronModel::Impl {
                     for (int i = 0; i < s.rows; ++i)
                         for (int j = 0; j < s.cols; ++j)
                             t[size_t(j) * size_t(s.rows) + size_t(i)] = s.w[size_t(i) * size_t(s.cols) + size_t(j)];
+                    if (mlp_tiled && (p.slot == 8 || p.slot == 10 || p.slot == 12)) {
+                        // nki_mlp.tile_weight: [K][N] -> blocks (kb, nb) of 128 partition rows of 4 x 1024 (rows kb*512 + j*128 + q)
+                        const size_t K = size_t(s.cols), N = size_t(s.rows);
+                        if (K % 512 || N % 1024)
+                            throw std::runtime_error(std::string(p.name) + ": tiled MLP needs K % 512 == 0 and N % 1024 == 0");
+                        std::vector<uint8_t> tiled(t.size());
+                        const size_t NBL = N / 1024;
+                        for (size_t k = 0; k < K; ++k) {
+                            const size_t kb = k / 512, jj = (k % 512) / 128, q = k % 128;
+                            for (size_t nb = 0; nb < NBL; ++nb)
+                                std::memcpy(&tiled[(((kb * NBL + nb) * 128 + q) * 4 + jj) * 1024], &t[k * N + nb * 1024], 1024);
+                        }
+                        t.swap(tiled);
+                    }
                     put(lw.w[p.slot], t.data(), t.size());
                 } else
                     put(lw.w[p.slot], s.w.data(), s.w.size());
@@ -1210,4 +1282,11 @@ int NeuronModel::max_context() const {
 }
 std::span<const float> NeuronModel::forward(const InferenceBatch &b) { return impl_->forward(b); }
 nlohmann::json NeuronModel::last_profile() const { return impl_->profile; }
+size_t NeuronModel::kv_page_bytes() const { return impl_->kv_page_rank_bytes() * size_t(impl_->tp); }
+void NeuronModel::kv_save(std::span<const int> device_pages, std::span<const int> host_pages, std::byte *arena) {
+    impl_->kv_copy(device_pages, host_pages, arena, true);
+}
+void NeuronModel::kv_restore(std::span<const int> host_pages, std::span<const int> device_pages, const std::byte *arena) {
+    impl_->kv_copy(device_pages, host_pages, const_cast<std::byte *>(arena), false);
+}
 } // namespace neuron

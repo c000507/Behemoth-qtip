@@ -2,9 +2,12 @@
 // metrics, with neuron::NeuronModel as the model backend. Same public contract as runtime/src/engine.cpp
 // (engine.hpp), so runtime/src/server.cpp links against it unchanged.
 //
-// Not carried over from the GPU engine: the prefix cache (KV save/restore) and structured-output constraints;
-// submit() rejects a constraint instead of ignoring it.
+// Prefix cache: the GPU engine's PrefixCache and scheduler hooks unchanged, with synchronous copies on the loop thread
+// (forward() is blocking, so saves and restores run between steps): a finished request's pages stay resident as the
+// cache's device tier (zero-copy hit for the next request with that prefix) and are copied to a host arena when the
+// pool needs them back. Not carried over: structured-output constraints (submit() rejects a constraint).
 #include "behemoth/engine.hpp"
+#include "behemoth/prefix_cache.hpp"
 #include "behemoth/constraint.hpp"
 #include "behemoth/sampling.hpp"
 #include "neuron_model.hpp"
@@ -112,6 +115,13 @@ struct Engine::Impl {
     double spec_page_cost = 0.01, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
+    // prefix cache (null when disabled): leases of requests restoring a prefix, requests waiting for their restore
+    std::unique_ptr<PrefixCache> cache;
+    std::map<uint64_t, PrefixCache::Lease> leases;
+    std::vector<uint64_t> awaiting;
+    std::vector<std::byte> arena; // host tier: host page h at h * model.kv_page_bytes()
+    uint64_t gpu_hits = 0, host_hits = 0, restored_tokens = 0, saves = 0, saved_pages = 0, failed_saves = 0;
+    double save_ms = 0, restore_ms = 0;
     std::thread thread;
 
     static int env_int(const char *name, int fallback) {
@@ -144,6 +154,27 @@ struct Engine::Impl {
         spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
         if (const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_PAGE_COST"))
             spec_page_cost = std::atof(v);
+        if (o.prefix_cache.slots && env_int("BEHEMOTH_NEURON_PREFIX_CACHE", 1)) {
+            auto co = o.prefix_cache;
+            // host tier: --prefix-cache-gb, capped by BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8: the instance's RAM also
+            // holds the embeddings and the load-time staging)
+            const char *cap_env = std::getenv("BEHEMOTH_NEURON_PREFIX_HOST_GB");
+            const double cap = std::min(std::max(0.0, o.prefix_cache_gb), cap_env ? std::atof(cap_env) : 8.0) * 1e9;
+            co.host_pages = size_t(cap / double(model.kv_page_bytes()));
+            if (!co.host_pages)
+                throw std::invalid_argument("Prefix cache memory cap below one page");
+            cache = std::make_unique<PrefixCache>(co);
+            arena.resize(co.host_pages * model.kv_page_bytes()); // untouched pages stay unbacked
+            scheduler.set_retain_finished(true);
+            scheduler.set_reclaim([this](size_t need) {
+                std::vector<int> pages;
+                cache->reclaim_gpu(need, pages);
+                return pages;
+            });
+            std::cerr << "Prefix cache: " << co.slots << " slots, host tier " << double(arena.size()) / 1e9 << " GB ("
+                      << co.host_pages << " pages of " << model.kv_page_bytes() / 1024 << " KiB), device tier "
+                      << (co.gpu_tier ? "on" : "off") << "\n";
+        }
         thread = std::thread([this] { loop(); });
     }
     ~Impl() { shutdown(); }
@@ -167,8 +198,113 @@ struct Engine::Impl {
         events.clear();
     }
 
-    void forget(uint64_t id) { // under the lock
+    // Under the lock: a done request's sequence (prompt + generated tokens with KV) is offered to the prefix cache, the
+    // pages it needs copied to the host tier now (synchronously: no step is running), then the request is erased.
+    void retire(uint64_t id) {
+        auto lease = leases.find(id);
+        if (cache) {
+            const auto &r = scheduler.request(id);
+            auto pages = scheduler.take_pages(id);
+            std::vector<int> release;
+            PrefixCache::SavePlan plan;
+            if (!failed && r.cached && pages.size() >= ceil_div(r.cached, 16)) {
+                const PrefixCache::Lease *restored =
+                    lease != leases.end() && r.restored && r.restored == lease->second.tokens ? &lease->second : nullptr;
+                plan = cache->insert(std::span<const int>(r.history.data(), r.cached), r.prompt_size, restored, release);
+            }
+            if (!plan.slot)
+                release.insert(release.end(), pages.begin(), pages.end());
+            else {
+                const size_t first = plan.first_page, n = plan.slot->host.size();
+                bool ok = true;
+                if (first < n)
+                    try {
+                        const auto t0 = Clock::now();
+                        model.kv_save(std::span<const int>(pages.data() + first, n - first),
+                                      std::span<const int>(plan.slot->host.data() + first, n - first), arena.data());
+                        save_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                        ++saves;
+                        saved_pages += n - first;
+                    } catch (const std::exception &e) {
+                        std::cerr << "Prefix cache: save failed: " << e.what() << "\n";
+                        ok = false;
+                        ++failed_saves;
+                    }
+                if (ok)
+                    cache->saved(plan, std::move(pages), release);
+                else {
+                    cache->abandon(plan);
+                    release.insert(release.end(), pages.begin(), pages.end());
+                }
+            }
+            scheduler.release_pages(release);
+        }
+        if (lease != leases.end()) {
+            cache->release(lease->second);
+            leases.erase(lease);
+        }
         scheduler.erase(id);
+    }
+
+    // Under the lock, before scheduling: restore the prefixes of waiting requests, from the device tier (the slot's
+    // resident pages, no copy) or the host tier into freshly allocated pages (whole prefix, else whatever whole pages fit).
+    void start_restores() {
+        for (auto it = awaiting.begin(); it != awaiting.end();) {
+            const uint64_t id = *it;
+            auto &lease = leases.at(id);
+            auto slot = lease.slot;
+            if (slot->failed) {
+                scheduler.abort_restore(id);
+                cache->release(lease);
+                leases.erase(id);
+                it = awaiting.erase(it);
+                continue;
+            }
+            if (!slot->ready) {
+                ++it;
+                continue;
+            }
+            size_t m = lease.tokens;
+            std::vector<int> release;
+            auto gpu = cache->take_gpu(slot, ceil_div(m, 16), release);
+            scheduler.release_pages(release);
+            if (!gpu.empty()) {
+                scheduler.begin_restore(id, std::move(gpu));
+                scheduler.finish_restore(id, m);
+                ++gpu_hits;
+                restored_tokens += m;
+                it = awaiting.erase(it);
+                continue;
+            }
+            std::vector<int> table;
+            if (!scheduler.allocate_pages(table, m)) {
+                const size_t fit = std::min(m, scheduler.free_pages() * 16);
+                if (fit < cache->options().min_tokens || !scheduler.allocate_pages(table, fit)) {
+                    ++it;
+                    continue;
+                }
+                m = lease.tokens = fit;
+            }
+            scheduler.begin_restore(id, table);
+            try {
+                const auto t0 = Clock::now();
+                model.kv_restore(std::span<const int>(lease.host.data(), ceil_div(m, 16)), std::span<const int>(table.data(), ceil_div(m, 16)), arena.data());
+                restore_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                scheduler.finish_restore(id, m);
+                ++host_hits;
+                restored_tokens += m;
+            } catch (const std::exception &e) {
+                std::cerr << "Prefix cache: restore failed: " << e.what() << "\n";
+                scheduler.abort_restore(id);
+                cache->release(lease);
+                leases.erase(id);
+            }
+            it = awaiting.erase(it);
+        }
+    }
+
+    void forget(uint64_t id) { // under the lock
+        retire(id);
         callbacks.erase(id);
         rng.erase(id);
         submitted.erase(id);
@@ -192,8 +328,13 @@ struct Engine::Impl {
                     return;
                 }
                 for (auto it = cancellations.begin(); it != cancellations.end(); it = cancellations.erase(it))
-                    if (callbacks.contains(*it) && !scheduler.request(*it).done)
+                    if (callbacks.contains(*it) && !scheduler.request(*it).done) {
+                        if (scheduler.request(*it).restoring) { // restores are synchronous: only a waiting one can be cancelled
+                            awaiting.erase(std::find(awaiting.begin(), awaiting.end(), *it));
+                            scheduler.abort_restore(*it);
+                        }
                         scheduler.cancel(*it);
+                    }
                 for (auto it = callbacks.begin(); it != callbacks.end();) {
                     const auto &r = scheduler.request(it->first);
                     if (!r.done) {
@@ -205,6 +346,8 @@ struct Engine::Impl {
                     ++it;
                     forget(id);
                 }
+                if (cache)
+                    start_restores();
                 step = scheduler.schedule();
                 drafts.clear();
                 if (!step.requests.empty()) {
@@ -360,6 +503,12 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
     if (impl_->failed || impl_->stop)
         throw std::runtime_error("Engine unavailable");
     const uint64_t id = impl_->scheduler.submit(prompt, max_new, options);
+    if (impl_->cache)
+        if (auto lease = impl_->cache->lookup(prompt)) {
+            impl_->scheduler.wait_restore(id);
+            impl_->leases.emplace(id, std::move(*lease));
+            impl_->awaiting.push_back(id);
+        }
     impl_->callbacks[id] = std::move(callback);
     impl_->rng.emplace(id, std::mt19937_64(options.seed));
     impl_->submitted[id] = Impl::Clock::now();
@@ -401,6 +550,22 @@ nlohmann::json Engine::metrics() const {
             {"ttft_ms_p95", percentile(impl_->ttft, .95)},
             {"itl_ms_p50", percentile(impl_->itl, .5)},
             {"itl_ms_p95", percentile(impl_->itl, .95)},
-            {"last_step", impl_->last_profile}};
+            {"last_step", impl_->last_profile},
+            {"prefix_cache", impl_->cache ? nlohmann::json{{"slots", impl_->cache->slots()},
+                                                           {"hits", impl_->cache->stats().hits},
+                                                           {"misses", impl_->cache->stats().misses},
+                                                           {"device_hits", impl_->gpu_hits},
+                                                           {"host_hits", impl_->host_hits},
+                                                           {"restored_tokens", impl_->restored_tokens},
+                                                           {"cached_tokens", impl_->cache->cached_tokens()},
+                                                           {"device_pages", impl_->cache->gpu_pages()},
+                                                           {"host_pages_used", impl_->cache->host_pages_used()},
+                                                           {"saves", impl_->saves},
+                                                           {"saved_pages", impl_->saved_pages},
+                                                           {"failed_saves", impl_->failed_saves},
+                                                           {"save_ms", impl_->save_ms},
+                                                           {"restore_ms", impl_->restore_ms},
+                                                           {"awaiting_restore", impl_->awaiting.size()}}
+                                           : nlohmann::json(nullptr)}};
 }
 } // namespace behemoth

@@ -106,6 +106,10 @@ if KV8:
 DOWN_BF16 = os.environ.get('DOWN_BF16', '0') == '1'  # diagnosis only: down_proj with bf16 activations (weights cast in-graph), no fp8 activation quantisation
 OUT_F32 = os.environ.get('OUT_F32', '0') == '1'  # o_proj / down_proj partial sums stay f32 into the all-reduce (bf16 rounding of massive-activation channels)
 WT = os.environ.get('WT') == '1'  # FP8 projections stored transposed [in, out]: contraction axis first, contiguous DMA rows
+# MLP=nki (needs WT=1): gate / up / down in the tiled layout of nki_mlp.tile_weight, decode steps (T <= MLP_ROWS) through
+# nki_mlp.mlp_fp8_tiled (weights as the moving operand, 4 KB DMA rows), wider steps (prefill) untile in the graph
+MLP = os.environ.get('MLP', 'xla')
+MLP_ROWS = int(os.environ.get('MLP_ROWS', 32))
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
 HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 
@@ -139,7 +143,17 @@ def shapes(R, Q, P, pages):
     if WT:
         for n in ('qf', 'of', 'kf', 'vf', 'gf', 'uf', 'df'):
             s[n] = (s[n][0][::-1], s[n][1])
+    if MLP == 'nki':
+        assert WT, 'MLP=nki needs WT=1'
+        for n in ('gf', 'uf', 'df'):
+            k, n_out = s[n][0]
+            s[n] = ((k // 512 * (n_out // 1024) * 128, 4096), f8)
     return s
+
+
+def untile(w, K, N):
+    """nki_mlp tiled layout -> [K, N] (contraction axis first), in the graph."""
+    return w.reshape(K // 512, N // 1024, 128, 4, 1024).permute(0, 3, 2, 1, 4).reshape(K, N)
 
 
 def layer_order():
@@ -363,6 +377,15 @@ def paged_layer(R, Q, P, *args):
         u = torch.index_select(qtip_graph.rotate_in(act, t['dsu'], FF), -1, t['sel_ff'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)
     else:
+        ff_local = FF // g.TP
+        if MLP == 'nki' and T <= MLP_ROWS:
+            import nki_mlp
+            ha = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+            h8T = (h.float() / ha).to(torch.float8_e4m3fn).T.contiguous()
+            y = nki_mlp.mlp_fp8_tiled(h8T, ha, t['gf'], t['gs'].reshape(1, -1), t['uf'], t['us'].reshape(1, -1), t['df'], t['ds'].reshape(1, -1))
+            return (x + allreduce(y), cache, cscale) if KV8 else (x + allreduce(y), cache)
+        if MLP == 'nki':
+            t = dict(t, gf=untile(t['gf'], H, ff_local), uf=untile(t['uf'], H, ff_local), df=untile(t['df'], ff_local, H))
         act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
         if DOWN_BF16:
             wd = t['df'] if WT else t['df'].T
@@ -478,7 +501,7 @@ def main():
             fn = lambda *a: paged_layer(R, Q, P, *a)
         if WEIGHTS not in ('fp8', 'qtip'):
             raise SystemExit(f'WEIGHTS={WEIGHTS}: expected fp8 or qtip')
-        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT, 'kv': 'fp8' if KV8 else 'bf16'}
+        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT, 'kv': 'fp8' if KV8 else 'bf16', 'mlp': 'tiled' if MLP == 'nki' else 'plain'}
     elif kind == 'model':
         if WEIGHTS != 'fp8' or KV8:
             raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8 with a bf16 KV cache')

@@ -40,5 +40,10 @@ class NeuronModel {
     // Logits of batch.sample_rows in order: [n_sample][vocab] (valid until the next call).
     std::span<const float> forward(const behemoth::InferenceBatch &);
     nlohmann::json last_profile() const;
+    // Prefix cache: host bytes of one 16-token page (K/V and FP8 scales of every layer and rank), and synchronous copies
+    // between pool pages and host pages of `arena` (host page h at arena + h * kv_page_bytes()). Call between forward()s.
+    size_t kv_page_bytes() const;
+    void kv_save(std::span<const int> device_pages, std::span<const int> host_pages, std::byte *arena);
+    void kv_restore(std::span<const int> host_pages, std::span<const int> device_pages, const std::byte *arena);
 };
 } // namespace neuron
