@@ -303,3 +303,6 @@ modified except for name-based input binding; its 2-position smoke check gave to
 one after the other). Zero rows hid it (z = 0), which is why padding rows matched while real tokens blew up, and the q / o probes never touched
 it. trace_model.py now gathers `[gate | up]` per rank and splits after the gather. Compressed 8B (24 compressed + 8 expanded layers; both NEFF
 variants per bucket), retraced dec1_32 / pre64_32, first three oracle positions: top-1 3/3, mean KL(top-256) 0.0029 (pos 5 / 17 / 100).
+Compressed 8B (24 compressed + 8 expanded layers, pre64_128 / dec1_128 / pre64_32 / dec1_32 graphs), 13 oracle positions 5 .. 1699:
+top-1 13/13, mean KL(top-256) 0.0057 (worst 0.030 at pos 256), versus ~0.02 for the FP8-expanded path (the compressed layers skip the FP8 weight rounding).
+The 256-token compressed prefill graph does not compile in practice (neuronx-cc walrus_driver used 24 GB for 50 min in anti_dependency_analyzer); use 64-token chunks.
