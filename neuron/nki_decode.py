@@ -53,9 +53,12 @@ def row_indices(table_pages, kv, groups):
 
 
 @nki.jit
-def decode_attention(qt, cache, idxk, idxv, bias, mask):
+def decode_attention(qt, cache, idxk, idxv, bias, mask, ksc=None, vsc=None):
     """qt [KVH, D, REP] bf16 (scaled by D ** -0.5), cache [blocks, 1024] bf16, idxk / idxv [KVH, 128, G] int32, bias [G, 16, 1024] f32,
-    mask [16, KVH] f32 (1 where row // 4 == h) -> o [16, D] f32 (row = 4 h + r)."""
+    mask [16, KVH] f32 (1 where row // 4 == h) -> o [16, D] f32 (row = 4 h + r).
+    FP8 cache (ksc / vsc given, [G, 16, 1024] f32 in the same native column order as bias, rows repeated over a head's query heads): cache holds E4M3 pages
+    (uint8 bits or a float8 tensor), converted to bf16 in SBUF; the K scale multiplies the scores, the V scale weights the probabilities before PV
+    (the softmax sum uses the unweighted p), as the GPU runtime does."""
     G = idxk.shape[2]
     out = nl.ndarray((ROWS, D), dtype=nl.float32, buffer=nl.shared_hbm)
     i1, _ = nl.mgrid[:128, :1]
@@ -74,11 +77,18 @@ def decode_attention(qt, cache, idxk, idxv, bias, mask):
     l = nl.zeros((ROWS, 1), dtype=nl.float32, buffer=nl.sbuf)
     acc = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.sbuf)
     for g in nl.sequential_range(G):
-        kraw = nl.ndarray((128, KVH * 1024), dtype=nl.bfloat16, buffer=nl.sbuf)
-        vraw = nl.ndarray((128, KVH * 1024), dtype=nl.bfloat16, buffer=nl.sbuf)
+        kraw = nl.ndarray((128, KVH * 1024), dtype=cache.dtype, buffer=nl.sbuf)
+        vraw = nl.ndarray((128, KVH * 1024), dtype=cache.dtype, buffer=nl.sbuf)
         for h in nl.affine_range(KVH):
             nisa.dma_copy(src=cache[tabk[i1, h * G + g], jf], dst=kraw[:, nl.ds(h * 1024, 1024)])
             nisa.dma_copy(src=cache[tabv[i1, h * G + g], jf], dst=vraw[:, nl.ds(h * 1024, 1024)])
+        if ksc is not None:                                                         # E4M3 pages -> bf16 (exact), scales for this group
+            kb = nl.copy(kraw.view(nl.float8_e4m3) if cache.dtype == nl.uint8 else kraw, dtype=nl.bfloat16)
+            vb = nl.copy(vraw.view(nl.float8_e4m3) if cache.dtype == nl.uint8 else vraw, dtype=nl.bfloat16)
+            ksc_t = nl.load(ksc[g])
+            vsc_t = nl.load(vsc[g])
+        else:
+            kb, vb = kraw, vraw
         bias_t = nl.load(bias[g])                                                   # [16, 1024] f32
         s_sb = nl.ndarray((ROWS, 1024), dtype=nl.float32, buffer=nl.sbuf)
         for half in nl.affine_range(2):
@@ -86,10 +96,13 @@ def decode_attention(qt, cache, idxk, idxv, bias, mask):
             for h in nl.affine_range(KVH):
                 kt_ps = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                 for tt in nl.affine_range(4):
-                    kt_ps[:, nl.ds(tt * 128, 128)] = nisa.nc_transpose(kraw[:, nl.ds(h * 1024 + (half * 4 + tt) * 128, 128)])
+                    kt_ps[:, nl.ds(tt * 128, 128)] = nisa.nc_transpose(kb[:, nl.ds(h * 1024 + (half * 4 + tt) * 128, 128)])
                 kt_sb = nl.copy(kt_ps, dtype=nl.bfloat16)
                 s_ps += nl.matmul(qp[:, nl.ds(h * ROWS, ROWS)], kt_sb, transpose_x=True)
-            s_sb[:, nl.ds(half * 512, 512)] = nl.add(s_ps, bias_t[:, nl.ds(half * 512, 512)])
+            if ksc is not None:
+                s_sb[:, nl.ds(half * 512, 512)] = nl.add(nl.multiply(s_ps, ksc_t[:, nl.ds(half * 512, 512)]), bias_t[:, nl.ds(half * 512, 512)])
+            else:
+                s_sb[:, nl.ds(half * 512, 512)] = nl.add(s_ps, bias_t[:, nl.ds(half * 512, 512)])
         mx = nisa.tensor_reduce(np.max, s_sb, axis=(1,), dtype=nl.float32, negate=False)          # [16, 1]
         m_new = nl.maximum(m, mx)
         alpha = nl.exp(nl.subtract(m, m_new))
@@ -99,16 +112,17 @@ def decode_attention(qt, cache, idxk, idxv, bias, mask):
             p[:, nl.ds(half * 512, 512)] = nisa.activation_reduce(np.exp, s_sb[:, nl.ds(half * 512, 512)], bias=nl.multiply(m_new, -1.0), scale=1.0,
                                                                     reduce_op=nl.add, reduce_res=psum_l[:, nl.ds(half, 1)], dtype=nl.bfloat16)
         l[...] = nl.add(nl.multiply(l, alpha), nl.sum(psum_l, axis=1, keepdims=True))
+        pw = nl.multiply(p, vsc_t, dtype=nl.bfloat16) if ksc is not None else p          # V scale weights the probabilities (not the sum)
         # P^T slices [128 blocks, 16 rows] per (half, tt)
         pt_sb = nl.ndarray((128, 8 * ROWS), dtype=nl.bfloat16, buffer=nl.sbuf)
         for c in nl.affine_range(8):
-            pt_ps = nisa.nc_transpose(p[:, nl.ds(c * 128, 128)])                       # [128, 16]
+            pt_ps = nisa.nc_transpose(pw[:, nl.ds(c * 128, 128)])                       # [128, 16]
             pt_sb[:, nl.ds(c * ROWS, ROWS)] = nl.copy(pt_ps, dtype=nl.bfloat16)
         acc[...] = nl.multiply(acc, alpha)
         for h in nl.sequential_range(KVH):
             pv_ps = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.psum)
             for t in nl.affine_range(8):
-                pv_ps += nl.matmul(pt_sb[:, nl.ds(t * ROWS, ROWS)], vraw[:, nl.ds(h * 1024 + t * 128, 128)], transpose_x=True)
+                pv_ps += nl.matmul(pt_sb[:, nl.ds(t * ROWS, ROWS)], vb[:, nl.ds(h * 1024 + t * 128, 128)], transpose_x=True)
             acc[...] = nl.add(acc, nl.multiply(pv_ps, rowmask[:, nl.ds(h, 1)]))
         m[...] = m_new
     res = nl.divide(acc, l)
