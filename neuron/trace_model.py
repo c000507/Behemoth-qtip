@@ -95,6 +95,7 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
+OUT_F32 = os.environ.get('OUT_F32', '0') == '1'  # o_proj / down_proj partial sums stay f32 into the all-reduce (bf16 rounding of massive-activation channels)
 WT = os.environ.get('WT') == '1'  # FP8 projections stored transposed [in, out]: contraction axis first, contiguous DMA rows
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
 HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
@@ -225,7 +226,7 @@ def paged_layer(R, Q, P, *args):
         u = torch.index_select(qtip_graph.rotate_in(attn_full, t['osu'], H), -1, t['sel_h'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['ow'], t['ol'])), t['osv'], H)
     else:
-        x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
+        x = x + allreduce(lin_fp8(attn, w('of', 'os'), OUT_F32).float())
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm2']).to(torch.bfloat16)
     if qtip:
         # gate | up column-parallel with one all-gather; their full outputs are replicated, so down (row-parallel)
@@ -243,7 +244,7 @@ def paged_layer(R, Q, P, *args):
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)
     else:
         act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
-        x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds')).float())
+        x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds'), OUT_F32).float())
     return x, cache
 
 

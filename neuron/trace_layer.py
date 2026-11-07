@@ -263,18 +263,19 @@ class Fp8Weight:
         self.wf, self.sc, self.transposed = wf, sc, transposed  # transposed: wf is [in, out], contraction axis first
 
 
-def fp8_linear(h, w):
+def fp8_linear(h, w, f32=False):
     """Scale the activation row into E4M3 range, run the matmul on the fp8 operands directly (no
     weight cast in the graph), then apply activation and per-row weight scales to the output.
     Compile after retargeting F8E4M3FN -> F8E4M3 (tools_patch_fp8_hlo.py)."""
     a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
     h8 = (h.float() / a).to(torch.float8_e4m3fn)
     y = torch.matmul(h8, w.wf if w.transposed else w.wf.T)
-    return (y.float() * a * w.sc.reshape(1, -1)).to(torch.bfloat16)
+    y = y.float() * a * w.sc.reshape(1, -1)
+    return y if f32 else y.to(torch.bfloat16)
 
 
-def lin_fp8(h, w):
-    return fp8_linear(h, w) if isinstance(w, Fp8Weight) else h @ w.T
+def lin_fp8(h, w, f32=False):
+    return fp8_linear(h, w, f32) if isinstance(w, Fp8Weight) else h @ w.T
 
 
 def layer_graph_fp8mm(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
