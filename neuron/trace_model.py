@@ -95,6 +95,7 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
+DOWN_BF16 = os.environ.get('DOWN_BF16', '0') == '1'  # diagnosis only: down_proj with bf16 activations (weights cast in-graph), no fp8 activation quantisation
 OUT_F32 = os.environ.get('OUT_F32', '0') == '1'  # o_proj / down_proj partial sums stay f32 into the all-reduce (bf16 rounding of massive-activation channels)
 WT = os.environ.get('WT') == '1'  # FP8 projections stored transposed [in, out]: contraction axis first, contiguous DMA rows
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
@@ -244,7 +245,11 @@ def paged_layer(R, Q, P, *args):
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)
     else:
         act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
-        x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds'), OUT_F32).float())
+        if DOWN_BF16:
+            wd = t['df'] if WT else t['df'].T
+            x = x + allreduce((torch.matmul(act.to(torch.bfloat16), wd.to(torch.bfloat16)).float() * t['ds'].reshape(1, -1)))
+        else:
+            x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds'), OUT_F32).float())
     return x, cache
 
 
