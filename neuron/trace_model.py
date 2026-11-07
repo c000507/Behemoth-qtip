@@ -174,7 +174,7 @@ def paged_layer(R, Q, P, *args):
     if qtip:
         # q column-parallel: rotate the replicated input, multiply this rank's rows of W~, all-gather z, finish on the
         # full vector and keep this rank's heads
-        z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']), t['sel_h'], H, allreduce)
+        z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']), t['sel_h'], H, allreduce, g.TP)
         q = torch.index_select(qtip_graph.finish(z, t['qsv'], H), -1, t['sel_h']).reshape(T, heads, D)
     else:
         q = lin_fp8(h, w('qf', 'qs')).float().reshape(T, heads, D)
@@ -196,7 +196,7 @@ def paged_layer(R, Q, P, *args):
     if qtip:
         # o row-parallel: the rotation needs all heads (all-gather, rank order = head order), this rank multiplies its
         # columns of W~ by its slice of u, the partial z is all-reduced and finished on both ranks
-        attn_full = qtip_graph.gather_tp(attn.float(), t['sel_h'], H, allreduce)
+        attn_full = qtip_graph.gather_tp(attn.float(), t['sel_h'], H, allreduce, g.TP)
         u = torch.index_select(qtip_graph.rotate_in(attn_full, t['osu'], H), -1, t['sel_h'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['ow'], t['ol'])), t['osv'], H)
     else:
@@ -208,7 +208,7 @@ def paged_layer(R, Q, P, *args):
         zg = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['gsu'], H), t['gw'], t['gl'])
         zu = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['usu'], H), t['uw'], t['ul'])
         sel2 = torch.cat((t['sel_ff'], t['sel_ff'] + FF))                      # [gate (FF) | up (FF)]: this rank's slices
-        z = qtip_graph.gather_tp(torch.cat((zg, zu), dim=-1), sel2, 2 * FF, allreduce).reshape(T, 2, FF)
+        z = qtip_graph.gather_tp(torch.cat((zg, zu), dim=-1), sel2, 2 * FF, allreduce, g.TP).reshape(T, 2, FF)
         gate = qtip_graph.finish(z[:, 0], t['gsv'], FF)
         up = qtip_graph.finish(z[:, 1], t['usv'], FF)
         act = torch.nn.functional.silu(gate) * up

@@ -40,12 +40,12 @@ allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(TP))])
 
 
 def col_graph(x, su, sv, words, lut, sel):           # replicated x -> this rank's slice of y
-    z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(x.to(torch.bfloat16), su, width), words, lut), sel, out, allreduce)
+    z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(x.to(torch.bfloat16), su, width), words, lut), sel, out, allreduce, TP)
     return torch.index_select(qtip_graph.finish(z, sv, out), -1, sel)
 
 
 def row_graph(x_local, su, sv, words, lut, sel):     # this rank's slice of x -> full y (replicated)
-    u = torch.index_select(qtip_graph.rotate_in(qtip_graph.gather_tp(x_local, sel, width, allreduce), su, width), -1, sel)
+    u = torch.index_select(qtip_graph.rotate_in(qtip_graph.gather_tp(x_local, sel, width, allreduce, TP), su, width), -1, sel)
     return qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, words, lut)), sv, out)
 
 

@@ -93,7 +93,8 @@ if __name__ == '__main__':
                 sel = torch.arange(out // TP) + rank * (out // TP)
                 u = qtip_graph.rotate_in(xt.to(torch.bfloat16), su_t, width)
                 z_local = u.float() @ shard.T                                              # [T, out/TP]
-                full = torch.zeros(T, out).index_copy(-1, sel, z_local)                  # gather_tp before the all-reduce
+                mask = torch.zeros(out).index_fill(0, sel, 1.0).reshape(1, out)
+            full = torch.cat([z_local] * TP, dim=-1) * mask                              # gather_tp before the all-reduce
             else:
                 sel = torch.arange(width // TP) + rank * (width // TP)
                 u = torch.index_select(qtip_graph.rotate_in(xt.to(torch.bfloat16), su_t, width), -1, sel)
