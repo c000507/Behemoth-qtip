@@ -198,3 +198,18 @@ start in prefill buckets. The step log prints `drafts=` and `tokens=` per step, 
 * The numerics of a bucket are not bit-identical to another bucket's (different fusion in neuronx-cc, fp8 rounding
   amplifies it, ~6-8 % relative logit difference between the 1-row and 8-row decode graphs), so greedy text can diverge
   late between requests served by different buckets; quality against the oracle is the same.
+
+### Layer-31 anomaly: what was found, and why a single NEFF is no longer worth chasing
+
+Real-text check (prompt tokens fed as single-row steps, BEHEMOTH_PREFILL_CHUNK=1, CUDA oracle, 7 positions): chain of two 16-layer segment graphs
+(layers 0-15, 16-31) is genuinely wrong, mean KL 5.2 and the same junk token at every position, versus 0.011 for the layer-by-layer path. Chains of
+1-, 2- and 4-layer segment graphs (32 / 16 / 8 launches, layer 31 in the last segment) are correct (KL 0.004-0.006), so the failure needs a large graph.
+It needs layer 31's real MLP data: with NEURON_SWAP_TENSORS rebinding any one of layer 31's gate / up / down tensors (weights alone or scales alone)
+from layer 30 the two paths agree again (the layer-31 MLP output cancels a residual of rms ~8 down to ~0.9, so the residual is cancellation-sensitive).
+Ruled out: bf16 rounding before the all-reduce (OUT_F32=1 gives identical results), fp8 quantisation of the down_proj input (DOWN_BF16=1 still wrong),
+tensor order / sizes, upload order, KV tensors, compiler flags (identical). Not root-caused; the likely class is a graph-size dependent numeric or
+scheduling difference in neuronx-cc that cancellation amplifies.
+It does not matter for speed any more: with async execution (depth 8) decode takes 37.9 ms/token with 32 layer launches, 37.6 ms with 8 four-layer
+segment launches, 40.0 ms with 16 two-layer ones and 44.0 ms with 32 one-layer segment graphs (plain-layout buckets, ctx 100), i.e. fewer launches buy
+about 1 %. The layer NEFF stays the default. Debug hooks: NEURON_SWAP_TENSORS / _FROM / _TARGET, NEURON_X_IN, NEURON_LAYER_OFFSET (loader names only
+partly covered), BEHEMOTH_PREFILL_CHUNK (CLI), trace_model.py OUT_F32 / DOWN_BF16.
