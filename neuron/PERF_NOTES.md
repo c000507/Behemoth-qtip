@@ -407,3 +407,13 @@ engine active 245 us (E4M3 -> bf16 conversion of both pages tiles plus the scale
 a whole page-head (16 tokens, 2 KB in fp8) per row (128 pages per DMA, 16 transposes per head and group), move the V conversion to the scalar / gpsimd engine, and
 build the native-order K / V scale tensors in the cache write instead of permuting them per layer in XLA. Expected ~170-200 us, i.e. ~3 ms/token at 14k over the bf16 kernel.
 Batched decode (R > 1) through the kernel is also not done (it runs one request).
+
+**Batched NKI decode, FP8 v2 and the rebuilt standard set.** The kernel takes R requests per launch (loop over requests inside the kernel; build_buckets.sh now builds decode graphs of
+up to 8 rows and 128+ pages with it, `ATTN_DEC=nki` default; smaller graphs keep the torch-op loop because the kernel pads to 64 pages). 8 requests x 1500-token prompts: ITL 45.9 -> 39.0 ms.
+Rebuilt set (bf16 cache, dec{1,4,8} x {128,512,1024} with the kernel, everything else as before): oracle with every prompt token as a decode step so the 128 / 512-page kernel graphs are
+exercised, all 13 positions 5 .. 1699: top-1 13/13, mean KL 0.0099; normal chunked-prefill oracle on the same set: 13/13, mean KL 0.0095. Speed: ctx 300 30.1 ms/token, ctx 14k 38.9 ms/token
+(43.0 before the kernel), 32 concurrent 619 tok/s (wide graphs unchanged).
+FP8 cache kernel v2 (`decode_attention_fp8`: page-head rows of 2 KB, 128 pages per DMA, K transposed straight from fp8, fp8 x fp8 PV with a per-row probability scale): correct (rel err 3.1e-3),
+288 us at 1024 pages (bf16 kernel 302 us), DMA 155 us (129 GB/s), vector 123, scalar 124, tensor 91: the engines do not overlap across groups because m / l / acc carry between them.
+A two-pass version (scores of all groups into SBUF, one global max, then exp / PV with V resident, no loop-carried state in pass 1) would let the DMA overlap the PE and might reach ~230 us,
+but the per-layer native-order K / V scale tensors the caller builds in XLA would eat part of that, so it is left unwired.
