@@ -674,6 +674,23 @@ struct NeuronModel::Impl {
             kv_bytes_rank += lw.kv.bytes;
         }
         weight_bytes_rank += ranks[0].head_w.bytes + ranks[0].head_ws.bytes + ranks[0].head_norm.bytes + ranks[0].sel_h.bytes + ranks[0].sel_ff.bytes;
+        if (const char *swap = std::getenv("NEURON_SWAP_TENSORS")) { // debugging: layer TARGET reuses layer FROM's tensors; list of 0 norm1, 1 norm2, 2 + k weight slot k
+            const int from = std::atoi(std::getenv("NEURON_SWAP_FROM") ? std::getenv("NEURON_SWAP_FROM") : "30");
+            const int target = std::atoi(std::getenv("NEURON_SWAP_TARGET") ? std::getenv("NEURON_SWAP_TARGET") : "31");
+            const std::string list = swap;
+            for (size_t at = 0; at < list.size();) {
+                const size_t comma = std::min(list.find(',', at), list.size());
+                const int i = std::atoi(list.substr(at, comma - at).c_str());
+                for (int r = 0; r < tp; ++r) {
+                    auto &dst = ranks[size_t(r)].layers[size_t(target)];
+                    const auto &src = ranks[size_t(r)].layers[size_t(from)];
+                    if (i == 0) dst.norm1 = src.norm1;
+                    else if (i == 1) dst.norm2 = src.norm2;
+                    else dst.w[size_t(i - 2)] = src.w[size_t(i - 2)];
+                }
+                at = comma + 1;
+            }
+        }
         build_sets();
         if (options.verbose)
             std::cerr << "model resident on " << tp << " NeuronCores in " << ms_since(t0) / 1e3 << " s, " << pages_total - 1 << " KV pages; per core "
