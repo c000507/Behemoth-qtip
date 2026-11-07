@@ -95,6 +95,10 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
+KV8 = os.environ.get('KV', 'bf16') == 'fp8'  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
+if KV8:
+    ORDER.insert(ORDER.index('cache') + 1, 'cscale')
+    ORDER_QTIP.insert(ORDER_QTIP.index('cache') + 1, 'cscale')
 DOWN_BF16 = os.environ.get('DOWN_BF16', '0') == '1'  # diagnosis only: down_proj with bf16 activations (weights cast in-graph), no fp8 activation quantisation
 OUT_F32 = os.environ.get('OUT_F32', '0') == '1'  # o_proj / down_proj partial sums stay f32 into the all-reduce (bf16 rounding of massive-activation channels)
 WT = os.environ.get('WT') == '1'  # FP8 projections stored transposed [in, out]: contraction axis first, contiguous DMA rows
@@ -108,7 +112,8 @@ def shapes(R, Q, P, pages):
     s = {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.bfloat16),
+        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.uint8 if KV8 else torch.bfloat16),
+        'cscale': ((pages, 2, g.KVHEADS // g.TP, PAGE), torch.float32),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
@@ -137,13 +142,15 @@ def layer_order():
     return ORDER_QTIP if WEIGHTS == 'qtip' else ORDER
 
 
-def flash_paged_nki(q, cache, table, pos, Q, P, kvh, rep):
+def flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep):
     """The same attention for one request (R = 1) through neuronxcc's flash_fwd kernel (fused scale / mask / online softmax / PV).
     The kernel wants dense K^T [kvh, D, keys] and V [kvh, keys, D] and a [Q, keys] additive mask, so the pages are gathered and permuted
     here; key j of the table is valid for the query at position p iff j <= p, as in flash_paged."""
     from neuronxcc.nki.kernels.attention import FlashConfig, flash_fwd
     D, keys = g.D, P * PAGE
     kv = cache[table[0]]                                                       # [P, 2, kvh, 16, D]
+    if cscale is not None:                                                     # FP8 cache: dequantise the gathered pages
+        kv = (kv.view(torch.float8_e4m3fn).float() * cscale[table[0]].unsqueeze(-1)).to(torch.bfloat16)
     k = kv[:, 0].permute(1, 3, 0, 2).reshape(1, kvh, D, keys)                  # K^T
     v = kv[:, 1].permute(1, 0, 2, 3).reshape(1, kvh, keys, D)
     qt = q.reshape(Q, kvh * rep, D).permute(1, 2, 0).reshape(1, kvh * rep, D, Q)  # heads are kv-head major
@@ -154,10 +161,52 @@ def flash_paged_nki(q, cache, table, pos, Q, P, kvh, rep):
     return o.float().permute(0, 2, 1, 3).reshape(1, Q, kvh, rep, D)
 
 
-def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
+def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
+    """Flash loop over an FP8 cache with the GPU runtime's attention semantics (runtime/src/attention.cpp): q is quantised per (query, head) row,
+    scores = (q8 . k8) q_scale k_scale / sqrt(D), probabilities are weighted by the V scale of their token, quantised per row and block to E4M3
+    (the softmax sum uses the unweighted p) and multiplied with the E4M3 V pages; both matmuls run fp8 x fp8 on the tensor engine."""
+    G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
+    assert P % G == 0
+    D = g.D
+    scale = D ** -0.5
+    neg, f8, dev = -1e30, torch.float8_e4m3fn, q.device
+    qf = q.float()
+    qa = torch.amax(torch.abs(qf), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0       # [R,Q,kvh,rep,1]
+    q8 = (qf / qa).to(f8)
+    m = torch.full((R, Q, kvh, rep), neg, device=dev)
+    l = torch.zeros(R, Q, kvh, rep, device=dev)
+    acc = torch.zeros(R, Q, kvh, rep, D, device=dev)
+    qpos = pos.reshape(R, Q, 1, 1, 1)
+    inblock = torch.arange(G * PAGE, dtype=torch.int64, device=dev).reshape(1, 1, 1, 1, G * PAGE)
+    for b in range(P // G):
+        pages = table[:, b * G:(b + 1) * G]                                              # [R,G]
+        kv = cache[pages]                                                                # [R,G,2,kvh,16,D] E4M3 bytes
+        sc = cscale[pages]                                                               # [R,G,2,kvh,16]
+        k8, v8 = kv[:, :, 0].view(f8), kv[:, :, 1].view(f8)
+        ksc = sc[:, :, 0].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
+        vsc = sc[:, :, 1].permute(0, 2, 1, 3).reshape(R, 1, kvh, 1, G, PAGE)
+        s = torch.einsum('rqhad,rghtd->rqhagt', q8, k8).float() * qa.unsqueeze(-1) * ksc
+        s = s.reshape(R, Q, kvh, rep, G * PAGE) * scale
+        s = torch.where(inblock + b * G * PAGE > qpos, torch.full_like(s, neg), s)
+        m_new = torch.maximum(m, s.amax(dim=-1))
+        p = torch.exp(s - m_new.unsqueeze(-1))
+        corr = torch.exp(m - m_new)
+        l = l * corr + p.sum(dim=-1)
+        pw = p.reshape(R, Q, kvh, rep, G, PAGE) * vsc
+        ps = (torch.amax(pw, dim=(-2, -1)) / 224.0).clamp(min=1e-30)                     # [R,Q,kvh,rep]
+        p8 = (pw / ps.unsqueeze(-1).unsqueeze(-1)).to(f8)
+        pv = torch.einsum('rqhagt,rghtd->rqhad', p8, v8).float() * ps.unsqueeze(-1)
+        acc = acc * corr.unsqueeze(-1) + pv
+        m = m_new
+    return acc / l.unsqueeze(-1)
+
+
+def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     if ATTN == 'nki' and R == 1 and Q % 128 == 0:
-        return flash_paged_nki(q, cache, table, pos, Q, P, kvh, rep)
+        return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
+    if cscale is not None:
+        return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
     assert P % G == 0
     D = g.D
@@ -217,8 +266,16 @@ def paged_layer(R, Q, P, *args):
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
     at = (page[:, None, None], torch.arange(2, dtype=torch.int64, device=x.device)[None, :, None],
           torch.arange(kvh, dtype=torch.int64, device=x.device)[None, None, :], off[:, None, None])
-    cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
-    attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, t['table'], t['pos'], R, Q, P, kvh, rep)
+    cscale = None
+    if KV8:
+        kk = torch.stack((k, v), dim=1)                                                  # [T,2,kvh,D] f32
+        sc = torch.amax(torch.abs(kk), dim=-1).clamp(min=1e-20) / 224.0                  # one scale per (token, K|V, kv head)
+        k8 = (kk / sc.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
+        cache = t['cache'].index_put(at, k8)
+        cscale = t['cscale'].index_put(at, sc)
+    else:
+        cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
+    attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, cscale, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
     if qtip:
         # o row-parallel: the rotation needs all heads (all-gather, rank order = head order), this rank multiplies its
@@ -250,7 +307,7 @@ def paged_layer(R, Q, P, *args):
             x = x + allreduce((torch.matmul(act.to(torch.bfloat16), wd.to(torch.bfloat16)).float() * t['ds'].reshape(1, -1)))
         else:
             x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds'), OUT_F32).float())
-    return x, cache
+    return (x, cache, cscale) if KV8 else (x, cache)
 
 
 LAYER_WEIGHTS = ['norm1', 'norm2', 'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
@@ -339,24 +396,30 @@ def main():
             class Layer(torch.nn.Module):
                 def __init__(self):
                     super().__init__()
-                    self.register_buffer('cache', inputs[ORDER.index('cache')])
+                    self.register_buffer('cache', inputs[layer_order().index('cache')])
+                    if KV8:
+                        self.register_buffer('cscale', inputs[layer_order().index('cscale')])
 
                 def forward(self, *rest):
                     a = list(rest)
                     a.insert(layer_order().index('cache'), self.cache)
-                    x, self.cache = paged_layer(R, Q, P, *a)  # mutated buffer: enable_aliasing makes it in-place
+                    if KV8:
+                        a.insert(layer_order().index('cscale'), self.cscale)
+                        x, self.cache, self.cscale = paged_layer(R, Q, P, *a)
+                    else:
+                        x, self.cache = paged_layer(R, Q, P, *a)  # mutated buffer: enable_aliasing makes it in-place
                     return x
             fn = Layer()
             kwargs['enable_aliasing'] = True
-            inputs = [t for k, t in zip(layer_order(), inputs) if k != 'cache']
+            inputs = [t for k, t in zip(layer_order(), inputs) if k not in ('cache', 'cscale')]
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
         if WEIGHTS not in ('fp8', 'qtip'):
             raise SystemExit(f'WEIGHTS={WEIGHTS}: expected fp8 or qtip')
-        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT}
+        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT, 'kv': 'fp8' if KV8 else 'bf16'}
     elif kind == 'model':
-        if WEIGHTS != 'fp8':
-            raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8')
+        if WEIGHTS != 'fp8' or KV8:
+            raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8 with a bf16 KV cache')
         R, Q, P, L, S = (int(a) for a in sys.argv[3:8])
         head = len(sys.argv) < 9 or sys.argv[8] != 'body'  # 'body': a segment without the head (residual out)
         pages = int(os.environ.get('PAGES', '64'))
