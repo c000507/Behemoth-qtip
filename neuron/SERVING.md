@@ -137,8 +137,12 @@ the engine samples each row and accepts draft i when row i - 1 sampled exactly i
 sampled at the mismatching row is still exact, so the accepted sequence is distributed as in sequential decoding (greedy
 output is identical; seeded sampling consumes the RNG differently). `Scheduler::reserve` allocates the pages the draft
 positions need and `Scheduler::accept` advances a request by an already-computed token. Only steps with at most
-`BEHEMOTH_NEURON_SPEC_REQUESTS` (4) decode requests draft, since rows are what a decode bucket costs and a wide step has none
-to spare. Continuations of up to 8 tokens (draft verification, the tail of a chunked prompt) use the row path; prompts still
+`BEHEMOTH_NEURON_SPEC_REQUESTS` (4) decode requests draft, and never past `BEHEMOTH_NEURON_SPEC_ROWS` (8) rows in total, since
+rows are what a decode bucket costs and a wide step has none to spare. A verify step is also dearer at long context (the K/V
+gather is rows x pages: `dec8_1024` costs 44 ms more per step than `dec1_1024`), so drafting is adaptive per request: it drafts
+while its running acceptance (accepted drafts per verify step, EMA from an optimistic start) times the plain step time exceeds
+`BEHEMOTH_NEURON_SPEC_PAGE_COST` (0.01 ms) x drafts x the pages of the bucket the step would land in, and a request that stopped
+recovers slowly to retry. Continuations of up to 8 tokens (draft verification, the tail of a chunked prompt) use the row path; prompts still
 start in prefill buckets. The step log prints `drafts=` and `tokens=` per step, `/metrics` has `drafted_tokens` and
 `accepted_drafts`.
 

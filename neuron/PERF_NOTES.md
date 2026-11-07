@@ -158,8 +158,27 @@ and emits 1 + accepted tokens. Measured while NEFF compiles ran on the host (abs
 | repeating text, up to 3 drafts | 51 over 18 steps | 41 (80 %) | 60.8 | 18.6 | identical to the reference for all 60 tokens |
 
 The free-form divergence is the known 6-8 % relative logit difference between two compilations of the same math (the
-1-row and 8-row graphs), not the acceptance logic: the repeating prompt, where every step verifies 3 drafts, reproduces the
-sequential output exactly. Clean numbers (no concurrent compiles; ctx 1.5k and 14k; 32 concurrent) follow below.
+1-row and 8-row graphs), not the acceptance logic: two copies of the free-form request run together (both in `dec8`, no
+drafts) agree with each other and diverge from the 1-row run at token 1, and the repeating prompt, where every step
+verifies drafts, reproduces the sequential output exactly.
+
+Clean numbers (nothing else on the host; `BEHEMOTH_NEURON_SPEC_TOKENS=7`, drafting always on):
+
+| context | no drafts, ms/token | 7 drafts, ms/token | accepted / drafted | verify-step layers vs plain |
+|---|---|---|---|---|
+| 300, free-form | 42.0 | **34.4** (3 drafts: 35.5) | 14 / 122 | 38.5 vs 36.7 ms (`dec8_32` vs `dec1_32`) |
+| 300, repeating text | 42.1 | **9.3** | 48 / 70 | greedy output identical to the no-draft run |
+| 1.5k, free-form | 45.7 | 48.9 | 7 / 210 | 52.3 vs 40.5 ms (`dec8_128`) |
+| 14k, free-form | 77.0 | 105.0 | 3 / 133 | 114.8 vs 71.1 ms (`dec8_1024`) |
+| 32 concurrent (300-token outputs) | ITL p50 62.0 ms, 425 tok/s | ITL p50 62.2 ms, 420 tok/s | no drafting at 32 rows | unchanged |
+
+The verify bucket's cost is the paged K/V gather of rows x pages (0.006-0.013 ms per draft row and page), so at long context
+drafting must pay for +14 / +44 ms per step with 3-5 % acceptance and loses. Hence the adaptive rule (SERVING.md): a request
+drafts only while its acceptance EMA x plain step time exceeds 0.01 ms x drafts x bucket pages, and retries slowly. With it:
+
+| context, 7 drafts adaptive | ms/token | drafted | note |
+|---|---|---|---|
+| see the follow-up rows below | | | |
 
 ### 70B on trn1 (Anubis 70B QTIP, 80 layers, hidden 8192, 64/8 heads, ff 28672, vocab 128256)
 

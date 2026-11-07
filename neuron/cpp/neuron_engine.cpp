@@ -107,8 +107,8 @@ struct Engine::Impl {
     int spec_tokens = 0, spec_requests = 4, spec_rows = 8, spec_ngram = 3, max_rows = 1;
     // Adaptive: a verify step costs about spec_page_cost ms per draft row and table page of the bucket it lands in (the
     // paged K/V gather, measured 0.006-0.013 on the 8B), on top of a plain step (plain_step_ms, running mean). A request
-    // drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats that
-    // overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers.
+    // drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats twice that
+    // overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers (~10 steps).
     double spec_page_cost = 0.01, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
@@ -213,8 +213,8 @@ struct Engine::Impl {
                                 continue;
                             double &alpha = acceptance.try_emplace(s.id, 1.0).first->second;
                             const double overhead = spec_page_cost * budget * model.decode_bucket_pages(int(ceil_div(s.begin + 1 + size_t(budget), size_t(16))));
-                            if (alpha * plain_step_ms < overhead) { // not worth a verify step now; recover slowly to retry
-                                alpha = std::min(1.0, alpha + 0.05);
+                            if (alpha * plain_step_ms < 2 * overhead) { // not worth a verify step now; recover slowly to retry
+                                alpha = std::min(1.0, alpha + 0.02);
                                 continue;
                             }
                             auto draft = prompt_lookup(r.history, budget, spec_ngram);
@@ -302,7 +302,7 @@ struct Engine::Impl {
                         }
                         accepted_drafts += accepted;
                         if (auto a = acceptance.find(request.id); a != acceptance.end())
-                            a->second = 0.7 * a->second + 0.3 * double(accepted);
+                            a->second = 0.5 * (a->second + double(accepted));
                     }
                     const auto &after = scheduler.request(request.id);
                     if (after.done) {
