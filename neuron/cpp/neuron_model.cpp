@@ -77,6 +77,7 @@ struct Meta {
     int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
     bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
     bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
+    bool kv8 = false;                             // kind "layer": FP8 KV cache (E4M3 bytes + f32 scale per K|V, token, head), trace_model.py KV=fp8
     bool wt = false;                              // kind "layer": FP8 projections stored transposed [in][out] (trace_model.py WT=1)
     std::string weights = "fp8";                  // kind "layer": "fp8" (seven E4M3 shards) or "qtip" (q/o/gate/up/down trellis resident)
     std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
@@ -90,9 +91,13 @@ const std::vector<std::string> kFp8Order = {"x", "cos_sin", "pos", "wslot", "tab
 // NEFF input order: the meta order with the aliased KV state moved to the end (torch_neuronx puts module state last).
 std::vector<std::string> neff_input_names(const Meta &m) {
     std::vector<std::string> names;
-    for (const auto &n : m.order.empty() ? kFp8Order : m.order)
-        if (n != "cache") names.push_back(n);
+    bool scale = false;
+    for (const auto &n : m.order.empty() ? kFp8Order : m.order) {
+        if (n == "cscale") scale = true;
+        if (n != "cache" && n != "cscale") names.push_back(n);
+    }
     names.push_back("cache");
+    if (scale) names.push_back("cscale");
     return names;
 }
 constexpr int kFp8Inputs = 22;
@@ -101,7 +106,7 @@ constexpr int kRowPathTokens = 8;
 
 struct LayerWeights {
     bool compressed = false;     // QTIP q/o/gate/up/down resident as trellis words (WEIGHTS=qtip NEFF) instead of FP8 shards
-    Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, dim] bf16
+    Dev norm1, norm2, w[14], kv, ks; // ks: FP8 KV scales [pages, 2, kv_heads, 16] f32 (kv8 only); w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, dim] bf16
     struct Packed { Dev words, lut, su, sv; } q[5]; // compressed layers: q, o, gate, up, down (w keeps only kf ks vf vs)
     size_t bytes() const {
         size_t b = norm1.bytes + norm2.bytes;
@@ -183,6 +188,7 @@ struct NeuronModel::Impl {
     nlohmann::json profile = nlohmann::json::object();
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
     size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
+    bool kv8 = false, kv8_seen = false;                                // FP8 KV cache: cache bytes + a scale tensor per layer (meta.kv)
     bool weights_transposed = false, wt_seen = false;                  // FP8 NEFFs take [in][out] projections (meta.wt, all alike)
     std::vector<bool> compressed;                                      // per layer: QTIP projections resident as trellis (decide_modes)
     int n_compressed = 0;
@@ -256,6 +262,11 @@ struct NeuronModel::Impl {
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
                 m.weights = j.value("weights", "fp8");
                 m.wt = j.value("wt", false);
+                m.kv8 = j.value("kv", "bf16") == "fp8";
+                if (kv8_seen && kv8 != m.kv8)
+                    throw std::runtime_error("layer NEFFs mix FP8 and bf16 KV caches");
+                kv8 = m.kv8;
+                kv8_seen = true;
                 if (m.weights == "fp8") {
                     if (wt_seen && weights_transposed != m.wt)
                         throw std::runtime_error("FP8 layer NEFFs in " + options.neff_dir.string() + " mix transposed (WT=1) and plain weights");
@@ -360,7 +371,8 @@ struct NeuronModel::Impl {
         std::sort(heads.begin(), heads.end(), [](const auto &a, const auto &b) { return a.meta.T != b.meta.T ? a.meta.T < b.meta.T : a.meta.S < b.meta.S; });
     }
 
-    size_t kv_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * size_t(dim) * 2; }
+    size_t kv_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * size_t(dim) * (kv8 ? 1 : 2); }
+    size_t kv_scale_bytes() const { return size_t(pages_total) * 2 * size_t(kv_local) * PAGE * 4; }
 
     // Load every NEFF on both cores and create its step tensors. Tensor sets are built after the weights exist.
     void load_buckets() {
@@ -399,13 +411,13 @@ struct NeuronModel::Impl {
                                       << " head=" << m.head << " weights=" << m.weights << ": " << info->tensor_count << " tensors\n";
                         const int base = b.full() ? (m.head ? 8 : 5) : 0;
                         const int layer_inputs = b.full() ? kFp8Inputs : int(neff_input_names(m).size());
-                        const int kv_index = b.full() ? base + 16 * m.L : layer_inputs - 1;
+                        const int kv_index = b.full() ? base + 16 * m.L : layer_inputs - (m.kv8 ? 2 : 1);
                         int ins = 0;
                         for (uint64_t i = 0; i < info->tensor_count; ++i)
                             if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
                                 const auto &t = info->tensor_array[i];
                                 if (std::stoul(std::string(t.name).substr(5)) == size_t(kv_index)) {
-                                    const int pages = int(t.size / size_t(2 * kv_local * PAGE * dim * 2));
+                                    const int pages = int(t.size / size_t(2 * kv_local * PAGE * dim * (m.kv8 ? 1 : 2)));
                                     if (pages_total && pages != pages_total)
                                         throw std::runtime_error("NEFFs disagree on the page count");
                                     pages_total = pages;
@@ -470,6 +482,11 @@ struct NeuronModel::Impl {
             put(lw.norm2, n2.data(), H * 4);
             lw.kv = alloc(r, zeros.size(), "kv_cache");
             put(lw.kv, zeros.data(), zeros.size());
+            if (kv8) { // scales start at 1 so an unwritten page dequantises to 0 * 1
+                std::vector<float> ones(kv_scale_bytes() / 4, 1.f);
+                lw.ks = alloc(r, kv_scale_bytes(), "kv_scale");
+                put(lw.ks, ones.data(), kv_scale_bytes());
+            }
         }
         const bool compress = compressed[size_t(layer)];
         for (const auto &p : projs) {
@@ -671,7 +688,7 @@ struct NeuronModel::Impl {
         }
         for (const auto &lw : ranks[0].layers) {
             weight_bytes_rank += lw.bytes();
-            kv_bytes_rank += lw.kv.bytes;
+            kv_bytes_rank += lw.kv.bytes + lw.ks.bytes;
         }
         weight_bytes_rank += ranks[0].head_w.bytes + ranks[0].head_ws.bytes + ranks[0].head_norm.bytes + ranks[0].sel_h.bytes + ranks[0].sel_ff.bytes;
         if (const char *swap = std::getenv("NEURON_SWAP_TENSORS")) { // debugging: layer TARGET reuses layer FROM's tensors; list of 0 norm1, 1 norm2, 2 + k weight slot k
@@ -759,6 +776,7 @@ struct NeuronModel::Impl {
             if (name == "wslot") return pr.wslot;
             if (name == "table") return pr.table;
             if (name == "cache") return lw.kv;
+            if (name == "cscale") return lw.ks;
             if (name == "norm1") return lw.norm1;
             if (name == "norm2") return lw.norm2;
             if (name == "sel_h") return ranks[size_t(r)].sel_h;
@@ -808,9 +826,9 @@ struct NeuronModel::Impl {
                                 check(nrt_add_tensor_to_tensor_set(in, t.name, dev.t), "add input");
                             } else if (name == "output0") {
                                 check(nrt_add_tensor_to_tensor_set(out, t.name, pr.x[1 - p].t), "add output");
-                            } else { // the updated KV state, written back into the same device buffer
-                                const Dev &kv = lw.kv;
-                                if (extra++ != 0 || kv.bytes != t.size)
+                            } else { // the updated KV state (cache, then its scales), written back into the same device buffers
+                                const Dev &kv = extra == 0 ? lw.kv : lw.ks;
+                                if (extra++ > (variant.meta.kv8 ? 1 : 0) || kv.bytes != t.size)
                                     throw std::runtime_error("unexpected extra output " + name);
                                 check(nrt_add_tensor_to_tensor_set(out, t.name, kv.t), "add kv output");
                             }
