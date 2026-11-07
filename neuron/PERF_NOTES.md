@@ -365,3 +365,18 @@ an earlier set with a subset of the NKI graphs gave 12/13 and 8/9 with near-tie 
 NKI indirect-DMA page gather (block per SBUF partition, as in nki/_pre_prod_kernels/gather_block_cache.py) works on trn1 and is exact, but measured
 throughput was erratic in micro-benchmarks (9-90 GB/s depending on row size and structure); the kernel therefore keeps the XLA gather. Decode
 (Q = 1) stays on the torch-op loop: flash_fwd needs 128-row query tiles, which would waste the tensor engine on one token.
+
+### The decode layer is at the DMA wall (why fusing the projections will not make it go much faster)
+
+neuron-profile of the current 8B dec1_32 layer (transposed FP8 weights): 0.76 ms of device work for 110 MB of HBM reads, the three MLP matmuls are 73 %
+of it, each streaming ~29.4 MB in ~170 us (~173 GB/s) with the tensor engine 38 % busy. The tensor engine runs 7148 LDWEIGHTS + MATMUL pairs per
+layer (weights stationary, one activation column moving; ~106 ns per 128 x 128 tile). To test whether that orientation was the limit,
+tests/bench_fp8_moving_nki.py streams the weights as the MOVING operand (activation stationary, 512 columns per instruction): numerically exact
+(rel err 1e-7) but profiled DMA-bound at 157 us / 187 GB/s for the same 29.4 MB (dge_mode.none: 136 us, 216 GB/s). Two independent schedules end at
+~175-215 GB/s, about half of the 410 GB/s HBM figure, so the weight-streaming DMA path is the wall for batch-1 decode: 126 MB / ~190 GB/s = 0.66 ms
+per layer against 0.71 ms observed in the compute window (+ ~0.25 ms of launch gaps and small ops per layer in the step time).
+Consequences: fusing q/k/v or gate/up cannot reduce bytes moved; sub-8-bit weights cost vector-engine unpack ops (~180 G elements/s per op, as many ops
+per weight as the format needs) so they cannot beat ~190 G weights/s either; what still helps is more tokens per weight read (batching, speculation),
+fewer launches (the 32-layer single graph is blocked by the layer-31 anomaly), and fewer KV bytes at long context (FP8 K/V).
+NKI DMA micro-benchmark caveat: PyTorch/XLA lazy tensors execute only the last of N queued identical calls, so any "N calls / elapsed" timing outside
+the kernel measured launch overhead; time with in-kernel loops or neuron-profile.
