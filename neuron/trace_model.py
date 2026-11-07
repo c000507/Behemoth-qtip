@@ -87,6 +87,7 @@ g = Geometry(LLAMA_8B, 2)
 PAGE = 16
 KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 128))  # G: pages per flash block for prefill (2048 keys; 32 was 6 % slower on a 14k prompt)
 ATTN = os.environ.get('ATTN', 'nki')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages; 'xla': torch-op flash loop
+ATTN_DEC = os.environ.get('ATTN_DEC', 'xla')  # 'nki': single-row decode (R = 1, Q = 1, bf16 cache) runs nki_decode.decode_attention
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
@@ -162,6 +163,29 @@ def flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep):
     return o.float().permute(0, 2, 1, 3).reshape(1, Q, kvh, rep, D)
 
 
+def flash_decode_nki(q, cache, table, pos, P, kvh, rep):
+    """One request, one query token through nki_decode.decode_attention (see that module for the layouts). q [1, 1, kvh, rep, D] bf16."""
+    import numpy as np
+    import nki_decode as nd
+    D, dev = g.D, q.device
+    G = max(1, P // nd.GROUP_PAGES)
+    pages = table[0]
+    if P < nd.GROUP_PAGES:                                                     # pad the table to one group with the scratch page
+        pages = torch.cat((pages, torch.full((nd.GROUP_PAGES - P,), cache.shape[0] - 1, dtype=pages.dtype, device=dev)))
+    pg = pages.reshape(G, nd.GROUP_PAGES)
+    half = torch.arange(2, dtype=torch.int64, device=dev).reshape(1, 1, 1, 2)
+    heads = torch.arange(kvh, dtype=torch.int64, device=dev).reshape(kvh, 1, 1, 1)
+    def rows(kv):                                                              # [kvh, 128, G] cache row of partition 2 j + half
+        base = (pg.reshape(1, G, nd.GROUP_PAGES, 1) * 2 + kv) * kvh
+        return ((base + heads) * 2 + half).reshape(kvh, G, 128).permute(0, 2, 1).to(torch.int32)
+    kpos = torch.tensor(nd.native_key_positions(G), dtype=torch.int64, device=dev)
+    bias = torch.where(kpos > pos[0], -30000.0, 0.0).to(torch.float32).reshape(G, 1, 1024).expand(G, nd.ROWS, 1024).contiguous()
+    mask = torch.tensor(np.kron(np.eye(kvh, dtype=np.float32), np.ones((rep, 1), np.float32)), device=dev)   # [16, kvh]
+    qt = (q.reshape(kvh, rep, D).float() * (D ** -0.5)).to(torch.bfloat16).permute(0, 2, 1).contiguous()
+    o = nd.decode_attention(qt, cache.reshape(-1, 1024), rows(0), rows(1), bias, mask)                       # [16, D] f32
+    return o.reshape(1, 1, kvh, rep, D)
+
+
 def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """Flash loop over an FP8 cache with the GPU runtime's attention semantics (runtime/src/attention.cpp): q is quantised per (query, head) row,
     scores = (q8 . k8) q_scale k_scale / sqrt(D), probabilities are weighted by the V scale of their token, quantised per row and block to E4M3
@@ -207,6 +231,8 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     if ATTN == 'nki' and R == 1 and Q % 128 == 0:
         return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
+    if ATTN_DEC == 'nki' and R == 1 and Q == 1 and cscale is None:
+        return flash_decode_nki(q, cache, table, pos, P, kvh, rep)
     if cscale is not None and KVATT == 'fp8':
         return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
