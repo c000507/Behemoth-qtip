@@ -213,7 +213,8 @@ struct Engine::Impl {
                                 continue;
                             double &alpha = acceptance.try_emplace(s.id, 1.0).first->second;
                             const double overhead = spec_page_cost * budget * model.decode_bucket_pages(int(ceil_div(s.begin + 1 + size_t(budget), size_t(16))));
-                            if (alpha * plain_step_ms < 2 * overhead) { // not worth a verify step now; recover slowly to retry
+                            // a verify step within 10 % of a plain one is always worth trying; dearer ones need the acceptance to pay
+                            if (overhead > 0.1 * plain_step_ms && alpha * plain_step_ms < 2 * overhead) { // recover slowly to retry
                                 alpha = std::min(1.0, alpha + 0.02);
                                 continue;
                             }
