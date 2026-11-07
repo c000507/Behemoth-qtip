@@ -28,54 +28,80 @@ def _f8(t, dtype):
     return t.view(nl.float8_e4m3) if dtype == nl.uint8 else t
 
 
-@nki.jit
-def mlp_fp8(h8T, ha, gf, gs, uf, us, df, ds):
-    H, T = h8T.shape
-    FF = gf.shape[1]
-    KT, FT = H // 128, FF // 128
-    y = nl.ndarray((T, H), dtype=nl.float32, buffer=nl.shared_hbm)
-    hx = nl.ndarray((128, KT * T), dtype=h8T.dtype, buffer=nl.sbuf)                 # stationary activation tiles, [128, (kt, T)]
-    for kt in nl.affine_range(KT):
-        hx[:, nl.ds(kt * T, T)] = nl.load(h8T[nl.ds(kt * 128, 128), :])
-    hs = nl.load(ha)                                                                  # [T, 1]
-    act = nl.ndarray((T, FF), dtype=nl.float32, buffer=nl.sbuf)
-    # gate | up: column blocks of NB, K accumulated in PSUM
-    for nb in nl.affine_range(FF // NB):
-        g0 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        g1 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        u0 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        u1 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        for kt in nl.sequential_range(KT):
-            xk = _f8(hx[:, nl.ds(kt * T, T)], h8T.dtype)
-            wg = _f8(nl.load(gf[nl.ds(kt * 128, 128), nl.ds(nb * NB, NB)]), gf.dtype)
-            wu = _f8(nl.load(uf[nl.ds(kt * 128, 128), nl.ds(nb * NB, NB)]), uf.dtype)
-            g0 += nl.matmul(xk, wg[:, 0:NC], transpose_x=True)
-            g1 += nl.matmul(xk, wg[:, NC:NB], transpose_x=True)
-            u0 += nl.matmul(xk, wu[:, 0:NC], transpose_x=True)
-            u1 += nl.matmul(xk, wu[:, NC:NB], transpose_x=True)
-        gsc = nl.broadcast_to(nl.load(gs[0:1, nl.ds(nb * NB, NB)]), shape=(T, NB))
-        usc = nl.broadcast_to(nl.load(us[0:1, nl.ds(nb * NB, NB)]), shape=(T, NB))
-        for c, gp, up in ((0, g0, u0), (NC, g1, u1)):                                 # Python-level unroll (PSUM tiles cannot be indexed by a loop var)
-            gate = nl.multiply(nl.multiply(gp, hs), gsc[:, nl.ds(c, NC)])
-            upv = nl.multiply(nl.multiply(up, hs), usc[:, nl.ds(c, NC)])
-            act[:, nl.ds(nb * NB + c, NC)] = nl.multiply(nl.silu(gate), upv)
-    # down: requantise the activation rows (amax / 224), transpose to [128, T] stationary tiles
-    aa = nl.maximum(nl.multiply(nisa.tensor_reduce(np.max, nl.abs(act), axis=(1,), dtype=nl.float32), 1.0 / 224.0), 1e-20)   # [T, 1]
-    a8 = nl.copy(nl.divide(act, aa), dtype=nl.float8_e4m3)
-    ax = nl.ndarray((128, FT * T), dtype=nl.float8_e4m3, buffer=nl.sbuf)
-    for ft in nl.affine_range(FT):
-        ax[:, nl.ds(ft * T, T)] = nl.copy(nisa.nc_transpose(a8[:, nl.ds(ft * 128, 128)]), dtype=nl.float8_e4m3)
-    for nb in nl.affine_range(H // NB):
-        d0 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        d1 = nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum)
-        for ft in nl.sequential_range(FT):
-            wd = _f8(nl.load(df[nl.ds(ft * 128, 128), nl.ds(nb * NB, NB)]), df.dtype)
-            d0 += nl.matmul(ax[:, nl.ds(ft * T, T)], wd[:, 0:NC], transpose_x=True)
-            d1 += nl.matmul(ax[:, nl.ds(ft * T, T)], wd[:, NC:NB], transpose_x=True)
-        dsc = nl.broadcast_to(nl.load(ds[0:1, nl.ds(nb * NB, NB)]), shape=(T, NB))
-        nl.store(y[:, nl.ds(nb * NB, NC)], nl.multiply(nl.multiply(d0, aa), dsc[:, 0:NC]))
-        nl.store(y[:, nl.ds(nb * NB + NC, NC)], nl.multiply(nl.multiply(d1, aa), dsc[:, NC:NB]))
-    return y
+def _tile(n, nb):
+    """Largest multiple of NC that divides n and is <= nb."""
+    return max(c for c in range(NC, nb + 1, NC) if n % c == 0)
+
+
+def make_mlp(NB=1024, dge=None):
+    """mlp_fp8 with NB weight columns per DMA tile (NB // 512 PSUM banks per projection pass; gate and up run as separate passes when
+    NB > 1024 so one pass never needs more than 4 of the 8 banks) and an optional nisa.dge_mode for the weight DMAs."""
+    split = NB > 1024
+    NBMAX = NB
+
+    @nki.jit
+    def mlp(h8T, ha, gf, gs, uf, us, df, ds):
+        H, T = h8T.shape
+        FF = gf.shape[1]
+        KT, FT = H // 128, FF // 128
+        NB = _tile(FF, NBMAX)                                                         # gate / up tile width (7168 -> 3584 for NBMAX 4096)
+        NJ = NB // NC
+        y = nl.ndarray((T, H), dtype=nl.float32, buffer=nl.shared_hbm)
+        hx = nl.ndarray((128, KT * T), dtype=h8T.dtype, buffer=nl.sbuf)             # stationary activation tiles, [128, (kt, T)]
+        for kt in nl.affine_range(KT):
+            hx[:, nl.ds(kt * T, T)] = nl.load(h8T[nl.ds(kt * 128, 128), :])
+        hs = nl.load(ha)                                                              # [T, 1]
+        gate = nl.ndarray((T, FF), dtype=nl.float32, buffer=nl.sbuf)
+        up = nl.ndarray((T, FF), dtype=nl.float32, buffer=nl.sbuf)
+        passes = (((gf, gs, gate),), ((uf, us, up),)) if split else (((gf, gs, gate), (uf, us, up)),)
+        for group in passes:                                                          # Python-level: one or two projection passes
+            for nb in nl.affine_range(FF // NB):
+                accs = [[nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum) for _ in nl.static_range(NJ)] for _ in group]
+                for kt in nl.sequential_range(KT):
+                    xk = _f8(hx[:, nl.ds(kt * T, T)], h8T.dtype)
+                    for m in nl.static_range(len(group)):
+                        W = group[m][0]
+                        if dge is None:
+                            wt = _f8(nl.load(W[nl.ds(kt * 128, 128), nl.ds(nb * NB, NB)]), W.dtype)
+                        else:
+                            raw = nl.ndarray((128, NB), dtype=W.dtype, buffer=nl.sbuf)
+                            nisa.dma_copy(src=W[nl.ds(kt * 128, 128), nl.ds(nb * NB, NB)], dst=raw, dge_mode=dge)
+                            wt = _f8(raw, W.dtype)
+                        for jj in nl.static_range(NJ):
+                            accs[m][jj] += nl.matmul(xk, wt[:, nl.ds(jj * NC, NC)], transpose_x=True)
+                for m in nl.static_range(len(group)):
+                    S, dst = group[m][1], group[m][2]
+                    sc = nl.broadcast_to(nl.load(S[0:1, nl.ds(nb * NB, NB)]), shape=(T, NB))
+                    for jj in nl.static_range(NJ):
+                        dst[:, nl.ds(nb * NB + jj * NC, NC)] = nl.multiply(nl.multiply(accs[m][jj], hs), sc[:, nl.ds(jj * NC, NC)])
+        act = nl.multiply(nl.silu(gate), up)
+        # down: requantise the activation rows (amax / 224), transpose to [128, T] stationary tiles
+        aa = nl.maximum(nl.multiply(nisa.tensor_reduce(np.max, nl.abs(act), axis=(1,), dtype=nl.float32), 1.0 / 224.0), 1e-20)   # [T, 1]
+        a8 = nl.copy(nl.divide(act, aa), dtype=nl.float8_e4m3)
+        ax = nl.ndarray((128, FT * T), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+        for ft in nl.affine_range(FT):
+            ax[:, nl.ds(ft * T, T)] = nl.copy(nisa.nc_transpose(a8[:, nl.ds(ft * 128, 128)]), dtype=nl.float8_e4m3)
+        NBD = _tile(H, NBMAX)                                                        # down tile width (Cydonia H = 5120 -> 2560)
+        NJD = NBD // NC
+        for nb in nl.affine_range(H // NBD):
+            accd = [nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum) for _ in nl.static_range(NJD)]
+            for ft in nl.sequential_range(FT):
+                if dge is None:
+                    wd = _f8(nl.load(df[nl.ds(ft * 128, 128), nl.ds(nb * NBD, NBD)]), df.dtype)
+                else:
+                    rawd = nl.ndarray((128, NBD), dtype=df.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(src=df[nl.ds(ft * 128, 128), nl.ds(nb * NBD, NBD)], dst=rawd, dge_mode=dge)
+                    wd = _f8(rawd, df.dtype)
+                for jj in nl.static_range(NJD):
+                    accd[jj] += nl.matmul(ax[:, nl.ds(ft * T, T)], wd[:, nl.ds(jj * NC, NC)], transpose_x=True)
+            dsc = nl.broadcast_to(nl.load(ds[0:1, nl.ds(nb * NBD, NBD)]), shape=(T, NBD))
+            for jj in nl.static_range(NJD):
+                nl.store(y[:, nl.ds(nb * NBD + jj * NC, NC)], nl.multiply(nl.multiply(accd[jj], aa), dsc[:, nl.ds(jj * NC, NC)]))
+        return y
+    return mlp
+
+
+mlp_fp8 = make_mlp()
 
 
 def mlp_reference(h, gf, gs, uf, us, df, ds):
