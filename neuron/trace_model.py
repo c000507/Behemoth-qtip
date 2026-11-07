@@ -85,7 +85,7 @@ def geometry_from_env():
 
 g = Geometry(LLAMA_8B, 2)
 PAGE = 16
-KEY_BLOCK_PAGES = 32  # G: pages per flash block (512 keys)
+KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 32))  # G: pages per flash block (512 keys)
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
 # compressed QTIP layer: per QTIP projection words / codebook / SU / SV (q, o, gate, up, down), k/v FP8 as above
