@@ -166,8 +166,8 @@ python neuron/tests/test_qtip_nki.py
 python neuron/tests/check_qtip_real.py /path/to/ckpt 0 self_attn.q_proj 2 0     # + DUMP/ROW0/ROWS from cpp/qtip_decode_dump
 ```
 
-Status: kernel, graph, runtime and TP probes verified on the device; the end-to-end compressed 8B oracle run and the 70B run
-were not completed in this session (`PERF_NOTES.md` "Status"). Cost: the decode is bound by the GpSimd gather (about 3.4 cycles per codebook lookup per GpSimd core, two weights per
+Status: kernel, runtime and single-projection TP probes verified on the device, but the full compressed layer graph still gives
+wrong logits end to end (`PERF_NOTES.md` "Status"); the mode is NOT usable yet, and the 70B run was not done (`PERF_NOTES.md` "Status"). Cost: the decode is bound by the GpSimd gather (about 3.4 cycles per codebook lookup per GpSimd core, two weights per
 lookup), ~5.3 G weights/s per NeuronCore, so a compressed 70B layer costs ~80 ms per step whatever the batch: single-stream
 decode is seconds per token and only prefill / wide batches amortise it. Numbers in `PERF_NOTES.md` ("Compressed QTIP").
 

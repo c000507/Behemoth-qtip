@@ -286,11 +286,14 @@ on both cores with real weights (`tests/test_qtip_tp_device.py` + `cpp/neff_io.c
 q_proj 1.5e-5 with the final (tile + mask) gather; the full compressed 8B loads in 11-17 s (2.07 GiB weights + 2.0 GiB KV per core
 vs 3.74 GiB expanded) and runs end to end. NOT yet verified: the end-to-end 8B oracle comparison (22 positions) and the 70B
 generation in compressed mode. The last e2e run before the gather fix was wrong (KL ~4): root-caused to `index_copy` of the kernel
-output (see above) and fixed in the graph (`gather_tp`), but the qtip buckets had to be retraced and the retrace / rerun did not
-finish within the session. Measured device time of a compressed 8B layer (neuron-profile, dec1_32, 1 row): 22.9 ms (GATHER 16.6 ms)
+output (see above) and fixed in the graph (`gather_tp`), but with the retraced dec1_32 / pre64_32 qtip buckets the 2-position 8B smoke run is STILL wrong (top-1 0/2, KL 4.3) while the
+isolated TP=2 projection probes pass: the remaining defect is in the full layer graph only (candidates, untested: the two
+identically shaped gate/up kernel calls in one graph (CSE / aliasing), the T = 64 prefill chunk vs the T <= 8 probes, the FP8 k/v
+path next to the kernels, the sel-based index_select of the q heads). Diagnose with NEURON_LAYERS=1 NEURON_DUMP_LAYERS=1
+NEURON_DUMP_X (the padding rows x = 0 already match the fp8 path to 2.7 %, the real tokens blow up to |x| ~ 2000). Measured device time of a compressed 8B layer (neuron-profile, dec1_32, 1 row): 22.9 ms (GATHER 16.6 ms)
 = the kernel numbers above; the engine's wall time per compressed layer was ~62 ms (host-side, unexplained, not yet profiled).
 Projection from the kernel rate: 70B ~80 ms per layer per step, ~6.5 s per decode token, ~30 tok/s for 256-token prefill chunks;
 the 70B compressed footprint is 8.6 GiB trellis + 0.66 GiB FP8 k/v + 1 GiB bf16 head + 2.6 GiB KV (16k) = ~12.9 GiB per core.
-Next steps: retrace the qtip buckets (q8/q70 chain on the instance: `chain8.sh`), rerun `qtest.sh BUCKETS compressed`, `q70run.sh`,
+Next steps: find that defect, then retrace the qtip buckets (q8/q70 chain on the instance: `chain8.sh`), rerun `qtest.sh BUCKETS compressed`, `q70run.sh`,
 profile the host-side per-launch overhead, and re-run the default FP8 oracle / 32-concurrent check (the default path was not
 modified except for name-based input binding; its 2-position smoke check gave top-1 2/2, KL 0.004 after the change).
