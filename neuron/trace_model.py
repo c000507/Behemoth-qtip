@@ -93,6 +93,7 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
+WT = os.environ.get('WT') == '1'  # FP8 projections stored transposed [in, out]: contraction axis first, contiguous DMA rows
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
 HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 
@@ -122,6 +123,9 @@ def shapes(R, Q, P, pages):
         'dw': (qtip_graph.words_shape(H, ff), torch.uint16), 'dl': ((128, 1024), torch.uint32),
         'dsu': ((1, g.FF), torch.float32), 'dsv': ((1, H), torch.float32),
     }
+    if WT:
+        for n in ('qf', 'of', 'kf', 'vf', 'gf', 'uf', 'df'):
+            s[n] = (s[n][0][::-1], s[n][1])
     return s
 
 
@@ -167,7 +171,7 @@ def paged_layer(R, Q, P, *args):
     D, heads, kvh = g.D, g.HEADS // g.TP, g.KVHEADS // g.TP
     rep, T, half = heads // kvh, R * Q, D // 2
     H, FF = g.H, g.FF
-    w = lambda a, b: Fp8Weight(t[a], t[b])
+    w = lambda a, b: Fp8Weight(t[a], t[b], WT)
     qtip = WEIGHTS == 'qtip'
     x = t['x']
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm1']).to(torch.bfloat16)
@@ -321,7 +325,7 @@ def main():
             fn = lambda *a: paged_layer(R, Q, P, *a)
         if WEIGHTS not in ('fp8', 'qtip'):
             raise SystemExit(f'WEIGHTS={WEIGHTS}: expected fp8 or qtip')
-        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS}
+        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT}
     elif kind == 'model':
         if WEIGHTS != 'fp8':
             raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8')

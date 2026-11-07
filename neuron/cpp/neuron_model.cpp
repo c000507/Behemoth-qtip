@@ -77,6 +77,7 @@ struct Meta {
     int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
     bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
     bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
+    bool wt = false;                              // kind "layer": FP8 projections stored transposed [in][out] (trace_model.py WT=1)
     std::string weights = "fp8";                  // kind "layer": "fp8" (seven E4M3 shards) or "qtip" (q/o/gate/up/down trellis resident)
     std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
     Geometry geometry;
@@ -181,6 +182,7 @@ struct NeuronModel::Impl {
     nlohmann::json profile = nlohmann::json::object();
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
     size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
+    bool weights_transposed = false, wt_seen = false;                  // FP8 NEFFs take [in][out] projections (meta.wt, all alike)
     std::vector<bool> compressed;                                      // per layer: QTIP projections resident as trellis (decide_modes)
     int n_compressed = 0;
 
@@ -249,6 +251,13 @@ struct NeuronModel::Impl {
             } else if (m.kind == "layer") {
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
                 m.weights = j.value("weights", "fp8");
+                m.wt = j.value("wt", false);
+                if (m.weights == "fp8") {
+                    if (wt_seen && weights_transposed != m.wt)
+                        throw std::runtime_error("FP8 layer NEFFs in " + options.neff_dir.string() + " mix transposed (WT=1) and plain weights");
+                    weights_transposed = m.wt;
+                    wt_seen = true;
+                }
                 if (j.contains("order"))
                     for (const auto &n : j.at("order")) m.order.push_back(n);
                 if (m.weights != "fp8" && m.weights != "qtip")
@@ -483,7 +492,14 @@ struct NeuronModel::Impl {
                 const auto &s = shards[size_t(r)];
                 lw.w[p.slot] = alloc(r, s.w.size(), p.name);
                 lw.w[p.slot + 1] = alloc(r, s.scale.size() * 4, p.name);
-                put(lw.w[p.slot], s.w.data(), s.w.size());
+                if (weights_transposed) { // NEFFs traced with WT=1 take [in][out]
+                    std::vector<uint8_t> t(s.w.size());
+                    for (int i = 0; i < s.rows; ++i)
+                        for (int j = 0; j < s.cols; ++j)
+                            t[size_t(j) * size_t(s.rows) + size_t(i)] = s.w[size_t(i) * size_t(s.cols) + size_t(j)];
+                    put(lw.w[p.slot], t.data(), t.size());
+                } else
+                    put(lw.w[p.slot], s.w.data(), s.w.size());
                 put(lw.w[p.slot + 1], s.scale.data(), s.scale.size() * 4);
             }
         }

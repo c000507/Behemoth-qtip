@@ -259,8 +259,8 @@ def layer_graph_fp8(x, slots, cos_sin, cache_k, cache_v, norm1, norm2, qw, ow,
 
 class Fp8Weight:
     """1-byte E4M3 weight [out, in] with a per-output-row scale, consumed by an fp8 x fp8 matmul."""
-    def __init__(self, wf, sc):
-        self.wf, self.sc = wf, sc
+    def __init__(self, wf, sc, transposed=False):
+        self.wf, self.sc, self.transposed = wf, sc, transposed  # transposed: wf is [in, out], contraction axis first
 
 
 def fp8_linear(h, w):
@@ -269,7 +269,7 @@ def fp8_linear(h, w):
     Compile after retargeting F8E4M3FN -> F8E4M3 (tools_patch_fp8_hlo.py)."""
     a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
     h8 = (h.float() / a).to(torch.float8_e4m3fn)
-    y = torch.matmul(h8, w.wf.T)
+    y = torch.matmul(h8, w.wf if w.transposed else w.wf.T)
     return (y.float() * a * w.sc.reshape(1, -1)).to(torch.bfloat16)
 
 
