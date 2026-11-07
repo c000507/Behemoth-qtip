@@ -96,7 +96,7 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
 KV8 = os.environ.get('KV', 'bf16') == 'fp8'
-KVATT = os.environ.get('KVATT', 'fp8')  # KV=fp8 attention: 'fp8' (fp8 x fp8 matmuls, GPU semantics) or 'deq' (dequantise the gathered pages, bf16 loop)  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
+KVATT = os.environ.get('KVATT', 'deq')  # KV=fp8 attention: 'deq' (dequantise the gathered pages, bf16 loop; validated) or 'fp8' (fp8 x fp8 batched matmuls, GPU semantics: gives non-finite logits on trn1, see PERF_NOTES)  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
 if KV8:
     ORDER.insert(ORDER.index('cache') + 1, 'cscale')
     ORDER_QTIP.insert(ORDER_QTIP.index('cache') + 1, 'cscale')
