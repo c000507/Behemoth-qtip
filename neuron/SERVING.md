@@ -48,6 +48,7 @@ Per layer and rank: RMSNorm, q/k/v (column-parallel) -> RoPE -> KV scatter -> pa
   scaled per row (amax/224) into E4M3, the weight is E4M3 with a per-output-row scale, the f32 accumulator is rescaled.
   QTIP, NVFP4 and FP8 checkpoint tensors are all expanded to that form at load (`qtip_expand.cpp`; QTIP is decoded and
   the randomized Hadamard folded in, so QTIP layers need no extra collectives). Attention score and PV matmuls are bf16.
+  Alternatively QTIP layers stay compressed on the device and are decoded in the graph ("Compressed QTIP layers" below).
 * **Paged KV.** `[pages, 2 (K,V), kv_heads_local, 16, 128]` bf16 per layer and rank: the server's 16-token pages and
   page tables (`AttentionLayout`), K and V of a page in one tensor so a page gather is one DMA and each layer has a
   single aliased state tensor. The graph scatters the step's K/V to flat slots (`page * 16 + offset`), updated in place
@@ -128,6 +129,46 @@ runs on this instance. The checkpoint itself is 2 bits/weight: ~107 MiB per laye
 lm_head (1 GiB bf16, 0.5 GiB E4M3) and KV (2.6 GiB per core for 1024 pages = 16k tokens), 12-13 GiB per core: it fits only
 with the trellis kept resident and decoded in the graph. See `PERF_NOTES.md` ("70B") for what that costs on this hardware
 and for the TP=8 FP8 alternative.
+
+## Compressed QTIP layers (trellis resident, decoded in the graph)
+
+The default keeps every projection as an E4M3 shard (QTIP decoded and rotated at load). That is 1 byte per weight: the 70B
+does not fit (33 GiB per core). `BEHEMOTH_NEURON_QTIP=compressed` (or `auto`) instead keeps the QTIP projections
+q/o/gate/up/down of a layer on the device as the checkpoint's 2-bit trellis words and decodes them every step inside the
+layer graph; k/v (FP8 in both checkpoints) and NVFP4 layers (8B) stay on the FP8 path.
+
+* **Kernel** (`qtip_nki.py`, NKI, traced into the layer NEFF): per output chunk of 32 tiles and input group of 2048 channels,
+  the 32 words of a tile give u_i = w_i << 16 | w_(i+1), the four 16-bit windows per word v = u >> (16 - 4k), the codebook
+  index ((v (v + 1)) >> 6) & 1023 (uint32 integer ops on the Vector engine) and a GpSimd gather from the 1024-entry bf16x2
+  codebook; 16 matmuls per chunk read strided views of the decoded pairs as the moving operand (the tile de-swizzle costs
+  nothing) and accumulate z[T, 512] in PSUM. The host lays the words out as `[in groups, 128 partitions, out tiles * 32]`
+  (`pack_qtip_shard`, mirrored by `qtip_nki.pack_shard`) so that one DMA brings the contraction axis onto the partitions.
+  128-token blocks share one decode, so prefill and wide decode pay it once per step.
+* **Graph** (`trace_model.py` with `WEIGHTS=qtip`, helpers in `qtip_graph.py`): the random Hadamard rotations cannot be folded
+  into trellis codes, so they run on the activations: u = hadUt_in(SU x) before the kernel, y = SV hadU_out(z) after it (the
+  12/28-factor sizes 14336 and 28672 included). With TP they need full vectors: z of q and of gate|up is all-gathered (one
+  collective each), the attention output is all-gathered before o_proj; the all-reduces after o and down are the FP8 graph's.
+  Two more collectives than the FP8 layer; the decoded weight is bf16 (exact codebook values), so there is no FP8 weight
+  rounding on these projections.
+* **Runtime**: `meta.json` records `"weights": "qtip"` and the input order; the runtime binds layer inputs by name, keeps one
+  bucket per (R, Q, P) with one NEFF per weight format and runs every layer through the NEFF of its own format. A mixed
+  model (compressed QTIP layers + NVFP4 or expanded layers) therefore needs BOTH variants of every bucket, and the loader
+  refuses a directory lacking the kind a layer needs. `BEHEMOTH_NEURON_QTIP=auto` compresses everything and then expands
+  layers from 0 up while `BEHEMOTH_NEURON_HBM_GIB` (16) - `BEHEMOTH_NEURON_HBM_RESERVE_GIB` (2) minus KV, head and the
+  compressed rest allows; the load report prints the plan and the per-core footprint.
+
+```sh
+# qtip variants of the buckets (same R Q P and PAGES as the fp8 ones; both go into one bucket directory)
+MODEL=/path/to/ckpt WEIGHTS=qtip PAGES=2049 python neuron/trace_model.py OUT/dec1_32_qtip layer 1 1 32
+BEHEMOTH_NEURON_QTIP=compressed BEHEMOTH_NEURON_NEFF_DIR=OUT BUILD/neuron_engine_cli /path/to/ckpt requests.json
+# checks: kernel vs numpy mirror on the simulator, and on the device against the C++ reference decode of a real layer
+python neuron/tests/test_qtip_nki.py
+python neuron/tests/check_qtip_real.py /path/to/ckpt 0 self_attn.q_proj 2 0     # + DUMP/ROW0/ROWS from cpp/qtip_decode_dump
+```
+
+Cost: the decode is bound by the GpSimd gather (about 3.4 cycles per codebook lookup per GpSimd core, two weights per
+lookup), ~5.3 G weights/s per NeuronCore, so a compressed 70B layer costs ~80 ms per step whatever the batch: single-stream
+decode is seconds per token and only prefill / wide batches amortise it. Numbers in `PERF_NOTES.md` ("Compressed QTIP").
 
 ## Speculative decoding (prompt lookup)
 

@@ -164,7 +164,6 @@ def paged_layer(R, Q, P, *args):
     t = dict(zip(order, args))
     groups = [list(range(g.TP))]
     allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=groups)
-    allgather = lambda v: xm.all_gather(v, dim=-1, groups=groups)
     D, heads, kvh = g.D, g.HEADS // g.TP, g.KVHEADS // g.TP
     rep, T, half = heads // kvh, R * Q, D // 2
     H, FF = g.H, g.FF
@@ -175,7 +174,7 @@ def paged_layer(R, Q, P, *args):
     if qtip:
         # q column-parallel: rotate the replicated input, multiply this rank's rows of W~, all-gather z, finish on the
         # full vector and keep this rank's heads
-        z = allgather(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']))
+        z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']), t['sel_h'], H, allreduce)
         q = torch.index_select(qtip_graph.finish(z, t['qsv'], H), -1, t['sel_h']).reshape(T, heads, D)
     else:
         q = lin_fp8(h, w('qf', 'qs')).float().reshape(T, heads, D)
@@ -197,7 +196,8 @@ def paged_layer(R, Q, P, *args):
     if qtip:
         # o row-parallel: the rotation needs all heads (all-gather, rank order = head order), this rank multiplies its
         # columns of W~ by its slice of u, the partial z is all-reduced and finished on both ranks
-        u = torch.index_select(qtip_graph.rotate_in(allgather(attn), t['osu'], H), -1, t['sel_h'])
+        attn_full = qtip_graph.gather_tp(attn.float(), t['sel_h'], H, allreduce)
+        u = torch.index_select(qtip_graph.rotate_in(attn_full, t['osu'], H), -1, t['sel_h'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['ow'], t['ol'])), t['osv'], H)
     else:
         x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
@@ -207,9 +207,10 @@ def paged_layer(R, Q, P, *args):
         # needs no all-gather of its input
         zg = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['gsu'], H), t['gw'], t['gl'])
         zu = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['usu'], H), t['uw'], t['ul'])
-        z = allgather(torch.cat((zg, zu), dim=-1)).reshape(T, g.TP, 2, FF // g.TP)
-        gate = qtip_graph.finish(z[:, :, 0].reshape(T, FF), t['gsv'], FF)
-        up = qtip_graph.finish(z[:, :, 1].reshape(T, FF), t['usv'], FF)
+        sel2 = torch.cat((t['sel_ff'], t['sel_ff'] + FF))                      # [gate (FF) | up (FF)]: this rank's slices
+        z = qtip_graph.gather_tp(torch.cat((zg, zu), dim=-1), sel2, 2 * FF, allreduce).reshape(T, 2, FF)
+        gate = qtip_graph.finish(z[:, 0], t['gsv'], FF)
+        up = qtip_graph.finish(z[:, 1], t['usv'], FF)
         act = torch.nn.functional.silu(gate) * up
         u = torch.index_select(qtip_graph.rotate_in(act, t['dsu'], FF), -1, t['sel_ff'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)

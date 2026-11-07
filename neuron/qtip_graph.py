@@ -7,7 +7,8 @@ with the trellis resident that is impossible (a sum of codebook entries is not a
 run in the graph and tensor parallelism needs the full rotated vectors:
 
   column-parallel (q, gate, up): u = hadUt_in(SU x) is replicated (x is); each rank multiplies its block of W~
-      rows, the ranks all-gather z = W~ u, both apply hadU_out + SV on the full z and keep their own slice of y.
+      rows, the ranks all-gather z = W~ u (gather_tp: an all-reduce of the zero-padded slices, since torch_xla drops
+      xm.all_gather from a single-process trace), both apply hadU_out + SV on the full z and keep their own slice of y.
   row-parallel (o, down): the rotation needs the full input (all-gathered attention output; gate/up outputs are
       already replicated), each rank multiplies its block of W~ columns by its slice of u, the partial z is
       all-reduced (as for the FP8 graph) and hadU_out + SV is applied to the full output on both ranks.
@@ -84,6 +85,14 @@ def kernel_matmul(u, words, lut):
         u = F.pad(u, (0, groups * IN_GROUP - width))
     xT = u.reshape(T, groups, 128, 16).permute(2, 1, 3, 0).contiguous()
     return qtip_linear(words, lut, xT)
+
+
+def gather_tp(x_local, sel, width, allreduce):
+    """all-gather of x_local [T, width/TP] along the last dim in rank order, as an all-reduce of a zero-padded tensor
+    (each rank copies its slice to the positions `sel` = rank * width/TP + arange). torch_xla drops xm.all_gather when it
+    traces a single process (the compiled HLO has no all-gather at all) while XLA_ALWAYS_ALLREDUCE keeps all_reduce."""
+    full = torch.zeros(x_local.shape[0], width, dtype=x_local.dtype, device=x_local.device)
+    return allreduce(full.index_copy(-1, sel, x_local))
 
 
 def groups_of(in_local):
