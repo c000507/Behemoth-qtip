@@ -131,7 +131,9 @@ def decode_pairs(w, lut, nt):
 def _lookup(u, lut, pairs, nt, k, shift):
     """pairs[k-th slice] = lut[((v (v + 1)) >> 6) & 1023], v = u_i >> shift (the window of pair t = 4 i + k)."""
     v = nisa.tensor_scalar(u, nl.right_shift, shift, op1=nl.bitwise_and, operand1=0xffff, dtype=nl.uint32)
-    p = nisa.scalar_tensor_tensor(data=v, op0=nl.add, operand0=1, op1=nl.multiply, operand1=v, dtype=nl.uint32)
+    # tensor_tensor multiplies uint32 exactly on the hardware; scalar_tensor_tensor rounds the product through fp32
+    v1 = nisa.tensor_scalar(v, nl.add, 1, op1=nl.add, operand1=0, dtype=nl.uint32)
+    p = nisa.tensor_tensor(v, v1, nl.multiply, dtype=nl.uint32)
     e = nisa.tensor_scalar(p, nl.right_shift, 6, op1=nl.bitwise_and, operand1=1023, dtype=nl.uint32)
     pairs[:, k * nt * 32:(k + 1) * nt * 32] = nl.gather_flattened(lut, e)
 
