@@ -71,7 +71,7 @@ t_words = torch.from_numpy(words.view(np.int16)).view(torch.uint16)
 t_lut = torch.from_numpy(lut.view(np.int32)).view(torch.uint32)
 t_x = torch.from_numpy(xT.view(np.int16)).view(torch.bfloat16)
 kernel = torch_neuronx.trace(lambda w, l, x: qtip_linear(w, l, x), (t_words, t_lut, t_x), compiler_workdir='/tmp/check_qtip_real')
-z = kernel(t_words, t_lut, t_x).float().numpy()
+z = kernel(t_words.view(torch.int16), t_lut.view(torch.int32), t_x).float().numpy()   # same bytes; the wrapper checks signed dtypes
 expected = u.astype(np.float64) @ dense.astype(np.float64).T
 rel = np.linalg.norm(z - expected) / np.linalg.norm(expected)
 print(f'device kernel vs reference decode: relative_l2={rel:.3e} max_abs={np.max(np.abs(z - expected)):.3e} (|z| ~ {np.abs(expected).mean():.2f})')
