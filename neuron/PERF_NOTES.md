@@ -399,3 +399,11 @@ head-row masks. Isolated kernel vs float32 reference: rel err 8e-4 (128 random p
 302 us total, DMA 254 us (137 GB/s), tensor 100 us, scalar 121 us, vector 72 us (about 0.5 ms for the torch-op loop at the same size).
 In the layer graph: oracle with every prompt token run as a single-row step through the kernel: 7/7 top-1, mean KL 0.0080; decode ctx 300 30.5 ms/token
 (same as XLA, the kernel pads to 64 pages), ctx 14k 39.0 ms/token (XLA loop 43.0). Not yet: batched decode (R > 1), the FP8 cache (would halve the DMA that bounds the kernel).
+
+**FP8-cache variant of the NKI decode kernel** (`decode_attention(..., ksc, vsc)`): correct (rel err 1.6e-3 against the dequantised float64 reference, 128 pages) but
+NOT faster: profile at 1024 pages 447 us total (bf16 cache kernel: 302 us). It reads 20 MB instead of 34.7 MB yet DMA active time is unchanged (253 us,
+79 GB/s): the gather unit is a half page of one head, 1 KB per partition row in fp8 instead of 2 KB, and the DMA rate follows row size, not bytes. Vector
+engine active 245 us (E4M3 -> bf16 conversion of both pages tiles plus the scale multiplies; bf16 kernel: 72 us). Not wired into the graph. What would fix it: gather
+a whole page-head (16 tokens, 2 KB in fp8) per row (128 pages per DMA, 16 transposes per head and group), move the V conversion to the scalar / gpsimd engine, and
+build the native-order K / V scale tensors in the cache write instead of permuting them per layer in XLA. Expected ~170-200 us, i.e. ~3 ms/token at 14k over the bf16 kernel.
+Batched decode (R > 1) through the kernel is also not done (it runs one request).
