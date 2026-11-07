@@ -189,6 +189,33 @@ def flash_decode_nki(q, cache, table, pos, R, P, kvh, rep):
     return o.reshape(R, 1, kvh, rep, D)
 
 
+def flash_decode_nki_fp8(q, cache, cscale, table, pos, R, P, kvh, rep):
+    """flash_decode_nki for the FP8 cache through nki_decode.decode_attention_fp8_2p (page-head rows, 128-page groups; scales and mask in the
+    kernel's native column order t * 128 + j, rows repeated over a head's query heads)."""
+    import numpy as np
+    import nki_decode as nd
+    D, dev, GP = g.D, q.device, nd.GROUP8_PAGES
+    G = -(-P // GP)
+    pages = table
+    if P < G * GP:                                                             # pad the tables to whole groups with the scratch page
+        pages = torch.cat((pages, torch.full((R, G * GP - P), cache.shape[0] - 1, dtype=pages.dtype, device=dev)), dim=1)
+    pg = pages.reshape(R, G, GP)
+    heads = torch.arange(kvh, dtype=torch.int64, device=dev).reshape(1, kvh, 1, 1)
+    def rows(kv):                                                              # [R, kvh, 128, G] cache row of page j of group g, head h
+        return ((pg.reshape(R, 1, G, GP) * 2 + kv) * kvh + heads).permute(0, 1, 3, 2).to(torch.int32)
+    kpos = torch.tensor(nd.native_key_positions8(G), dtype=torch.int64, device=dev)                       # [G, 2048]
+    bias = torch.where(kpos.reshape(1, G, 2048) > pos.reshape(R, 1, 1), -30000.0, 0.0).to(torch.float32)
+    bias = bias.reshape(R, G, 1, 2048).expand(R, G, nd.ROWS, 2048).contiguous()
+    sc = cscale[pages].reshape(R, G, GP, 2, kvh, PAGE)                                                    # [R, G, j, K|V, h, t]
+    def native(kv):                                                            # [R, G, 16 rows, 2048]: row 4 h + i, column t * 128 + j
+        s = sc[:, :, :, kv].permute(0, 1, 3, 4, 2).reshape(R, G, kvh, 1, PAGE * GP)
+        return s.expand(R, G, kvh, rep, PAGE * GP).reshape(R, G, kvh * rep, PAGE * GP).contiguous()
+    mask = torch.tensor(np.kron(np.eye(kvh, dtype=np.float32), np.ones((rep, 1), np.float32)), device=dev)
+    qt = (q.reshape(R, kvh, rep, D).float() * (D ** -0.5)).to(torch.bfloat16).permute(0, 1, 3, 2).contiguous()
+    o = nd.decode_attention_fp8_2p(qt, cache.reshape(-1, PAGE * D), rows(0), rows(1), bias, mask, native(0), native(1))
+    return o.reshape(R, 1, kvh, rep, D)
+
+
 def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """Flash loop over an FP8 cache with the GPU runtime's attention semantics (runtime/src/attention.cpp): q is quantised per (query, head) row,
     scores = (q8 . k8) q_scale k_scale / sqrt(D), probabilities are weighted by the V scale of their token, quantised per row and block to E4M3
@@ -236,6 +263,8 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
         return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
     if ATTN_DEC == 'nki' and Q == 1 and cscale is None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
         return flash_decode_nki(q, cache, table, pos, R, P, kvh, rep)
+    if ATTN_DEC == 'nki' and Q == 1 and cscale is not None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
+        return flash_decode_nki_fp8(q, cache, cscale, table, pos, R, P, kvh, rep)
     if cscale is not None and KVATT == 'fp8':
         return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)

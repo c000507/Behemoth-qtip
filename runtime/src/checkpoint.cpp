@@ -150,8 +150,16 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
             c.q_heads <= 0 || c.kv_heads <= 0 || c.q_heads % c.kv_heads != 0 ||
             c.dim <= 0 || c.dim > 256 || c.dim % 2 != 0)
             throw std::invalid_argument("Invalid attention/vocabulary geometry in config.json");
+        // the Hadamard sizes only constrain QTIP layers: a checkpoint whose layer_formats has none (e.g. a repacked all-NVFP4
+        // export, neuron/repack_compressed_tensors.py) may use any geometry
+        bool any_qtip = true;
+        if (j.contains("qtip_quant") && j.at("qtip_quant").contains("layer_formats")) {
+            any_qtip = false;
+            for (const auto &f : j.at("qtip_quant").at("layer_formats"))
+                any_qtip |= f == "qtip";
+        }
         for (int n : {c.hidden, c.intermediate, c.q_heads * c.dim, c.kv_heads * c.dim})
-            if (n % 32 != 0 || hadamard_pow2_part(n) == 0 || hadamard_pow2_part(n) > 8192)
+            if (any_qtip && (n % 32 != 0 || hadamard_pow2_part(n) == 0 || hadamard_pow2_part(n) > 8192))
                 throw std::invalid_argument("Unsupported projection dimension " + std::to_string(n) +
                                             " (need 2^p / 12*2^p / 28*2^p, multiple of 32, pow2 part <= 8192)");
         c.max_context = j.at("max_position_embeddings").get<int>();

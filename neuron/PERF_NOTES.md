@@ -417,3 +417,26 @@ FP8 cache kernel v2 (`decode_attention_fp8`: page-head rows of 2 KB, 128 pages p
 288 us at 1024 pages (bf16 kernel 302 us), DMA 155 us (129 GB/s), vector 123, scalar 124, tensor 91: the engines do not overlap across groups because m / l / acc carry between them.
 A two-pass version (scores of all groups into SBUF, one global max, then exp / PV with V resident, no loop-carried state in pass 1) would let the DMA overlap the PE and might reach ~230 us,
 but the per-layer native-order K / V scale tensors the caller builds in XLA would eat part of that, so it is left unwired.
+
+**FP8 two-pass decode kernel, wired.** `decode_attention_fp8_2p`: pass 1 scores every 128-page group into one SBUF tile with a per-group max (no
+loop-carried state), one global max, pass 2 gathers V, exponentiates, quantises the V-weighted probabilities per group and keeps each group's PV
+in its own slice. 1024 pages: 246 us (v2 288, bf16 kernel 302), rel err 1.6e-3. Tried and dropped: V gathered during pass 1 (267 us, pass 1
+becomes DMA-bound) and all heads' PV in one PSUM accumulation with column-masked P^T (261 us, the masking costs what the adds saved).
+trace_model routes KV=fp8 decode graphs (Q = 1, R <= ATTN_DEC_ROWS, P >= ATTN_DEC_MIN_PAGES) to it; tracing needs UNSAFE_FP8FNCAST=1
+(neuronxcc rejects float8_e4m3fn inputs; values are scaled to <= 224, where e4m3fn and e4m3 bits agree).
+8B, FP8 cache: ctx 300 27.1 ms/token (FP8 deq path 27.0), ctx 14k 35.0 ms/token (FP8 deq path 53.1, bf16 cache + NKI kernel 38.9).
+Oracle, every prompt token as a decode step through the 128-page kernel graphs: 12/13 top-1 (pos 1023 differs, KL 0.030), mean KL 0.0118
+(bf16 cache 13/13, 0.0099).
+
+**Where a decode layer's time goes (8B, dec1_32 / dec1_128, transposed FP8, ~0.80 ms active).** Weight DMA busy 77-79 % of the layer at
+194-198 GB/s (the streaming wall). Idle ~160 us: a repeating 3.2 us stall every ~4.6 us inside the MLP matmuls (the DMA waits on the PE:
+at M = 1 the weights are the stationary operand, one LDWEIGHTS per 128 x 128 tile), the all-reduce (12-22 us), ~10 us before the QKV
+stream starts. Launch gaps between layer NEFFs are small (32 x 0.80 ms + head ~ the 27 ms token). Prefetching the next layer's weights
+would hide only the start / all-reduce gaps (~4 %); a weights-moving NKI MLP (bench_fp8_moving_nki.py keeps the DMA at the wall) is
+the larger lever (up to ~15 %).
+
+**Stock compressed-tensors NVFP4 checkpoints.** `repack_compressed_tensors.py` converts an llm-compressor `nvfp4-pack-quantized` export
+(tensor names already match) into the runtime's per-layer layout, storing 1 / weight_global_scale (compressed-tensors divides by it, the
+runtime multiplies) and a QTIP-hfized llama config with layer_formats all nvfp4; checkpoint.cpp skips the Hadamard-size check when no layer
+is QTIP. Cydonia-24B-v4.3 (Mistral Small 3.x: hidden 5120, 32 / 8 heads, head_dim 128, ff 32768, vocab 131072, 40 layers) on trn1.2xlarge
+TP = 2: per core 10.99 GiB FP8 weights + 2.50 GiB KV (2048 pages), load ~170 s, 71 ms/token single stream (ctx ~400), coherent output.
