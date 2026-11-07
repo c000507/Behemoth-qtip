@@ -277,3 +277,20 @@ one core, 200 steps incl. launch): weight stored `[out, in]` and multiplied as `
 `[in, out]` and multiplied as `h @ w` 0.219 ms. The transposed form sits at the PE element-rate floor (29.4 M elements / 128 per
 cycle / 1.4 GHz = 0.16 ms + launch), the current layout pays ~25 % on top of it for the strided [128 in x 512 out] tile DMA.
 Not changed here (it touches the default fast path's upload and graph); worth ~0.1 ms of the ~1.0 ms 8B decode layer.
+
+**Status (end of this session, honest).** Implemented and pushed: the fused NKI decode+matmul kernel, the WEIGHTS=qtip layer
+graph, the runtime's compressed / expanded / auto modes with per-format NEFF variants, the C++ packing (bit-identical to the
+Python packing on q/down/gate shards), and the device checks above. Verified on hardware: the kernel against the C++ reference
+decode on real 8B and 70B layers (1e-7); one compressed projection as a device graph incl. the Hadamards (1.7e-5); TP=2 probes
+on both cores with real weights (`tests/test_qtip_tp_device.py` + `cpp/neff_io.cpp`): row-parallel o_proj 8.5e-7, column-parallel
+q_proj 1.5e-5 with the final (tile + mask) gather; the full compressed 8B loads in 11-17 s (2.07 GiB weights + 2.0 GiB KV per core
+vs 3.74 GiB expanded) and runs end to end. NOT yet verified: the end-to-end 8B oracle comparison (22 positions) and the 70B
+generation in compressed mode. The last e2e run before the gather fix was wrong (KL ~4): root-caused to `index_copy` of the kernel
+output (see above) and fixed in the graph (`gather_tp`), but the qtip buckets had to be retraced and the retrace / rerun did not
+finish within the session. Measured device time of a compressed 8B layer (neuron-profile, dec1_32, 1 row): 22.9 ms (GATHER 16.6 ms)
+= the kernel numbers above; the engine's wall time per compressed layer was ~62 ms (host-side, unexplained, not yet profiled).
+Projection from the kernel rate: 70B ~80 ms per layer per step, ~6.5 s per decode token, ~30 tok/s for 256-token prefill chunks;
+the 70B compressed footprint is 8.6 GiB trellis + 0.66 GiB FP8 k/v + 1 GiB bf16 head + 2.6 GiB KV (16k) = ~12.9 GiB per core.
+Next steps: retrace the qtip buckets (q8/q70 chain on the instance: `chain8.sh`), rerun `qtest.sh BUCKETS compressed`, `q70run.sh`,
+profile the host-side per-launch overhead, and re-run the default FP8 oracle / 32-concurrent check (the default path was not
+modified except for name-based input binding; its 2-position smoke check gave top-1 2/2, KL 0.004 after the change).
