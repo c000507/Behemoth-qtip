@@ -25,8 +25,16 @@ Inputs (order == ORDER), per rank:
   host: llama3 rope scaling, any position), pos [T] i64, wslot [T] i64, table [R,P] i64, cache [pages,2,kv_heads,16,D],
   norms and the seven FP8 projections with per-row scales.
 
+Weight formats of a layer NEFF (meta.json "weights"):
+  fp8  (default) the seven projections are row-scaled E4M3 shards, QTIP/NVFP4 tensors expanded at load (qtip_expand.cpp)
+  qtip q/o/gate/up/down stay the checkpoint's 2-bit trellis words on the device and are decoded every step by the fused
+       NKI kernel (qtip_nki.py); k/v are FP8 as in the checkpoints; the Hadamard rotations run in the graph (qtip_graph.py).
+       Inputs per QTIP projection: words uint16 [G, 128, O*32], codebook uint32 [128, 1024], SU [1, in] and SV [1, out] f32,
+       plus per-rank index vectors sel_h [H/TP] and sel_ff [FF/TP] selecting this rank's slice of a full vector.
+
 usage: trace_model.py WORKDIR layer R Q P | head S | model R Q P L S [body]
-       env: MODEL / CONFIG (geometry), TP, PAGES, HEAD_ROWS=T (head), HEAD_FP8=1 (E4M3 lm_head with per-row scale), NCC_FLAGS
+       env: MODEL / CONFIG (geometry), TP, PAGES, WEIGHTS=fp8|qtip (layer), HEAD_ROWS=T (head), HEAD_FP8=1 (E4M3 lm_head with
+            per-row scale), NCC_FLAGS
 """
 import json
 import os
@@ -39,6 +47,7 @@ import torch
 os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trace_layer import Fp8Weight, lin_fp8
+import qtip_graph
 
 LLAMA_8B = {'hidden': 4096, 'heads': 32, 'kv_heads': 8, 'head_dim': 128, 'intermediate': 14336, 'vocab': 128257, 'layers': 32}
 
@@ -79,6 +88,11 @@ PAGE = 16
 KEY_BLOCK_PAGES = 32  # G: pages per flash block (512 keys)
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
          'qf', 'qs', 'of', 'os', 'kf', 'ks', 'vf', 'vs', 'gf', 'gs', 'uf', 'us', 'df', 'ds']
+# compressed QTIP layer: per QTIP projection words / codebook / SU / SV (q, o, gate, up, down), k/v FP8 as above
+ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2', 'sel_h', 'sel_ff',
+              'qw', 'ql', 'qsu', 'qsv', 'ow', 'ol', 'osu', 'osv', 'kf', 'ks', 'vf', 'vs',
+              'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
+WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
 HEAD_ORDER = ['x', 'rows', 'norm', 'w']
 HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 
@@ -86,7 +100,7 @@ HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 def shapes(R, Q, P, pages):
     H, D, f8 = g.H, g.D, torch.float8_e4m3fn
     T, q, kv, ff = R * Q, g.HEADS * D // g.TP, g.KVHEADS * D // g.TP, g.FF // g.TP
-    return {
+    s = {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
         'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.bfloat16),
@@ -95,7 +109,24 @@ def shapes(R, Q, P, pages):
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
         'gf': ((ff, H), f8), 'gs': ((ff,), torch.float32), 'uf': ((ff, H), f8), 'us': ((ff,), torch.float32),
         'df': ((H, ff), f8), 'ds': ((H,), torch.float32),
+        # compressed QTIP projections: (out_local, in_local) = q (H/TP, H), o (H, H/TP), gate/up (FF/TP, H), down (H, FF/TP)
+        'sel_h': ((q,), torch.int64), 'sel_ff': ((ff,), torch.int64),
+        'qw': (qtip_graph.words_shape(q, H), torch.uint16), 'ql': ((128, 1024), torch.uint32),
+        'qsu': ((1, H), torch.float32), 'qsv': ((1, H), torch.float32),
+        'ow': (qtip_graph.words_shape(H, q), torch.uint16), 'ol': ((128, 1024), torch.uint32),
+        'osu': ((1, H), torch.float32), 'osv': ((1, H), torch.float32),
+        'gw': (qtip_graph.words_shape(ff, H), torch.uint16), 'gl': ((128, 1024), torch.uint32),
+        'gsu': ((1, H), torch.float32), 'gsv': ((1, g.FF), torch.float32),
+        'uw': (qtip_graph.words_shape(ff, H), torch.uint16), 'ul': ((128, 1024), torch.uint32),
+        'usu': ((1, H), torch.float32), 'usv': ((1, g.FF), torch.float32),
+        'dw': (qtip_graph.words_shape(H, ff), torch.uint16), 'dl': ((128, 1024), torch.uint32),
+        'dsu': ((1, g.FF), torch.float32), 'dsv': ((1, H), torch.float32),
     }
+    return s
+
+
+def layer_order():
+    return ORDER_QTIP if WEIGHTS == 'qtip' else ORDER
 
 
 def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
@@ -129,14 +160,25 @@ def flash_paged(q, cache, table, pos, R, Q, P, kvh, rep):
 
 def paged_layer(R, Q, P, *args):
     import torch_xla.core.xla_model as xm
-    t = dict(zip(ORDER, args))
-    allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=[list(range(g.TP))])
+    order = layer_order()
+    t = dict(zip(order, args))
+    groups = [list(range(g.TP))]
+    allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=groups)
+    allgather = lambda v: xm.all_gather(v, dim=-1, groups=groups)
     D, heads, kvh = g.D, g.HEADS // g.TP, g.KVHEADS // g.TP
     rep, T, half = heads // kvh, R * Q, D // 2
+    H, FF = g.H, g.FF
     w = lambda a, b: Fp8Weight(t[a], t[b])
+    qtip = WEIGHTS == 'qtip'
     x = t['x']
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm1']).to(torch.bfloat16)
-    q = lin_fp8(h, w('qf', 'qs')).float().reshape(T, heads, D)
+    if qtip:
+        # q column-parallel: rotate the replicated input, multiply this rank's rows of W~, all-gather z, finish on the
+        # full vector and keep this rank's heads
+        z = allgather(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']))
+        q = torch.index_select(qtip_graph.finish(z, t['qsv'], H), -1, t['sel_h']).reshape(T, heads, D)
+    else:
+        q = lin_fp8(h, w('qf', 'qs')).float().reshape(T, heads, D)
     k = lin_fp8(h, w('kf', 'ks')).float().reshape(T, kvh, D)
     v = lin_fp8(h, w('vf', 'vs')).float().reshape(T, kvh, D)
     cos, sin = t['cos_sin'][:, 0].reshape(T, 1, half), t['cos_sin'][:, 1].reshape(T, 1, half)
@@ -152,10 +194,28 @@ def paged_layer(R, Q, P, *args):
     cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
     attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
-    x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
+    if qtip:
+        # o row-parallel: the rotation needs all heads (all-gather, rank order = head order), this rank multiplies its
+        # columns of W~ by its slice of u, the partial z is all-reduced and finished on both ranks
+        u = torch.index_select(qtip_graph.rotate_in(allgather(attn), t['osu'], H), -1, t['sel_h'])
+        x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['ow'], t['ol'])), t['osv'], H)
+    else:
+        x = x + allreduce(lin_fp8(attn, w('of', 'os')).float())
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm2']).to(torch.bfloat16)
-    act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
-    x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds')).float())
+    if qtip:
+        # gate | up column-parallel with one all-gather; their full outputs are replicated, so down (row-parallel)
+        # needs no all-gather of its input
+        zg = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['gsu'], H), t['gw'], t['gl'])
+        zu = qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['usu'], H), t['uw'], t['ul'])
+        z = allgather(torch.cat((zg, zu), dim=-1)).reshape(T, g.TP, 2, FF // g.TP)
+        gate = qtip_graph.finish(z[:, :, 0].reshape(T, FF), t['gsv'], FF)
+        up = qtip_graph.finish(z[:, :, 1].reshape(T, FF), t['usv'], FF)
+        act = torch.nn.functional.silu(gate) * up
+        u = torch.index_select(qtip_graph.rotate_in(act, t['dsu'], FF), -1, t['sel_ff'])
+        x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['dw'], t['dl'])), t['dsv'], H)
+    else:
+        act = torch.nn.functional.silu(lin_fp8(h, w('gf', 'gs'))).float() * lin_fp8(h, w('uf', 'us')).float()
+        x = x + allreduce(lin_fp8(act.to(torch.bfloat16), w('df', 'ds')).float())
     return x, cache
 
 
@@ -222,7 +282,7 @@ def full_model_inputs(R, Q, P, L, S, head=True):
 def example_inputs(R, Q, P, pages):
     s = shapes(R, Q, P, pages)
     out = []
-    for k in ORDER:
+    for k in layer_order():
         shape, dtype = s[k]
         out.append(torch.zeros(shape).to(dtype) if dtype in (torch.float8_e4m3fn, torch.bfloat16) else torch.zeros(shape, dtype=dtype))
     return out
@@ -248,16 +308,20 @@ def main():
 
                 def forward(self, *rest):
                     a = list(rest)
-                    a.insert(ORDER.index('cache'), self.cache)
+                    a.insert(layer_order().index('cache'), self.cache)
                     x, self.cache = paged_layer(R, Q, P, *a)  # mutated buffer: enable_aliasing makes it in-place
                     return x
             fn = Layer()
             kwargs['enable_aliasing'] = True
-            inputs = [t for k, t in zip(ORDER, inputs) if k != 'cache']
+            inputs = [t for k, t in zip(layer_order(), inputs) if k != 'cache']
         else:
             fn = lambda *a: paged_layer(R, Q, P, *a)
-        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': ORDER}
+        if WEIGHTS not in ('fp8', 'qtip'):
+            raise SystemExit(f'WEIGHTS={WEIGHTS}: expected fp8 or qtip')
+        meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS}
     elif kind == 'model':
+        if WEIGHTS != 'fp8':
+            raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8')
         R, Q, P, L, S = (int(a) for a in sys.argv[3:8])
         head = len(sys.argv) < 9 or sys.argv[8] != 'body'  # 'body': a segment without the head (residual out)
         pages = int(os.environ.get('PAGES', '64'))
