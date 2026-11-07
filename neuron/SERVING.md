@@ -76,6 +76,8 @@ See `PERF_NOTES.md` for the numbers; the checks are:
 
 * teacher-forced logits at 13 positions (5 ... 1699, around the 255/256/257 chunk boundary) and 9 positions up to 14999
   (past the llama3 original-context 8192) against the CUDA runtime: top-1 agrees at 22 of 22, mean KL(top-256) 0.018-0.020;
+* after the geometry/TP refactor and the speculative engine: the same 22 positions give 22 / 22 top-1, mean KL 0.019 (bf16 head);
+  32 concurrent requests: ITL p50 62 ms, ~425 tok/s with and without drafting enabled (drafting does not engage at 32 rows);
 * 13 mixed concurrent requests (different lengths, greedy / seeded sampling, one cancelled) produce exactly the tokens
   of the same requests run one at a time, within a bucket choice; seeded requests are reproducible;
 * HTTP: chat completion, SSE streaming, 8 concurrent requests, `finish_reason: stop` on `<|eot_id|>`.

@@ -92,6 +92,7 @@ Measured through `behemoth::Engine` / `neuron_server`, end to end (embedding on 
 |---|---|
 | model resident (weights expand + upload) | 85 s |
 | decode, 1 request, ctx 100 (graph `1x1x32`) | 38 ms/token (26 tok/s); layers 32 ms, head 2.5 ms |
+| decode, 1 request, ctx 300 / 1.5k / 14k (this session's binary) | 42.0 / 45.7 / 77.0 ms/token; with prompt-lookup drafts 34.6 / 44.8 / 77.3 (9.2 on text that repeats its prompt), see "Single-stream decode" |
 | decode, 1 request, ctx 1.5k / 6k / 14k | 42 / 57 / 74 ms/token |
 | decode, 4 / 8 concurrent requests (300-token prompts) | ITL 44 / 46.5 ms, ~90 / ~170 tok/s aggregate |
 | prefill, 256-token chunks, ctx <= 2k | 3.3-3.4k tok/s (77 ms per 256) |
@@ -176,9 +177,20 @@ The verify bucket's cost is the paged K/V gather of rows x pages (0.006-0.013 ms
 drafting must pay for +14 / +44 ms per step with 3-5 % acceptance and loses. Hence the adaptive rule (SERVING.md): a request
 drafts only while its acceptance EMA x plain step time exceeds 0.01 ms x drafts x bucket pages, and retries slowly. With it:
 
-| context, 7 drafts adaptive | ms/token | drafted | note |
+| context, 7 drafts, adaptive (default) | no drafts | adaptive | drafted / accepted |
 |---|---|---|---|
-| see the follow-up rows below | | | |
+| 300, free-form | 42.0 | **34.6** | 122 / 14 (verify within 10 % of a plain step: always on) |
+| 300, repeating text | 42.1 | **9.2** | 70 / 48, greedy output identical |
+| 1.5k, free-form | 45.7 | 44.8 | 49 / 3 (drafts in a third of the steps) |
+| 14k, free-form | 77.0 | 77.3 | 0 (a verify step would cost +57 %) |
+
+Before the margin and the cheap-verify rule the adaptive policy oscillated at 1.5k (drafting every other step, 50.1 ms/token)
+and throttled the cheap case (39.6 at ctx 300); both are in the commit history.
+
+Not done for single-stream latency, with what the measurements say about each: fusing q/k/v and gate/up (the PE element rate is
+the floor, see above; the gain would be part of the ~0.4 ms/layer of non-overlapped work, unmeasured); fewer launches (7 % at
+best, and the 32-layer graph is blocked by the layer-31 problem, SERVING.md); an NKI paged-attention kernel for the 14k case
+(+35 ms/token of bf16 K/V gather and per-head matmuls, the biggest remaining item at long context); FP8 K/V (halves that gather).
 
 ### 70B on trn1 (Anubis 70B QTIP, 80 layers, hidden 8192, 64/8 heads, ff 28672, vocab 128256)
 
