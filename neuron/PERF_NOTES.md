@@ -335,3 +335,20 @@ Full set (transposed FP8 weights + 256-page decode blocks + async depth 8, no sp
 | single stream, ctx 14k | 73.3 ms/token | 43.0 ms/token |
 | 32 concurrent, 41-token prompts | ITL 62.8 ms, 366-446 tok/s | ITL 42.1 ms, 633 tok/s |
 | 14k-token prefill | 9.6-10.2 s | 9.64 s (unchanged) |
+
+### Final validation of this round (8B adaptive QTIP/NVFP4, trn1.2xlarge, default build_buckets.sh set)
+
+Transposed FP8 projections and lm_head (WT=1), 256-page decode blocks, 128-page prefill blocks, async depth 8 (now the default in the runtime).
+The transposed lm_head changed nothing measurable (30.0 -> 30.1 ms/token); 128-page prefill blocks gave 9.64 -> 8.82 s for a 14k prompt (~8 %).
+Oracle (CUDA runtime, teacher-forced, top-256 KL): 13 positions 5 .. 1699: top-1 13/13, mean KL 0.0222 (worst 0.124 at pos 255, as before);
+9 positions 2047 .. 14999: top-1 7/9, mean KL 0.0116 (before: 9/9, 0.018). The two misses (pos 8191, 14000) are near ties: logit gaps 0.047 and 0.021 on
+the CUDA side, 0.064 and 0.049 on ours. HTTP: chat, SSE stream, 400 on an over-context prompt, 8 concurrent requests all 200.
+
+| 8B, ms/token unless noted | start of the speed work | now |
+|---|---|---|
+| single stream, ctx 300 | 42.0 | 30.0 |
+| single stream, ctx 1.5k | 45.7 | not re-measured |
+| single stream, ctx 14k | 77.0 | 43.0 |
+| 32 concurrent: ITL / aggregate | 62 ms / 425-446 tok/s | 42.2 ms / 630 tok/s |
+| 14k prefill | 10.5 s | 8.8 s |
+(speculative decoding, which lowers ctx-300 free text to ~35 ms before these changes, was off in these runs.)
