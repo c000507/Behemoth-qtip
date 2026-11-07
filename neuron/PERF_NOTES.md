@@ -312,3 +312,10 @@ Compressed 8B end to end through neuron_server / neuron_engine_cli (24 compresse
 gather) + 8 expanded; the "62 ms wall per layer" in an earlier note was wrong. Implicit async execution does not change it.
 Rows per step (dec1_32 / dec8_32 / dec32_32, 41-token prompts, 12 new tokens): 1 row 575 ms (1.7 tok/s), 8 rows 654 ms (12.2 tok/s),
 32 rows 966 ms (33 tok/s). The decode is shared across rows within a 128-token block, so batching amortises it.
+
+### Transposed FP8 projections (WT=1)
+
+The profile of a decode layer showed every projection streaming weights at ~145 GB/s (of 410) with the tensor engine 42 % busy: the
+weights were stored [out, in], so the contraction axis (in) was strided in HBM. Storing them [in, out] (trace_model.py WT=1; the runtime
+transposes the shards at upload and reads meta.wt) gives, single stream, ctx 300, async 8, no speculation: 38.0 -> 30.0 ms/token (-21 %), layers
+25.0 -> 17.5 ms. Oracle on the 7 positions <= 500: top-1 7/7, mean KL 0.0158 (the plain-layout graphs: 6/7, 0.0216). build_buckets.sh now defaults to WT=1.

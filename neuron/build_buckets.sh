@@ -9,6 +9,7 @@ set -e
 OUT=${1:?output directory}; export PAGES=${2:-2049}
 HERE=$(cd "$(dirname "$0")" && pwd)
 export PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:/opt/aws/neuron/bin:$PATH NEURON_PLATFORM_TARGET_OVERRIDE=trn1
+export WT=${WT:-1}  # transposed FP8 projections [in, out]: 21 % faster single-stream decode than [out, in] (PERF_NOTES); WT=0 for the old layout
 mkdir -p "$OUT"
 build() { n=$1; shift; [ -f "$OUT/$n/graph.neff" ] || { (cd "$OUT" && python "$HERE/trace_model.py" "$OUT/$n" "$@" > "$n.log" 2>&1); }; }
 for spec in "dec1_32 1 1 32" "dec1_128 1 1 128" "dec1_512 1 1 512" "dec1_1024 1 1 1024" "dec4_128 4 1 128" "dec4_512 4 1 512" \
