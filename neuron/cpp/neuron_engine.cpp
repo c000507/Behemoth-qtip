@@ -126,6 +126,12 @@ struct Engine::Impl {
         if (!dir)
             throw std::invalid_argument("set BEHEMOTH_NEURON_NEFF_DIR to the directory of traced NEFF buckets");
         m.neff_dir = dir;
+        if (const char *v = std::getenv("BEHEMOTH_NEURON_QTIP")) // expanded (default) | compressed | auto
+            m.qtip_mode = v;
+        if (const char *v = std::getenv("BEHEMOTH_NEURON_HBM_GIB"))
+            m.hbm_gib = std::atof(v);
+        if (const char *v = std::getenv("BEHEMOTH_NEURON_HBM_RESERVE_GIB"))
+            m.hbm_reserve_gib = std::atof(v);
         return m;
     }
     explicit Impl(const RuntimeOptions &o)

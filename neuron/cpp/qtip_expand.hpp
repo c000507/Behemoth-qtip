@@ -32,4 +32,21 @@ Fp8Shard quantize_rows(const float *w, int rows, int cols);
 // re-encoded with a per-row scale (max 224).
 std::vector<Fp8Shard> load_projection_shards(const behemoth::SafeTensorFile &file, int layer, const std::string &name,
                                              const behemoth::ModelConfig &config, int tp, bool column_parallel);
+
+// A QTIP projection kept COMPRESSED on the device for the fused decode kernel (neuron/qtip_nki.py, WEIGHTS=qtip
+// graphs): this rank's trellis words re-ordered so that the matmul's contraction axis is on the SBUF partitions,
+// plus the device codebook and the rotation scales. Mirrors qtip_nki.pack_shard / codebook_u32 exactly.
+struct QtipPacked {
+    int out_local = 0, in_local = 0;  // this rank's matrix (column-parallel: rows sharded; row-parallel: columns)
+    int groups = 0, out_tiles = 0;    // words layout [groups][128][out_tiles * 32]: partition p of group g holds the
+    std::vector<uint16_t> words;      // 32 words of every output tile for input channels g*2048 + 16 p + c (zero padded)
+    std::vector<uint32_t> lut;        // [128][1024] bf16x2 codebook (qtip::Codebook::bf16x2) replicated per partition
+    std::vector<float> su, sv;        // [in] and [out] of the FULL matrix (the graph rotates full vectors)
+    size_t device_bytes() const { return words.size() * 2 + lut.size() * 4 + (su.size() + sv.size()) * 4; }
+};
+QtipPacked pack_qtip_shard(const behemoth::qtip::HostLinear &l, int tp, int rank, bool column_parallel);
+// Resident bytes of pack_qtip_shard for a (out, in) QTIP projection without decoding it (planning).
+size_t qtip_packed_bytes(int out, int in, int tp, bool column_parallel);
+// True when the layer file stores `name` as a QTIP trellis (rather than FP8 or NVFP4 tensors).
+bool is_qtip_projection(const behemoth::SafeTensorFile &file, int layer, const std::string &name);
 } // namespace neuron

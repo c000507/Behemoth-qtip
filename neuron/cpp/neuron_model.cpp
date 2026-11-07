@@ -77,28 +77,53 @@ struct Meta {
     int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
     bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
     bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
+    std::string weights = "fp8";                  // kind "layer": "fp8" (seven E4M3 shards) or "qtip" (q/o/gate/up/down trellis resident)
+    std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
     Geometry geometry;
     std::filesystem::path neff;
 };
 
-// Layer NEFF input order after torch_neuronx moved the aliased KV state to the end.
-constexpr int kInputs = 22, kKvInput = 21;
+// Layer NEFF inputs of the first generator version (no "order" in meta.json): the FP8 layer.
+const std::vector<std::string> kFp8Order = {"x", "cos_sin", "pos", "wslot", "table", "cache", "norm1", "norm2", "qf", "qs", "of", "os",
+                                            "kf", "ks", "vf", "vs", "gf", "gs", "uf", "us", "df", "ds"};
+// NEFF input order: the meta order with the aliased KV state moved to the end (torch_neuronx puts module state last).
+std::vector<std::string> neff_input_names(const Meta &m) {
+    std::vector<std::string> names;
+    for (const auto &n : m.order.empty() ? kFp8Order : m.order)
+        if (n != "cache") names.push_back(n);
+    names.push_back("cache");
+    return names;
+}
+constexpr int kFp8Inputs = 22;
 // Continuations of up to this many tokens run as rows of a decode bucket instead of a prefill chunk.
 constexpr int kRowPathTokens = 8;
 
 struct LayerWeights {
+    bool compressed = false;     // QTIP q/o/gate/up/down resident as trellis words (WEIGHTS=qtip NEFF) instead of FP8 shards
     Dev norm1, norm2, w[14], kv; // w: qf qs of os kf ks vf vs gf gs uf us df ds; kv: [pages, 2 (K, V), kv_heads, 16, dim] bf16
+    struct Packed { Dev words, lut, su, sv; } q[5]; // compressed layers: q, o, gate, up, down (w keeps only kf ks vf vs)
+    size_t bytes() const {
+        size_t b = norm1.bytes + norm2.bytes;
+        for (const auto &d : w) b += d.bytes;
+        for (const auto &p : q) b += p.words.bytes + p.lut.bytes + p.su.bytes + p.sv.bytes;
+        return b;
+    }
 };
 
 struct RankState {
     int core = 0;
     std::vector<LayerWeights> layers;
     Dev head_w, head_norm, head_ws; // head_w: bf16 rows, or E4M3 rows + head_ws scales when an fp8 head NEFF is loaded
+    Dev sel_h, sel_ff;              // compressed layers: this rank's slice of a full hidden / intermediate vector (int64 indices)
 };
 
 struct LayerBucket {
     Meta meta;
-    std::vector<nrt_model_t *> model; // [rank]
+    std::vector<nrt_model_t *> model;         // [rank]: the meta.weights variant (the first layer NEFF found for this R, Q, P)
+    // Layer NEFFs of the same (R, Q, P) traced for the other weight format: a layer runs the variant of its own format.
+    struct Variant { Meta meta; std::vector<nrt_model_t *> model; };
+    std::map<std::string, Variant> variants;  // by weights ("fp8", "qtip"), including meta.weights -> {meta, model}
+    const std::vector<nrt_model_t *> &model_for(bool compressed) const { return variants.at(compressed ? "qtip" : "fp8").model; }
     // Whole-model buckets run as a chain of segments (one segment when the toolchain compiles all layers into one graph).
     struct Seg {
         Meta meta;
@@ -156,6 +181,8 @@ struct NeuronModel::Impl {
     nlohmann::json profile = nlohmann::json::object();
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
     size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
+    std::vector<bool> compressed;                                      // per layer: QTIP projections resident as trellis (decide_modes)
+    int n_compressed = 0;
 
     explicit Impl(const ModelOptions &o) : options(o), config(ModelConfig::read(o.model / "config.json")) {
         if (const char *n = std::getenv("NEURON_LAYERS")) // debugging: run only the first n layers (and whole-model NEFFs traced with L=n)
@@ -221,10 +248,27 @@ struct NeuronModel::Impl {
                 segments.push_back(m);
             } else if (m.kind == "layer") {
                 m.R = j.at("R"); m.Q = j.at("Q"); m.P = j.at("P");
+                m.weights = j.value("weights", "fp8");
+                if (j.contains("order"))
+                    for (const auto &n : j.at("order")) m.order.push_back(n);
+                if (m.weights != "fp8" && m.weights != "qtip")
+                    throw std::runtime_error("NEFF " + m.neff.string() + " has unknown weights format " + m.weights);
                 accept(m);
-                LayerBucket b;
-                b.meta = m;
-                (m.Q == 1 ? decode : prefill).push_back(std::move(b));
+                auto &set = m.Q == 1 ? decode : prefill;
+                LayerBucket *same = nullptr;
+                for (auto &b : set)
+                    if (!b.full() && b.meta.R == m.R && b.meta.Q == m.Q && b.meta.P == m.P) same = &b;
+                if (same) {
+                    if (same->variants.count(m.weights))
+                        throw std::runtime_error("two " + m.weights + " layer NEFFs for the same bucket R=" + std::to_string(m.R) + " Q=" +
+                                                 std::to_string(m.Q) + " P=" + std::to_string(m.P) + " in " + options.neff_dir.string());
+                    same->variants[m.weights] = {m, {}};
+                } else {
+                    LayerBucket b;
+                    b.meta = m;
+                    b.variants[m.weights] = {m, {}};
+                    set.push_back(std::move(b));
+                }
             } else {
                 m.S = j.at("S"); m.T = j.at("T");
                 m.fp8 = j.value("fp8", false);
@@ -307,10 +351,15 @@ struct NeuronModel::Impl {
     void load_buckets() {
         auto load_layer = [&](LayerBucket &b) {
             std::vector<std::vector<char>> neffs;
+            std::vector<std::string> variant_names; // per-layer buckets: the variant each NEFF belongs to
             if (b.full())
                 for (const auto &seg : b.segs) neffs.push_back(slurp(seg.meta.neff));
             else
-                neffs.push_back(slurp(b.meta.neff));
+                for (auto &[name, v] : b.variants) {
+                    neffs.push_back(slurp(v.meta.neff));
+                    variant_names.push_back(name);
+                    v.model.resize(size_t(tp));
+                }
             b.model.resize(size_t(tp));
             b.rank.resize(size_t(tp));
             for (auto &seg : b.segs) {
@@ -323,16 +372,19 @@ struct NeuronModel::Impl {
                 jobs.push_back(workers[size_t(r)]->submit([&, r] {
                     for (size_t g = 0; g < neffs.size(); ++g) {
                         const auto &neff = neffs[g];
-                        nrt_model_t *&handle = b.full() ? b.segs[g].model[size_t(r)] : b.model[size_t(r)];
+                        nrt_model_t *&handle = b.full() ? b.segs[g].model[size_t(r)] : b.variants.at(variant_names[g]).model[size_t(r)];
                         check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), uint32_t(tp), &handle), "nrt_load_collectives");
+                        if (!b.full() && variant_names[g] == b.meta.weights)
+                            b.model[size_t(r)] = handle;
                         nrt_tensor_info_array_t *info = nullptr;
                         check(nrt_get_model_tensor_info(handle, &info), "tensor info");
-                        const Meta &m = b.full() ? b.segs[g].meta : b.meta;
+                        const Meta &m = b.full() ? b.segs[g].meta : b.variants.at(variant_names[g]).meta;
                         if (options.verbose && r == 0)
                             std::cerr << (b.full() ? "model" : "layer") << " NEFF R=" << m.R << " Q=" << m.Q << " P=" << m.P << " L=" << (b.full() ? m.L : 1)
-                                      << " head=" << m.head << ": " << info->tensor_count << " tensors\n";
+                                      << " head=" << m.head << " weights=" << m.weights << ": " << info->tensor_count << " tensors\n";
                         const int base = b.full() ? (m.head ? 8 : 5) : 0;
-                        const int kv_index = b.full() ? base + 16 * m.L : kKvInput;
+                        const int layer_inputs = b.full() ? kFp8Inputs : int(neff_input_names(m).size());
+                        const int kv_index = b.full() ? base + 16 * m.L : layer_inputs - 1;
                         int ins = 0;
                         for (uint64_t i = 0; i < info->tensor_count; ++i)
                             if (info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT) {
@@ -345,7 +397,7 @@ struct NeuronModel::Impl {
                                 }
                                 ++ins;
                             }
-                        if (ins != (b.full() ? base + 17 * m.L : kInputs))
+                        if (ins != (b.full() ? base + 17 * m.L : layer_inputs))
                             throw std::runtime_error("NEFF has " + std::to_string(ins) + " inputs, unexpected for its layer count");
                     }
                     auto &pr = b.rank[size_t(r)];
@@ -404,7 +456,27 @@ struct NeuronModel::Impl {
             lw.kv = alloc(r, zeros.size(), "kv_cache");
             put(lw.kv, zeros.data(), zeros.size());
         }
+        const bool compress = compressed[size_t(layer)];
         for (const auto &p : projs) {
+            const bool kv_proj = p.slot == 4 || p.slot == 6;
+            if (compress && !kv_proj) {
+                // trellis words stay compressed: pack this rank's shard for the fused decode kernel (qtip_nki.py layout)
+                const auto l = qtip::load_linear(file, layer, p.name, &config);
+                const int which = p.slot == 0 ? 0 : p.slot == 2 ? 1 : p.slot == 8 ? 2 : p.slot == 10 ? 3 : 4; // q o gate up down
+                for (int r = 0; r < tp; ++r) {
+                    const QtipPacked packed = pack_qtip_shard(l, tp, r, p.col);
+                    auto &q = ranks[size_t(r)].layers[size_t(layer)].q[which];
+                    q.words = alloc(r, packed.words.size() * 2, p.name);
+                    q.lut = alloc(r, packed.lut.size() * 4, p.name);
+                    q.su = alloc(r, packed.su.size() * 4, p.name);
+                    q.sv = alloc(r, packed.sv.size() * 4, p.name);
+                    put(q.words, packed.words.data(), packed.words.size() * 2);
+                    put(q.lut, packed.lut.data(), packed.lut.size() * 4);
+                    put(q.su, packed.su.data(), packed.su.size() * 4);
+                    put(q.sv, packed.sv.data(), packed.sv.size() * 4);
+                }
+                continue;
+            }
             auto shards = load_projection_shards(file, layer, p.name, config, tp, p.col);
             for (int r = 0; r < tp; ++r) {
                 auto &lw = ranks[size_t(r)].layers[size_t(layer)];
@@ -417,10 +489,89 @@ struct NeuronModel::Impl {
         }
     }
 
+    // Which layers keep their QTIP projections compressed (options.qtip_mode), and whether the NEFF buckets can run the
+    // result: a compressed layer needs a WEIGHTS=qtip layer NEFF in every bucket, an expanded one a WEIGHTS=fp8 NEFF.
+    void decide_modes() {
+        compressed.assign(size_t(config.layers), false);
+        std::vector<bool> compressible(size_t(config.layers), false);
+        std::vector<size_t> packed_bytes(size_t(config.layers), 0), expanded_bytes(size_t(config.layers), 0);
+        const int H = hidden, FF = config.intermediate;
+        struct P { const char *name; bool col; int out, in; };
+        const P projs[] = {{"self_attn.q_proj", true, H, H}, {"self_attn.o_proj", false, H, H}, {"mlp.gate_proj", true, FF, H},
+                           {"mlp.up_proj", true, FF, H}, {"mlp.down_proj", false, H, FF}};
+        for (int layer = 0; layer < config.layers; ++layer) {
+            char name[64];
+            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer);
+            SafeTensorFile file(options.model / name);
+            bool all = true;
+            for (const auto &p : projs) {
+                all = all && is_qtip_projection(file, layer, p.name);
+                packed_bytes[size_t(layer)] += qtip_packed_bytes(p.out, p.in, tp, p.col);
+                expanded_bytes[size_t(layer)] += size_t(p.out) * size_t(p.in) / size_t(tp) + size_t(p.col ? p.out / tp : p.out) * 4;
+            }
+            compressible[size_t(layer)] = all;
+        }
+        const int n_compressible = int(std::count(compressible.begin(), compressible.end(), true));
+        if (options.qtip_mode == "compressed" || options.qtip_mode == "auto")
+            compressed = compressible;
+        else if (options.qtip_mode != "expanded")
+            throw std::runtime_error("BEHEMOTH_NEURON_QTIP must be expanded, compressed or auto (got " + options.qtip_mode + ")");
+        if (options.qtip_mode == "auto") {
+            // fill the HBM budget with expanded layers (from layer 0 up): every layer's fixed part (norms, FP8 k/v, KV cache),
+            // the lm_head and the compressed form of every QTIP layer are committed first
+            const double budget = (options.hbm_gib - options.hbm_reserve_gib) * double(1 << 30);
+            double used = double(vocab_shard) * double(hidden) * (head_fp8 ? 1.0 : 2.0) + double(vocab_shard) * 4;
+            for (int layer = 0; layer < config.layers; ++layer) {
+                used += double(kv_bytes()) + 2.0 * hidden * 4 + 2.0 * (size_t(config.kv_heads / tp) * size_t(dim) * size_t(hidden) + size_t(config.kv_heads / tp) * size_t(dim) * 4);
+                used += compressible[size_t(layer)] ? double(packed_bytes[size_t(layer)]) : double(expanded_bytes[size_t(layer)]);
+            }
+            for (int layer = 0; layer < config.layers; ++layer) {
+                if (!compressible[size_t(layer)]) continue;
+                const double extra = double(expanded_bytes[size_t(layer)]) - double(packed_bytes[size_t(layer)]);
+                if (used + extra > budget) break;
+                used += extra;
+                compressed[size_t(layer)] = false;
+            }
+            if (options.verbose)
+                std::cerr << "QTIP auto: planned " << used / double(1 << 30) << " GiB of a " << budget / double(1 << 30) << " GiB budget per core\n";
+        }
+        n_compressed = int(std::count(compressed.begin(), compressed.end(), true));
+        if (options.verbose)
+            std::cerr << "QTIP mode " << options.qtip_mode << ": " << n_compressed << " of " << n_compressible << " QTIP layers compressed (trellis resident), "
+                      << config.layers - n_compressed << " layers expanded to FP8\n";
+        const bool need_qtip = n_compressed > 0, need_fp8 = n_compressed < config.layers;
+        for (const auto *group : {&decode, &prefill})
+            for (const auto &b : *group) {
+                if (b.full()) {
+                    if (need_qtip)
+                        throw std::runtime_error("whole-model NEFF buckets cannot run compressed QTIP layers (NEURON_USE_LAYERS=1 or BEHEMOTH_NEURON_QTIP=expanded)");
+                    continue;
+                }
+                for (const auto &[need, name] : {std::pair{need_qtip, "qtip"}, std::pair{need_fp8, "fp8"}})
+                    if (need && !b.variants.count(name))
+                        throw std::runtime_error("layer bucket R=" + std::to_string(b.meta.R) + " Q=" + std::to_string(b.meta.Q) + " P=" + std::to_string(b.meta.P) +
+                                                 " has no WEIGHTS=" + name + " layer NEFF, which BEHEMOTH_NEURON_QTIP=" + options.qtip_mode + " needs for " +
+                                                 (std::string(name) == "qtip" ? "the compressed" : "the expanded") + " layers (retrace with WEIGHTS=" + name + ")");
+            }
+    }
+
     void load_weights() {
         const auto t0 = Clock::now();
-        for (auto &rs : ranks)
+        decide_modes();
+        for (auto &rs : ranks) {
             rs.layers.resize(size_t(config.layers));
+            for (int l = 0; l < config.layers; ++l) rs.layers[size_t(l)].compressed = compressed[size_t(l)];
+        }
+        if (n_compressed) // this rank's slice of a full hidden / intermediate vector (compressed graphs select it after the rotation)
+            for (int r = 0; r < tp; ++r) {
+                std::vector<int64_t> h(size_t(hidden / tp)), ff(size_t(config.intermediate / tp));
+                for (size_t i = 0; i < h.size(); ++i) h[i] = int64_t(r) * int64_t(h.size()) + int64_t(i);
+                for (size_t i = 0; i < ff.size(); ++i) ff[i] = int64_t(r) * int64_t(ff.size()) + int64_t(i);
+                ranks[size_t(r)].sel_h = alloc(r, h.size() * 8, "sel_h");
+                ranks[size_t(r)].sel_ff = alloc(r, ff.size() * 8, "sel_ff");
+                put(ranks[size_t(r)].sel_h, h.data(), h.size() * 8);
+                put(ranks[size_t(r)].sel_ff, ff.data(), ff.size() * 8);
+            }
         std::atomic<int> next{0};
         std::mutex log;
         std::vector<std::thread> pool;
@@ -483,16 +634,15 @@ struct NeuronModel::Impl {
             }
         }
         for (const auto &lw : ranks[0].layers) {
-            weight_bytes_rank += lw.norm1.bytes + lw.norm2.bytes;
-            for (const auto &w : lw.w) weight_bytes_rank += w.bytes;
+            weight_bytes_rank += lw.bytes();
             kv_bytes_rank += lw.kv.bytes;
         }
-        weight_bytes_rank += ranks[0].head_w.bytes + ranks[0].head_ws.bytes + ranks[0].head_norm.bytes;
+        weight_bytes_rank += ranks[0].head_w.bytes + ranks[0].head_ws.bytes + ranks[0].head_norm.bytes + ranks[0].sel_h.bytes + ranks[0].sel_ff.bytes;
         build_sets();
         if (options.verbose)
             std::cerr << "model resident on " << tp << " NeuronCores in " << ms_since(t0) / 1e3 << " s, " << pages_total - 1 << " KV pages; per core "
                       << weight_bytes_rank / double(1 << 30) << " GiB weights + " << kv_bytes_rank / double(1 << 30) << " GiB KV ("
-                      << Geometry::of(config, tp).str() << ", " << config.layers << " layers)\n";
+                      << Geometry::of(config, tp).str() << ", " << config.layers << " layers, " << n_compressed << " compressed)\n";
     }
 
     void build_sets() {
@@ -546,6 +696,31 @@ struct NeuronModel::Impl {
                 }
             }
         };
+        // the device tensor behind a layer NEFF input name (trace_model.py ORDER / ORDER_QTIP) for layer l, parity p
+        auto tensor_for = [&](const std::string &name, int r, const LayerBucket::PerRank &pr, const LayerWeights &lw, int p) -> const Dev & {
+            static const std::map<std::string, int> fp8_slot = {{"qf", 0}, {"qs", 1}, {"of", 2}, {"os", 3}, {"kf", 4}, {"ks", 5}, {"vf", 6},
+                                                                {"vs", 7}, {"gf", 8}, {"gs", 9}, {"uf", 10}, {"us", 11}, {"df", 12}, {"ds", 13}};
+            if (name == "x") return pr.x[p];
+            if (name == "cos_sin") return pr.cos_sin;
+            if (name == "pos") return pr.pos;
+            if (name == "wslot") return pr.wslot;
+            if (name == "table") return pr.table;
+            if (name == "cache") return lw.kv;
+            if (name == "norm1") return lw.norm1;
+            if (name == "norm2") return lw.norm2;
+            if (name == "sel_h") return ranks[size_t(r)].sel_h;
+            if (name == "sel_ff") return ranks[size_t(r)].sel_ff;
+            if (auto it = fp8_slot.find(name); it != fp8_slot.end()) return lw.w[it->second];
+            if (name.size() >= 2 && std::string("qogud").find(name[0]) != std::string::npos) { // qw ql qsu qsv ... dsv
+                const auto &q = lw.q[size_t(std::string("qogud").find(name[0]))];
+                const std::string field = name.substr(1);
+                if (field == "w") return q.words;
+                if (field == "l") return q.lut;
+                if (field == "su") return q.su;
+                if (field == "sv") return q.sv;
+            }
+            throw std::runtime_error("unknown layer NEFF input " + name);
+        };
         auto build = [&](LayerBucket &b) {
             if (b.full()) {
                 build_full(b);
@@ -553,29 +728,31 @@ struct NeuronModel::Impl {
             }
             for (int r = 0; r < tp; ++r) {
                 auto &pr = b.rank[size_t(r)];
-                nrt_tensor_info_array_t *info = nullptr;
-                check(nrt_get_model_tensor_info(b.model[size_t(r)], &info), "tensor info");
                 pr.in.resize(ranks[size_t(r)].layers.size());
                 pr.out.resize(pr.in.size());
-                for (size_t l = 0; l < pr.in.size(); ++l)
+                for (size_t l = 0; l < pr.in.size(); ++l) {
+                    const auto &lw = ranks[size_t(r)].layers[l];
+                    const auto &variant = b.variants.at(lw.compressed ? "qtip" : "fp8");
+                    const std::vector<std::string> names = neff_input_names(variant.meta);
+                    nrt_tensor_info_array_t *info = nullptr;
+                    check(nrt_get_model_tensor_info(variant.model[size_t(r)], &info), "tensor info");
                     for (int p = 0; p < 2; ++p) {
-                        const auto &lw = ranks[size_t(r)].layers[l];
                         nrt_tensor_set_t *in = nullptr, *out = nullptr;
                         check(nrt_allocate_tensor_set(&in), "set");
                         check(nrt_allocate_tensor_set(&out), "set");
-                        const Dev *by_index[kInputs] = {&pr.x[p], &pr.cos_sin, &pr.pos, &pr.wslot, &pr.table, &lw.norm1, &lw.norm2,
-                                                        &lw.w[0], &lw.w[1], &lw.w[2], &lw.w[3], &lw.w[4], &lw.w[5], &lw.w[6], &lw.w[7],
-                                                        &lw.w[8], &lw.w[9], &lw.w[10], &lw.w[11], &lw.w[12], &lw.w[13], &lw.kv};
                         int extra = 0;
                         for (uint64_t i = 0; i < info->tensor_count; ++i) {
                             const auto &t = info->tensor_array[i];
                             const std::string name = t.name;
                             if (t.usage == NRT_TENSOR_USAGE_INPUT) {
                                 const size_t index = std::stoul(name.substr(5));
-                                if (by_index[index]->bytes != t.size)
-                                    throw std::runtime_error("input " + name + " expects " + std::to_string(t.size) + " B, host has " +
-                                                             std::to_string(by_index[index]->bytes));
-                                check(nrt_add_tensor_to_tensor_set(in, t.name, by_index[index]->t), "add input");
+                                if (index >= names.size())
+                                    throw std::runtime_error("layer NEFF input " + name + " beyond its meta order");
+                                const Dev &dev = tensor_for(names[index], r, pr, lw, p);
+                                if (dev.bytes != t.size)
+                                    throw std::runtime_error("input " + name + " (" + names[index] + ") expects " + std::to_string(t.size) + " B, host has " +
+                                                             std::to_string(dev.bytes) + " (layer " + std::to_string(l) + ")");
+                                check(nrt_add_tensor_to_tensor_set(in, t.name, dev.t), "add input");
                             } else if (name == "output0") {
                                 check(nrt_add_tensor_to_tensor_set(out, t.name, pr.x[1 - p].t), "add output");
                             } else { // the updated KV state, written back into the same device buffer
@@ -588,6 +765,7 @@ struct NeuronModel::Impl {
                         pr.in[l][size_t(p)] = in;
                         pr.out[l][size_t(p)] = out;
                     }
+                }
             }
         };
         for (auto &b : decode) build(b);
@@ -761,7 +939,7 @@ struct NeuronModel::Impl {
                     }
                     for (size_t step = 0; step < order.size(); ++step) {
                         const size_t l = size_t(order[step]), parity = step % 2;
-                        check(nrt_execute(b.model[size_t(r)], pr.in[l][parity], pr.out[l][parity]), "layer execute");
+                        check(nrt_execute(b.model_for(compressed[l])[size_t(r)], pr.in[l][parity], pr.out[l][parity]), "layer execute");
                         if (r == 0)
                             dump_x(b, int(step) + 1, pr.x[(step + 1) % 2]);
                     }

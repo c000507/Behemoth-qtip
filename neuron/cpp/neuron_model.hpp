@@ -16,6 +16,12 @@ struct ModelOptions {
     std::filesystem::path neff_dir; // subdirectories with meta.json + graph.neff (trace_model.py outputs)
     int load_threads = 4;           // layers expanded and uploaded concurrently
     bool verbose = true;
+    // QTIP layers: "expanded" decodes them to FP8 shards at load (the fast path, needs WEIGHTS=fp8 layer NEFFs);
+    // "compressed" keeps the trellis resident and decodes in the graph every step (WEIGHTS=qtip NEFFs, ~1/4 of the
+    // HBM, far slower per token); "auto" compresses everything, then expands layers from 0 up while the HBM budget
+    // (hbm_gib - hbm_reserve_gib, minus KV, head and the compressed rest) allows. A mixed model needs both NEFF kinds.
+    std::string qtip_mode = "expanded";
+    double hbm_gib = 16.0, hbm_reserve_gib = 2.0;
 };
 
 class NeuronModel {

@@ -118,4 +118,50 @@ std::vector<Fp8Shard> load_projection_shards(const SafeTensorFile &file, int lay
     }
     throw std::invalid_argument("projection not found in layer file: " + base);
 }
+
+bool is_qtip_projection(const SafeTensorFile &file, int layer, const std::string &name) {
+    return file.contains("model.layers." + std::to_string(layer) + "." + name + ".trellis");
+}
+
+namespace {
+constexpr int kInGroup = 2048;   // qtip_nki.IN_GROUP: input channels per 128-partition group (16 per partition)
+constexpr int kChunkTiles = 32;  // qtip_nki.NT: output tiles per kernel chunk
+}
+
+size_t qtip_packed_bytes(int out, int in, int tp, bool column_parallel) {
+    const int out_local = column_parallel ? out / tp : out, in_local = column_parallel ? in : in / tp;
+    const int groups = (in_local / 16 + 127) / 128;
+    return size_t(groups) * 128 * size_t(out_local / 16) * 32 * 2 + size_t(128) * 1024 * 4 + size_t(in + out) * 4;
+}
+
+QtipPacked pack_qtip_shard(const qtip::HostLinear &l, int tp, int rank, bool column_parallel) {
+    if (l.is_fp8() || l.is_nvfp4())
+        throw std::invalid_argument("pack_qtip_shard expects a QTIP projection");
+    if (rank < 0 || rank >= tp || (column_parallel ? l.out / 16 : l.in / 16) % tp)
+        throw std::invalid_argument("invalid tensor-parallel shard");
+    QtipPacked p;
+    p.out_local = column_parallel ? l.out / tp : l.out;
+    p.in_local = column_parallel ? l.in : l.in / tp;
+    p.out_tiles = p.out_local / 16;
+    if (p.out_tiles % kChunkTiles)
+        throw std::invalid_argument("QTIP output tiles must be a multiple of " + std::to_string(kChunkTiles));
+    const int in_tiles = p.in_local / 16;
+    p.groups = (in_tiles + 127) / 128;
+    const int ob0 = column_parallel ? rank * p.out_tiles : 0, ib0 = column_parallel ? 0 : rank * in_tiles;
+    p.words.assign(size_t(p.groups) * 128 * size_t(p.out_tiles) * 32, 0);
+#pragma omp parallel for schedule(static)
+    for (int ib = 0; ib < in_tiles; ++ib) {
+        uint16_t *dst = p.words.data() + (size_t(ib / 128) * 128 + size_t(ib % 128)) * size_t(p.out_tiles) * 32;
+        for (int ob = 0; ob < p.out_tiles; ++ob)
+            for (int c = 0; c < 32; ++c)
+                dst[size_t(ob) * 32 + size_t(c)] = l.word(ob0 + ob, ib0 + ib, c);
+    }
+    const qtip::Codebook cb = qtip::make_codebook(l.tlut);
+    p.lut.resize(size_t(128) * qtip::lut_entries);
+    for (int part = 0; part < 128; ++part)
+        std::copy(cb.bf16x2.begin(), cb.bf16x2.end(), p.lut.begin() + size_t(part) * qtip::lut_entries);
+    p.su = l.su;
+    p.sv = l.sv;
+    return p;
+}
 } // namespace neuron
