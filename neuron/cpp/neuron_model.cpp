@@ -191,6 +191,9 @@ std::vector<char> slurp(const std::filesystem::path &p) {
 
 struct NeuronModel::Impl {
     ModelOptions options;
+    // Prepared shards (BEHEMOTH_NEURON_PREPARED_DIR / BEHEMOTH_NEURON_WRITE_PREPARED): every layer's per-rank device bytes as uploaded
+    // (transposed, tiled, row scales, norms) in one file per layer, so a load is read + copy with no expansion pass.
+    std::filesystem::path prepared_dir, write_prepared_dir;
     ModelConfig config;
     std::unique_ptr<SafeTensorFile> embed_file;
     FloatTensorView embed, final_norm;
@@ -537,18 +540,114 @@ struct NeuronModel::Impl {
     void upload_layer(int layer) {
         char name[64];
         std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
-        wait_ready(options.model / name);
-        upload_layer_file(layer, options.model / name);
+        std::filesystem::path src = options.model / name;
+        if (!prepared_dir.empty())
+            src = prepared_dir / prepared_name(layer);
+        wait_ready(src);
+        if (!prepared_dir.empty())
+            upload_prepared(layer, src);
+        else
+            upload_layer_file(layer, src);
         // streamed loading: tell the downloader this file is consumed, and drop the staged copy if asked (tmpfs staging)
         if (std::getenv("BEHEMOTH_NEURON_WAIT_READY")) {
-            std::ofstream(options.model / (std::string(name) + ".done")).put('\n');
+            std::ofstream(src.string() + ".done").put('\n');
             if (std::getenv("BEHEMOTH_NEURON_UNLINK_LAYERS")) {
                 std::error_code ec;
-                const auto target = std::filesystem::canonical(options.model / name, ec);
+                const auto target = std::filesystem::canonical(src, ec);
                 if (!ec)
                     std::filesystem::remove(target, ec);
             }
         }
+    }
+
+    static std::string prepared_name(int layer) {
+        char name[64];
+        std::snprintf(name, sizeof name, "model-layer-%05d.bin", layer + layer_offset());
+        return name;
+    }
+    // What the prepared bytes depend on: a directory written for another layout must not be loaded.
+    nlohmann::json prepared_layout() const {
+        return {{"format", 1}, {"tp", tp}, {"wt", weights_transposed}, {"mlp_tiled", mlp_tiled}, {"hidden", hidden},
+                {"intermediate", config.intermediate}, {"q_heads", config.q_heads}, {"kv_heads", config.kv_heads}, {"dim", dim},
+                {"layers", config.layers}, {"layer_offset", layer_offset()}};
+    }
+    void check_prepared() {
+        if (const char *d = std::getenv("BEHEMOTH_NEURON_PREPARED_DIR"))
+            prepared_dir = d;
+        if (const char *d = std::getenv("BEHEMOTH_NEURON_WRITE_PREPARED"))
+            write_prepared_dir = d;
+        if ((!prepared_dir.empty() || !write_prepared_dir.empty()) && n_compressed)
+            throw std::runtime_error("prepared shards cover FP8-expanded layers only (QTIP layers kept compressed)");
+        if (!prepared_dir.empty()) {
+            wait_ready(prepared_dir / "layout.json");
+            std::ifstream f(prepared_dir / "layout.json");
+            const auto have = nlohmann::json::parse(f);
+            if (have != prepared_layout())
+                throw std::runtime_error("prepared shards in " + prepared_dir.string() + " were written for " + have.dump() + ", this load needs " +
+                                         prepared_layout().dump());
+            if (options.verbose)
+                std::cerr << "loading prepared shards from " << prepared_dir << "\n";
+        }
+        if (!write_prepared_dir.empty()) {
+            std::filesystem::create_directories(write_prepared_dir);
+            std::ofstream(write_prepared_dir / "layout.json") << prepared_layout().dump(1) << "\n";
+        }
+    }
+    // file: "BSHD0001", u32 entries, then per entry u32 rank, u32 slot (0..13: w[], 100 / 101: norm1 / norm2), u64 bytes; then the data
+    struct PreparedEntry { uint32_t rank, slot; uint64_t bytes; };
+    void write_prepared(int layer, const std::vector<PreparedEntry> &entries, const std::vector<std::vector<uint8_t>> &data) {
+        const auto path = write_prepared_dir / prepared_name(layer);
+        const auto tmp = path.string() + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            const uint32_t n = uint32_t(entries.size());
+            f.write("BSHD0001", 8);
+            f.write(reinterpret_cast<const char *>(&n), 4);
+            f.write(reinterpret_cast<const char *>(entries.data()), std::streamsize(entries.size() * sizeof(PreparedEntry)));
+            for (const auto &d : data)
+                f.write(reinterpret_cast<const char *>(d.data()), std::streamsize(d.size()));
+            if (!f)
+                throw std::runtime_error("cannot write " + tmp);
+        }
+        std::filesystem::rename(tmp, path);
+    }
+    void init_layer_state(int layer) { // KV cache (zeros) and FP8 scales (ones) of every rank
+        std::vector<uint8_t> zeros(kv_bytes(), 0);
+        for (int r = 0; r < tp; ++r) {
+            auto &lw = ranks[size_t(r)].layers[size_t(layer)];
+            lw.kv = alloc(r, zeros.size(), "kv_cache");
+            put(lw.kv, zeros.data(), zeros.size());
+            if (kv8) { // scales start at 1 so an unwritten page dequantises to 0 * 1
+                std::vector<float> ones(kv_scale_bytes() / 4, 1.f);
+                lw.ks = alloc(r, kv_scale_bytes(), "kv_scale");
+                put(lw.ks, ones.data(), kv_scale_bytes());
+            }
+        }
+    }
+    void upload_prepared(int layer, const std::filesystem::path &path) {
+        std::ifstream f(path, std::ios::binary);
+        char magic[8];
+        uint32_t n = 0;
+        f.read(magic, 8);
+        f.read(reinterpret_cast<char *>(&n), 4);
+        if (!f || std::string(magic, 8) != "BSHD0001" || n > 64)
+            throw std::runtime_error("bad prepared shard file " + path.string());
+        std::vector<PreparedEntry> entries(n);
+        f.read(reinterpret_cast<char *>(entries.data()), std::streamsize(n * sizeof(PreparedEntry)));
+        std::vector<uint8_t> buf;
+        for (const auto &e : entries) {
+            if (e.rank >= uint32_t(tp) || !(e.slot < 14 || e.slot == 100 || e.slot == 101))
+                throw std::runtime_error("bad prepared entry in " + path.string());
+            auto &lw = ranks[size_t(e.rank)].layers[size_t(layer)];
+            Dev &d = e.slot == 100 ? lw.norm1 : e.slot == 101 ? lw.norm2 : lw.w[e.slot];
+            buf.resize(size_t(e.bytes));
+            f.read(reinterpret_cast<char *>(buf.data()), std::streamsize(e.bytes));
+            if (!f)
+                throw std::runtime_error("truncated prepared shard file " + path.string());
+            d = alloc(int(e.rank), size_t(e.bytes), "prepared");
+            put(d, buf.data(), buf.size());
+        }
+        init_layer_state(layer);
     }
 
     void upload_layer_file(int layer, const std::filesystem::path &path) {
@@ -563,21 +662,25 @@ struct NeuronModel::Impl {
             auto a = file.floats(base + "input_layernorm.weight"), b = file.floats(base + "post_attention_layernorm.weight");
             for (size_t i = 0; i < H; ++i) { n1[i] = a[i]; n2[i] = b[i]; }
         }
-        std::vector<uint8_t> zeros(kv_bytes(), 0);
+        // BEHEMOTH_NEURON_WRITE_PREPARED: keep a copy of every uploaded weight buffer for this layer's prepared shard file
+        const bool record = !write_prepared_dir.empty();
+        std::vector<PreparedEntry> rec_entries;
+        std::vector<std::vector<uint8_t>> rec_data;
+        auto upload = [&](int r, uint32_t slot, Dev &d, const void *src, size_t bytes) {
+            put(d, src, bytes);
+            if (record) {
+                rec_entries.push_back({uint32_t(r), slot, uint64_t(bytes)});
+                rec_data.emplace_back(static_cast<const uint8_t *>(src), static_cast<const uint8_t *>(src) + bytes);
+            }
+        };
         for (int r = 0; r < tp; ++r) {
             auto &lw = ranks[size_t(r)].layers[size_t(layer)];
             lw.norm1 = alloc(r, H * 4, "norm1");
             lw.norm2 = alloc(r, H * 4, "norm2");
-            put(lw.norm1, n1.data(), H * 4);
-            put(lw.norm2, n2.data(), H * 4);
-            lw.kv = alloc(r, zeros.size(), "kv_cache");
-            put(lw.kv, zeros.data(), zeros.size());
-            if (kv8) { // scales start at 1 so an unwritten page dequantises to 0 * 1
-                std::vector<float> ones(kv_scale_bytes() / 4, 1.f);
-                lw.ks = alloc(r, kv_scale_bytes(), "kv_scale");
-                put(lw.ks, ones.data(), kv_scale_bytes());
-            }
+            upload(r, 100, lw.norm1, n1.data(), H * 4);
+            upload(r, 101, lw.norm2, n2.data(), H * 4);
         }
+        init_layer_state(layer);
         const bool compress = compressed[size_t(layer)];
         for (const auto &p : projs) {
             const bool kv_proj = p.slot == 4 || p.slot == 6;
@@ -632,12 +735,14 @@ struct NeuronModel::Impl {
                         }
                         t.swap(tiled);
                     }
-                    put(lw.w[p.slot], t.data(), t.size());
+                    upload(r, uint32_t(p.slot), lw.w[p.slot], t.data(), t.size());
                 } else
-                    put(lw.w[p.slot], s.w.data(), s.w.size());
-                put(lw.w[p.slot + 1], s.scale.data(), s.scale.size() * 4);
+                    upload(r, uint32_t(p.slot), lw.w[p.slot], s.w.data(), s.w.size());
+                upload(r, uint32_t(p.slot + 1), lw.w[p.slot + 1], s.scale.data(), s.scale.size() * 4);
             }
         }
+        if (record)
+            write_prepared(layer, rec_entries, rec_data);
     }
 
     // Which layers keep their QTIP projections compressed (options.qtip_mode), and whether the NEFF buckets can run the
@@ -743,6 +848,7 @@ struct NeuronModel::Impl {
                 put(ranks[size_t(r)].sel_h, h.data(), h.size() * 8);
                 put(ranks[size_t(r)].sel_ff, ff.data(), ff.size() * 8);
             }
+        check_prepared();
         std::atomic<int> next{0};
         std::mutex log;
         std::vector<std::thread> pool;

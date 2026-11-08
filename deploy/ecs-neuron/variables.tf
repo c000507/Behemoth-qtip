@@ -121,6 +121,12 @@ variable "graphs_s3_prefix" {
 }
 
 # ------------------------------------------------------------------ images
+variable "prepared_s3_prefix" {
+  description = "Optional prefix of prepared shards (neuron_server BEHEMOTH_NEURON_WRITE_PREPARED output: layout.json + model-layer-NNNNN.bin): the backend streams these instead of the safetensors layer files and skips the expansion pass. Must match the graphs' layout (the server checks layout.json)."
+  type        = string
+  default     = ""
+}
+
 variable "backend_ecr_repository_name" {
   description = "Existing ECR repository of the neuron_server image (created outside Terraform, read via data source)."
   type        = string
@@ -172,6 +178,12 @@ variable "backend_root_volume_gb" {
 
 variable "backend_use_spot" {
   description = "Run the trn backend on spot (true) or on-demand (false). Spot needs the 'All Trn Spot Instance Requests' vCPU quota; on-demand uses 'Running On-Demand Trn instances'. Switching only changes the ASG's instances distribution (in place)."
+  type        = bool
+  default     = true
+}
+
+variable "backend_warm_pool" {
+  description = "On-demand only: keep one stopped, pre-initialised backend instance in an ASG warm pool (cold start skips launch, boot and the image pull; costs the stopped instance's root volume, ~$8/month for 100 GB gp3)."
   type        = bool
   default     = true
 }

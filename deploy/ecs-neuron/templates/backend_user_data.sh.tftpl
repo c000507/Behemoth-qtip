@@ -1,10 +1,15 @@
 #!/bin/bash
-# trn host bootstrap: mount the NVMe instance store for the pulled model/graph files, then join the ECS cluster.
-# The ECS agent (ecs.service) starts after cloud-init, so the mount exists before any task is placed.
+# trn host bootstrap: a systemd unit (before ecs.service, on EVERY boot) mounts the NVMe instance store for the pulled
+# model / graph files, since a warm-pool instance is stopped and started again and the instance store comes back empty;
+# then the instance joins the ECS cluster (ECS_WARM_POOLS_CHECK keeps the agent from registering while it is warming).
 set -euxo pipefail
 
+cat > /usr/local/sbin/behemoth-mount-data <<'SCRIPT'
+#!/bin/bash
+set -eux
 MNT=${data_mount}
 mkdir -p "$MNT"
+mountpoint -q "$MNT" && exit 0
 DEV=$(ls /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* 2>/dev/null | grep -v -- '-ns-' | head -n1 || true)
 if [ -n "$DEV" ]; then
   DEV=$(readlink -f "$DEV")
@@ -15,11 +20,32 @@ else
   echo "no instance store found; model files go to the root volume under $MNT"
 fi
 mkdir -p "$MNT/behemoth"
+SCRIPT
+chmod +x /usr/local/sbin/behemoth-mount-data
 
-cat >> /etc/ecs/ecs.config <<EOF
+cat > /etc/systemd/system/behemoth-mount-data.service <<'UNIT'
+[Unit]
+Description=Mount the instance store for behemoth model files
+Before=ecs.service docker.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/behemoth-mount-data
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable behemoth-mount-data.service
+systemctl start behemoth-mount-data.service
+
+cat >> /etc/ecs/ecs.config <<EOF2
 ECS_CLUSTER=${cluster_name}
 ECS_ENABLE_SPOT_INSTANCE_DRAINING=true
 ECS_CONTAINER_STOP_TIMEOUT=60s
 ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
 ECS_ENABLE_CONTAINER_METADATA=true
-EOF
+ECS_WARM_POOLS_CHECK=true
+EOF2

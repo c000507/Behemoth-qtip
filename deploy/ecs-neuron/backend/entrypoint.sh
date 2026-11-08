@@ -45,6 +45,9 @@ STREAM_LOAD=${STREAM_LOAD:-1}
 STAGE_DIR=${STAGE_DIR:-$MODEL_DIR}
 STREAM_PAR=${STREAM_PAR:-4}      # layer files downloading at once
 STREAM_AHEAD=${STREAM_AHEAD:-48} # layers downloaded but not yet uploaded (bounds tmpfs use)
+# PREPARED_S3_PREFIX: stream prepared shards (neuron_server BEHEMOTH_NEURON_WRITE_PREPARED output: layout.json + one
+# model-layer-NNNNN.bin per layer, the device bytes as uploaded) instead of the safetensors layer files: no expansion pass.
+PREPARED_PREFIX=${PREPARED_S3_PREFIX%/}
 
 if [ "$STREAM_LOAD" = 1 ]; then
   t0=$SECONDS
@@ -53,28 +56,39 @@ if [ "$STREAM_LOAD" = 1 ]; then
   p1=$!
   pull "$GRAPHS_PREFIX" "$GRAPH_DIR" &
   p2=$!
-  layers=$(s5cmd ls "s3://$S3_BUCKET/$MODEL_PREFIX/model-layer-*" | awk '{print $NF}' | sort)
+  if [ -n "$PREPARED_PREFIX" ]; then
+    SRC_PREFIX=$PREPARED_PREFIX
+    MARK_DIR=$DATA_DIR/$PREPARED_PREFIX
+    mkdir -p "$MARK_DIR"
+    s5cmd cp "s3://$S3_BUCKET/$PREPARED_PREFIX/layout.json" "$MARK_DIR/layout.json" >/dev/null && touch "$MARK_DIR/layout.json.ready"
+    layers=$(s5cmd ls "s3://$S3_BUCKET/$PREPARED_PREFIX/model-layer-*.bin" | awk '{print $NF}' | sort)
+    export BEHEMOTH_NEURON_PREPARED_DIR=$MARK_DIR
+  else
+    SRC_PREFIX=$MODEL_PREFIX
+    MARK_DIR=$MODEL_DIR
+    layers=$(s5cmd ls "s3://$S3_BUCKET/$MODEL_PREFIX/model-layer-*" | awk '{print $NF}' | sort)
+  fi
   wait $p1
   wait $p2
   test -f "$MODEL_DIR/config.json" || { echo "no config.json in $MODEL_DIR"; exit 1; }
   check_graphs
   for f in $layers; do
-    rm -f "$MODEL_DIR/$f.ready" "$MODEL_DIR/$f.done" "$MODEL_DIR/$f.failed"
-    [ "$STAGE_DIR" = "$MODEL_DIR" ] || ln -sfn "$STAGE_DIR/$f" "$MODEL_DIR/$f"
+    rm -f "$MARK_DIR/$f.ready" "$MARK_DIR/$f.done" "$MARK_DIR/$f.failed"
+    [ "$STAGE_DIR" = "$MARK_DIR" ] || ln -sfn "$STAGE_DIR/$f" "$MARK_DIR/$f"
   done
-  echo "small files and graphs in $((SECONDS - t0)) s; streaming $(echo "$layers" | wc -w) layer files (par $STREAM_PAR, ahead $STREAM_AHEAD)"
+  echo "small files and graphs in $((SECONDS - t0)) s; streaming $(echo "$layers" | wc -w) layer files from $SRC_PREFIX (par $STREAM_PAR, ahead $STREAM_AHEAD)"
   fetch_layer() { # index name
     local i=$1 f=$2
-    while [ $(( i - $(ls "$MODEL_DIR"/*.done 2>/dev/null | wc -l) )) -ge "$STREAM_AHEAD" ]; do sleep 0.2; done
+    while [ $(( i - $(ls "$MARK_DIR"/*.done 2>/dev/null | wc -l) )) -ge "$STREAM_AHEAD" ]; do sleep 0.2; done
     if s5cmd --retry-count 5 cp --concurrency "$S5CMD_CONCURRENCY" --part-size "$S5CMD_PART_MB" \
-        "s3://$S3_BUCKET/$MODEL_PREFIX/$f" "$STAGE_DIR/$f" >/dev/null; then
-      touch "$MODEL_DIR/$f.ready"
+        "s3://$S3_BUCKET/$SRC_PREFIX/$f" "$STAGE_DIR/$f" >/dev/null; then
+      touch "$MARK_DIR/$f.ready"
     else
-      echo "download failed: $f"; touch "$MODEL_DIR/$f.failed"
+      echo "download failed: $f"; touch "$MARK_DIR/$f.failed"
     fi
   }
   export -f fetch_layer
-  export MODEL_DIR STAGE_DIR S3_BUCKET MODEL_PREFIX S5CMD_CONCURRENCY S5CMD_PART_MB STREAM_AHEAD
+  export MARK_DIR STAGE_DIR S3_BUCKET SRC_PREFIX S5CMD_CONCURRENCY S5CMD_PART_MB STREAM_AHEAD
   (
     t1=$SECONDS
     echo "$layers" | nl -v0 -w1 -s' ' | xargs -P "$STREAM_PAR" -n 2 bash -c 'fetch_layer "$0" "$1"'

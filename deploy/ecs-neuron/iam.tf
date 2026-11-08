@@ -118,6 +118,7 @@ data "aws_iam_policy_document" "backend_task" {
       values = [
         var.model_s3_prefix, "${var.model_s3_prefix}/*",
         var.graphs_s3_prefix, "${var.graphs_s3_prefix}/*",
+        local.prepared_prefix, "${local.prepared_prefix}/*",
       ]
     }
   }
@@ -127,6 +128,7 @@ data "aws_iam_policy_document" "backend_task" {
     resources = [
       "${aws_s3_bucket.models.arn}/${var.model_s3_prefix}/*",
       "${aws_s3_bucket.models.arn}/${var.graphs_s3_prefix}/*",
+      "${aws_s3_bucket.models.arn}/${local.prepared_prefix}/*",
     ]
   }
   dynamic "statement" {

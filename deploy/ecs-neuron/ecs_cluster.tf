@@ -74,22 +74,49 @@ resource "aws_autoscaling_group" "backend" {
   capacity_rebalance    = false
   health_check_type     = "EC2"
 
-  mixed_instances_policy {
-    instances_distribution {
-      on_demand_base_capacity                  = 0
-      on_demand_percentage_above_base_capacity = var.backend_use_spot ? 0 : 100 # spot only, or on-demand only
-      spot_allocation_strategy                 = "price-capacity-optimized"
-      spot_max_price                           = var.backend_use_spot && var.spot_max_price != "" ? var.spot_max_price : null
+  # Spot runs through a mixed instances policy; on-demand uses the launch template directly, which is what lets it have a
+  # warm pool (EC2 Auto Scaling supports warm pools neither with mixed instances policies nor with spot).
+  dynamic "launch_template" {
+    for_each = var.backend_use_spot ? [] : [1]
+    content {
+      id      = aws_launch_template.backend.id
+      version = "$Latest"
     }
-    launch_template {
-      launch_template_specification {
-        launch_template_id = aws_launch_template.backend.id
-        version            = "$Latest"
+  }
+
+  # Warm pool (on-demand only): one stopped, already-initialised instance (cluster join done, image cached on the root
+  # volume) that a scale-out starts instead of launching and booting a new one; scale-in returns it to the pool.
+  dynamic "warm_pool" {
+    for_each = !var.backend_use_spot && var.backend_warm_pool ? [1] : []
+    content {
+      pool_state                  = "Stopped"
+      min_size                    = 1
+      max_group_prepared_capacity = 1
+      instance_reuse_policy {
+        reuse_on_scale_in = true
       }
-      dynamic "override" {
-        for_each = var.backend_instance_types
-        content {
-          instance_type = override.value
+    }
+  }
+
+  dynamic "mixed_instances_policy" {
+    for_each = var.backend_use_spot ? [1] : []
+    content {
+      instances_distribution {
+        on_demand_base_capacity                  = 0
+        on_demand_percentage_above_base_capacity = var.backend_use_spot ? 0 : 100 # spot only, or on-demand only
+        spot_allocation_strategy                 = "price-capacity-optimized"
+        spot_max_price                           = var.backend_use_spot && var.spot_max_price != "" ? var.spot_max_price : null
+      }
+      launch_template {
+        launch_template_specification {
+          launch_template_id = aws_launch_template.backend.id
+          version            = "$Latest"
+        }
+        dynamic "override" {
+          for_each = var.backend_instance_types
+          content {
+            instance_type = override.value
+          }
         }
       }
     }

@@ -6,11 +6,14 @@ resource "aws_cloudwatch_log_group" "backend" {
 locals {
   backend_image = "${data.aws_ecr_repository.backend.repository_url}:${var.backend_image_tag}"
 
+  # IAM needs some prefix even when prepared shards are off; a name nothing is ever written under
+  prepared_prefix = var.prepared_s3_prefix != "" ? var.prepared_s3_prefix : "prepared/unused"
   backend_env = merge({
     AWS_REGION              = var.region
     S3_BUCKET               = aws_s3_bucket.models.bucket
     MODEL_S3_PREFIX         = var.model_s3_prefix
     GRAPHS_S3_PREFIX        = var.graphs_s3_prefix
+    PREPARED_S3_PREFIX      = var.prepared_s3_prefix
     DATA_DIR                = "/data"
     PORT                    = tostring(var.backend_port)
     S5CMD_WORKERS           = tostring(var.s5cmd_workers)
