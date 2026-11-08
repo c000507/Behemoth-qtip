@@ -1,5 +1,8 @@
 # Serving Llama on NeuronCores (trn1, TP=2)
 
+> GLM-5.3-Flash (KDA, sparse MLA, mHC, MoE; the 320B MoE and the 80-layer dense conversion) runs through the same
+> `NeuronModel` / `Engine` / server with its own graphs and runtime: see [GLM53.md](GLM53.md).
+
 The server's own `Engine` / `Scheduler` / `PagePool` run unchanged on top of a Neuron model backend. Weights, the
 paged KV cache and all activations stay on the two NeuronCores; the host supplies token embeddings, RoPE rows, page
 tables and write slots each step and reads back the logits of the sampled rows.

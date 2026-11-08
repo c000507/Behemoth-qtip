@@ -145,6 +145,11 @@ class GlmModel final : public Backend {
         eos_ = prepared.at("eos").get<std::vector<int>>();
         max_context_ = prepared.at("max_context");
         map_embedding();
+        // BEHEMOTH_NEURON_GLM_ASYNC=1: implicit async execution (launches return before the device finishes; the logits
+        // read synchronises), hides launch gaps. Off by default: a KDA state spill / restore between two launches of one
+        // step relies on the previous launch having finished.
+        if (const char *a = std::getenv("BEHEMOTH_NEURON_GLM_ASYNC"); a && std::atoi(a))
+            setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "8", 0);
         check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
         ranks.resize(size_t(tp));
         for (int r = 0; r < tp; ++r)

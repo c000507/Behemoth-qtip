@@ -8,7 +8,8 @@ A GLM layer is two sub-blocks, each wrapped in its own mHC pre/post (hyper-conne
     x [T, S*H] f32 (replicated) -> hyper_pre -> RMSNorm -> {kda | mla} -> hyper_post -> x
     x                           -> hyper_pre -> RMSNorm -> {dense | moe} -> hyper_post -> x
 One NEFF per (block kind, bucket) serves every layer of that kind (the runtime binds the layer's weights and state by
-name, glm_runtime / cpp/glm_model.cpp). Buckets: decode R rows x Q=1, prefill R=1 x Q tokens of one request.
+name, cpp/glm_model.cpp; glm_runner.py is the same step logic on the CPU). Buckets: decode R rows x Q=1, prefill
+R=1 x Q tokens of one request. kind layer_<attn>_<mlp> puts both sub-blocks of a layer into one NEFF.
 
 Sharding over TP ranks (every rank runs the same NEFF; rank-dependent data are inputs, never graph constants):
   KDA   q/k/v, conv, f_b, g_b, b, A_log, dt_bias by linear head (column-parallel), f_a / g_a replicated (128 rows),
@@ -336,9 +337,9 @@ def moe_block(n, t, g, allreduce, mode='all'):
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [El, 2EIl, H], [El, EIl, H]
     if mode == 'gather' and g.K * T < g.El:                                            # else every local expert may be needed
         slots = g.K * T
-        used = (comb > 0).float().amax(dim=0)                                          # [El]
-        rank = used - torch.arange(g.El, device=n.device).float() * (0.5 / g.El)        # used first, then low ids
-        idx = torch.topk(rank, slots)[1]
+        used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, El]
+        rank = used - torch.arange(g.El, device=n.device).float().reshape(1, g.El) * (0.5 / g.El)  # used first, then low ids
+        idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                         # (a 1-D topk crashes the XLA trace)
         comb = torch.index_select(comb, 1, idx)
         gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None

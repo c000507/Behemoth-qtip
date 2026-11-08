@@ -1,5 +1,7 @@
 # Experimental Neuron inference path
 
+> GLM-5.3-Flash on Neuron (TP / EP graphs, runtime, tool calls, feasibility on trn1.32xlarge): [GLM53.md](GLM53.md).
+>
 > The tensor-parallel, device-resident serving path (paged KV, flash attention, cFP8, the server's Engine and an HTTP
 > server) is documented in [SERVING.md](SERVING.md); the text below describes the earlier single-sequence NKI runner.
 
