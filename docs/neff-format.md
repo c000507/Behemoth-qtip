@@ -212,3 +212,31 @@ reference engine streams) produces BIT-IDENTICAL output to the original.
   yields all-NaN outputs).
 - neff.json: heads points at the tvm_op NODE INDEX; node_row_ptr has
   len(nodes)+1 entries; shapes/storage cover all node outputs.
+
+## Elementwise numerics proven (kernel-26bb replica, trn1 2026-11-09)
+
+Container emitted by tools/neff_emit.py + lift_hip.py with reference engine
+streams runs BIT-IDENTICAL to the original NEFF. Decode of that kernel:
+- Pool op212 descriptors: dst marker16 scratch addrs 0x82c000 (x) / 0x2c000
+  (w); DVE op65 (TENSOR_TENSOR_ARITH = multiply) reads scratch in ITS address
+  space (space1, addr = pool addr >> 4); ACTIVATE(33) applies a constant
+  scale; result written back to 0x82c000; op212-out (waits sem6 GE 3) copies
+  to HBM var (DGE table[2]).
+- Semaphore units: op212 sem_increment = 16 per descriptor; DVE waits GE 16;
+  sem6 counts ENGINE EVENTS (+1 each), op212-out waits GE 3 (3 compute instrs).
+- Numerics: y = 3.3214889 * x * w (constant = kernel-specific activation imm).
+
+## PE (matmul) path - open items
+
+Single-tile y[128,128] = x@w via [177][204][LW][MM] with pool-op212 staging
+still yields all-zero PSUM drain. Variants ruled out: space0/space1, addr>>4,
+full addr, psum_accumulate_flags SINGLE(3). Reference FFN instrs replicate
+byte-identically (tools/neff_isa round-trip), so field VALUES in a working
+context are the missing piece - next step: perturb the KNOWN-WORKING ffn
+container (identity-matmul graph) one instruction at a time:
+1. run ffn with controlled inputs, map y tiles to staged SB regions
+2. confirms PE src/dst address <-> SB offset mapping and PSUM row layout
+   (dst = 0x2000000 + row*0x800 suggests partition-per-row)
+3. then reuse the mapping for the lifted GEMM stream.
+Working reference streams live in /tmp/opencode/ref26bb/sg00/ and
+/tmp/opencode/neff/ffn_x/sg00/ (volatile; re-pull from nki-cache on box).
