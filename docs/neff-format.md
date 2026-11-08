@@ -240,3 +240,32 @@ container (identity-matmul graph) one instruction at a time:
 3. then reuse the mapping for the lifted GEMM stream.
 Working reference streams live in /tmp/opencode/ref26bb/sg00/ and
 /tmp/opencode/neff/ffn_x/sg00/ (volatile; re-pull from nki-cache on box).
+
+## PE ucode loading + slot structure (2026-11-09, neuron-dbg findings)
+
+- Sequencer disasm (neuron-dbg `capture` + `disasm`) shows each engine runs a
+  tiny RUNTIME-GENERATED orchestration program ([SOM][EVSEM][WR config][NOP
+  wait event][DRN]) - IDENTICAL for working ffn and my containers. The
+  PE0.bin/DVE0.bin streams are HW UCODE loaded into each engine's instruction
+  memory; the sequencer just pokes start/config CSRs.
+- v2 PE stream slot rules (from working ffn stream): 32B slots DENSE, every
+  instruction followed by a pad slot: zeros after 177/204/EVENT_SEMAPHORE(160),
+  op10 (v2-only) after LDWEIGHTS/MATMUL - op10 carries the PSUM accumulate
+  mode (b1=1 MULTI_START after LW, b1=2 MULTI_END after MM; b1=3 = SINGLE
+  variant seen). Back-to-back instrs without pads are silently DROPPED by the
+  v2 translator (result: zeros, no load error).
+- ffn program shape: [177][0][204][0][160 wait sem24 GE16][0][LW wait sem8
+  GE16][op10(1)][MM upd19/5][op10(2)][LW][op10(2)][MM]... (6144 LW + 6144 MM,
+  y = identity @ staged tiles per-tile).
+- ffn pool op212 dst addresses (marker16) = SB byte offsets 0x2bc00-descending
+  = exactly the LW src region; LW step -1 compensates the compiler's
+  descending chunk order. marker32 = HBM var (DGE table idx + byte offset).
+- DGE table = IO var-id list; wrong list = "Failed to find io name for mr N".
+- NRT 1004 = exec completed with engine errors; 1203 = DMA abort (bad pool
+  descs); 5 = timeout (IO refill ring never drained by truncated consumer).
+- Elementwise (DVE) path: FULLY WORKING numeric pipeline (see above).
+- PE matmul path: ucode accepted (with pads) but compute still yields zeros.
+  Remaining unknowns: LW B-tile addressing semantics, PSUM drain mapping.
+  Next step: compile trivial torch.matmul via torch_neuronx.trace on the box
+  (nki-cache kernels are mostly elementwise; only cache kernel with PE =
+  complex attention) -> clean minimal PE ucode oracle with known shapes.
