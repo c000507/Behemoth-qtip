@@ -60,15 +60,23 @@ class FakeECS:
 class FakeASG:
     """Mimics describe_auto_scaling_groups / set_desired_capacity."""
 
-    def __init__(self, desired=0):
-        self.desired, self.sets = desired, []
+    def __init__(self, desired=0, instances=None):
+        self.desired, self.sets, self.unprotected = desired, [], []
+        self.instances = instances if instances is not None else []
 
     def describe_auto_scaling_groups(self, AutoScalingGroupNames):
-        return {"AutoScalingGroups": [{"AutoScalingGroupName": AutoScalingGroupNames[0], "DesiredCapacity": self.desired}]}
+        return {"AutoScalingGroups": [{"AutoScalingGroupName": AutoScalingGroupNames[0], "DesiredCapacity": self.desired,
+                                       "Instances": self.instances}]}
 
     def set_desired_capacity(self, AutoScalingGroupName, DesiredCapacity, HonorCooldown):
         self.sets.append(DesiredCapacity)
         self.desired = DesiredCapacity
+
+    def set_instance_protection(self, AutoScalingGroupName, InstanceIds, ProtectedFromScaleIn):
+        self.unprotected += InstanceIds
+        for i in self.instances:
+            if i["InstanceId"] in InstanceIds:
+                i["ProtectedFromScaleIn"] = ProtectedFromScaleIn
 
 
 def fake_backend(state):
@@ -192,6 +200,18 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
                 break
         self.assertEqual(self.ecs.updates, [1, 0])
         self.assertEqual(asg.sets, [1, 0])
+
+    async def test_stuck_protected_instance_released(self):
+        # desired already 0 but the idle instance is still in service and protected (the scale-in was cancelled)
+        asg = FakeASG(desired=0, instances=[{"InstanceId": "i-1", "LifecycleState": "InService", "ProtectedFromScaleIn": True}])
+        c = await self.start(FakeECS(), asg=asg, asg_name="behemoth-asg", idle_timeout_s=0.2)
+        self.client.app  # started; the reaper sees state "unknown" first, then idle-stops (nothing to stop) and releases
+        for _ in range(60):
+            await asyncio.sleep(0.1)
+            if asg.unprotected:
+                break
+        self.assertEqual(asg.unprotected, ["i-1"])
+        self.assertEqual(asg.sets[-1], 0)
 
     async def test_asg_failure_is_not_fatal(self):
         class Broken(FakeASG):

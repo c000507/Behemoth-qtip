@@ -171,7 +171,7 @@ data "aws_iam_policy_document" "router_task" {
   # Scale the backend ASG directly: the capacity provider's own scale-out from 0 takes ~2-3 min to react.
   statement {
     sid       = "ScaleBackendAsg"
-    actions   = ["autoscaling:SetDesiredCapacity"]
+    actions   = ["autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection"]
     resources = [aws_autoscaling_group.backend.arn]
   }
   statement {

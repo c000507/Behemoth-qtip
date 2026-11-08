@@ -146,17 +146,32 @@ class Backend:
             log.warning("ASG scale-out failed (capacity provider will catch up): %s", e)
 
     async def maybe_asg_scale_in(self) -> bool:
-        """After an idle stop: once no backend task is left, drop the ASG to 0 now (managed scaling would wait ~15 min)."""
+        """After an idle stop: once no backend task is left, drop the ASG to 0 now (managed scaling would wait ~15 min).
+        Runs every reaper cycle while stopped: ECS managed termination protection can leave the idle instance protected
+        from scale-in, which cancels the ASG's scale-in ("all remaining instances are protected") with no retry, so an
+        in-service instance with no task gets its protection cleared here and the ASG set to 0 again."""
         if self.state != "stopped" or not (self.asg and self.cfg.asg_name):
             return False
         if (await self._call("list_tasks", cluster=self.cfg.cluster, serviceName=self.cfg.service)).get("taskArns"):
             return False
-        cur = await self._asg_desired()
-        if cur:
+        groups = (await asyncio.to_thread(self.asg.describe_auto_scaling_groups,
+                                          AutoScalingGroupNames=[self.cfg.asg_name])).get("AutoScalingGroups", [])
+        if not groups:
+            return False
+        g = groups[0]
+        in_service = [i for i in g.get("Instances", []) if i.get("LifecycleState") == "InService"]
+        protected = [i["InstanceId"] for i in in_service if i.get("ProtectedFromScaleIn")]
+        acted = False
+        if protected:
+            log.info("backend stopped: clearing scale-in protection on %s", ",".join(protected))
+            await asyncio.to_thread(self.asg.set_instance_protection, AutoScalingGroupName=self.cfg.asg_name,
+                                    InstanceIds=protected, ProtectedFromScaleIn=False)
+            acted = True
+        if g.get("DesiredCapacity", 0) > 0 or (in_service and protected):
             log.info("backend stopped: scaling ASG %s to 0", self.cfg.asg_name)
             await self._set_asg(0)
-            return True
-        return False
+            acted = True
+        return acted
 
     async def _start(self) -> str:
         self.state = "starting"
