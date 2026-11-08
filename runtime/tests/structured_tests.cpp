@@ -808,7 +808,7 @@ static void tool_tests() {
         {"role":"tool","tool_call_id":"call_1","content":"21 C"}])");
     const ojson tools = ojson::parse(R"([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}])");
     const std::string rendered = render_mistral_tools(messages, tools, mistral_tools, "<s>", "</s>", "Default.");
-    CHECK(rendered == "<s>[SYSTEM_PROMPT]Default.[/SYSTEM_PROMPT][INST]Hi[/INST]Hello</s>"
+    CHECK(rendered == "<s>[SYSTEM_PROMPT]Default.\n\n" + tool_instruction(mistral_tools) + "[/SYSTEM_PROMPT][INST]Hi[/INST]Hello</s>"
                       "[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"ping\", \"parameters\": "
                       "{\"type\": \"object\", \"properties\": {}}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST]"
                       "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"unit\": \"celsius\"}</s>"
@@ -817,6 +817,11 @@ static void tool_tests() {
     with_system.insert(with_system.begin(), ojson{{"role", "system"}, {"content", {{{"type", "text"}, {"text", "Be brief."}}}}});
     CHECK(render_mistral_tools(with_system, ojson(), mistral_tools, "<s>", "</s>", "Default.")
               .rfind("<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][INST]Hi[/INST]", 0) == 0);
+    CHECK(render_mistral_tools(with_system, tools, mistral_tools, "<s>", "</s>", "")
+              .rfind("<s>[SYSTEM_PROMPT]Be brief.\n\nYou can call the functions", 0) == 0);
+    CHECK(render_mistral_tools(messages, tools, mistral_tools, "<s>", "</s>", "")
+              .rfind("<s>[SYSTEM_PROMPT]" + tool_instruction(mistral_tools) + "[/SYSTEM_PROMPT]", 0) == 0);
+    CHECK(tool_instruction(mistral_tools).find("[TOOL_CALLS]function_name[ARGS]{") != std::string::npos);
     rejects([&] { render_mistral_tools(ojson::parse(R"([{"role":"robot","content":"x"}])"), ojson(), mistral_tools, "", "", ""); });
     CHECK(python_json(ojson::parse(R"({"a":[1,"é\n",{"b":null}],"c":true})")) == "{\"a\": [1, \"\xc3\xa9\\n\", {\"b\": null}], \"c\": true}");
 
@@ -860,6 +865,16 @@ static void tool_tests() {
         }
         CHECK(rejects([&] { chat({{"messages", {{{"role", "user"}, {"content", "x"}}}}, {"functions", ojson::array()}}); }) ==
               "Unsupported parameter: functions");
+        // a backend without think by default constrains from the first token unless reasoning_effort says otherwise
+        auto rf = ojson{{"messages", {{{"role", "user"}, {"content", "x"}}}}, {"response_format", {{"type", "json_object"}}}};
+        CHECK(chat(rf).structured.allow_think);
+        auto no_think = backend;
+        no_think.think = false;
+        set_chat_backend(no_think);
+        CHECK(!chat(rf).structured.allow_think);
+        rf["reasoning_effort"] = "high";
+        CHECK(chat(rf).structured.allow_think);
+        set_chat_backend(backend);
         // tool messages without tools still use the tool renderer
         auto history = chat({{"messages", messages}});
         CHECK(!history.tools.active() && history.rendered.find("[TOOL_RESULTS]21 C[/TOOL_RESULTS]") != std::string::npos);
@@ -868,6 +883,67 @@ static void tool_tests() {
         throw;
     }
     set_chat_backend({});
+}
+
+// tool_choice auto: answers that write the call as JSON text instead of [TOOL_CALLS]
+static void tool_fallback_tests() {
+    using ojson = nlohmann::ordered_json;
+    const auto all = parse_tools({{"tools", weather_tools()}});
+    auto parse = [&](const ToolRequest &r, const std::string &text, bool bytewise = false) {
+        auto p = std::make_unique<ToolCallParser>(mistral_tools, &r);
+        if (bytewise)
+            for (char c : text)
+                p->feed(std::string(1, c));
+        else
+            p->feed(text);
+        p->feed("", true);
+        return p;
+    };
+    CHECK(schema_accepts(ojson::parse(R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}},"required":["a","b"]})"),
+                         nlohmann::json::parse(R"({"b":"x","a":1})"))); // any key order
+    CHECK(!schema_accepts(weather_tools()[0]["function"]["parameters"], nlohmann::json::parse(R"({"city":"x","zip":1})")));
+    CHECK(!schema_accepts(weather_tools()[0]["function"]["parameters"], nlohmann::json::parse(R"({"city":3})")));
+    CHECK(trailing_json("a ```json\n{\"x\": 1}\n```  ")->first == 2);
+    CHECK(trailing_json("see {x} then [1, 2]")->first == 13);
+    CHECK(!trailing_json("{\"x\": 1} and more") && !trailing_json("no json") && !trailing_json("```"));
+
+    auto fenced = parse(all, "I'll check the weather for you.\n```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n```");
+    CHECK(fenced->content() == "I'll check the weather for you." && fenced->calls().size() == 1);
+    CHECK(fenced->calls()[0].name == "get_weather" && fenced->calls()[0].arguments == "{\"city\":\"Paris\"}");
+    auto bare = parse(all, "{\"name\": \"ping\", \"parameters\": {}}");
+    CHECK(bare->content().empty() && bare->calls().size() == 1 && bare->calls()[0].name == "ping");
+    auto list = parse(all, R"([{"name":"ping","arguments":"{}"},{"function":{"name":"get_weather","arguments":{"unit":"celsius","city":"Oslo"}}}])");
+    CHECK(list->calls().size() == 2 && list->calls()[1].name == "get_weather" &&
+          nlohmann::json::parse(list->calls()[1].arguments) == nlohmann::json::parse(R"({"city":"Oslo","unit":"celsius"})"));
+    for (const char *rejected : {R"(Here: {"name": "nope", "arguments": {}})", R"({"name": "get_weather", "arguments": {"city": 3}})",
+                                 R"([{"name":"ping"},{"name":"nope"}])", R"(Use {"city": "Paris"} as input.)"}) {
+        auto p = parse(all, rejected);
+        CHECK(p->calls().empty() && p->content() == rejected);
+    }
+    // one tool offered: an object matching its parameters is a call to it (the on-device Cydonia answer)
+    auto one = parse_tools({{"tools", {weather_tools()[0]}}});
+    auto args_only = parse(one, "I'll get the weather in Tokyo for you. ```json {\"city\": \"Tokyo\"} ```");
+    CHECK(args_only->content() == "I'll get the weather in Tokyo for you." && args_only->calls().size() == 1 &&
+          args_only->calls()[0].name == "get_weather" && args_only->calls()[0].arguments == "{\"city\":\"Tokyo\"}");
+    CHECK(parse(all, "```json {\"city\": \"Tokyo\"} ```")->calls().empty()); // two tools: whose arguments?
+    CHECK(parse(one, "```json {\"town\": \"Tokyo\"} ```")->calls().empty());
+    // streaming: content streams up to the first "{", "[" or "`", the rest is held to the end
+    ToolCallParser s(mistral_tools, &all);
+    std::string streamed;
+    for (char c : std::string("Let me look. {\"name\": \"ping\", \"arguments\": {}}"))
+        streamed += s.feed(std::string(1, c)).content;
+    CHECK(streamed == "Let me look.");
+    auto last = s.feed("", true);
+    CHECK(last.content.empty() && s.calls().size() == 1 && last.tool_calls.size() == 2);
+    auto markdown = parse(all, "See [the docs](x) and `code`.", true);
+    CHECK(markdown->content() == "See [the docs](x) and `code`." && markdown->calls().empty());
+    // the native form still wins, and without the fallback (required / named) JSON text is only text
+    CHECK(parse(all, "[TOOL_CALLS]ping[ARGS]{}")->calls().size() == 1);
+    ToolCallParser plain(mistral_tools);
+    plain.feed("{\"name\": \"ping\", \"arguments\": {}}", true);
+    CHECK(plain.calls().empty());
+    auto required = parse_tools({{"tools", weather_tools()}, {"tool_choice", "required"}});
+    CHECK(parse(required, "{\"name\": \"ping\", \"arguments\": {}}")->calls().empty());
 }
 
 static void cache_tests() {
@@ -926,6 +1002,7 @@ int main() {
                  {"grammar_cache", cache_tests},
                  {"big_vocabulary", big_vocabulary_tests},
                  {"tools", tool_tests},
+                 {"tool_fallback", tool_fallback_tests},
                  {"timing", timing_report}}) {
             fn();
             std::cout << "PASS " << name << '\n';

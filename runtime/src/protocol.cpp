@@ -195,6 +195,8 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
     const bool tool_constraint = r.tools.choice == ToolRequest::Required || r.tools.choice == ToolRequest::Named;
     r.structured = ordered ? parse_structured(*ordered, tool_constraint)
                            : parse_structured(nlohmann::ordered_json(j), tool_constraint);
+    if (!backend().think && (!j.contains("reasoning_effort") || j.at("reasoning_effort").is_null()))
+        r.structured.allow_think = false;
     if (r.tools.active() && r.structured.kind != StructuredOutput::None)
         throw RequestError("response_format and grammar cannot be combined with tools (tool_choice must be none)",
                            "tool_choice");

@@ -1,9 +1,11 @@
 #include "behemoth/tools.hpp"
+#include "behemoth/gbnf.hpp"
 #include "behemoth/json_schema.hpp"
 #include "behemoth/protocol.hpp"
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <random>
 #include <set>
 
@@ -48,12 +50,75 @@ std::string text_content(const ojson &m, bool allow_null) {
     std::string out;
     for (const auto &block : c) {
         if (!block.is_object() || block.value("type", "") != "text" || !block.contains("text") || !block.at("text").is_string())
-            throw std::invalid_argument("Only text content blocks are supported");
+            throw std::invalid_argument("Only text message content is supported (no images or other content parts)");
         out += block.at("text").get<std::string>();
     }
     return out;
 }
+// `v` with object keys in the order the schema declares its properties (the grammar's order), recursively.
+ojson schema_order(const nlohmann::json &v, const ojson &s) {
+    const ojson none = ojson::object();
+    if (v.is_object()) {
+        ojson o = ojson::object();
+        const ojson &props = s.is_object() && s.contains("properties") && s.at("properties").is_object() ? s.at("properties") : none;
+        for (auto it = props.begin(); it != props.end(); ++it)
+            if (v.contains(it.key()))
+                o[it.key()] = schema_order(v.at(it.key()), it.value());
+        const ojson &extra = s.is_object() && s.contains("additionalProperties") && s.at("additionalProperties").is_object()
+                                 ? s.at("additionalProperties")
+                                 : none;
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if (!props.contains(it.key()))
+                o[it.key()] = schema_order(it.value(), extra);
+        return o;
+    }
+    if (v.is_array()) {
+        ojson a = ojson::array();
+        const ojson &items = s.is_object() && s.contains("items") && s.at("items").is_object() ? s.at("items") : none;
+        for (const auto &x : v)
+            a.push_back(schema_order(x, items));
+        return a;
+    }
+    return ojson(v);
+}
 } // namespace
+
+bool schema_accepts(const ojson &schema, const nlohmann::json &value) {
+    try {
+        grammar::Grammar g = grammar::ParseGbnf(grammar::json_schema_grammar(schema));
+        grammar::Matcher m(g);
+        return m.Matches(schema_order(value, schema).dump());
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+std::optional<std::pair<size_t, nlohmann::json>> trailing_json(std::string_view text) {
+    while (!text.empty() && is_space(text.back()))
+        text.remove_suffix(1);
+    if (text.ends_with("```")) {
+        if (text.size() < 6)
+            return std::nullopt;
+        const size_t open = text.rfind("```", text.size() - 6);
+        if (open == std::string_view::npos)
+            return std::nullopt;
+        std::string_view inner = text.substr(open + 3, text.size() - 3 - (open + 3));
+        size_t tag = 0; // language tag (```json)
+        while (tag < inner.size() && std::isalnum(static_cast<unsigned char>(inner[tag])))
+            ++tag;
+        const auto v = nlohmann::json::parse(inner.substr(tag), nullptr, false);
+        if (v.is_discarded() || !v.is_structured())
+            return std::nullopt;
+        return std::pair{open, v};
+    }
+    int tries = 0;
+    for (size_t i = text.find_first_of("{["); i != std::string_view::npos && tries < 64; i = text.find_first_of("{[", i + 1), ++tries) {
+        const auto v = nlohmann::json::parse(text.substr(i), nullptr, false);
+        if (!v.is_discarded() && v.is_structured())
+            return std::pair{i, v};
+    }
+    return std::nullopt;
+}
 
 ToolRequest parse_tools(const ojson &j) {
     ToolRequest r;
@@ -168,11 +233,15 @@ std::string render_mistral_tools(const ojson &messages, const ojson &tools, cons
         throw std::invalid_argument("messages must be a nonempty array");
     std::string out = bos;
     size_t begin = 0, last_user = messages.size();
+    std::string prompt = system;
     if (messages[0].is_object() && messages[0].value("role", "") == "system") {
-        out += "[SYSTEM_PROMPT]" + text_content(messages[0], false) + "[/SYSTEM_PROMPT]";
+        prompt = text_content(messages[0], false);
         begin = 1;
-    } else if (!system.empty())
-        out += "[SYSTEM_PROMPT]" + system + "[/SYSTEM_PROMPT]";
+    }
+    if (tools.is_array() && !tools.empty()) // fine-tunes of tool-trained bases may need telling (tool_instruction)
+        prompt += (prompt.empty() ? "" : "\n\n") + tool_instruction(f);
+    if (!prompt.empty())
+        out += "[SYSTEM_PROMPT]" + prompt + "[/SYSTEM_PROMPT]";
     for (size_t i = begin; i < messages.size(); ++i)
         if (messages[i].is_object() && messages[i].value("role", "") == "user")
             last_user = i;
@@ -217,11 +286,84 @@ std::string render_mistral_tools(const ojson &messages, const ojson &tools, cons
     return out;
 }
 
+std::string tool_instruction(const ToolFormat &f) {
+    return "You can call the functions in the available tools. Call one whenever the request needs it: current or "
+           "real-time information (weather, time, news, prices), lookups, calculations, or actions you cannot do "
+           "yourself; never say you have no access to something a function provides. To call a function, reply with "
+           "only " + f.calls + "function_name" + f.args + "{\"argument\": \"value\"} (the arguments as one JSON "
+           "object; one " + f.calls + " per call; no other text, no Markdown, no code block). The results come back "
+           "as tool results; then answer from them. If no function fits, answer normally.";
+}
+
 nlohmann::json ToolCall::openai() const {
     return {{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", arguments}}}};
 }
 
-ToolCallParser::ToolCallParser(ToolFormat format) : format_(std::move(format)) {}
+ToolCallParser::ToolCallParser(ToolFormat format, const ToolRequest *fallback) : format_(std::move(format)) {
+    if (fallback && fallback->choice == ToolRequest::Auto) {
+        fallback_ = true;
+        tools_ = fallback->tools;
+    }
+}
+
+// Fallback (tool_choice auto): the answer ends with a JSON tool call written as text, bare or in a ``` fence:
+// {"name", "arguments" | "parameters"} (or {"function": {...}}) or a list of them, every name offered and every
+// argument object matching that tool's parameters schema; or, with exactly one tool offered, an object matching its
+// parameters. The text before it stays content.
+bool ToolCallParser::convert_trailing(Delta &d) {
+    const auto found = trailing_json(buffer_);
+    if (!found)
+        return false;
+    const auto &[at, value] = *found;
+    std::vector<std::pair<std::string, nlohmann::json>> calls;
+    auto parameters = [&](const std::string &name) -> const ojson * {
+        for (const auto &t : tools_)
+            if (t.at("function").at("name") == name)
+                return &t.at("function").at("parameters");
+        return nullptr;
+    };
+    auto named = [&](const nlohmann::json &item) {
+        const nlohmann::json *x = &item;
+        if (x->is_object() && x->contains("function") && x->at("function").is_object())
+            x = &x->at("function");
+        if (!x->is_object() || !x->contains("name") || !x->at("name").is_string())
+            return false;
+        const ojson *schema = parameters(x->at("name"));
+        if (!schema)
+            return false;
+        nlohmann::json args = nlohmann::json::object();
+        for (const char *key : {"arguments", "parameters"})
+            if (x->contains(key))
+                args = x->at(key).is_string() ? nlohmann::json::parse(x->at(key).get<std::string>(), nullptr, false) : x->at(key);
+        if (!args.is_object() || !schema_accepts(*schema, args))
+            return false;
+        calls.push_back({x->at("name").get<std::string>(), std::move(args)});
+        return true;
+    };
+    bool ok = false;
+    if (value.is_array()) {
+        ok = !value.empty();
+        for (const auto &item : value)
+            ok = ok && named(item);
+    } else if (!(ok = named(value)) && tools_.size() == 1 && value.is_object()) {
+        calls.clear();
+        const auto &fn = tools_[0].at("function");
+        if ((ok = schema_accepts(fn.at("parameters"), value)))
+            calls.push_back({fn.at("name").get<std::string>(), value});
+    }
+    if (!ok)
+        return false;
+    std::string_view prose = std::string_view(buffer_).substr(0, at);
+    while (!prose.empty() && is_space(prose.back()))
+        prose.remove_suffix(1);
+    d.content += prose;
+    for (auto &[name, args] : calls) {
+        start_call(name, d);
+        add_arguments(args.dump(), d);
+    }
+    buffer_.clear();
+    return true;
+}
 
 std::string ToolCallParser::new_id() {
     static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -300,8 +442,18 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
             const size_t keep = finish ? 0 : partial_suffix(buffer_, format_.calls);
             if (!finish && leading && trim(std::string_view(buffer_).substr(0, buffer_.size() - keep)).empty())
                 break;
-            d.content += buffer_.substr(0, buffer_.size() - keep);
-            buffer_.erase(0, buffer_.size() - keep);
+            size_t emit = buffer_.size() - keep;
+            if (fallback_) { // auto: from the first possible JSON / fence start on, the text is held to the end
+                if (finish && convert_trailing(d))
+                    break;
+                if (!finish) { // and whitespace before it, which a converted call drops
+                    emit = std::min(emit, buffer_.find_first_of("{[`"));
+                    while (emit > 0 && is_space(buffer_[emit - 1]))
+                        --emit;
+                }
+            }
+            d.content += buffer_.substr(0, emit);
+            buffer_.erase(0, emit);
             break;
         }
         case Head: {

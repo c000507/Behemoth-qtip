@@ -8,11 +8,13 @@
 // Tool calling (tools.hpp), for Mistral tokenizers (Tekken: [AVAILABLE_TOOLS], [TOOL_CALLS] and [ARGS] control
 // tokens; Cydonia / Mistral Small 3.2): their chat templates take no tools, so conversations with tools or tool
 // messages are rendered in Mistral's v11 form (render_mistral_tools) behind the template's own system prompt.
-// BEHEMOTH_TOOLS=0 turns tool calling off.
+// BEHEMOTH_TOOLS=0 turns tool calling off. Constrained answers start with an optional <think> block only for templates
+// that know <think> (ChatBackend::think). Message content may be text blocks (joined); other parts are rejected.
 #include "behemoth/protocol.hpp"
 #include "behemoth/tokenizer.hpp"
 #include "glm53.hpp"
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 
 namespace behemoth {
@@ -58,11 +60,37 @@ struct Tokenizer::Impl {
         return text.substr(open + 15, close - open - 15);
     }
 };
+// Content given as text blocks joined into one string (the templates take strings); anything else is rejected.
+static nlohmann::json text_only(nlohmann::json messages) {
+    for (auto &m : messages)
+        if (m.is_object() && m.contains("content") && m.at("content").is_array()) {
+            std::string text;
+            for (const auto &b : m.at("content")) {
+                if (!b.is_object() || b.value("type", "") != "text" || !b.contains("text") || !b.at("text").is_string())
+                    throw std::invalid_argument("Only text message content is supported (no images or other content parts)");
+                text += b.at("text").get<std::string>();
+            }
+            m["content"] = text;
+        }
+    return messages;
+}
+// The checkpoint's chat template source (tokenizer_config.json, else chat_template.jinja), for feature checks.
+static std::string template_source(const std::filesystem::path &root) {
+    std::ifstream config(root / "tokenizer_config.json");
+    const auto c = nlohmann::json::parse(config, nullptr, false);
+    if (!c.is_discarded() && c.contains("chat_template"))
+        return c.at("chat_template").dump();
+    std::ifstream jinja(root / "chat_template.jinja");
+    return std::string(std::istreambuf_iterator<char>(jinja), {});
+}
 Tokenizer::Tokenizer(const std::filesystem::path &root) : impl_(std::make_unique<Impl>(root)) {
     auto *impl = impl_.get();
     const char *name = std::getenv("BEHEMOTH_MODEL_NAME");
     ChatBackend backend{name ? name : root.filename().string(),
-                        [impl](const nlohmann::json &messages) { return impl->bpe.chat(messages, true); }};
+                        [impl](const nlohmann::json &messages) { return impl->bpe.chat(text_only(messages), true); }};
+    // Constrained answers may open with <think> only for templates that know it (reasoning models); others (Cydonia)
+    // are constrained from the first token unless the request sets reasoning_effort.
+    backend.think = template_source(root).find("<think>") != std::string::npos;
     if (impl->tools.supported()) {
         backend.tools = impl->tools;
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {

@@ -18,6 +18,7 @@
 #include "behemoth/constraint.hpp"
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,7 +53,10 @@ std::string tool_call_grammar(const ToolRequest &, const ToolFormat &);
 
 // Mistral v11 prompt for a conversation with tools and/or tool messages. `system` is the system prompt used when
 // the conversation has none (the checkpoint template's default; empty: no system block); tools null or empty: no
-// [AVAILABLE_TOOLS] block.
+// [AVAILABLE_TOOLS] block. With tools, the system prompt ends with tool_instruction().
+
+// How and when to call (fine-tunes of a tool-trained base, Cydonia, otherwise answer in prose or write bare JSON).
+std::string tool_instruction(const ToolFormat &);
 std::string render_mistral_tools(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools,
                                  const ToolFormat &, const std::string &bos, const std::string &eos,
                                  const std::string &system);
@@ -60,6 +64,12 @@ std::string render_mistral_tools(const nlohmann::ordered_json &messages, const n
 // JSON text as Python's json.dumps(ensure_ascii=False) writes it (", " and ": " separators): the form Mistral's
 // tokenizer gives the tool definitions and call arguments in.
 std::string python_json(const nlohmann::ordered_json &);
+
+// Whether `value` matches the JSON Schema (the grammar compiler's subset; object keys in any order).
+bool schema_accepts(const nlohmann::ordered_json &schema, const nlohmann::json &value);
+// The JSON value (object or array, bare or in a ``` fence) that ends `text` (trailing whitespace aside): its start
+// offset in `text` (the fence's when fenced) and the value; the earliest start that parses as the whole rest.
+std::optional<std::pair<size_t, nlohmann::json>> trailing_json(std::string_view text);
 
 struct ToolCall {
     std::string id, name, arguments;
@@ -70,9 +80,11 @@ struct ToolCall {
 // content text (held back while it may be the start of a marker) and OpenAI stream items for "tool_calls"
 // ({"index", "id", "type", "function": {"name", "arguments": ""}} when a call's name is complete, then
 // {"index", "function": {"arguments": fragment}}).
+// `fallback` (tool_choice auto): an answer that ends with a JSON tool call written as text (no [TOOL_CALLS]; see
+// convert_trailing) becomes calls too. Streaming then holds the content from its first "{", "[" or "`" to the end.
 class ToolCallParser {
   public:
-    explicit ToolCallParser(ToolFormat format);
+    explicit ToolCallParser(ToolFormat format, const ToolRequest *fallback = nullptr);
     struct Delta {
         std::string content;
         nlohmann::json tool_calls = nlohmann::json::array();
@@ -90,7 +102,10 @@ class ToolCallParser {
     ToolFormat format_;
     std::string buffer_, content_, list_;
     std::vector<ToolCall> calls_;
+    bool fallback_ = false;
+    nlohmann::ordered_json tools_;
     std::string new_id();
+    bool convert_trailing(Delta &);
     void start_call(std::string name, Delta &);
     void add_arguments(std::string_view, Delta &);
     void finish_list(Delta &);

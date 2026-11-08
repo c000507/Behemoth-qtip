@@ -201,7 +201,10 @@ parser, grammar compiler and `StructuredConstraint`); the constraint vocabulary 
 logit processing, per sampled row: unconstrained sample first where the constraint allows it (greedy), else the allowed-token
 mask. Draft rows are sampled in order and only while the drafts match, so speculation gives the same tokens with or without a
 constraint (greedy and seeded sampling); preemption re-prefills the history and keeps the constraint; prefix-cache restores
-cover prompt K/V only.
+cover prompt K/V only. Constrained answers may open with a `<think>` block only when the checkpoint's chat template knows
+`<think>` (a reasoning model) or the request sets `reasoning_effort`; otherwise (Cydonia) the constraint applies from the
+first token, so a short `max_tokens` is not spent thinking (the GPU server, serving a reasoning model, keeps think on by
+default). Text content blocks are joined into one string; image or other content parts are rejected with HTTP 400.
 
 OpenAI tool calling (`tools`, `tool_choice` none / auto / required / a function, `parallel_tool_calls`, assistant
 `tool_calls` and `tool` messages in the history, `tool_calls` in the answer and as streaming deltas, `finish_reason`
@@ -211,7 +214,14 @@ so those conversations are rendered in Mistral's v11 form (runtime/src/tools.cpp
 template's own default system prompt. `required` / a function constrain the whole answer to
 `[TOOL_CALLS]name[ARGS]{arguments}` calls whose arguments match the tool's `parameters` schema; `auto` leaves the answer
 free until the model emits `[TOOL_CALLS]`, then the same grammar takes over. The parser also reads the older v7 form
-(`[TOOL_CALLS][{"name": ..., "arguments": ...}]`). Not offered: `tools` together with `response_format` / `grammar`
+(`[TOOL_CALLS][{"name": ..., "arguments": ...}]`). With tools, the system prompt (the request's, else the template default)
+ends with an instruction to call functions as `[TOOL_CALLS]name[ARGS]{...}` and when (Cydonia, a roleplay fine-tune, otherwise
+answers in prose or writes JSON). `auto` also takes calls written as text: an answer that ends with
+`{"name": ..., "arguments" | "parameters": ...}` (or `{"function": {...}}`, or a list of them), bare or in a ```` ``` ```` fence,
+with offered names and arguments that match the parameters schema, becomes `tool_calls` (the prose before it stays content);
+with exactly one tool offered, a trailing object that matches its parameters is a call to it. To make that possible, streamed
+`auto` content is held from its first `{`, `[` or `` ` `` (and the whitespace before it) until the answer ends, then sent as
+content or as tool calls; content before that streams as usual. Not offered: `tools` together with `response_format` / `grammar`
 (HTTP 400 unless `tool_choice` is `none`). `BEHEMOTH_TOOLS=0` turns tool calling off. `/metrics` `structured_output` has the
 constrained requests, tokens, masked samples and constraint time per token.
 

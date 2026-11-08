@@ -16,6 +16,10 @@ struct ChatBackend {
     // conversations with tools (null or an array) or tool messages. Unset: tools / tool_choice are rejected.
     ToolFormat tools;
     std::function<std::string(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools)> render_tools;
+    // Whether a constrained answer (response_format, grammar, tool_choice required / a function) may start with a
+    // <think> block when the request gives no reasoning_effort: true for reasoning models (the Behemoth default);
+    // false constrains from the first token, so a non-reasoning model cannot spend the token budget thinking.
+    bool think = true;
 };
 const ChatBackend &chat_backend();
 void set_chat_backend(ChatBackend);

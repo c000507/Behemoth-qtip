@@ -230,8 +230,9 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
     for (const auto &message : messages) {
         std::string role = message.at("role");
         check(role == "system" || role == "user" || role == "assistant", "text-only chat roles required");
-        check(message.at("content").is_string() && !message.contains("tool_calls"),
-              "text-only content required; tool calls are not supported");
+        check(message.at("content").is_string(),
+              "only text message content is supported (no images or other content parts)");
+        check(!message.contains("tool_calls"), "assistant tool_calls are not supported by this chat template");
     }
     auto source = config_.at("chat_template");
     if (source.is_array()) {

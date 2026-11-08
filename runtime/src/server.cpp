@@ -371,7 +371,7 @@ class Session : public std::enable_shared_from_this<Session> {
                 } else if (format.calls_token >= 0)
                     constraint = std::make_shared<TriggeredConstraint>(format.calls_token, std::move(calls),
                                                                        structured_.vocabulary.size());
-                tool_parser_ = std::make_unique<ToolCallParser>(format);
+                tool_parser_ = std::make_unique<ToolCallParser>(format, &request.tools); // auto: JSON-as-text fallback
                 if (!diagnostic_dir_.empty())
                     diagnostic_["tools"] = {{"choice", int(request.tools.choice)}, {"grammar", request.tool_grammar}};
             }
