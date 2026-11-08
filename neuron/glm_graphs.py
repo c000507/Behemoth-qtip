@@ -28,7 +28,8 @@ Sharding over TP ranks (every rank runs the same NEFF; rank-dependent data are i
 Weights: WEIGHTS=fp8 (default) row-scaled E4M3 x E4M3-activation matmuls like trace_model.py (routed expert down_proj
 is scaled per input channel so the experts' contraction folds into one 2D matmul), WEIGHTS=bf16 for exactness checks.
 
-usage: glm_graphs.py WORKDIR {kda|mla|dense|moe} R Q P | head T S
+usage: glm_graphs.py WORKDIR {kda|mla|dense|moe|layer_<kda|mla>_<dense|moe>} R Q P | head T S
+  (layer_*: a whole layer, attention + MLP sub-blocks, in one NEFF: half the launches; weights named a.* / m.*)
   env: MODEL (checkpoint dir with config.json) or CONFIG, TP, EP, PAGES (incl. one scratch page), SLOTS (KDA state
        slots incl. one scratch slot), WEIGHTS=fp8|bf16, KV=bf16|fp8, MOE=all|gather, NCC_FLAGS
 """
@@ -428,6 +429,10 @@ def weight_shapes(kind, g, fp8=True, kv8=False):
     return s
 
 
+# MLA weights only the top-k selection reads (absent from graphs whose bucket has at most index_topk keys)
+INDEXER_QUERY = ('iq', 'iq_s', 'iw', 'iw_s', 'ape')
+
+
 def state_shapes(kind, g, pages, slots, kv8=False):
     if kind == 'kda':
         return {'kstate': ((slots, g.hl, g.ldim, g.ldim), torch.float32), 'cstate': ((slots, 3, g.wl, g.conv - 1), torch.float32)}
@@ -494,14 +499,23 @@ def main():
         kwargs = {}
     else:
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-        step = step_shapes(kind, R, Q, P, g)
-        wsh = weight_shapes(kind, g, fp8, kv8)
-        ssh = state_shapes(kind, g, pages, slots, kv8)
+        # layer_<attn>_<mlp>: both sub-blocks of a layer in one NEFF (half the launches); weights 'a.*' / 'm.*'
+        parts = kind.split('_')[1:] if kind.startswith('layer_') else [kind]
+        step, wsh = {}, {}
+        for i, part in enumerate(parts):
+            step.update(step_shapes(part, R, Q, P, g))
+            pre = ('a.', 'm.')[i] if len(parts) > 1 else ''
+            w = weight_shapes(part, g, fp8, kv8)
+            if part == 'mla' and P * PAGE <= g.topk:   # every key visible: the indexer's query side is not in the graph
+                w = {k: v for k, v in w.items() if k not in INDEXER_QUERY}
+            wsh.update({pre + k: v for k, v in w.items()})
+        ssh = state_shapes(parts[0], g, pages, slots, kv8)
         names = list(step) + list(wsh)
         snames = list(ssh)
         inputs = [zeros(*step[n]) for n in step] + [zeros(*wsh[n]) for n in wsh]
-        if kind == 'moe':
-            inputs[names.index('eids')] = torch.arange(g.El, dtype=torch.int64)
+        for n_ in names:
+            if n_.endswith('eids'):
+                inputs[names.index(n_)] = torch.arange(g.El, dtype=torch.int64)
 
         class Block(torch.nn.Module):
             def __init__(self):
@@ -513,7 +527,13 @@ def main():
                 t = dict(zip(names, a))
                 for n_ in snames:
                     t[n_] = getattr(self, n_)
-                x, st = sublayer(kind, t, g, R, Q, P, allreduce, kv8, moe_mode)
+                if len(parts) == 1:
+                    x, st = sublayer(kind, t, g, R, Q, P, allreduce, kv8, moe_mode)
+                else:
+                    sub = lambda pre: {k[len(pre):]: v for k, v in t.items() if k.startswith(pre)}
+                    common = {k: v for k, v in t.items() if '.' not in k}
+                    x, st = sublayer(parts[0], {**common, **sub('a.')}, g, R, Q, P, allreduce, kv8, moe_mode)
+                    x, _ = sublayer(parts[1], {**common, **sub('m.'), 'x': x}, g, R, Q, P, allreduce, kv8, moe_mode)
                 for n_ in snames:
                     setattr(self, n_, st[n_])   # mutated buffers: aliased input -> output (in place on the device)
                 return x

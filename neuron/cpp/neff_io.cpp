@@ -4,6 +4,8 @@
 //   DIR/out<j>.r<rank>  raw bytes of output<j> of that rank, written by this tool
 // build: g++ -std=c++20 -O2 -pthread -I/opt/aws/neuron/include neuron/cpp/neff_io.cpp -L/opt/aws/neuron/lib -lnrt -Wl,-rpath,/opt/aws/neuron/lib -o neff_io
 // run:   NEURON_RT_VISIBLE_CORES=0-1 NEURON_RT_ROOT_COMM_ID=127.0.0.1:62128 neff_io graph.neff DIR [ranks]
+// NEFF_IO_STATES=n: the graph's last n inputs are aliased state (outputs 1..n), bound to the same device tensors as
+// in the runtime (a graph that writes its state and then reads it, like a KV cache, needs that).
 #include <nrt/nrt.h>
 #include <nrt/nrt_experimental.h>
 
@@ -45,12 +47,25 @@ int main(int argc, char **argv) {
             check(nrt_allocate_tensor_set(&out), "set", r);
             struct Out { nrt_tensor_t *dev; std::string path; size_t bytes; };
             std::vector<Out> outputs;
+            const int states = std::getenv("NEFF_IO_STATES") ? std::atoi(std::getenv("NEFF_IO_STATES")) : 0;
+            int inputs = 0;
+            for (uint64_t i = 0; i < info->tensor_count; ++i)
+                inputs += info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT;
+            std::vector<nrt_tensor_t *> by_input(size_t(inputs), nullptr);
+            for (int pass = 0; pass < 2; ++pass) // inputs first, so outputs can alias them
             for (uint64_t i = 0; i < info->tensor_count; ++i) {
                 const auto &t = info->tensor_array[i];
-                nrt_tensor_t *dev = nullptr;
-                check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, r, t.size, t.name, &dev), "alloc", r);
                 const std::string name = t.name;
+                if ((t.usage == NRT_TENSOR_USAGE_INPUT) != (pass == 0))
+                    continue;
+                nrt_tensor_t *dev = nullptr;
+                const int out_index = t.usage == NRT_TENSOR_USAGE_INPUT ? -1 : std::atoi(name.substr(6).c_str());
+                if (out_index >= 1 && out_index <= states)
+                    dev = by_input[size_t(inputs - states + out_index - 1)];
+                else
+                    check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, r, t.size, t.name, &dev), "alloc", r);
                 if (t.usage == NRT_TENSOR_USAGE_INPUT) {
+                    by_input[size_t(std::atoi(name.substr(5).c_str()))] = dev;
                     auto path = dir / (std::string("in") + name.substr(5) + ".r" + std::to_string(r));
                     if (!std::filesystem::exists(path)) path = dir / (std::string("in") + name.substr(5));
                     const auto data = slurp(path);

@@ -80,9 +80,10 @@ float bf16_to_f32(uint16_t b) {
     return f;
 }
 
-// One NEFF: a sub-block kind ("kda", "mla", "dense", "moe") or "head", for one bucket.
+// One NEFF: a sub-block kind ("kda", "mla", "dense", "moe"), a whole layer ("layer_<attn>_<mlp>": both sub-blocks,
+// weights named a.* / m.*) or "head", for one bucket.
 struct Graph {
-    std::string kind;
+    std::string kind, attn, mlp; // attn / mlp: the sub-blocks it contains ("" for none)
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0, slots = 0;
     std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
     std::vector<nrt_model_t *> model;        // [rank]
@@ -199,6 +200,14 @@ class GlmModel final : public Backend {
                                              ", the prepared model has " + geo.at(k).dump() + " (retrace with MODEL=... TP=... EP=...)");
             Graph gr;
             gr.kind = kind.substr(4);
+            if (gr.kind.rfind("layer_", 0) == 0) {
+                const size_t us = gr.kind.find('_', 6);
+                gr.attn = gr.kind.substr(6, us - 6);
+                gr.mlp = gr.kind.substr(us + 1);
+            } else if (gr.kind == "kda" || gr.kind == "mla")
+                gr.attn = gr.kind;
+            else if (gr.kind != "head")
+                gr.mlp = gr.kind;
             gr.inputs = m.at("inputs").get<std::vector<std::string>>();
             gr.states = m.at("states").get<std::vector<std::string>>();
             gr.neff = dir.path() / "graph.neff";
@@ -212,12 +221,12 @@ class GlmModel final : public Backend {
                 gr.T = gr.R * gr.Q;
                 gr.pages = m.at("pages");
                 gr.slots = m.at("slots");
-                if (gr.kind == "mla") {
+                if (gr.attn == "mla") {
                     if (pages_total && pages_total != gr.pages)
                         throw std::runtime_error("GLM NEFFs disagree on the page count");
                     pages_total = gr.pages;
                 }
-                if (gr.kind == "kda") {
+                if (gr.attn == "kda") {
                     if (slots_total && slots_total != gr.slots)
                         throw std::runtime_error("GLM NEFFs disagree on the KDA slot count");
                     slots_total = gr.slots;
@@ -236,24 +245,36 @@ class GlmModel final : public Backend {
         for (const auto &g : graphs)
             if (g.kind != "head")
                 groups.insert({g.R, g.Q});
-        std::set<std::string> kinds(attn_kind.begin(), attn_kind.end());
-        kinds.insert(mlp_kind.begin(), mlp_kind.end());
         for (auto [R, Q] : groups) {
-            for (const auto &k : kinds)
-                if (!find(k, R, Q, k == "mla" ? 1 : 0))
-                    throw std::runtime_error("GLM bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " lacks a " + k + " NEFF");
+            for (int l = 0; l < layers; ++l)
+                if (!layer_graph(l, R, Q, 1) && (!find(attn_kind[size_t(l)], R, Q, 1) || !find(mlp_kind[size_t(l)], R, Q, 1)))
+                    throw std::runtime_error("GLM bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has neither a layer_" +
+                                             attn_kind[size_t(l)] + "_" + mlp_kind[size_t(l)] + " NEFF nor both sub-block NEFFs for layer " +
+                                             std::to_string(l));
             if (!head_for(R * Q, 1))
                 throw std::runtime_error("GLM bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has no head NEFF for " +
                                          std::to_string(R * Q) + " rows");
         }
     }
-    // the cheapest graph of `kind` with exactly (R, Q) and at least P table pages (P ignored except for mla)
+    // the cheapest graph of `kind` with exactly (R, Q) and at least P table pages (P ignored without an mla sub-block)
     const Graph *find(const std::string &kind, int R, int Q, int P) const {
         const Graph *best = nullptr;
         for (const auto &g : graphs)
-            if (g.kind == kind && g.R == R && g.Q == Q && (kind != "mla" || g.P >= P) && (!best || g.P < best->P))
+            if (g.kind == kind && g.R == R && g.Q == Q && (g.attn != "mla" || g.P >= P) && (!best || g.P < best->P))
                 best = &g;
         return best;
+    }
+    // any graph containing attention sub-block `attn` (kda / mla) for (R, Q) (R = 0: any), at least P pages
+    const Graph *find_attn(const std::string &attn, int R, int Q, int P) const {
+        const Graph *best = nullptr;
+        for (const auto &g : graphs)
+            if (g.attn == attn && (!R || (g.R == R && g.Q == Q)) && (attn != "mla" || g.P >= P) && (!best || g.P < best->P))
+                best = &g;
+        return best;
+    }
+    // the fused graph of layer l (attention + MLP in one NEFF) for (R, Q), if traced
+    const Graph *layer_graph(int l, int R, int Q, int P) const {
+        return find("layer_" + attn_kind[size_t(l)] + "_" + mlp_kind[size_t(l)], R, Q, P);
     }
     const Graph *head_for(int T, int S) const {
         const Graph *best = nullptr;
@@ -319,7 +340,7 @@ class GlmModel final : public Backend {
                         }
                 }
             }
-            if (gr.kind == "mla" && !v[0].table.count(gr.P))
+            if (gr.attn == "mla" && !v[0].table.count(gr.P))
                 for (int r = 0; r < tp; ++r)
                     v[size_t(r)].table[gr.P] = alloc(r, size_t(gr.R) * size_t(gr.P) * 8, "table");
         }
@@ -346,7 +367,7 @@ class GlmModel final : public Backend {
                     upload("r" + std::to_string(r) + "/" + layer_file(l), layer_prefix(l));
                 // state tensors, zeroed, sized by the NEFFs
                 for (int l = 0; l < layers; ++l) {
-                    const Graph *g = find(attn_kind[size_t(l)], first_group().first, first_group().second, 1);
+                    const Graph *g = find_attn(attn_kind[size_t(l)], 0, 0, 1);
                     for (size_t s = 0; s < g->states.size(); ++s) {
                         const std::string name = layer_prefix(l) + "attn." + g->states[s];
                         Dev d = alloc(r, g->state_bytes[s], name);
@@ -379,17 +400,21 @@ class GlmModel final : public Backend {
             return it->second;
         auto &st = steps.at({g.R, g.Q})[size_t(r)];
         auto &rank = ranks[size_t(r)];
-        const std::string sub = (g.kind == "kda" || g.kind == "mla") ? "attn." : "mlp.";
-        const std::string pre = layer_prefix(l) + sub;
+        // weights / states: sub-block graphs by their own sub-block, fused layers by a.* (attention) / m.* (MLP); states
+        // always belong to the attention sub-block
+        const std::string sub = g.attn.empty() ? "mlp." : "attn.";
         auto bind = [&](const std::string &name) -> const Dev & {
             if (name == "x") return st.x[parity];
             if (name == "pos") return st.pos;
             if (name == "slot") return st.slot;
             if (name == "wslot") return st.wslot;
             if (name == "table") return st.table.at(g.P);
-            auto it = rank.t.find(pre + name);
+            std::string full = layer_prefix(l) + sub + name;
+            if (name.rfind("a.", 0) == 0) full = layer_prefix(l) + "attn." + name.substr(2);
+            if (name.rfind("m.", 0) == 0) full = layer_prefix(l) + "mlp." + name.substr(2);
+            auto it = rank.t.find(full);
             if (it == rank.t.end())
-                throw std::runtime_error("GLM: layer " + std::to_string(l) + " has no tensor " + pre + name + " for the " + g.kind + " NEFF");
+                throw std::runtime_error("GLM: layer " + std::to_string(l) + " has no tensor " + full + " for the " + g.kind + " NEFF");
             return it->second;
         };
         nrt_tensor_set_t *in = nullptr, *out = nullptr;
@@ -431,7 +456,7 @@ class GlmModel final : public Backend {
 
     // ---- KDA state slots ----------------------------------------------------------------------------------------
     size_t slot_state_bytes(int l, size_t s) const {
-        const Graph *g = find("kda", first_group().first, first_group().second, 1);
+        const Graph *g = find_attn("kda", 0, 0, 1);
         return g->state_bytes[s] / size_t(slots_total);
     }
     void copy_slot(int seq, int slot, bool save) {
@@ -439,7 +464,7 @@ class GlmModel final : public Backend {
         if (save)
             blob.assign(size_t(tp), {});
         std::vector<std::future<void>> jobs;
-        const Graph *g = find("kda", first_group().first, first_group().second, 1);
+        const Graph *g = find_attn("kda", 0, 0, 1);
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
                 size_t at = 0;
@@ -552,19 +577,24 @@ class GlmModel final : public Backend {
             if (!head)
                 throw std::runtime_error("GLM: no head NEFF for " + std::to_string(L.head_rows.size()) + " rows");
         }
-        std::vector<const Graph *> attn(static_cast<size_t>(layers)), mlp(static_cast<size_t>(layers));
+        // per layer: the fused layer NEFF when traced for this bucket, else the attention and MLP sub-block NEFFs
+        std::vector<std::vector<const Graph *>> plan(static_cast<size_t>(layers));
         for (int l = 0; l < layers; ++l) {
-            attn[size_t(l)] = find(attn_kind[size_t(l)], L.R, L.Q, L.P);
-            mlp[size_t(l)] = find(mlp_kind[size_t(l)], L.R, L.Q, 0);
+            if (const Graph *f = layer_graph(l, L.R, L.Q, L.P))
+                plan[size_t(l)] = {f};
+            else
+                plan[size_t(l)] = {find(attn_kind[size_t(l)], L.R, L.Q, L.P), find(mlp_kind[size_t(l)], L.R, L.Q, 0)};
         }
-        const int P = attn_kind.end() != std::find(attn_kind.begin(), attn_kind.end(), "mla") ? find("mla", L.R, L.Q, L.P)->P : L.P;
-        if (P != L.P) { // widen the table to the bucket's page count
-            std::vector<int64_t> t(size_t(L.R) * size_t(P), pages_total - 1);
-            for (int r = 0; r < L.R; ++r)
-                std::copy_n(L.table.begin() + std::ptrdiff_t(r * L.P), L.P, t.begin() + std::ptrdiff_t(r * P));
-            L.table = std::move(t);
-            L.P = P;
-        }
+        // every table width the bucket's mla graphs use gets the request pages, padded with the scratch page
+        std::map<int, std::vector<int64_t>> tables;
+        for (const auto &v : plan)
+            for (const Graph *g : v)
+                if (g->attn == "mla" && !tables.count(g->P)) {
+                    auto &t = tables[g->P];
+                    t.assign(size_t(L.R) * size_t(g->P), pages_total - 1);
+                    for (int r = 0; r < L.R; ++r)
+                        std::copy_n(L.table.begin() + std::ptrdiff_t(r * L.P), std::min(L.P, g->P), t.begin() + std::ptrdiff_t(r * g->P));
+                }
         std::vector<int64_t> rows(head ? size_t(head->S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
@@ -579,11 +609,11 @@ class GlmModel final : public Backend {
                 put(st.pos, L.pos.data(), L.pos.size() * 8);
                 put(st.wslot, L.wslot.data(), L.wslot.size() * 8);
                 put(st.slot, L.slot.data(), L.slot.size() * 8);
-                if (st.table.count(L.P))
-                    put(st.table.at(L.P), L.table.data(), L.table.size() * 8);
+                for (const auto &[width, t] : tables)
+                    put(st.table.at(width), t.data(), t.size() * 8);
                 int parity = 0;
                 for (int l = 0; l < layers; ++l)
-                    for (const Graph *g : {attn[size_t(l)], mlp[size_t(l)]}) {
+                    for (const Graph *g : plan[size_t(l)]) {
                         auto [in, o] = layer_set(*g, l, parity, r);
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
                         parity ^= 1;
@@ -623,20 +653,20 @@ class GlmModel final : public Backend {
     int max_decode_rows() const override {
         int r = 0;
         for (const auto &g : graphs)
-            if (g.kind == "kda" && g.Q == 1) r = std::max(r, g.R);
+            if (g.attn == "kda" && g.Q == 1) r = std::max(r, g.R);
         return std::min(r, slots_total - 1);
     }
     int decode_bucket_pages(int pages) const override {
         int best = 0;
         for (const auto &g : graphs)
-            if (g.kind == "mla" && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
+            if (g.attn == "mla" && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
         return best;
     }
     const std::vector<int> &eos() const override { return eos_; }
     int max_context() const override {
         int p = 0;
         for (const auto &g : graphs)
-            if (g.kind == "mla") p = std::max(p, g.P);
+            if (g.attn == "mla") p = std::max(p, g.P);
         return std::min(p * PAGE, max_context_);
     }
     json last_profile() const override { return profile; }
@@ -667,7 +697,7 @@ class GlmModel final : public Backend {
         std::set<int> decode_R;
         std::set<int> prefill_Q;
         for (const auto &g : graphs)
-            if (g.kind == "kda") (g.Q == 1 ? decode_R.insert(g.R) : prefill_Q.insert(g.Q));
+            if (g.attn == "kda") (g.Q == 1 ? decode_R.insert(g.R) : prefill_Q.insert(g.Q));
         const int maxR = std::min(decode_R.empty() ? 0 : *decode_R.rbegin(), slots_total - 1);
         for (size_t at = 0; at < rows.size();) {
             if (!maxR)
@@ -676,7 +706,7 @@ class GlmModel final : public Backend {
             int R = *decode_R.lower_bound(int(n)), pages = 1;
             for (size_t i = 0; i < n; ++i)
                 pages = std::max(pages, pages_needed(rows[at + i]));
-            const Graph *g = find("mla", R, 1, pages);
+            const Graph *g = find_attn("mla", R, 1, pages);
             if (!g)
                 throw std::runtime_error("GLM: no decode bucket R=" + std::to_string(R) + " with " + std::to_string(pages) + " pages");
             auto L = fresh(R, 1, g->P);
@@ -705,7 +735,7 @@ class GlmModel final : public Backend {
                     Q = 1;
                 }
                 const int take = std::min(left, Q);
-                const Graph *g = find("mla", 1, Q, pages_needed(req));
+                const Graph *g = find_attn("mla", 1, Q, pages_needed(req));
                 if (!g)
                     throw std::runtime_error("GLM: no prefill bucket Q=" + std::to_string(Q) + " with " + std::to_string(pages_needed(req)) + " pages");
                 auto L = fresh(1, Q, g->P);

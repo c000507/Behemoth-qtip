@@ -1,8 +1,9 @@
 // Teacher-forced logits of a GLM prepared model on NeuronCores through NeuronModel::forward (no scheduler), for oracle checks.
-//   glm_run PREPARED_DIR NEFF_DIR TOKENS.json OUT.f32 [chunk|rows2]
+//   glm_run PREPARED_DIR NEFF_DIR TOKENS.json OUT.f32 [chunk|rowsK]
 // chunk 1 (default): every token is a one-row decode step and is sampled -> [n][vocab]
 // chunk N > 1:       prefill chunks of N tokens, the last token of each chunk sampled -> [ceil(n/N)][vocab]
-// rows2:             the sequence and its reverse as two rows of every decode step -> [n][2][vocab]
+// rowsK (K = 2..8):   K sequences (the tokens, reversed, then rotated by n/K, 2n/K, ...) as K rows of every decode step
+//                    -> [n][K][vocab]; with fewer KDA state slots than K the runtime spills / restores states every step
 // Prints the per-step wall time (ms) of the decode steps.
 #include "neuron_model.hpp"
 #include <chrono>
@@ -11,7 +12,7 @@
 
 int main(int argc, char **argv) {
     if (argc < 5) {
-        std::cerr << "usage: glm_run PREPARED_DIR NEFF_DIR TOKENS.json OUT.f32 [chunk|rows2]\n";
+        std::cerr << "usage: glm_run PREPARED_DIR NEFF_DIR TOKENS.json OUT.f32 [chunk|rowsK]\n";
         return 2;
     }
     try {
@@ -23,9 +24,14 @@ int main(int argc, char **argv) {
         const auto j = nlohmann::json::parse(f);
         const std::vector<int> tokens = (j.is_array() ? j : j.at("tokens")).get<std::vector<int>>();
         const std::string mode = argc > 5 ? argv[5] : "1";
-        const bool rows2 = mode == "rows2";
-        const int chunk = rows2 ? 1 : std::stoi(mode);
-        const int n = int(tokens.size()), pages = (n + 15) / 16, second = pages + 1; // second sequence's first page
+        const int seqs = mode.rfind("rows", 0) == 0 ? std::stoi(mode.substr(4)) : 1;
+        const int chunk = seqs > 1 ? 1 : std::stoi(mode);
+        const int n = int(tokens.size()), pages = (n + 15) / 16;
+        auto token_of = [&](int s, int p) {
+            if (s == 0) return tokens[size_t(p)];
+            if (s == 1) return tokens[size_t(n - 1 - p)];
+            return tokens[size_t((p + s * n / seqs) % n)];
+        };
         std::ofstream out(argv[4], std::ios::binary);
         std::vector<double> step_ms;
         for (int at = 0; at < n; at += chunk) {
@@ -35,16 +41,16 @@ int main(int argc, char **argv) {
             l.physical_pages = model.cache_pages();
             l.table_stride = pages;
             l.query_offsets = {0};
-            for (int s = 0; s < (rows2 ? 2 : 1); ++s) {
+            for (int s = 0; s < seqs; ++s) {
                 for (int i = 0; i < take; ++i) {
                     const int p = at + i;
-                    b.tokens.push_back(s ? tokens[size_t(n - 1 - p)] : tokens[size_t(p)]);
+                    b.tokens.push_back(token_of(s, p));
                     l.positions.push_back(p);
                 }
                 l.query_offsets.push_back(l.query_offsets.back() + take);
                 l.lengths.push_back(at + take);
                 for (int pg = 0; pg < pages; ++pg)
-                    l.page_table.push_back(s ? second + pg : pg);
+                    l.page_table.push_back(s * (pages + 1) + pg);
                 b.sample_rows.push_back(l.query_offsets.back() - 1);
                 b.sample_ids.push_back(uint64_t(s + 1));
             }
