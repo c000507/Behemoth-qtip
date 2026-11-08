@@ -1140,19 +1140,29 @@ struct Compiler {
             if (!v.is_number())
                 throw SchemaError(std::string("'") + key + "' must be a number");
             double d = v.get<double>();
-            if (!std::isfinite(d) || std::fabs(d) > 9.0e15)
-                unsupported(std::string("'") + key + "' beyond 16 digits");
+            if (!std::isfinite(d))
+                unsupported(std::string("'") + key + "' that is not finite");
+            // Generated numbers have at most 16 digits, so a bound beyond that (JavaScript's
+            // Number.MIN_SAFE_INTEGER from zod, say) is either no limit or admits no value; the
+            // range grammars tell which. Integer literals below 1e16 are taken exactly.
+            d = std::clamp(d, -1e16, 1e16);
+            const bool exact = v.is_number_integer() && std::fabs(d) < 1e16;
             long long value;
             if (integer) {
                 // x integer: x >= d <=> x >= ceil(d); x > d <=> x >= floor(d) + 1
-                double r = lower ? (inclusive ? std::ceil(d) : std::floor(d) + 1)
-                                 : (inclusive ? std::floor(d) : std::ceil(d) - 1);
-                value = static_cast<long long>(r);
+                if (exact) {
+                    const long long x = v.get<long long>();
+                    value = inclusive ? x : (lower ? x + 1 : x - 1);
+                } else {
+                    double r = lower ? (inclusive ? std::ceil(d) : std::floor(d) + 1)
+                                     : (inclusive ? std::floor(d) : std::ceil(d) - 1);
+                    value = static_cast<long long>(r);
+                }
                 inclusive = true;
             } else {
                 if (d != std::floor(d))
                     unsupported(std::string("'") + key + "' with a non-integer value on a number");
-                value = static_cast<long long>(d);
+                value = exact ? v.get<long long>() : static_cast<long long>(d);
             }
             if (b.has) { // keep the tighter bound
                 bool tighter = lower ? (value > b.value || (value == b.value && !inclusive))

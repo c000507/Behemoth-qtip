@@ -244,6 +244,12 @@ static void json_schema_tests() {
     CHECK(!in_range(R"({"type":"number","minimum":-5})", "-5.5"));
     CHECK(in_range(R"({"type":"number","maximum":-5})", "-5"));
     CHECK(!in_range(R"({"type":"number","maximum":-5})", "-4.5"));
+    // Bounds past 16 digits (zod writes JavaScript's safe-integer limits): no limit, or no value.
+    const char *safe = R"({"type":"integer","minimum":-9007199254740991,"maximum":9007199254740991})";
+    CHECK(in_range(safe, "-5") && in_range(safe, "9007199254740991") && !in_range(safe, "9007199254740992"));
+    CHECK(in_range(R"({"type":"integer","minimum":-1e300})", "-9999999999999999"));
+    CHECK(in_range(R"({"type":"number","maximum":1e20})", "12.5"));
+    CHECK(!rejects([] { grammar::json_schema_grammar(schema(R"({"type":"integer","minimum":1e20})")); }).empty());
     CHECK(in_range(R"({"type":"integer","minimum":1.5,"maximum":3.5})", "2"));
     CHECK(!in_range(R"({"type":"integer","minimum":1.5,"maximum":3.5})", "1"));
     CHECK(!in_range(R"({"type":"integer","minimum":1.5,"maximum":3.5})", "4"));

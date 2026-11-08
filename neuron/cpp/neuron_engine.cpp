@@ -555,6 +555,8 @@ struct Engine::Impl {
                     if (scheduler.request(request.id).done)
                         forget(request.id);
             } catch (const std::exception &error) {
+                // fatal: /health turns 503 and the orchestrator replaces the server, so say why
+                std::cerr << "engine step failed, engine stopped: " << error.what() << std::endl;
                 std::vector<std::pair<GenerationCallback, GenerationEvent>> errors;
                 {
                     std::lock_guard lock(mutex);

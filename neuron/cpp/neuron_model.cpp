@@ -1357,7 +1357,10 @@ struct NeuronModel::Impl {
             else
                 multi.push_back(req);
         }
-        // all rows in one launch when a bucket fits, else in groups of the largest R
+        // Short requests first, so they share the wide buckets (which have short page tables) and a long one does
+        // not drag them into a long-table launch; stable keeps each request's rows in token order.
+        std::stable_sort(rows.begin(), rows.end(), [&](const Row &a, const Row &b) { return pages_needed(a.req) < pages_needed(b.req); });
+        // all rows in one launch when a bucket fits, else the largest group a bucket covers
         for (size_t at = 0; at < rows.size();) {
             size_t n = rows.size() - at;
             auto pages_of = [&](size_t count) {
@@ -1366,12 +1369,12 @@ struct NeuronModel::Impl {
                 return pages;
             };
             LayerBucket *bucket = pick(decode, int(n), 1, pages_of(n));
-            if (!bucket) {
-                n = std::min<size_t>(n, size_t(max_rows));
+            while (!bucket && n > 1) {
+                n = std::min(n - 1, size_t(max_rows));
                 bucket = pick(decode, int(n), 1, pages_of(n));
-                if (!bucket)
-                    throw std::runtime_error("no decode NEFF bucket large enough for " + std::to_string(pages_of(n)) + " pages");
             }
+            if (!bucket)
+                throw std::runtime_error("no decode NEFF bucket large enough for " + std::to_string(pages_of(n)) + " pages");
             auto L = fresh(*bucket);
             for (size_t i = 0; i < n; ++i) {
                 const int req = rows[at + i].req, token_index = rows[at + i].token_index;
