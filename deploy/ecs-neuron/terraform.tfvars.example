@@ -36,3 +36,7 @@ enable_alb = false
 # alb_subnet_ids      = ["subnet-a", "subnet-b"]
 # alb_certificate_arn = "arn:aws:acm:us-east-1:912935854432:certificate/..."
 # router_api_key_secret_arn = "arn:aws:secretsmanager:...:secret:behemoth/router-key-XXXXXX"
+
+# Streamed load (entrypoint STREAM_LOAD=1, default): layer files download while the server loads. Optional RAM staging:
+# backend_shm_size_mib = 6144
+# backend_extra_env = { STAGE_DIR = "/dev/shm/layers", STREAM_UNLINK = "1", STREAM_AHEAD = "8" }
