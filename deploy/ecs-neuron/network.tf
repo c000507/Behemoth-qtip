@@ -18,6 +18,9 @@ resource "aws_security_group" "router" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    # the subnets assign IPv6 addresses and resolve through DNS64: IPv4-only AWS endpoints come back as 64:ff9b:: (NAT64)
+    # addresses tried first, so without IPv6 egress every API call hangs until the client's connect timeout
+    ipv6_cidr_blocks = ["::/0"]
   }
 }
 
@@ -43,6 +46,9 @@ resource "aws_security_group" "backend_task" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    # the subnets assign IPv6 addresses and resolve through DNS64: IPv4-only AWS endpoints come back as 64:ff9b:: (NAT64)
+    # addresses tried first, so without IPv6 egress every API call hangs until the client's connect timeout
+    ipv6_cidr_blocks = ["::/0"]
   }
 }
 
