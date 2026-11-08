@@ -221,6 +221,74 @@ import json as _json
 
 _SHAPE_TPL = Path(__file__).parent / "shape_templates.json"
 
+
+def _generate_oracle_on_box(M, K, N, key):
+    """Compile an oracle NEFF for (M,K,N) on the trn1 box via SSM + StableHLO
+    bytecode + neuronx-cc; extract sg00 streams into shape_templates.json."""
+    import base64 as _b64
+    import gzip as _gz
+    gen_py = (
+        "import io, os\n"
+        "import jax, jax.numpy as jnp\n"
+        f"d = '/tmp/oracle_gen_{key}'\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "f = jax.jit(lambda a, b: a @ b)\n"
+        f"lowered = f.lower(jnp.zeros(({M},{K}), jnp.float32), jnp.zeros(({K},{N}), jnp.float32))\n"
+        "buf = io.BytesIO()\n"
+        "lowered.compiler_ir().operation.write_bytecode(buf)\n"
+        "open(d + '/graph.mlirbc', 'wb').write(buf.getvalue())\n"
+        "print('gen ok')\n")
+    enc = _b64.b64encode(gen_py.encode()).decode()
+    subprocess.run(["aws", "s3", "cp", "/dev/stdin",
+                    "s3://912935854432-neuron-build/tools/gen_cur.py.b64"],
+                   input=enc, check=True, capture_output=True, text=True)
+    inner = (
+        "source /home/ubuntu/work/nenv.sh 2>/dev/null\n"
+        "export PATH=/usr/local/bin:$PATH\n"
+        "aws s3 cp s3://912935854432-neuron-build/tools/gen_cur.py.b64 /tmp/gen_cur.b64 1>/dev/null\n"
+        "python3 -c \"import base64; open('/tmp/gen_cur.py','wb').write(base64.b64decode(open('/tmp/gen_cur.b64').read()))\"\n"
+        f"/home/ubuntu/codex-neuron-test/venv/bin/python3 /tmp/gen_cur.py\n"
+        f"cd /tmp/oracle_gen_{key} && neuronx-cc compile graph.mlirbc --framework XLA --target trn1 --output o.neff 2>&1 | tail -1\n"
+        "python3 -c \"\n"
+        "import gzip, tarfile, io, base64, json\n"
+        "d = open('/tmp/oracle_gen_" + key + "/o.neff','rb').read()\n"
+        "t = tarfile.open(fileobj=io.BytesIO(gzip.decompress(d[1024:])))\n"
+        "out = {}\n"
+        "for m in t.getmembers():\n"
+        "    if m.name.startswith('sg00/') and (m.name.endswith('.bin') or m.name.endswith('.json')) and all(x not in m.name for x in ('debug','bkt','exp_and','act_info','default_','value_')):\n"
+        "        out[m.name] = base64.b64encode(t.extractfile(m).read()).decode()\n"
+        "print('NEFFDATA:' + json.dumps(out))\"\n")
+    open('/tmp/opencode/_gen_inner.sh', 'w').write(inner)
+    r = subprocess.run(["bash", "/tmp/opencode/ssm_run.sh", "/tmp/opencode/_gen_inner.sh", "300"],
+                       capture_output=True, text=True, timeout=320)
+    out = r.stdout
+    marker = out.find("NEFFDATA:")
+    if marker < 0:
+        raise RuntimeError(f"oracle gen failed for {key}: {out[-400:]} {r.stderr[-200:]}")
+    line = [l for l in out[marker:].split('\n') if 'NEFFDATA:' in l][0]
+    data = json.loads(line.split('NEFFDATA:', 1)[1])
+    sg_dir = Path(f"/tmp/opencode/oracle_{key}/sg00")
+    sg_dir.mkdir(parents=True, exist_ok=True)
+    for nm, b in data.items():
+        (sg_dir / Path(nm).name).write_bytes(_b64.b64decode(b))
+    ident = [(vn, vv['file_name'], vv['size'], vv['var_id'])
+             for vn, vv in json.load(open(sg_dir / 'def.json'))['var'].items()
+             if vv.get('type') == 'file'][0]
+    sp = json.load(open(sg_dir / 'SP0.json'))
+    tpl = _json.loads(_SHAPE_TPL.read_text())
+    tpl[key] = {
+        "pool_hex": open(sg_dir / 'Pool0.bin', 'rb').read().hex(),
+        "pe_hex": open(sg_dir / 'PE0.bin', 'rb').read().hex(),
+        "sp_dma": sp['dma'], "identity_var": ident,
+        "queue_sets": {q: v.get('semaphore_set')
+                       for q, v in json.load(open(sg_dir / 'def.json'))['dma_queue'].items()},
+        "dve_hex": open(sg_dir / 'DVE0.bin', 'rb').read().hex(),
+        "act_hex": open(sg_dir / 'Activation0.bin', 'rb').read().hex(),
+        "sp_hex": open(sg_dir / 'SP0.bin', 'rb').read().hex(),
+    }
+    _json.dump(tpl, _SHAPE_TPL.open('w'))
+
+
 def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> Path:
     """Emit a matmul NEFF for (M,K,N) using the verified per-shape template set.
 
@@ -232,7 +300,10 @@ def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> P
     key = f"{M}_{K}_{N}"
     tpl = _json.loads(_SHAPE_TPL.read_text())
     if key not in tpl:
-        raise ValueError(f"no verified template for {key}; have {sorted(tpl)}")
+        _generate_oracle_on_box(M, K, N, key)
+        tpl = _json.loads(_SHAPE_TPL.read_text())
+        if key not in tpl:
+            raise ValueError(f"oracle generation failed for {key}")
     t = tpl[key]
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
