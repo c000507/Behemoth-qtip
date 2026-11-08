@@ -1,6 +1,6 @@
 // Structured outputs on the checkpoint vocabulary (CPU only, no GPU, no weights):
 //  1. exactness: along constrained random walks, every step's mask equals accepts()
-//     over all 32768 ids, and completed answers validate against the schema;
+//     over every vocabulary id, and completed answers validate against the schema;
 //  2. cost: per-token time of the constraint calls the engine makes (accepts() for
 //     the greedy fast path, allowed() + advance() for masked sampling), cold
 //     (fresh grammar) and warm (grammar reused through the GrammarCache).
@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
         const int walks = argc > 2 ? std::stoi(argv[2]) : 20;
         Tokenizer tokenizer(argv[1]);
         auto t0 = Clock::now();
-        Vocabulary vocab(vocabulary_pieces(tokenizer));
+        Vocabulary vocab(vocabulary_pieces(tokenizer), vocabulary_eos(tokenizer));
         std::cout << "vocabulary: " << vocab.nodes().size() << " trie nodes, " << vocab.close_candidates().size()
                   << " '>' tokens, built in " << ms_since(t0) << " ms\n";
         const std::vector<std::pair<std::string, ojson>> schemas = {
@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
                     }
                     worst_ms = std::max(worst_ms, am + cm + vm);
                     ++tokens;
-                    if (t == eos_token) {
+                    if (t == vocab.eos()) {
                         ended = true;
                         break;
                     }
@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
                     c.advance(t);
                 else
                     throw std::runtime_error("answer token rejected after think");
-            if (!c.complete() || c.allowed().single != eos_token)
+            if (!c.complete() || c.allowed().single != vocab.eos())
                 throw std::runtime_error("EOS not forced after the answer");
             std::cout << "think -> answer -> forced EOS: ok\n";
         }

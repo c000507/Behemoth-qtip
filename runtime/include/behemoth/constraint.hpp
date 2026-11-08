@@ -27,10 +27,13 @@
 
 namespace behemoth {
 
+// Behemoth (Mistral SentencePiece) vocabulary: the GPU runtime's size and EOS. Other vocabularies (the Neuron
+// backend's Tekken / Llama-3 BPE checkpoints) pass their own size and EOS to Vocabulary.
 inline constexpr int vocabulary_size = 32768;
 inline constexpr int eos_token = 2;
 inline constexpr size_t mask_words = vocabulary_size / 64;
-using TokenMask = std::array<uint64_t, mask_words>;
+// Bitset over the vocabulary's ids (bit i of word i / 64), ceil(size / 64) words.
+using TokenMask = std::vector<uint64_t>;
 
 // Engine-facing interface. All calls for one request come from one thread at a
 // time (the engine's sampler job for that request); implementations need no locks.
@@ -46,6 +49,7 @@ class TokenConstraint {
     virtual bool accept_first(bool greedy) const = 0;
     // Allowed set for the next token. `count` = number of allowed ids; `single` is
     // the allowed id when count == 1 (forced token, e.g. EOS when the JSON is done).
+    // `mask` covers the constraint's vocabulary (mask->size() words).
     struct Allowed {
         const TokenMask *mask = nullptr;
         int count = 0;
@@ -64,7 +68,7 @@ class Vocabulary {
         bool first_after = false; // value of `first` after emitting at first position
         bool special = false;     // control token: emits nothing, never part of an answer
     };
-    explicit Vocabulary(std::vector<Token> tokens);
+    explicit Vocabulary(std::vector<Token> tokens, int eos = eos_token);
     const Token &token(int id) const {
         return tokens_[static_cast<size_t>(id)];
     }
@@ -86,9 +90,16 @@ class Vocabulary {
     size_t size() const {
         return tokens_.size();
     }
+    size_t words() const { // TokenMask words
+        return (tokens_.size() + 63) / 64;
+    }
+    int eos() const { // the token that ends a constrained answer
+        return eos_;
+    }
 
   private:
     std::vector<Token> tokens_;
+    int eos_;
     std::vector<Node> nodes_;
     std::vector<int32_t> same_;
     std::vector<int> close_candidates_;

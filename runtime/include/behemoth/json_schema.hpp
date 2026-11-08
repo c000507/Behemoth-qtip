@@ -14,9 +14,11 @@
 // naming the keyword so the server answers HTTP 400.
 #pragma once
 
+#include <functional>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace behemoth::grammar {
 
@@ -29,6 +31,14 @@ std::string json_object_grammar();
 
 // Grammar for a JSON Schema (OpenAI {"type":"json_schema"}).
 std::string json_schema_grammar(const nlohmann::ordered_json &schema);
+
+// One grammar for several schemas: rule names[i] matches schemas[i] (each schema its own $ref root), and
+// `root(names)` returns the body of the root rule built from them (tool calls: tools.hpp).
+std::string json_schemas_grammar(const std::vector<nlohmann::ordered_json> &schemas,
+                                 const std::function<std::string(const std::vector<std::string> &names)> &root);
+
+// GBNF string literal matching exactly the bytes of `s`.
+std::string gbnf_literal(const std::string &s);
 
 // GBNF for the decimal integers in [lo, hi] (inclusive; at most 16 digits,
 // i.e. |x| < 1e16). Exposed for tests.

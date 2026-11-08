@@ -36,6 +36,9 @@ class Tokenizer {
     std::string decode(const std::vector<int> &, bool special = false) const;
     std::string chat(const json &, bool generation = true) const;
     json summary() const;
+    size_t size() const { // token ids (highest id + 1)
+        return decode_.size();
+    }
 };
 struct Tensor {
     std::vector<size_t> shape;

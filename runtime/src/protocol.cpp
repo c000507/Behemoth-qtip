@@ -6,7 +6,7 @@
 #include <algorithm>
 
 namespace behemoth {
-StructuredOutput parse_structured(const nlohmann::ordered_json &j) {
+StructuredOutput parse_structured(const nlohmann::ordered_json &j, bool tool_constraint) {
     using ojson = nlohmann::ordered_json;
     StructuredOutput out;
     if (j.contains("response_format") && !j.at("response_format").is_null()) {
@@ -70,7 +70,7 @@ StructuredOutput parse_structured(const nlohmann::ordered_json &j) {
         if (!e.is_string() || std::find(levels.begin(), levels.end(), e.get<std::string>()) == levels.end())
             throw RequestError("reasoning_effort must be none, minimal, low, medium or high", "reasoning_effort");
         if (e == "none") {
-            if (out.kind == StructuredOutput::None)
+            if (out.kind == StructuredOutput::None && !tool_constraint)
                 throw RequestError("reasoning_effort=none is only enforced together with response_format "
                                    "json_object/json_schema or grammar",
                                    "reasoning_effort");
@@ -86,6 +86,7 @@ ChatBackend &backend() {
 }
 } // namespace
 void set_chat_backend(ChatBackend b) { backend() = std::move(b); }
+const ChatBackend &chat_backend() { return backend(); }
 const std::string &model_name() {
     static const std::string fallback = model_id;
     return backend().model_id.empty() ? fallback : backend().model_id;
@@ -97,14 +98,32 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
         throw std::invalid_argument("Unknown model");
     if (j.value("n", 1) != 1)
         throw std::invalid_argument("Only n=1 is supported");
+    const bool tools = backend().tools.supported() && backend().render_tools;
     for (const char *key : {"tools", "tool_choice", "functions", "function_call", "logprobs"})
-        if (j.contains(key))
+        if (j.contains(key) && (!tools || (std::string_view(key) != "tools" && std::string_view(key) != "tool_choice")))
             throw std::invalid_argument(std::string("Unsupported parameter: ") + key);
     auto messages = j.at("messages");
     if (!messages.is_array() || messages.empty())
         throw std::invalid_argument("messages must be a nonempty array");
     ChatRequest r;
-    if (backend().render) {
+    bool tool_messages = false; // the conversation has tool results or assistant tool calls
+    // tool definitions and call arguments keep their declared key order (ordered), as the model is shown them
+    const nlohmann::ordered_json own = tools && !ordered ? nlohmann::ordered_json(j) : nlohmann::ordered_json();
+    const auto &o = ordered ? *ordered : own;
+    if (tools) {
+        r.tools = parse_tools(o);
+        for (const auto &m : messages)
+            tool_messages |= m.is_object() && (m.value("role", "") == "tool" || m.contains("tool_calls"));
+        if (r.tools.active())
+            try {
+                r.tool_grammar = tool_call_grammar(r.tools, backend().tools);
+            } catch (const grammar::SchemaError &e) {
+                throw RequestError(std::string("Invalid tool parameters schema: ") + e.what(), "tools");
+            }
+    }
+    if (tools && (r.tools.active() || tool_messages)) {
+        r.rendered = backend().render_tools(o.at("messages"), r.tools.active() ? r.tools.tools : nlohmann::ordered_json());
+    } else if (backend().render) {
         r.rendered = backend().render(messages);
     } else {
         r.rendered = "<s>";
@@ -173,7 +192,12 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
             if (s.empty())
                 throw std::invalid_argument("Stop strings must be nonempty");
     }
-    r.structured = ordered ? parse_structured(*ordered) : parse_structured(nlohmann::ordered_json(j));
+    const bool tool_constraint = r.tools.choice == ToolRequest::Required || r.tools.choice == ToolRequest::Named;
+    r.structured = ordered ? parse_structured(*ordered, tool_constraint)
+                           : parse_structured(nlohmann::ordered_json(j), tool_constraint);
+    if (r.tools.active() && r.structured.kind != StructuredOutput::None)
+        throw RequestError("response_format and grammar cannot be combined with tools (tool_choice must be none)",
+                           "tool_choice");
     return r;
 }
 } // namespace behemoth

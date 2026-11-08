@@ -7,6 +7,7 @@
 #include "behemoth/json_schema.hpp"
 #include "behemoth/protocol.hpp"
 #include "behemoth/sampling.hpp"
+#include "behemoth/tools.hpp"
 #include "structured_support.hpp"
 #include <chrono>
 #include <functional>
@@ -101,6 +102,10 @@ static std::unique_ptr<StructuredConstraint> make(const std::string &gbnf, bool 
                                                   cache);
 }
 // Feeds token ids; returns false at the first rejected one.
+static std::string trim_copy(const std::string &s) {
+    const size_t b = s.find_first_not_of(" \t\n"), e = s.find_last_not_of(" \t\n");
+    return b == std::string::npos ? "" : s.substr(b, e - b + 1);
+}
 static bool feed(StructuredConstraint &c, const std::vector<int> &tokens) {
     for (int t : tokens) {
         if (!c.accepts(t))
@@ -485,7 +490,7 @@ static void sampling_tests() {
     logits[9] = 5;
     logits[100] = 4;
     logits[20000] = 4.5f;
-    TokenMask mask{};
+    TokenMask mask(mask_words, 0);
     auto allow = [&](int t) { mask[size_t(t) >> 6] |= uint64_t(1) << (t & 63); };
     allow(9);
     allow(100);
@@ -506,7 +511,7 @@ static void sampling_tests() {
     SamplingOptions topp{1.0f, 0, 0.5f, 0};
     for (int i = 0; i < 50; ++i)
         CHECK(sample_logits(lo, hi, topp, rng, mask.data()) == 9);
-    TokenMask none{};
+    TokenMask none(mask_words, 0);
     rejects([&] { sample_logits(lo, hi, hot, rng, none.data()); });
     // Unconstrained results are unchanged by the refactor (same RNG stream).
     std::mt19937_64 a(42), b(42);
@@ -568,6 +573,303 @@ static void protocol_tests() {
     CHECK(param(effort) == "reasoning_effort");
 }
 
+
+// ---------------------------------------------------------------------------
+// Tool calling (tools.hpp) and vocabularies other than Behemoth's
+// ---------------------------------------------------------------------------
+static const ToolFormat mistral_tools{"[TOOL_CALLS]", "[ARGS]", 9, 32};
+
+// Tekken-like 131072-id vocabulary: ids 0..999 control tokens (EOS 2; [TOOL_CALLS] 9 and [ARGS] 32 as their
+// marker text, as the Neuron server's vocabulary gives them), bytes at 1000.., a few pieces, filler words.
+static std::map<std::string, int> big_ids;
+static const Vocabulary &big_vocab() {
+    static const Vocabulary v = [] {
+        std::vector<Vocabulary::Token> t(131072);
+        for (size_t i = 0; i < 1000; ++i)
+            t[i].special = true;
+        auto set = [&](size_t i, const std::string &p) {
+            t[i].special = false;
+            t[i].first = t[i].rest = p;
+            big_ids.emplace(p, int(i));
+        };
+        set(9, mistral_tools.calls);
+        set(32, mistral_tools.args);
+        for (int b = 0; b < 256; ++b)
+            set(1000 + size_t(b), std::string(1, char(b)));
+        size_t next = 1256;
+        for (const char *p : {"get", "_weather", "get_weather", "{\"", "city", "\":", " \"", "Paris", "\"}", "ping", "{}",
+                              "Sure", " thing", "\"unit\":", "celsius"})
+            set(next++, p);
+        for (size_t i = 0; next < t.size(); ++i, ++next) { // filler, up to the last id
+            std::string w = " w" + std::to_string(i);
+            t[next].first = t[next].rest = w;
+        }
+        return Vocabulary(std::move(t), 2);
+    }();
+    return v;
+}
+static int big(const std::string &p) {
+    if (p.size() == 1)
+        return 1000 + int(uint8_t(p[0]));
+    return big_ids.at(p);
+}
+static bool feed_text(TokenConstraint &c, const std::string &text) { // byte by byte
+    for (char ch : text) {
+        const int t = 1000 + int(uint8_t(ch));
+        if (!c.accepts(t))
+            return false;
+        c.advance(t);
+    }
+    return true;
+}
+static bool feed_ids(TokenConstraint &c, const std::vector<int> &ids) {
+    for (int t : ids) {
+        if (!c.accepts(t))
+            return false;
+        c.advance(t);
+    }
+    return true;
+}
+static nlohmann::ordered_json weather_tools() {
+    return nlohmann::ordered_json::parse(R"([
+        {"type":"function","function":{"name":"get_weather","description":"Current weather",
+         "parameters":{"type":"object","properties":{"city":{"type":"string"},"unit":{"enum":["celsius","fahrenheit"]}},
+                       "required":["city"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"ping"}}])");
+}
+
+static void big_vocabulary_tests() {
+    const auto &v = big_vocab();
+    CHECK(v.size() == 131072 && v.words() == 2048 && v.eos() == 2);
+    rejects([] { Vocabulary(std::vector<Vocabulary::Token>(64), 64); }); // EOS outside the vocabulary
+    GrammarCache cache;
+    // JSON object over the whole id range: masks cover every id, EOS is the vocabulary's
+    auto c = std::make_unique<StructuredConstraint>(v, cache.acquire(grammar::json_object_grammar(), true), false, &cache);
+    auto a = c->allowed();
+    CHECK(a.mask->size() == 2048 && bit(*a.mask, big("{\"")) && bit(*a.mask, big("{")) && !bit(*a.mask, 131071) && !bit(*a.mask, 2));
+    CHECK(int(ids(*a.mask).size()) == a.count);
+    CHECK(feed_text(*c, "{\"a\":1"));
+    CHECK(c->accepts(131071 - 1) == false && c->accepts(big("}")));
+    c->advance(big("}"));
+    CHECK(c->allowed().single == 2 && c->accepts(2) && !c->accepts(1000 + ' '));
+    // exact masks: allowed() equals accepts() over all 131072 ids, inside a string (filler words allowed)
+    auto s = std::make_unique<StructuredConstraint>(v, cache.acquire(grammar::json_object_grammar(), true), false, &cache);
+    CHECK(feed_text(*s, "{\"k\":\"x"));
+    auto m = s->allowed();
+    int count = 0;
+    for (int t = 0; t < 131072; ++t) {
+        CHECK(bit(*m.mask, t) == s->accepts(t));
+        count += bit(*m.mask, t);
+    }
+    CHECK(count == m.count && bit(*m.mask, 131071)); // " w..." filler is string text
+    // think phase on a vocabulary that is not a multiple of 64 ids: no bits past the end
+    std::vector<Vocabulary::Token> odd(100);
+    for (int i = 0; i < 100; ++i)
+        odd[size_t(i)].first = odd[size_t(i)].rest = std::string(1, char('a' + i % 26));
+    odd[0] = {};
+    odd[0].special = true;
+    odd[1].first = odd[1].rest = "<think>";
+    const Vocabulary ov(std::move(odd), 0);
+    auto t = std::make_unique<StructuredConstraint>(ov, cache.acquire(grammar::json_object_grammar(), true), true, &cache);
+    CHECK(t->accepts(1));
+    t->advance(1);
+    auto ta = t->allowed();
+    CHECK(ta.mask->size() == 2 && ta.count == int(ids(*ta.mask).size()) && ids(*ta.mask).back() < 100 && !bit(*ta.mask, 0));
+}
+
+static void tool_tests() {
+    using ojson = nlohmann::ordered_json;
+    ojson req = {{"tools", weather_tools()}};
+    auto r = parse_tools(req);
+    CHECK(r.choice == ToolRequest::Auto && r.tools.size() == 2 && r.parallel);
+    CHECK(r.tools[1]["function"]["parameters"] == ojson::parse(R"({"type":"object","properties":{}})"));
+    req["tool_choice"] = "none";
+    CHECK(parse_tools(req).choice == ToolRequest::None);
+    req["tool_choice"] = "required";
+    req["parallel_tool_calls"] = false;
+    r = parse_tools(req);
+    CHECK(r.choice == ToolRequest::Required && !r.parallel);
+    req["tool_choice"] = {{"type", "function"}, {"function", {{"name", "ping"}}}};
+    CHECK(parse_tools(req).choice == ToolRequest::Named && parse_tools(req).name == "ping");
+    auto param = [](const ojson &j) {
+        try {
+            parse_tools(j);
+        } catch (const RequestError &e) {
+            return e.param;
+        }
+        throw std::runtime_error("expected RequestError");
+    };
+    req["tool_choice"] = {{"type", "function"}, {"function", {{"name", "nope"}}}};
+    CHECK(param(req) == "tool_choice");
+    req["tool_choice"] = "sometimes";
+    CHECK(param(req) == "tool_choice");
+    CHECK(param({{"tool_choice", "required"}}) == "tool_choice");
+    CHECK(parse_tools({{"tool_choice", "none"}}).choice == ToolRequest::None);
+    CHECK(param({{"tools", {{{"type", "function"}, {"function", {{"name", "bad name"}}}}}}}) == "tools[0].function.name");
+    CHECK(param({{"tools", {{{"type", "code"}}}}}) == "tools[0]");
+    auto dup = weather_tools();
+    dup.push_back(dup[1]);
+    CHECK(param({{"tools", dup}}) == "tools[2].function.name");
+
+    // grammar: [TOOL_CALLS]name[ARGS]<arguments matching the schema>, several calls when parallel
+    ToolRequest all = parse_tools({{"tools", weather_tools()}});
+    const auto g = tool_call_grammar(all, mistral_tools);
+    CHECK(matches(g, R"([TOOL_CALLS]get_weather[ARGS]{"city":"Paris"})"));
+    CHECK(matches(g, R"([TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "unit": "celsius"}[TOOL_CALLS]ping[ARGS]{})"));
+    CHECK(!matches(g, R"([TOOL_CALLS]get_weather[ARGS]{"town":"Paris"})"));
+    CHECK(!matches(g, R"([TOOL_CALLS]get_weather[ARGS]{"city":"Paris","unit":"kelvin"})"));
+    CHECK(!matches(g, R"([TOOL_CALLS]other[ARGS]{})"));
+    CHECK(!matches(g, R"(Sure [TOOL_CALLS]ping[ARGS]{})"));
+    ToolRequest one = parse_tools({{"tools", weather_tools()}, {"tool_choice", "required"}, {"parallel_tool_calls", false}});
+    CHECK(!matches(tool_call_grammar(one, mistral_tools), R"([TOOL_CALLS]ping[ARGS]{}[TOOL_CALLS]ping[ARGS]{})"));
+    ToolRequest named = parse_tools({{"tools", weather_tools()}, {"tool_choice", {{"type", "function"}, {"function", {{"name", "ping"}}}}}});
+    CHECK(matches(tool_call_grammar(named, mistral_tools), R"([TOOL_CALLS]ping[ARGS]{})"));
+    CHECK(!matches(tool_call_grammar(named, mistral_tools), R"([TOOL_CALLS]get_weather[ARGS]{"city":"x"})"));
+    // schemas with their own $defs: references resolve per tool
+    ojson defs = ojson::parse(R"([{"type":"function","function":{"name":"a","parameters":{"$defs":{"x":{"type":"integer"}},
+        "type":"object","properties":{"v":{"$ref":"#/$defs/x"}},"required":["v"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"b","parameters":{"$defs":{"x":{"type":"string"}},
+        "type":"object","properties":{"v":{"$ref":"#/$defs/x"}},"required":["v"],"additionalProperties":false}}}])");
+    const auto gd = tool_call_grammar(parse_tools({{"tools", defs}}), mistral_tools);
+    CHECK(matches(gd, R"([TOOL_CALLS]a[ARGS]{"v":1}[TOOL_CALLS]b[ARGS]{"v":"s"})"));
+    CHECK(!matches(gd, R"([TOOL_CALLS]a[ARGS]{"v":"s"})") && !matches(gd, R"([TOOL_CALLS]b[ARGS]{"v":1})"));
+
+    // constraint on the 131072-id vocabulary: control tokens 9 / 32 carry the markers
+    GrammarCache cache;
+    auto c = std::make_shared<StructuredConstraint>(big_vocab(), cache.acquire(g, true), false, &cache);
+    CHECK(c->accepts(9) && !c->accepts(big("Sure")) && !c->accepts(2));
+    CHECK(feed_ids(*c, {9, big("get_weather"), 32, big("{\""), big("city"), big("\":"), big(" \""), big("Paris"), big("\"}")}));
+    auto a = c->allowed();
+    // EOS or a further call ([TOOL_CALLS], or its text spelled from "["); no whitespace after the arguments
+    CHECK(bit(*a.mask, 2) && bit(*a.mask, 9) && bit(*a.mask, big("[")) && !bit(*a.mask, 1000 + ' ') && a.count == 3);
+    // the literal marker text spelled in bytes is the same answer
+    auto spelled = std::make_shared<StructuredConstraint>(big_vocab(), cache.acquire(g, true), false, &cache);
+    CHECK(feed_text(*spelled, R"([TOOL_CALLS]ping[ARGS]{})") && spelled->allowed().count == 3);
+
+    // tool_choice auto: free text until [TOOL_CALLS], then the grammar
+    auto inner = std::make_shared<StructuredConstraint>(big_vocab(), cache.acquire(g, true), false, &cache);
+    TriggeredConstraint lazy(9, inner, big_vocab().size());
+    CHECK(lazy.accept_first(false) && lazy.accepts(big("Sure")) && lazy.accepts(131071) && lazy.accepts(2));
+    CHECK(lazy.allowed().count == 131072 && lazy.allowed().mask->size() == 2048);
+    CHECK(feed_ids(lazy, {big("Sure"), big(" thing"), 32}) && !lazy.triggered()); // [ARGS] alone does not trigger
+    CHECK(feed_ids(lazy, {9}) && lazy.triggered());
+    CHECK(!lazy.accepts(big("Sure")) && !lazy.accepts(2) && lazy.accepts(big("ping")));
+    CHECK(feed_ids(lazy, {big("ping"), 32, big("{}")}) && lazy.accepts(2));
+
+    // parser: streamed one byte at a time, content then two calls
+    const std::string out = "Sure.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"} [TOOL_CALLS]ping[ARGS]{}";
+    ToolCallParser p(mistral_tools);
+    std::string content, args0;
+    nlohmann::json first_items = nlohmann::json::array();
+    for (size_t i = 0; i <= out.size(); ++i) {
+        auto d = i < out.size() ? p.feed(out.substr(i, 1)) : p.feed("", true);
+        content += d.content;
+        for (const auto &item : d.tool_calls) {
+            if (item.contains("id"))
+                first_items.push_back(item);
+            else if (item["index"] == 0)
+                args0 += item["function"]["arguments"].get<std::string>();
+        }
+    }
+    CHECK(content == "Sure." && p.content() == "Sure." && p.calls().size() == 2);
+    CHECK(p.calls()[0].name == "get_weather" && p.calls()[0].arguments == "{\"city\": \"Paris\"}");
+    CHECK(p.calls()[1].name == "ping" && p.calls()[1].arguments == "{}");
+    CHECK(first_items.size() == 2 && first_items[0]["function"]["name"] == "get_weather" &&
+          first_items[0]["function"]["arguments"] == "" && first_items[0]["type"] == "function" &&
+          first_items[0]["id"].get<std::string>().rfind("call_", 0) == 0 && first_items[1]["index"] == 1);
+    CHECK(trim_copy(args0) == p.calls()[0].arguments);
+    CHECK(p.calls()[0].openai()["function"]["arguments"] == "{\"city\": \"Paris\"}");
+    CHECK(p.calls()[0].id != p.calls()[1].id);
+    // brackets that are not the marker stay content; a held partial marker is released at the end
+    ToolCallParser q(mistral_tools);
+    auto d1 = q.feed("a [b] [TOOL_");
+    CHECK(d1.content == "a [b] ");
+    auto d2 = q.feed("x", true);
+    CHECK(d2.content == "[TOOL_x" && q.calls().empty());
+    // v7 form: a JSON list after the marker
+    ToolCallParser v7(mistral_tools);
+    v7.feed("[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}, {\"name\": \"ping\"}]");
+    auto d3 = v7.feed("", true);
+    CHECK(v7.calls().size() == 2 && v7.calls()[0].arguments == "{\"city\":\"Oslo\"}" && v7.calls()[1].arguments == "{}");
+    CHECK(d3.tool_calls.size() == 4 && v7.content().empty());
+    ToolCallParser junk(mistral_tools);
+    junk.feed("[TOOL_CALLS][not json");
+    CHECK(junk.feed("", true).content == "[TOOL_CALLS][not json" && junk.calls().empty());
+    // name followed directly by the arguments (no [ARGS])
+    ToolCallParser brace(mistral_tools);
+    brace.feed("[TOOL_CALLS]ping{}", true);
+    CHECK(brace.calls().size() == 1 && brace.calls()[0].name == "ping" && brace.calls()[0].arguments == "{}");
+
+    // prompt: Mistral v11 with tools before the last user turn, calls and results in the history
+    const auto messages = ojson::parse(R"([{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"},
+        {"role":"user","content":"Weather in Paris?"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",
+          "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\",\"unit\":\"celsius\"}"}}]},
+        {"role":"tool","tool_call_id":"call_1","content":"21 C"}])");
+    const ojson tools = ojson::parse(R"([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}])");
+    const std::string rendered = render_mistral_tools(messages, tools, mistral_tools, "<s>", "</s>", "Default.");
+    CHECK(rendered == "<s>[SYSTEM_PROMPT]Default.[/SYSTEM_PROMPT][INST]Hi[/INST]Hello</s>"
+                      "[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"ping\", \"parameters\": "
+                      "{\"type\": \"object\", \"properties\": {}}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST]"
+                      "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"unit\": \"celsius\"}</s>"
+                      "[TOOL_RESULTS]21 C[/TOOL_RESULTS]");
+    auto with_system = messages;
+    with_system.insert(with_system.begin(), ojson{{"role", "system"}, {"content", {{{"type", "text"}, {"text", "Be brief."}}}}});
+    CHECK(render_mistral_tools(with_system, ojson(), mistral_tools, "<s>", "</s>", "Default.")
+              .rfind("<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][INST]Hi[/INST]", 0) == 0);
+    rejects([&] { render_mistral_tools(ojson::parse(R"([{"role":"robot","content":"x"}])"), ojson(), mistral_tools, "", "", ""); });
+    CHECK(python_json(ojson::parse(R"({"a":[1,"é\n",{"b":null}],"c":true})")) == "{\"a\": [1, \"\xc3\xa9\\n\", {\"b\": null}], \"c\": true}");
+
+    // requests: tools are rejected unless the backend renders them
+    auto chat = [](const ojson &body) {
+        return parse_chat(nlohmann::json::parse(body.dump()), &body);
+    };
+    ojson body = {{"messages", {{{"role", "user"}, {"content", "Weather?"}}}}, {"tools", weather_tools()}};
+    CHECK(rejects([&] { chat(body); }) == "Unsupported parameter: tools");
+    ChatBackend backend;
+    backend.model_id = model_id;
+    backend.tools = mistral_tools;
+    backend.render_tools = [](const ojson &m, const ojson &t) {
+        return render_mistral_tools(m, t, mistral_tools, "<s>", "</s>", "");
+    };
+    set_chat_backend(backend);
+    try {
+        auto cr = chat(body);
+        CHECK(cr.tools.choice == ToolRequest::Auto && matches(cr.tool_grammar, R"([TOOL_CALLS]ping[ARGS]{})"));
+        CHECK(cr.rendered.find("[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", "
+                               "\"description\": \"Current weather\", \"parameters\": {\"type\": \"object\", \"properties\": "
+                               "{\"city\": ") != std::string::npos);
+        body["tool_choice"] = "none";
+        cr = chat(body);
+        CHECK(!cr.tools.active() && cr.tool_grammar.empty() && cr.rendered == "<s>[INST] Weather?[/INST]"); // the plain renderer
+        body["tool_choice"] = "auto";
+        body["response_format"] = {{"type", "json_object"}};
+        try {
+            chat(body);
+            CHECK(false);
+        } catch (const RequestError &e) {
+            CHECK(e.param == "tool_choice");
+        }
+        body.erase("response_format");
+        body["tools"][0]["function"]["parameters"] = {{"type", "string"}, {"pattern", "a+"}};
+        try {
+            chat(body);
+            CHECK(false);
+        } catch (const RequestError &e) {
+            CHECK(e.param == "tools");
+        }
+        CHECK(rejects([&] { chat({{"messages", {{{"role", "user"}, {"content", "x"}}}}, {"functions", ojson::array()}}); }) ==
+              "Unsupported parameter: functions");
+        // tool messages without tools still use the tool renderer
+        auto history = chat({{"messages", messages}});
+        CHECK(!history.tools.active() && history.rendered.find("[TOOL_RESULTS]21 C[/TOOL_RESULTS]") != std::string::npos);
+    } catch (...) {
+        set_chat_backend({});
+        throw;
+    }
+    set_chat_backend({});
+}
+
 static void cache_tests() {
     GrammarCache cache(2);
     const std::string g = grammar::json_object_grammar();
@@ -622,6 +924,8 @@ int main() {
                  {"masked_sampling", sampling_tests},
                  {"protocol", protocol_tests},
                  {"grammar_cache", cache_tests},
+                 {"big_vocabulary", big_vocabulary_tests},
+                 {"tools", tool_tests},
                  {"timing", timing_report}}) {
             fn();
             std::cout << "PASS " << name << '\n';

@@ -110,6 +110,7 @@ std::vector<Vocabulary::Token> vocabulary_pieces(const Tokenizer &tokenizer) {
     }
     return tokens;
 }
+int vocabulary_eos(const Tokenizer &) { return eos_token; }
 std::string Tokenizer::decode(const std::vector<int> &ids) const {
     std::string out;
     bool first = true;

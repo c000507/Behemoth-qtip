@@ -19,9 +19,11 @@ void set_bit(TokenMask &m, size_t t) {
 // ---------------------------------------------------------------------------
 // Vocabulary
 // ---------------------------------------------------------------------------
-Vocabulary::Vocabulary(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
-    if (tokens_.size() != size_t(vocabulary_size))
-        throw std::invalid_argument("Vocabulary must have 32768 tokens");
+Vocabulary::Vocabulary(std::vector<Token> tokens, int eos) : tokens_(std::move(tokens)), eos_(eos) {
+    if (tokens_.empty() || tokens_.size() > (size_t(1) << 24))
+        throw std::invalid_argument("Vocabulary must have 1 .. 2^24 tokens");
+    if (eos_ < 0 || size_t(eos_) >= tokens_.size())
+        throw std::invalid_argument("Vocabulary EOS outside the vocabulary");
     nodes_.push_back(Node{});
     same_.assign(tokens_.size(), -1);
     for (size_t id = 0; id < tokens_.size(); ++id) {
@@ -182,7 +184,7 @@ void GrammarCache::release(std::unique_ptr<GrammarEngine> engine) {
 StructuredConstraint::StructuredConstraint(const Vocabulary &vocab, std::unique_ptr<GrammarEngine> engine,
                                            bool allow_think, GrammarCache *cache)
     : vocab_(vocab), engine_(std::move(engine)), cache_(cache),
-      cur_{ThinkSplitter(allow_think), engine_->matcher.initial_state(), {}, true} {}
+      cur_{ThinkSplitter(allow_think), engine_->matcher.initial_state(), {}, true}, scratch_(vocab.words(), 0) {}
 
 StructuredConstraint::~StructuredConstraint() {
     if (cache_ && engine_)
@@ -210,11 +212,11 @@ bool StructuredConstraint::step_answer_bytes(State &st, std::string_view bytes) 
 }
 
 bool StructuredConstraint::step(State &st, int token) {
-    if (token < 0 || token >= vocabulary_size)
+    if (token < 0 || size_t(token) >= vocab_.size())
         return false;
     const auto &t = vocab_.token(token);
     if (t.special) {
-        if (token == eos_token) // only a complete answer may end
+        if (token == vocab_.eos()) // only a complete answer may end
             return (st.split.phase == ThinkSplitter::Answer || st.split.phase == ThinkSplitter::AnswerLead) &&
                    accepting(st.sid, st.partial);
         return st.split.phase == ThinkSplitter::Think; // control tokens: reasoning only
@@ -237,14 +239,14 @@ bool StructuredConstraint::step(State &st, int token) {
 
 bool StructuredConstraint::accepts(int token) {
     if (dead_)
-        return token == eos_token;
+        return token == vocab_.eos();
     State copy = cur_;
     try {
         return step(copy, token);
     } catch (const std::exception &e) {
         std::cerr << "[structured] grammar error: " << e.what() << '\n';
         dead_ = true;
-        return token == eos_token;
+        return token == vocab_.eos();
     }
 }
 
@@ -254,26 +256,29 @@ bool StructuredConstraint::accept_first(bool greedy) const {
 
 void StructuredConstraint::scan_all(TokenMask &mask) {
     ++stats_.scans;
+    const int n = int(vocab_.size()), eos = vocab_.eos();
     if (cur_.split.phase == ThinkSplitter::Think) {
         // Everything except EOS, minus '>' tokens that would close the block
         // into text the grammar rejects.
-        mask.fill(~uint64_t(0));
-        mask[size_t(eos_token) >> 6] &= ~(uint64_t(1) << (eos_token & 63));
+        std::fill(mask.begin(), mask.end(), ~uint64_t(0));
+        if (n & 63) // no ids past the vocabulary
+            mask.back() = (uint64_t(1) << (n & 63)) - 1;
+        mask[size_t(eos) >> 6] &= ~(uint64_t(1) << (eos & 63));
         for (int id : vocab_.close_candidates()) {
             State copy = cur_;
             if (!step(copy, id))
                 mask[size_t(id) >> 6] &= ~(uint64_t(1) << (id & 63));
         }
         if (cur_.first) // first-position pieces differ: check them exactly
-            for (int id = 0; id < vocabulary_size; ++id) {
+            for (int id = 0; id < n; ++id) {
                 State copy = cur_;
                 if (!step(copy, id))
                     mask[size_t(id) >> 6] &= ~(uint64_t(1) << (id & 63));
             }
         return;
     }
-    mask.fill(0);
-    for (int id = 0; id < vocabulary_size; ++id) {
+    std::fill(mask.begin(), mask.end(), 0);
+    for (int id = 0; id < n; ++id) {
         State copy = cur_;
         if (step(copy, id))
             set_bit(mask, size_t(id));
@@ -346,10 +351,11 @@ TokenConstraint::Allowed StructuredConstraint::allowed() {
         if (count != 1)
             single = -1;
     };
+    const int eos = vocab_.eos();
     auto forced_eos = [&]() -> Allowed {
-        scratch_.fill(0);
-        set_bit(scratch_, size_t(eos_token));
-        return {&scratch_, 1, eos_token};
+        std::fill(scratch_.begin(), scratch_.end(), 0);
+        set_bit(scratch_, size_t(eos));
+        return {&scratch_, 1, eos};
     };
     if (dead_)
         return forced_eos();
@@ -362,12 +368,14 @@ TokenConstraint::Allowed StructuredConstraint::allowed() {
                 return {&it->second.mask, it->second.count, it->second.single};
             }
             auto start = std::chrono::steady_clock::now();
-            if (engine_->masks.size() >= 4096)
-                engine_->masks.clear(); // bound memory (4 KiB per entry)
+            // bound memory: 16 MiB of masks (4096 entries of 4 KiB at the Behemoth vocabulary, 1024 at 131072 ids)
+            if (engine_->masks.size() >= std::max<size_t>(64, (size_t(16) << 20) / (vocab_.words() * 8)))
+                engine_->masks.clear();
             GrammarEngine::CachedMask cached{};
+            cached.mask.assign(vocab_.words(), 0);
             walk(0, cur_.sid, cur_.partial, cached.mask);
             if (accepting(cur_.sid, cur_.partial))
-                set_bit(cached.mask, size_t(eos_token));
+                set_bit(cached.mask, size_t(eos));
             summarize(cached.mask, cached.count, cached.single);
             ++stats_.mask_builds;
             stats_.mask_build_ms +=

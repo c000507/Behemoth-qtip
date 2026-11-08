@@ -254,7 +254,7 @@ struct Compiler {
     static constexpr int max_repeat = 4096; // = the GBNF parser's cap
     static constexpr size_t max_properties = 1024;
 
-    const json &root;
+    const json *root; // the schema being compiled ($ref "#" and "#/..." resolve against it)
     int depth = 0;
     size_t grammar_bytes = 0;
     std::map<std::string, int> next_suffix;
@@ -264,7 +264,7 @@ struct Compiler {
     std::map<std::string, std::string> ref_rules; // "$ref" pointer -> rule name
     bool used_format[3] = {false, false, false};
 
-    explicit Compiler(const json &r) : root(r) {
+    explicit Compiler(const json &r) : root(&r) {
         for (const char *n : {"space", "string", "char", "integer", "number", "boolean", "null", "value",
                               "object", "kv", "array", "root", "date-fmt", "time-fmt", "uuid-fmt"})
             names.insert(n);
@@ -340,10 +340,10 @@ struct Compiler {
 
     const json *resolve_ref(const std::string &ref) {
         if (ref == "#")
-            return &root;
+            return root;
         if (ref.rfind("#/", 0) != 0)
             unsupported("$ref '" + ref + "' (only local #/ references)");
-        const json *cur = &root;
+        const json *cur = root;
         size_t i = 2;
         while (i <= ref.size()) {
             size_t j = ref.find('/', i);
@@ -784,9 +784,17 @@ struct Compiler {
         return "value"; // {} -- anything
     }
 
+    // Rule matching `schema` (a further root: its references resolve within it), added to this grammar.
+    std::string compile(const json &schema, const std::string &hint) {
+        root = &schema;
+        ref_rules.clear(); // pointers are per root; rule names stay unique
+        return visit(schema, hint);
+    }
     std::string build() {
-        std::string root_rule = visit(root, "root-value");
-        std::string out = "root ::= " + root_rule + "\n";
+        return build_root(visit(*root, "root-value"));
+    }
+    std::string build_root(const std::string &root_body) {
+        std::string out = "root ::= " + root_body + "\n";
         for (const auto &[n, b] : rules)
             out += n + " ::= " + b + "\n";
         out += primitives;
@@ -811,6 +819,20 @@ std::string json_object_grammar() {
 std::string json_schema_grammar(const json &schema) {
     Compiler c(schema);
     return c.build();
+}
+
+std::string json_schemas_grammar(const std::vector<json> &schemas,
+                                 const std::function<std::string(const std::vector<std::string> &)> &root) {
+    const json empty = json::object();
+    Compiler c(empty);
+    std::vector<std::string> rules;
+    for (size_t i = 0; i < schemas.size(); ++i)
+        rules.push_back(c.compile(schemas[i], "schema-" + std::to_string(i)));
+    return c.build_root(root(rules));
+}
+
+std::string gbnf_literal(const std::string &s) {
+    return literal(s);
 }
 
 } // namespace behemoth::grammar

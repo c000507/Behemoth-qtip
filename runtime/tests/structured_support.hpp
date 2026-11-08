@@ -185,7 +185,7 @@ inline WalkResult walk(const Vocabulary &vocab, StructuredConstraint &c, bool al
         if (int(allowed.size()) != a.count)
             throw std::runtime_error("allowed count mismatch");
         if (exact)
-            for (int id = 0; id < behemoth::vocabulary_size; ++id)
+            for (int id = 0; id < int(vocab.size()); ++id)
                 if (bit(*a.mask, id) != c.accepts(id))
                     throw std::runtime_error("mask/accepts mismatch at token " + std::to_string(id) +
                                              " after " + std::to_string(r.tokens) + " tokens");
@@ -194,7 +194,7 @@ inline WalkResult walk(const Vocabulary &vocab, StructuredConstraint &c, bool al
             throw std::runtime_error("chosen token not accepted");
         c.advance(t);
         r.sequence.push_back(t);
-        if (t == behemoth::eos_token) {
+        if (t == vocab.eos()) {
             r.ended = true;
             ++r.tokens;
             break;
@@ -217,7 +217,7 @@ inline std::function<int(const std::vector<int> &)> biased_chooser(const Vocabul
     return [&vocab, &rng](const std::vector<int> &allowed) {
         std::vector<int> preferred;
         for (int id : allowed) {
-            if (id == behemoth::eos_token) {
+            if (id == vocab.eos()) {
                 preferred.assign(4, id);
                 break;
             }

@@ -1,0 +1,399 @@
+#include "behemoth/tools.hpp"
+#include "behemoth/json_schema.hpp"
+#include "behemoth/protocol.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <random>
+#include <set>
+
+namespace behemoth {
+namespace {
+using ojson = nlohmann::ordered_json;
+
+bool valid_name(const std::string &n) {
+    return !n.empty() && n.size() <= 64 &&
+           n.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == std::string::npos;
+}
+bool is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+std::string trim(std::string_view s) {
+    size_t b = 0, e = s.size();
+    while (b < e && is_space(s[b]))
+        ++b;
+    while (e > b && is_space(s[e - 1]))
+        --e;
+    return std::string(s.substr(b, e - b));
+}
+// Length of the longest suffix of `text` that is a proper prefix of `marker` (text that may still become it).
+size_t partial_suffix(std::string_view text, std::string_view marker) {
+    for (size_t n = std::min(marker.size() - 1, text.size()); n > 0; --n)
+        if (text.substr(text.size() - n) == marker.substr(0, n))
+            return n;
+    return 0;
+}
+// Message content as text: a string, null (assistant turns that only call tools) or text blocks.
+std::string text_content(const ojson &m, bool allow_null) {
+    if (!m.contains("content") || m.at("content").is_null()) {
+        if (allow_null)
+            return "";
+        throw std::invalid_argument("message content is required");
+    }
+    const auto &c = m.at("content");
+    if (c.is_string())
+        return c.get<std::string>();
+    if (!c.is_array())
+        throw std::invalid_argument("message content must be a string or an array of text blocks");
+    std::string out;
+    for (const auto &block : c) {
+        if (!block.is_object() || block.value("type", "") != "text" || !block.contains("text") || !block.at("text").is_string())
+            throw std::invalid_argument("Only text content blocks are supported");
+        out += block.at("text").get<std::string>();
+    }
+    return out;
+}
+} // namespace
+
+ToolRequest parse_tools(const ojson &j) {
+    ToolRequest r;
+    std::set<std::string> names;
+    if (j.contains("tools") && !j.at("tools").is_null()) {
+        if (!j.at("tools").is_array())
+            throw RequestError("tools must be an array", "tools");
+        if (j.at("tools").size() > 128)
+            throw RequestError("At most 128 tools are supported", "tools");
+        for (size_t i = 0; i < j.at("tools").size(); ++i) {
+            const auto &t = j.at("tools")[i];
+            const std::string at = "tools[" + std::to_string(i) + "]";
+            if (!t.is_object() || t.value("type", "") != "function" || !t.contains("function") || !t.at("function").is_object())
+                throw RequestError(at + " must be {\"type\": \"function\", \"function\": {...}}", at);
+            const auto &f = t.at("function");
+            if (!f.contains("name") || !f.at("name").is_string() || !valid_name(f.at("name").get<std::string>()))
+                throw RequestError(at + ".function.name must match ^[a-zA-Z0-9_-]{1,64}$", at + ".function.name");
+            const std::string name = f.at("name");
+            if (!names.insert(name).second)
+                throw RequestError("Duplicate tool name: " + name, at + ".function.name");
+            ojson fn = {{"name", name}};
+            if (f.contains("description") && !f.at("description").is_null()) {
+                if (!f.at("description").is_string())
+                    throw RequestError(at + ".function.description must be a string", at + ".function.description");
+                fn["description"] = f.at("description");
+            }
+            if (f.contains("parameters") && !f.at("parameters").is_null()) {
+                if (!f.at("parameters").is_object())
+                    throw RequestError(at + ".function.parameters must be a JSON Schema object", at + ".function.parameters");
+                fn["parameters"] = f.at("parameters");
+            } else
+                fn["parameters"] = {{"type", "object"}, {"properties", ojson::object()}};
+            r.tools.push_back({{"type", "function"}, {"function", std::move(fn)}});
+        }
+    }
+    if (j.contains("parallel_tool_calls") && !j.at("parallel_tool_calls").is_null()) {
+        if (!j.at("parallel_tool_calls").is_boolean())
+            throw RequestError("parallel_tool_calls must be a boolean", "parallel_tool_calls");
+        r.parallel = j.at("parallel_tool_calls");
+    }
+    r.choice = r.tools.empty() ? ToolRequest::None : ToolRequest::Auto;
+    if (j.contains("tool_choice") && !j.at("tool_choice").is_null()) {
+        const auto &c = j.at("tool_choice");
+        if (c.is_string()) {
+            const std::string s = c;
+            if (s == "none")
+                r.choice = ToolRequest::None;
+            else if (s == "auto" || s == "required")
+                r.choice = s == "auto" ? ToolRequest::Auto : ToolRequest::Required;
+            else
+                throw RequestError("tool_choice must be none, auto, required or a function", "tool_choice");
+        } else if (c.is_object() && c.value("type", "") == "function" && c.contains("function") &&
+                   c.at("function").is_object() && c.at("function").contains("name") &&
+                   c.at("function").at("name").is_string()) {
+            r.choice = ToolRequest::Named;
+            r.name = c.at("function").at("name");
+            if (!names.contains(r.name))
+                throw RequestError("tool_choice names a function that is not in tools: " + r.name, "tool_choice");
+        } else
+            throw RequestError("tool_choice must be none, auto, required or {\"type\": \"function\", \"function\": {\"name\": ...}}",
+                               "tool_choice");
+        if (r.choice != ToolRequest::None && r.tools.empty())
+            throw RequestError("tool_choice requires tools", "tool_choice");
+    }
+    return r;
+}
+
+std::string tool_call_grammar(const ToolRequest &r, const ToolFormat &f) {
+    std::vector<ojson> schemas;
+    std::vector<std::string> names;
+    for (const auto &t : r.tools) {
+        const auto &fn = t.at("function");
+        if (r.choice == ToolRequest::Named && fn.at("name") != r.name)
+            continue;
+        names.push_back(fn.at("name"));
+        schemas.push_back(fn.at("parameters"));
+    }
+    if (names.empty())
+        throw std::invalid_argument("No tools to call");
+    return grammar::json_schemas_grammar(schemas, [&](const std::vector<std::string> &rules) {
+        std::string call = grammar::gbnf_literal(f.calls) + " (";
+        for (size_t i = 0; i < rules.size(); ++i)
+            call += (i ? " | " : " ") + grammar::gbnf_literal(names[i] + f.args) + " " + rules[i];
+        call += " )";
+        return r.parallel ? call + " ( " + call + " )*" : call;
+    });
+}
+
+std::string python_json(const ojson &v) {
+    if (v.is_object()) {
+        std::string out = "{";
+        bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            out += (first ? "" : ", ") + ojson(it.key()).dump(-1, ' ', false, ojson::error_handler_t::replace) + ": " +
+                   python_json(it.value());
+            first = false;
+        }
+        return out + "}";
+    }
+    if (v.is_array()) {
+        std::string out = "[";
+        for (size_t i = 0; i < v.size(); ++i)
+            out += (i ? ", " : "") + python_json(v[i]);
+        return out + "]";
+    }
+    return v.dump(-1, ' ', false, ojson::error_handler_t::replace);
+}
+
+std::string render_mistral_tools(const ojson &messages, const ojson &tools, const ToolFormat &f, const std::string &bos,
+                                 const std::string &eos, const std::string &system) {
+    if (!messages.is_array() || messages.empty())
+        throw std::invalid_argument("messages must be a nonempty array");
+    std::string out = bos;
+    size_t begin = 0, last_user = messages.size();
+    if (messages[0].is_object() && messages[0].value("role", "") == "system") {
+        out += "[SYSTEM_PROMPT]" + text_content(messages[0], false) + "[/SYSTEM_PROMPT]";
+        begin = 1;
+    } else if (!system.empty())
+        out += "[SYSTEM_PROMPT]" + system + "[/SYSTEM_PROMPT]";
+    for (size_t i = begin; i < messages.size(); ++i)
+        if (messages[i].is_object() && messages[i].value("role", "") == "user")
+            last_user = i;
+    for (size_t i = begin; i < messages.size(); ++i) {
+        const auto &m = messages[i];
+        if (!m.is_object() || !m.contains("role") || !m.at("role").is_string())
+            throw std::invalid_argument("every message needs a string role");
+        const std::string role = m.at("role");
+        if (role == "user") {
+            if (i == last_user && tools.is_array() && !tools.empty())
+                out += "[AVAILABLE_TOOLS]" + python_json(tools) + "[/AVAILABLE_TOOLS]";
+            out += "[INST]" + text_content(m, false) + "[/INST]";
+        } else if (role == "system")
+            out += "[SYSTEM_PROMPT]" + text_content(m, false) + "[/SYSTEM_PROMPT]";
+        else if (role == "assistant") {
+            const bool calls = m.contains("tool_calls") && !m.at("tool_calls").is_null();
+            out += text_content(m, calls);
+            if (calls) {
+                if (!m.at("tool_calls").is_array())
+                    throw std::invalid_argument("tool_calls must be an array");
+                for (const auto &c : m.at("tool_calls")) {
+                    if (!c.is_object() || !c.contains("function") || !c.at("function").is_object() ||
+                        !c.at("function").contains("name") || !c.at("function").at("name").is_string())
+                        throw std::invalid_argument("tool_calls entries need function.name");
+                    const auto &fn = c.at("function");
+                    std::string arguments = "{}";
+                    if (fn.contains("arguments") && fn.at("arguments").is_string()) {
+                        const std::string raw = fn.at("arguments");
+                        const auto parsed = ojson::parse(raw, nullptr, false);
+                        arguments = parsed.is_discarded() ? raw : python_json(parsed);
+                    } else if (fn.contains("arguments") && !fn.at("arguments").is_null())
+                        arguments = python_json(fn.at("arguments"));
+                    out += f.calls + fn.at("name").get<std::string>() + f.args + arguments;
+                }
+            }
+            out += eos;
+        } else if (role == "tool")
+            out += "[TOOL_RESULTS]" + text_content(m, false) + "[/TOOL_RESULTS]";
+        else
+            throw std::invalid_argument("Only system, user, assistant and tool roles are supported");
+    }
+    return out;
+}
+
+nlohmann::json ToolCall::openai() const {
+    return {{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", arguments}}}};
+}
+
+ToolCallParser::ToolCallParser(ToolFormat format) : format_(std::move(format)) {}
+
+std::string ToolCallParser::new_id() {
+    static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    thread_local std::mt19937_64 rng(std::random_device{}());
+    std::string id = "call_";
+    for (int i = 0; i < 24; ++i)
+        id += alphabet[rng() % (sizeof alphabet - 1)];
+    return id;
+}
+
+void ToolCallParser::start_call(std::string name, Delta &d) {
+    calls_.push_back({new_id(), std::move(name), ""});
+    d.tool_calls.push_back({{"index", calls_.size() - 1},
+                            {"id", calls_.back().id},
+                            {"type", "function"},
+                            {"function", {{"name", calls_.back().name}, {"arguments", ""}}}});
+}
+
+void ToolCallParser::add_arguments(std::string_view text, Delta &d) {
+    if (text.empty() || calls_.empty())
+        return;
+    // leading whitespace of the arguments is dropped (the parser trims the final arguments too)
+    if (calls_.back().arguments.empty()) {
+        while (!text.empty() && is_space(text.front()))
+            text.remove_prefix(1);
+        if (text.empty())
+            return;
+    }
+    calls_.back().arguments += text;
+    d.tool_calls.push_back({{"index", calls_.size() - 1}, {"function", {{"arguments", std::string(text)}}}});
+}
+
+// v7 form: [TOOL_CALLS][{"name": ..., "arguments": {...}}, ...] (or one object). Unparseable text stays content.
+void ToolCallParser::finish_list(Delta &d) {
+    const auto parsed = nlohmann::json::parse(list_, nullptr, false);
+    std::vector<nlohmann::json> items;
+    if (parsed.is_array())
+        items.assign(parsed.begin(), parsed.end());
+    else if (parsed.is_object())
+        items.push_back(parsed);
+    bool ok = !items.empty();
+    for (const auto &it : items)
+        ok = ok && it.is_object() && it.contains("name") && it.at("name").is_string();
+    if (!ok) {
+        d.content += format_.calls + list_;
+        content_ += format_.calls + list_;
+        list_.clear();
+        return;
+    }
+    for (const auto &it : items) {
+        start_call(it.at("name"), d);
+        const auto args = it.contains("arguments") ? it.at("arguments") : nlohmann::json::object();
+        add_arguments(args.is_string() ? args.get<std::string>() : args.dump(), d);
+    }
+    list_.clear();
+}
+
+ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
+    Delta d;
+    buffer_ += text;
+    for (bool progress = true; progress;) {
+        progress = false;
+        switch (mode_) {
+        case Content: {
+            // whitespace before anything else is held: dropped when the answer turns out to be calls only
+            const bool leading = content_.empty() && d.content.empty();
+            const size_t at = buffer_.find(format_.calls);
+            if (at != std::string::npos) {
+                if (!leading || !trim(std::string_view(buffer_).substr(0, at)).empty())
+                    d.content += buffer_.substr(0, at);
+                buffer_.erase(0, at + format_.calls.size());
+                mode_ = Head;
+                progress = true;
+                break;
+            }
+            const size_t keep = finish ? 0 : partial_suffix(buffer_, format_.calls);
+            if (!finish && leading && trim(std::string_view(buffer_).substr(0, buffer_.size() - keep)).empty())
+                break;
+            d.content += buffer_.substr(0, buffer_.size() - keep);
+            buffer_.erase(0, buffer_.size() - keep);
+            break;
+        }
+        case Head: {
+            size_t i = 0;
+            while (i < buffer_.size() && is_space(buffer_[i]))
+                ++i;
+            buffer_.erase(0, i);
+            if (buffer_.empty())
+                break;
+            mode_ = buffer_[0] == '[' || buffer_[0] == '{' ? List : Name;
+            progress = true;
+            break;
+        }
+        case Name: {
+            // name, then [ARGS] (or the arguments' "{" directly, as some fine-tunes write it)
+            size_t at = format_.args.empty() ? std::string::npos : buffer_.find(format_.args);
+            const size_t brace = buffer_.find('{');
+            size_t skip = format_.args.size();
+            if (brace != std::string::npos && (at == std::string::npos || brace < at)) {
+                at = brace;
+                skip = 0;
+            }
+            if (at == std::string::npos) {
+                if (finish && !trim(buffer_).empty()) { // a name without arguments
+                    start_call(trim(buffer_), d);
+                    buffer_.clear();
+                }
+                break;
+            }
+            start_call(trim(std::string_view(buffer_).substr(0, at)), d);
+            buffer_.erase(0, at + skip);
+            mode_ = Args;
+            progress = true;
+            break;
+        }
+        case Args: {
+            const size_t at = buffer_.find(format_.calls);
+            if (at != std::string::npos) {
+                add_arguments(std::string_view(buffer_).substr(0, at), d);
+                buffer_.erase(0, at + format_.calls.size());
+                mode_ = Head;
+                progress = true;
+                break;
+            }
+            const size_t keep = finish ? 0 : partial_suffix(buffer_, format_.calls);
+            add_arguments(std::string_view(buffer_).substr(0, buffer_.size() - keep), d);
+            buffer_.erase(0, buffer_.size() - keep);
+            break;
+        }
+        case List:
+            list_ += buffer_;
+            buffer_.clear();
+            if (finish)
+                finish_list(d);
+            break;
+        }
+    }
+    if (finish)
+        for (auto &c : calls_) {
+            c.arguments = trim(c.arguments);
+            if (c.arguments.empty())
+                c.arguments = "{}";
+        }
+    content_ += d.content;
+    return d;
+}
+
+TriggeredConstraint::TriggeredConstraint(int trigger, std::shared_ptr<TokenConstraint> inner, size_t vocabulary)
+    : trigger_(trigger), inner_(std::move(inner)), all_((vocabulary + 63) / 64, ~uint64_t(0)), count_(int(vocabulary)) {
+    if (vocabulary & 63)
+        all_.back() = (uint64_t(1) << (vocabulary & 63)) - 1;
+}
+
+bool TriggeredConstraint::accepts(int token) {
+    return triggered_ ? inner_->accepts(token) : true;
+}
+
+bool TriggeredConstraint::accept_first(bool greedy) const {
+    return triggered_ ? inner_->accept_first(greedy) : true;
+}
+
+TokenConstraint::Allowed TriggeredConstraint::allowed() {
+    if (triggered_)
+        return inner_->allowed();
+    return {&all_, count_, -1};
+}
+
+void TriggeredConstraint::advance(int token) {
+    if (!triggered_ && token == trigger_)
+        triggered_ = true;
+    if (triggered_)
+        inner_->advance(token);
+}
+
+} // namespace behemoth

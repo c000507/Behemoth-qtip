@@ -30,7 +30,7 @@ using namespace behemoth;
 struct StructuredContext {
     Vocabulary vocabulary;
     GrammarCache grammars;
-    explicit StructuredContext(const Tokenizer &tokenizer) : vocabulary(vocabulary_pieces(tokenizer)) {}
+    explicit StructuredContext(const Tokenizer &tokenizer) : vocabulary(vocabulary_pieces(tokenizer), vocabulary_eos(tokenizer)) {}
 };
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -42,6 +42,10 @@ class Session : public std::enable_shared_from_this<Session> {
     StructuredContext &structured_;
     bool constrained_ = false;
     ThinkSplitter splitter_;
+    // Tool calling (tools.hpp): the answer's split into content and tool calls, and whether the format's control
+    // tokens are streamed as their marker text (requests with tools or a constraint, which sees them as text).
+    std::unique_ptr<ToolCallParser> tool_parser_;
+    bool markers_ = false;
     uint64_t id_ = 0;
     std::time_t created_ = std::time(nullptr);
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
@@ -133,26 +137,47 @@ class Session : public std::enable_shared_from_this<Session> {
         queue_.push_back(std::move(wire));
         write_next();
     }
+    // Answer text: content, or with tools the parser's content and tool_calls deltas.
+    void answer(const std::string &text, bool finish) {
+        if (!tool_parser_) {
+            if (text.empty())
+                return;
+            output_ += text;
+            if (streaming_)
+                enqueue("data: " + chunk({{"content", text}}).dump() + "\n\n");
+            return;
+        }
+        auto delta = tool_parser_->feed(text, finish);
+        output_ += delta.content;
+        if (streaming_ && !delta.content.empty())
+            enqueue("data: " + chunk({{"content", delta.content}}).dump() + "\n\n");
+        if (streaming_ && !delta.tool_calls.empty())
+            enqueue("data: " + chunk({{"tool_calls", delta.tool_calls}}).dump() + "\n\n");
+    }
     void emit(const std::string &text, bool finish = false) {
         if (constrained_) {
             // Same split as the decoding gate: one leading think block, then the answer.
-            std::string reasoning, answer;
-            splitter_.feed(text, &reasoning, &answer, finish);
-            for (auto *part : {&reasoning, &answer}) {
-                if (part->empty())
-                    continue;
-                const bool is_reasoning = part == &reasoning;
-                (is_reasoning ? reasoning_output_ : output_) += *part;
+            std::string reasoning, answer_text;
+            splitter_.feed(text, &reasoning, &answer_text, finish);
+            if (!reasoning.empty()) {
+                reasoning_output_ += reasoning;
                 if (streaming_)
-                    enqueue("data: " + chunk({{is_reasoning ? "reasoning_content" : "content", *part}}).dump() + "\n\n");
+                    enqueue("data: " + chunk({{"reasoning_content", reasoning}}).dump() + "\n\n");
             }
+            answer(answer_text, finish);
             return;
         }
         for (const auto &part : reasoning_.append(text, finish)) {
-            (part.reasoning ? reasoning_output_ : output_) += part.text;
+            if (!part.reasoning) {
+                answer(part.text, false);
+                continue;
+            }
+            reasoning_output_ += part.text;
             if (streaming_)
-                enqueue("data: " + chunk({{part.reasoning ? "reasoning_content" : "content", part.text}}).dump() + "\n\n");
+                enqueue("data: " + chunk({{"reasoning_content", part.text}}).dump() + "\n\n");
         }
+        if (finish)
+            answer("", true);
     }
     static json usage(const GenerationEvent &event) {
         return {{"prompt_tokens", event.prompt_tokens},
@@ -160,10 +185,13 @@ class Session : public std::enable_shared_from_this<Session> {
                 {"total_tokens", event.prompt_tokens + event.completion_tokens},
                 {"prompt_tokens_details", {{"cached_tokens", event.cached_tokens}}}};
     }
-    void finish(const GenerationEvent &event, const std::string &reason) {
+    void finish(const GenerationEvent &event, std::string reason) {
         if (finished_ || closed_)
             return;
         emit(text_.append("", true), true);
+        const bool calls = tool_parser_ && !tool_parser_->calls().empty();
+        if (calls && reason == "stop")
+            reason = "tool_calls";
         if (!diagnostic_dir_.empty()) {
             try {
                 namespace fs = std::filesystem;
@@ -199,18 +227,23 @@ class Session : public std::enable_shared_from_this<Session> {
                         "\n\n");
             enqueue("data: [DONE]\n\n");
             enqueue("", true);
-        } else
+        } else {
+            json message = {{"role", "assistant"}, {"content", output_}, {"reasoning_content", reasoning_output_}};
+            if (calls) {
+                message["tool_calls"] = json::array();
+                for (const auto &c : tool_parser_->calls())
+                    message["tool_calls"].push_back(c.openai());
+                if (output_.empty())
+                    message["content"] = nullptr;
+            }
             respond(http::status::ok,
                     {{"id", completion_id()},
                      {"object", "chat.completion"},
                      {"created", created_},
                      {"model", model_name()},
-                     {"choices",
-                      {{{"index", 0},
-                        {"message", {{"role", "assistant"}, {"content", output_},
-                                     {"reasoning_content", reasoning_output_}}},
-                        {"finish_reason", reason}}}},
+                     {"choices", {{{"index", 0}, {"message", std::move(message)}, {"finish_reason", reason}}}},
                      {"usage", usage(event)}});
+        }
     }
     void on_event(const GenerationEvent &event) {
         if (closed_ || finished_)
@@ -228,7 +261,11 @@ class Session : public std::enable_shared_from_this<Session> {
         }
         if (event.token >= 0) {
             if (!diagnostic_dir_.empty()) diagnostic_["tokens"].push_back(event.token);
-            emit(text_.append(tokenizer_.piece(event.token, first_piece_)));
+            const auto &format = chat_backend().tools;
+            if (markers_ && (event.token == format.calls_token || event.token == format.args_token))
+                emit(text_.append(event.token == format.calls_token ? format.calls : format.args));
+            else
+                emit(text_.append(tokenizer_.piece(event.token, first_piece_)));
             if (text_.stopped()) {
                 engine_.cancel(id_);
                 finish(event, "stop");
@@ -313,6 +350,32 @@ class Session : public std::enable_shared_from_this<Session> {
                                                  {"allow_think", request.structured.allow_think},
                                                  {"grammar", request.structured.gbnf}};
             }
+            if (request.tools.active()) {
+                // required / a named function: the whole answer is tool calls; auto: free text until the model
+                // starts a call ([TOOL_CALLS]), then the call grammar
+                const auto &format = chat_backend().tools;
+                const bool lazy = request.tools.choice == ToolRequest::Auto;
+                std::unique_ptr<GrammarEngine> grammar;
+                try {
+                    grammar = structured_.grammars.acquire(request.tool_grammar, true);
+                } catch (const std::exception &e) {
+                    throw RequestError(std::string("Invalid tool grammar: ") + e.what(), "tools");
+                }
+                auto calls = std::make_shared<StructuredConstraint>(structured_.vocabulary, std::move(grammar),
+                                                                    !lazy && request.structured.allow_think,
+                                                                    &structured_.grammars);
+                if (!lazy) {
+                    constraint = std::move(calls);
+                    constrained_ = true;
+                    splitter_ = ThinkSplitter(request.structured.allow_think);
+                } else if (format.calls_token >= 0)
+                    constraint = std::make_shared<TriggeredConstraint>(format.calls_token, std::move(calls),
+                                                                       structured_.vocabulary.size());
+                tool_parser_ = std::make_unique<ToolCallParser>(format);
+                if (!diagnostic_dir_.empty())
+                    diagnostic_["tools"] = {{"choice", int(request.tools.choice)}, {"grammar", request.tool_grammar}};
+            }
+            markers_ = (constrained_ || tool_parser_) && chat_backend().tools.supported();
             std::weak_ptr<Session> weak = shared_from_this();
             id_ = engine_.submit(prompt, request.max_new, request.sampling,
                                  [weak](const GenerationEvent &event) {
