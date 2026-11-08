@@ -33,8 +33,9 @@ resource "aws_ecs_task_definition" "backend" {
   task_role_arn            = aws_iam_role.backend_task.arn
 
   volume {
-    name      = "data"
-    host_path = "${local.backend_data_mount}/behemoth" # NVMe instance store (see templates/backend_user_data.sh.tftpl)
+    name                = "data"
+    host_path           = "${local.backend_data_mount}/behemoth" # NVMe instance store (see templates/backend_user_data.sh.tftpl)
+    configure_at_launch = false
   }
 
   # null-valued keys (e.g. no hard memory limit) are dropped so the provider sees no perpetual diff
@@ -45,14 +46,17 @@ resource "aws_ecs_task_definition" "backend" {
     cpu               = var.backend_cpu
     memoryReservation = var.backend_memory_reservation_mib
     memory            = var.backend_memory_hard_limit_mib > 0 ? var.backend_memory_hard_limit_mib : null
-    portMappings      = [{ containerPort = var.backend_port, protocol = "tcp" }]
-    environment       = [for k, v in local.backend_env : { name = k, value = v }]
-    mountPoints       = [{ sourceVolume = "data", containerPath = "/data", readOnly = false }]
+    # hostPort / volumesFrom / capabilities.drop / configure_at_launch spelled out as ECS stores them: otherwise every plan
+    # replaces the task definition, and each apply restarts a running backend
+    portMappings = [{ containerPort = var.backend_port, hostPort = var.backend_port, protocol = "tcp" }]
+    volumesFrom  = []
+    environment  = [for k, v in local.backend_env : { name = k, value = v }]
+    mountPoints  = [{ sourceVolume = "data", containerPath = "/data", readOnly = false }]
     linuxParameters = {
       devices            = [{ hostPath = "/dev/neuron0", containerPath = "/dev/neuron0", permissions = ["read", "write"] }]
       sharedMemorySize   = var.backend_shm_size_mib
       initProcessEnabled = true
-      capabilities       = { add = ["IPC_LOCK"] } # pinned host memory for Neuron DMA (with memlock ulimit)
+      capabilities       = { add = ["IPC_LOCK"], drop = [] } # pinned host memory for Neuron DMA (with memlock ulimit)
     }
     ulimits = [{ name = "memlock", softLimit = -1, hardLimit = -1 }, { name = "nofile", softLimit = 65536, hardLimit = 65536 }]
     # IPv4 only inside the task: the subnets resolve through DNS64, so S3 (IPv4-only) comes back as a 64:ff9b:: address
