@@ -77,9 +77,9 @@ resource "aws_autoscaling_group" "backend" {
   mixed_instances_policy {
     instances_distribution {
       on_demand_base_capacity                  = 0
-      on_demand_percentage_above_base_capacity = 0 # spot only
+      on_demand_percentage_above_base_capacity = var.backend_use_spot ? 0 : 100 # spot only, or on-demand only
       spot_allocation_strategy                 = "price-capacity-optimized"
-      spot_max_price                           = var.spot_max_price != "" ? var.spot_max_price : null
+      spot_max_price                           = var.backend_use_spot && var.spot_max_price != "" ? var.spot_max_price : null
     }
     launch_template {
       launch_template_specification {

@@ -77,6 +77,12 @@ variable "create_s3_gateway_endpoint" {
   default     = true
 }
 
+variable "nat_security_group_id" {
+  description = "Security group of a NAT instance the subnets route 0.0.0.0/0 through (empty: NAT gateway or public IPs, nothing to open). The router and backend task groups are admitted to it."
+  type        = string
+  default     = ""
+}
+
 variable "s3_endpoint_route_table_ids" {
   description = "Route tables (of the backend subnets) to attach the S3 gateway endpoint to. Required when create_s3_gateway_endpoint = true."
   type        = list(string)
@@ -162,6 +168,12 @@ variable "backend_root_volume_gb" {
   description = "Root gp3 volume size (docker images; also the fallback for model files if no instance store is found)."
   type        = number
   default     = 100
+}
+
+variable "backend_use_spot" {
+  description = "Run the trn backend on spot (true) or on-demand (false). Spot needs the 'All Trn Spot Instance Requests' vCPU quota; on-demand uses 'Running On-Demand Trn instances'. Switching only changes the ASG's instances distribution (in place)."
+  type        = bool
+  default     = true
 }
 
 variable "spot_max_price" {

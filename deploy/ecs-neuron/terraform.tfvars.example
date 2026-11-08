@@ -2,13 +2,14 @@
 region = "us-east-1"
 name   = "behemoth"
 
-vpc_id                              = "vpc-REPLACE_ME" # VPC of subnet-05a70c02d594e2500
+vpc_id                              = "vpc-050026757f6099d13" # VPC of subnet-05a70c02d594e2500
 backend_subnet_ids                  = ["subnet-05a70c02d594e2500"] # us-east-1f (trn1)
 router_subnet_ids                   = []                           # default: same as backend
 backend_instance_security_group_ids = ["sg-0264b44fbe050547a"]
 # vpc-050026757f6099d13 already has an S3 gateway endpoint (vpce-07c6158572ce17f29) on rtb-05af3fa1cabeaab8a, the route table of
 # subnet-05a70c02d594e2500; its default route goes through the NAT instance i-00c3e4e9cd77689fe (which does not do NAT64).
 create_s3_gateway_endpoint          = false
+nat_security_group_id               = "sg-076f774f9b5fb9317" # the NAT instance must admit the router / backend task groups
 s3_endpoint_route_table_ids         = ["rtb-05af3fa1cabeaab8a"]
 
 backend_instance_types = ["trn1.2xlarge"]

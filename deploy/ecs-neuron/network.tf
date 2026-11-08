@@ -81,3 +81,21 @@ resource "aws_vpc_endpoint" "s3" {
     }
   }
 }
+
+# A NAT instance (instead of a NAT gateway) only forwards traffic its own security group admits: let the router and
+# backend task ENIs reach it (ECR, Secrets Manager, CloudWatch Logs, the Cloudflare edge go out through it).
+resource "aws_vpc_security_group_ingress_rule" "nat_from_router" {
+  count                        = var.nat_security_group_id != "" ? 1 : 0
+  security_group_id            = var.nat_security_group_id
+  referenced_security_group_id = aws_security_group.router.id
+  ip_protocol                  = "-1"
+  description                  = "${var.name} router egress via the NAT instance"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "nat_from_backend_task" {
+  count                        = var.nat_security_group_id != "" ? 1 : 0
+  security_group_id            = var.nat_security_group_id
+  referenced_security_group_id = aws_security_group.backend_task.id
+  ip_protocol                  = "-1"
+  description                  = "${var.name} backend task egress via the NAT instance"
+}
