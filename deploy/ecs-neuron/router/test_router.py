@@ -36,7 +36,7 @@ class FakeECS:
             self.desired = desiredCount
             self.polls_since_up = 0
 
-    def list_tasks(self, cluster, serviceName, desiredStatus):
+    def list_tasks(self, cluster, serviceName, desiredStatus="RUNNING"):
         self.calls.append("list_tasks")
         with self.lock:
             if self.desired < 1 or self.never_start:
@@ -55,6 +55,20 @@ class FakeECS:
     def kill(self):
         with self.lock:
             self.polls_since_up = 0
+
+
+class FakeASG:
+    """Mimics describe_auto_scaling_groups / set_desired_capacity."""
+
+    def __init__(self, desired=0):
+        self.desired, self.sets = desired, []
+
+    def describe_auto_scaling_groups(self, AutoScalingGroupNames):
+        return {"AutoScalingGroups": [{"AutoScalingGroupName": AutoScalingGroupNames[0], "DesiredCapacity": self.desired}]}
+
+    def set_desired_capacity(self, AutoScalingGroupName, DesiredCapacity, HonorCooldown):
+        self.sets.append(DesiredCapacity)
+        self.desired = DesiredCapacity
 
 
 def fake_backend(state):
@@ -92,12 +106,12 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
             await self.client.close()
         await self.backend.close()
 
-    async def start(self, ecs, **kw):
+    async def start(self, ecs, asg=None, **kw):
         cfg = Config(backend_port=self.backend.port, poll_interval_s=0.02, keepalive_interval_s=0.02,
                      max_wait_s=kw.pop("max_wait_s", 5), idle_timeout_s=kw.pop("idle_timeout_s", 60),
                      health_ttl_s=kw.pop("health_ttl_s", 10), **kw)
         self.ecs = ecs
-        self.client = TestClient(TestServer(make_app(cfg, ecs)))
+        self.client = TestClient(TestServer(make_app(cfg, ecs, asg=asg)))
         await self.client.start_server()
         return self.client
 
@@ -165,6 +179,27 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         r = await c.post("/v1/chat/completions", json={"messages": []})
         self.assertEqual(r.status, 503)
         self.assertEqual(self.state["requests"], 0)
+
+    async def test_asg_scaled_directly(self):
+        asg = FakeASG()
+        c = await self.start(FakeECS(), asg=asg, asg_name="behemoth-asg", idle_timeout_s=0.3)
+        r = await c.post("/v1/chat/completions", json={"model": "cydonia-24b", "messages": []})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(asg.sets, [1])               # scale-out without waiting for the capacity provider
+        for _ in range(60):                           # idle: service to 0, then ASG to 0 once no task is left
+            await asyncio.sleep(0.1)
+            if asg.sets == [1, 0]:
+                break
+        self.assertEqual(self.ecs.updates, [1, 0])
+        self.assertEqual(asg.sets, [1, 0])
+
+    async def test_asg_failure_is_not_fatal(self):
+        class Broken(FakeASG):
+            def set_desired_capacity(self, **kw):
+                raise RuntimeError("AccessDenied")
+        c = await self.start(FakeECS(), asg=Broken(), asg_name="behemoth-asg")
+        r = await c.post("/v1/chat/completions", json={"model": "cydonia-24b", "messages": []})
+        self.assertEqual(r.status, 200)
 
     async def test_idle_shutdown(self):
         c = await self.start(FakeECS(), idle_timeout_s=0.3)

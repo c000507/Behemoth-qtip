@@ -52,6 +52,10 @@ resource "aws_ecs_task_definition" "backend" {
       capabilities       = { add = ["IPC_LOCK"] } # pinned host memory for Neuron DMA (with memlock ulimit)
     }
     ulimits = [{ name = "memlock", softLimit = -1, hardLimit = -1 }, { name = "nofile", softLimit = 65536, hardLimit = 65536 }]
+    # IPv4 only inside the task: the subnets resolve through DNS64, so S3 (IPv4-only) comes back as a 64:ff9b:: address
+    # that Go clients (s5cmd) try first; that path is NAT64 on the NAT instance (~115 MB/s, and past the free S3 gateway
+    # endpoint). Without IPv6 the pull takes the gateway endpoint: 5.3 GB in 5 s instead of 46 s.
+    systemControls = var.backend_disable_ipv6 ? [{ namespace = "net.ipv6.conf.all.disable_ipv6", value = "1" }] : null
     healthCheck = {
       command     = ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval    = 30

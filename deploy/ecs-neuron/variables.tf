@@ -236,6 +236,12 @@ variable "backend_extra_server_args" {
   default     = ""
 }
 
+variable "backend_disable_ipv6" {
+  description = "Disable IPv6 in the backend task's network namespace so the S3 pull uses IPv4 and the S3 gateway endpoint (DNS64 subnets otherwise route it through NAT64)."
+  type        = bool
+  default     = true
+}
+
 variable "s5cmd_workers" {
   description = "Parallel files for the S3 pull."
   type        = number

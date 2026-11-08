@@ -10,6 +10,7 @@ locals {
     AWS_REGION          = var.region
     ECS_CLUSTER         = aws_ecs_cluster.this.name
     ECS_SERVICE         = aws_ecs_service.backend.name
+    BACKEND_ASG         = aws_autoscaling_group.backend.name
     BACKEND_PORT        = tostring(var.backend_port)
     LISTEN_PORT         = tostring(var.router_port)
     MODEL_IDS           = join(",", var.model_ids)

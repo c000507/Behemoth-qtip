@@ -32,6 +32,7 @@ HOP_BY_HOP = {
 class Config:
     cluster: str = "behemoth"
     service: str = "behemoth-backend"
+    asg_name: str | None = None  # backend ASG: scaled directly (the capacity provider alone takes minutes to react from 0)
     region: str | None = None
     backend_port: int = 1337
     listen_port: int = 1337
@@ -58,6 +59,7 @@ class Config:
         c = cls()
         c.cluster = env.get("ECS_CLUSTER", c.cluster)
         c.service = env.get("ECS_SERVICE", c.service)
+        c.asg_name = env.get("BACKEND_ASG") or None
         c.region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
         c.backend_port = int(env.get("BACKEND_PORT", c.backend_port))
         c.listen_port = int(env.get("LISTEN_PORT", c.listen_port))
@@ -83,8 +85,8 @@ class StartupError(Exception):
 class Backend:
     """Owns the ECS service's desiredCount and the backend address."""
 
-    def __init__(self, cfg: Config, ecs, http: ClientSession):
-        self.cfg, self.ecs, self.http = cfg, ecs, http
+    def __init__(self, cfg: Config, ecs, http: ClientSession, asg=None):
+        self.cfg, self.ecs, self.http, self.asg = cfg, ecs, http, asg
         self.address: str | None = None  # "ip:port"
         self.healthy_at = 0.0
         self.state = "unknown"  # unknown | stopped | starting | ready | failed | stopping
@@ -122,6 +124,40 @@ class Backend:
     async def _set_desired(self, n: int):
         await self._call("update_service", cluster=self.cfg.cluster, service=self.cfg.service, desiredCount=n)
 
+    async def _asg_desired(self) -> int | None:
+        if not (self.asg and self.cfg.asg_name):
+            return None
+        groups = (await asyncio.to_thread(self.asg.describe_auto_scaling_groups,
+                                          AutoScalingGroupNames=[self.cfg.asg_name])).get("AutoScalingGroups", [])
+        return groups[0].get("DesiredCapacity", 0) if groups else None
+
+    async def _set_asg(self, n: int):
+        await asyncio.to_thread(self.asg.set_desired_capacity, AutoScalingGroupName=self.cfg.asg_name,
+                                DesiredCapacity=n, HonorCooldown=False)
+
+    async def _asg_scale_out(self):
+        """Launch the instance now instead of waiting for the capacity provider's scale-out (~2-3 min from 0)."""
+        try:
+            cur = await self._asg_desired()
+            if cur is not None and cur < 1:
+                log.info("scaling ASG %s to 1", self.cfg.asg_name)
+                await self._set_asg(1)
+        except Exception as e:  # the capacity provider still scales out on its own
+            log.warning("ASG scale-out failed (capacity provider will catch up): %s", e)
+
+    async def maybe_asg_scale_in(self) -> bool:
+        """After an idle stop: once no backend task is left, drop the ASG to 0 now (managed scaling would wait ~15 min)."""
+        if self.state != "stopped" or not (self.asg and self.cfg.asg_name):
+            return False
+        if (await self._call("list_tasks", cluster=self.cfg.cluster, serviceName=self.cfg.service)).get("taskArns"):
+            return False
+        cur = await self._asg_desired()
+        if cur:
+            log.info("backend stopped: scaling ASG %s to 0", self.cfg.asg_name)
+            await self._set_asg(0)
+            return True
+        return False
+
     async def _start(self) -> str:
         self.state = "starting"
         deadline = time.monotonic() + self.cfg.max_wait_s
@@ -132,6 +168,7 @@ class Backend:
         if svcs[0].get("desiredCount", 0) < 1:
             log.info("scaling %s to 1", self.cfg.service)
             await self._set_desired(1)
+        await self._asg_scale_out()
         while time.monotonic() < deadline:
             try:
                 addr = await self._running_address()
@@ -208,15 +245,15 @@ async def _keepalive_until(resp: web.StreamResponse, fut: asyncio.Future, interv
 
 
 class Router:
-    def __init__(self, cfg: Config, ecs, http: ClientSession | None = None):
-        self.cfg, self.ecs, self._http = cfg, ecs, http
+    def __init__(self, cfg: Config, ecs, http: ClientSession | None = None, asg=None):
+        self.cfg, self.ecs, self._http, self.asg = cfg, ecs, http, asg
         self.backend: Backend | None = None
         self._reaper: asyncio.Task | None = None
 
     async def on_startup(self, app):
         if self._http is None:
             self._http = ClientSession(timeout=ClientTimeout(total=None, sock_connect=10))
-        self.backend = Backend(self.cfg, self.ecs, self._http)
+        self.backend = Backend(self.cfg, self.ecs, self._http, self.asg)
         self._reaper = asyncio.create_task(self._reap())
 
     async def on_cleanup(self, app):
@@ -231,6 +268,7 @@ class Router:
             await asyncio.sleep(interval)
             try:
                 await self.backend.maybe_idle_stop()
+                await self.backend.maybe_asg_scale_in()
             except Exception as e:
                 log.warning("idle check failed: %s", e)
 
@@ -353,8 +391,8 @@ class _BackendGone(Exception):
         self.started = started
 
 
-def make_app(cfg: Config, ecs, http: ClientSession | None = None) -> web.Application:
-    r = Router(cfg, ecs, http)
+def make_app(cfg: Config, ecs, http: ClientSession | None = None, asg=None) -> web.Application:
+    r = Router(cfg, ecs, http, asg)
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.on_startup.append(r.on_startup)
     app.on_cleanup.append(r.on_cleanup)
@@ -372,7 +410,8 @@ def main():
 
     cfg = Config.from_env()
     ecs = boto3.client("ecs", region_name=cfg.region)
-    web.run_app(make_app(cfg, ecs), host="0.0.0.0", port=cfg.listen_port, access_log=None)
+    asg = boto3.client("autoscaling", region_name=cfg.region) if cfg.asg_name else None
+    web.run_app(make_app(cfg, ecs, asg=asg), host="0.0.0.0", port=cfg.listen_port, access_log=None)
 
 
 if __name__ == "__main__":
