@@ -409,3 +409,10 @@ IMPLEMENTATION NOTE: exact scratch tile placement (0x4000 vs 0x2f980 base)
 = compiler allocator choice; any free SB region works as long as LW/MM
 addresses are consistent. Emitter validates byte-exactly against the six
 archived oracle streams (oracles_x/mm_*).
+
+## Validation matrix (2026-11-09, trn1)
+
+All 12 shapes K{128,256,512} x M{32,64} x N{128,256} emitted by
+lift_hip.emit_matmul (verified per-shape template set) execute on trn1 with
+numpy x@w agreement (allclose 1e-2, no NaN/zeros): 12 pass, 0 fail.
+templates archived: tools/shape_templates.json (12 buckets).
