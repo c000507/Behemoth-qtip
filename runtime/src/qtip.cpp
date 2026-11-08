@@ -335,12 +335,13 @@ HostLinear load_fp8_linear(const SafeTensorFile &file, const SafeTensorFile &sca
     if (dtype != "BF16" && dtype != "F32")
         throw std::invalid_argument("FP8 scales must be BF16 or FP32: " + base);
     auto scales = scale_file.floats(base + "weight_scale");
-    if (scales.size() != size_t(w.out))
+    // per-output-row scales, or one per-tensor scale (stock FP8 exports) for every row
+    if (scales.size() != size_t(w.out) && scales.size() != 1)
         throw std::invalid_argument("Invalid FP8 per-output scale: " + base);
-    w.fp8_scale.resize(scales.size());
-    for (size_t i = 0; i < scales.size(); ++i) {
-        w.fp8_scale[i] = scales[i];
-        if (!std::isfinite(scales[i]) || scales[i] < 0)
+    w.fp8_scale.resize(size_t(w.out));
+    for (size_t i = 0; i < size_t(w.out); ++i) {
+        w.fp8_scale[i] = scales[scales.size() == 1 ? 0 : i];
+        if (!std::isfinite(w.fp8_scale[i]) || w.fp8_scale[i] < 0)
             throw std::invalid_argument("Nonfinite or negative FP8 scale: " + base);
     }
     for (uint8_t x : w.fp8)

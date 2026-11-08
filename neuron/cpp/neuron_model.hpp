@@ -14,7 +14,7 @@ namespace neuron {
 struct ModelOptions {
     std::filesystem::path model;    // Behemoth/QTIP checkpoint directory
     std::filesystem::path neff_dir; // subdirectories with meta.json + graph.neff (trace_model.py outputs)
-    int load_threads = 4;           // layers expanded and uploaded concurrently
+    int load_threads = 8;           // layers expanded and uploaded concurrently (8: one per trn1.2xlarge vCPU, 67 s vs 89 s at 4 for 24B FP8)
     bool verbose = true;
     // QTIP layers: "expanded" decodes them to FP8 shards at load (the fast path, needs WEIGHTS=fp8 layer NEFFs);
     // "compressed" keeps the trellis resident and decodes in the graph every step (WEIGHTS=qtip NEFFs, ~1/4 of the

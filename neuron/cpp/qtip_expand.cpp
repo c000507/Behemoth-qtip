@@ -108,6 +108,27 @@ std::vector<Fp8Shard> load_projection_shards(const SafeTensorFile &file, int lay
     }
     if (file.contains(base + "weight")) {
         const auto l = qtip::load_fp8_linear(file, layer, name);
+        // Codes with exponent < 15 (|v| < 256) mean the same in e4m3fn and the devices' IEEE-style e4m3: slice the bytes
+        // and row scales as they are (exact, no f32 pass over the matrix). Checkpoints using the e4m3fn range above 240
+        // (stock FP8 exports, max 448) are requantised below.
+        if (std::none_of(l.fp8.begin(), l.fp8.end(), [](uint8_t b) { return (b & 0x78) == 0x78; })) {
+            if (tp < 1 || (column_parallel ? l.out : l.in) % tp)
+                throw std::invalid_argument("invalid tensor-parallel shard");
+            std::vector<Fp8Shard> shards(static_cast<size_t>(tp));
+            for (int rank = 0; rank < tp; ++rank) {
+                const int r0 = column_parallel ? rank * (l.out / tp) : 0, r1 = column_parallel ? r0 + l.out / tp : l.out;
+                const int c0 = column_parallel ? 0 : rank * (l.in / tp), c1 = column_parallel ? l.in : c0 + l.in / tp;
+                Fp8Shard &s = shards[size_t(rank)];
+                s.rows = r1 - r0;
+                s.cols = c1 - c0;
+                s.w.resize(size_t(s.rows) * size_t(s.cols));
+                s.scale.assign(l.fp8_scale.begin() + r0, l.fp8_scale.begin() + r1);
+#pragma omp parallel for schedule(static)
+                for (int r = 0; r < s.rows; ++r)
+                    std::copy_n(l.fp8.data() + size_t(r0 + r) * size_t(l.in) + size_t(c0), size_t(s.cols), s.w.data() + size_t(r) * size_t(s.cols));
+            }
+            return shards;
+        }
         std::vector<float> w(size_t(l.out) * size_t(l.in));
 #pragma omp parallel for schedule(static)
         for (int o = 0; o < l.out; ++o)

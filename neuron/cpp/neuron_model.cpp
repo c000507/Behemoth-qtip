@@ -575,9 +575,16 @@ struct NeuronModel::Impl {
                 lw.w[p.slot + 1] = alloc(r, s.scale.size() * 4, p.name);
                 if (weights_transposed) { // NEFFs traced with WT=1 take [in][out]
                     std::vector<uint8_t> t(s.w.size());
-                    for (int i = 0; i < s.rows; ++i)
-                        for (int j = 0; j < s.cols; ++j)
-                            t[size_t(j) * size_t(s.rows) + size_t(i)] = s.w[size_t(i) * size_t(s.cols) + size_t(j)];
+                    // 64 x 64 blocks over threads: the element-wise strided transpose was most of the load time
+                    constexpr int B = 64;
+                    const int rb = (s.rows + B - 1) / B, cb = (s.cols + B - 1) / B;
+#pragma omp parallel for schedule(static)
+                    for (int blk = 0; blk < rb * cb; ++blk) {
+                        const int i0 = (blk / cb) * B, j0 = (blk % cb) * B, i1 = std::min(s.rows, i0 + B), j1 = std::min(s.cols, j0 + B);
+                        for (int i = i0; i < i1; ++i)
+                            for (int j = j0; j < j1; ++j)
+                                t[size_t(j) * size_t(s.rows) + size_t(i)] = s.w[size_t(i) * size_t(s.cols) + size_t(j)];
+                    }
                     if (mlp_tiled && (p.slot == 8 || p.slot == 10 || p.slot == 12)) {
                         // nki_mlp.tile_weight: [K][N] -> blocks (kb, nb) of 128 partition rows of 4 x 1024 (rows kb*512 + j*128 + q)
                         const size_t K = size_t(s.cols), N = size_t(s.rows);
@@ -585,6 +592,7 @@ struct NeuronModel::Impl {
                             throw std::runtime_error(std::string(p.name) + ": tiled MLP needs K % 512 == 0 and N % 1024 == 0");
                         std::vector<uint8_t> tiled(t.size());
                         const size_t NBL = N / 1024;
+#pragma omp parallel for schedule(static)
                         for (size_t k = 0; k < K; ++k) {
                             const size_t kb = k / 512, jj = (k % 512) / 128, q = k % 128;
                             for (size_t nb = 0; nb < NBL; ++nb)

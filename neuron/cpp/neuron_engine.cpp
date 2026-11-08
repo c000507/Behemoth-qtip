@@ -140,6 +140,8 @@ struct Engine::Impl {
             m.qtip_mode = v;
         if (const char *v = std::getenv("BEHEMOTH_NEURON_HBM_GIB"))
             m.hbm_gib = std::atof(v);
+        if (const char *v = std::getenv("BEHEMOTH_NEURON_LOAD_THREADS")) // layers prepared and uploaded concurrently (default 8)
+            m.load_threads = std::max(1, std::atoi(v));
         if (const char *v = std::getenv("BEHEMOTH_NEURON_HBM_RESERVE_GIB"))
             m.hbm_reserve_gib = std::atof(v);
         return m;

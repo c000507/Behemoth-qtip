@@ -452,3 +452,8 @@ only with 1 KB rows. 8B end to end (bf16 KV): oracle 13/13 top-1, mean KL 0.0091
 (NeuronModel::kv_save / kv_restore: per layer and rank, runs of consecutive pages per nrt transfer, FP8 scales included). 8B, 7678-token
 prompt: 7.71 s cold, 1.57 s repeated (7677 cached, device-tier hit, identical greedy output), follow-up turn 1.90 s (7717 cached, host-tier
 restore of 486 pages in 205 ms). Host tier capped at BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8); BEHEMOTH_NEURON_PREFIX_CACHE=0 disables.
+
+**Direct FP8 checkpoints and load time.** `repack_compressed_tensors.py --fp8` writes row-scaled E4M3 projections (also takes
+compressed-tensors FP8 exports, per-tensor or per-channel scales); qtip_expand slices E4M3 codes below 256 straight into the per-core
+shards (no f32 pass), the upload transposes / tiles in 64 x 64 blocks over threads. 24B cold start (model resident): NVFP4 ~170 s,
+FP8 136 s, + blocked transpose 89 s (4 load threads), 67.6 s (8, now the default). Decode unchanged (56.0 ms/token, ctx ~400, FP8 KV).
