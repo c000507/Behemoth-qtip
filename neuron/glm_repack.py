@@ -17,6 +17,7 @@ usage: glm_repack.py MODEL OUT [--tp N] [--ep M] [--weights fp8|bf16] [--layers 
 """
 import argparse
 import json
+import shutil
 import struct
 import sys
 from pathlib import Path
@@ -258,6 +259,11 @@ def main():
                 'layers': kinds, 'eos': g.eos, 'max_context': g.max_context, 'files': files, 'source': str(Path(a.model).resolve()),
                 'config': cfg}
     (out / 'prepared.json').write_text(json.dumps(manifest))
+    # the server loads the tokenizer and chat template from the same directory
+    (out / 'config.json').write_text(json.dumps(cfg))
+    for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'special_tokens_map.json', 'generation_config.json'):
+        if (Path(a.model) / name).exists():
+            shutil.copyfile(Path(a.model) / name, out / name)
     print('wrote', out)
 
 

@@ -43,10 +43,11 @@ class CpuRunner:
     def table(self, seq):
         return [seq * self.mpp + i for i in range(self.mpp)]
 
-    def step(self, entries, P=None):
-        """entries: [(seq, tokens, start)], all of the same length (Q) -> logits [len(entries) * Q, vocab] (every row)."""
+    def step(self, entries, P=None, Q=None):
+        """entries: [(seq, tokens, start)] -> logits [len(entries) * Q, vocab] (every row). Q (default: the longest entry)
+        pads shorter entries with position -1 tokens, as the runtime pads a prefill chunk to its bucket."""
         g = self.g
-        R, Q = len(entries), len(entries[0][1])
+        R, Q = len(entries), Q or max(len(e[1]) for e in entries)
         P = P or self.mpp
         T = R * Q
         x = torch.zeros(T, g.S * g.H)
@@ -54,6 +55,8 @@ class CpuRunner:
         wslot = torch.zeros(T, dtype=torch.int64)
         table = torch.zeros(R, P, dtype=torch.int64)
         slot = torch.zeros(R, dtype=torch.int64)
+        pos -= 1
+        wslot += (self.pages - 1) * G.PAGE
         for r, (seq, toks, start) in enumerate(entries):
             tab = self.table(seq)
             table[r] = torch.tensor(tab[:P])

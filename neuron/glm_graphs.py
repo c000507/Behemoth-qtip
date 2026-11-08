@@ -186,7 +186,8 @@ def hyper_post(x, y, post, mix, g):
 def kda_block(n, t, g, R, Q, allreduce):
     """KDA (glm53 Model::attention, linear_attention) on this rank's heads. n [T, H] normalized input (T = R * Q, one
     request per row r, its Q tokens in order). State slot per row: t['slot'] [R]; a row whose first token is at position
-    0 starts from zero state (new or re-prefilled request), so the host never clears state."""
+    0 starts from zero state (new or re-prefilled request), so the host never clears state. A prefill chunk shorter than
+    the bucket ends with padding tokens at position -1, which leave the state untouched."""
     T, hl, D, W, K = R * Q, g.hl, g.ldim, g.wl, g.conv
     slot = t['slot']
     keep = (t['pos'].reshape(R, Q)[:, 0] != 0).float()                                # 0: start from zero state
@@ -195,7 +196,13 @@ def kda_block(n, t, g, R, Q, allreduce):
     seq = torch.cat((cs.permute(0, 3, 1, 2), proj), dim=1)                             # [R, K-1+Q, 3, W]
     w = t['conv']                                                                      # [3, W, K]
     conv = sum(seq[:, j:j + Q] * w[:, :, j].reshape(1, 1, 3, W) for j in range(K))     # [R, Q, 3, W]
-    cstate = t['cstate'].index_put((slot,), seq[:, Q:].permute(0, 2, 3, 1)) if K > 1 else t['cstate']
+    valid = t['pos'].reshape(R, Q) >= 0                                                # padding tokens (pos -1) end a chunk
+    if K > 1:                                                                          # state = the K-1 inputs before the first padding token
+        nvalid = valid.long().sum(dim=1)
+        idx = (nvalid.reshape(R, 1) + torch.arange(K - 1, device=n.device).reshape(1, K - 1)).reshape(R, K - 1, 1, 1).expand(R, K - 1, 3, W)
+        cstate = t['cstate'].index_put((slot,), torch.gather(seq, 1, idx).permute(0, 2, 3, 1))
+    else:
+        cstate = t['cstate']
     act = bf(conv * torch.sigmoid(conv)).reshape(R, Q, 3, hl, D)
     q, k, v = act[:, :, 0], act[:, :, 1], act[:, :, 2]                                 # [R, Q, hl, D]
     gg = lin(lin(n, t, 'fa'), t, 'fb').reshape(R, Q, hl, D)
@@ -207,11 +214,12 @@ def kda_block(n, t, g, R, Q, allreduce):
     st = t['kstate'][slot] * keep.reshape(R, 1, 1, 1)                                 # [R, hl, D(key i), D(value d)]
     outs = []
     for i in range(Q):                                                                 # the recurrence, token by token
-        st = st * decay[:, i].unsqueeze(-1)
-        mem = torch.einsum('rhid,rhi->rhd', st, kn[:, i])
+        nst = st * decay[:, i].unsqueeze(-1)
+        mem = torch.einsum('rhid,rhi->rhd', nst, kn[:, i])
         delta = (v[:, i] - mem) * beta[:, i].unsqueeze(-1)
-        st = st + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
-        outs.append(torch.einsum('rhid,rhi->rhd', st, qn[:, i]))
+        nst = nst + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+        outs.append(torch.einsum('rhid,rhi->rhd', nst, qn[:, i]))
+        st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 else nst
     kstate = t['kstate'].index_put((slot,), st)
     y = bf(torch.stack(outs, dim=1))                                                   # [R, Q, hl, D]
     gate = lin(lin(n, t, 'ga'), t, 'gb').reshape(R, Q, hl, D)
@@ -276,9 +284,8 @@ def mla_block(n, t, g, R, Q, P, allreduce, kv8=False):
         valid = pidx < complete
         score = score - pidx.float() * 1e-30                                            # ties (relu zeros) -> lower pool first, as the oracle
         score = torch.where(valid, score, torch.full_like(score, -3e38))
-        top = torch.topk(score, g.topk // pool, dim=-1).indices                         # [R, Q, topk / pool]
-        chosen = torch.zeros(R, Q, NP, device=n.device).scatter(-1, top, 1.0) > 0.5
-        chosen = chosen & valid
+        kth = torch.topk(score, g.topk // pool, dim=-1)[0][..., -1:]                    # k-th best pool score
+        chosen = (score >= kth) & valid                                                 # (scores are distinct: tie-break above)
         tail = kpos.reshape(1, 1, keys) >= complete * pool
         visible = visible & (chosen.unsqueeze(-1).expand(R, Q, NP, pool).reshape(R, Q, keys) | tail)
     kvb = t['kvb'].reshape(hl, g.qdim + g.vdim, KR).float()
@@ -303,17 +310,21 @@ def route(n, t, g):
     scores = torch.sigmoid(torch.matmul(n.float(), t['rw'].T))                         # [T, E] f32 router
     choice = scores + t['rb']
     T = n.shape[0]
+    experts = torch.arange(g.E, device=n.device)
+    # one-hot masks instead of scatter / gather: torch scatter into [T, E] gave wrong rows on trn1 for T = 16
+    # (tests/test_glm_device.py), the comparisons are exact and cheap at E <= 288
     if g.groups > 1:
         per = g.E // g.groups
-        top2 = torch.topk(choice.reshape(T, g.groups, per), 2, dim=-1).values.sum(-1)  # [T, groups]
-        gsel = torch.topk(top2, g.top_groups, dim=-1).indices
-        gmask = torch.zeros(T, g.groups, device=n.device).scatter(-1, gsel, 1.0) > 0.5
-        choice = torch.where(gmask.unsqueeze(-1).expand(T, g.groups, per).reshape(T, g.E), choice, torch.full_like(choice, -3e38))
-    top = torch.topk(choice, g.K, dim=-1).indices                                       # [T, K]
-    w = torch.gather(scores, 1, top)
+        top2 = torch.topk(choice.reshape(T, g.groups, per), 2, dim=-1)[0].sum(-1)      # [T, groups]
+        gsel = torch.topk(top2, g.top_groups, dim=-1)[1]                               # [T, top_groups]
+        allowed = (gsel.unsqueeze(-1) == (experts // per).reshape(1, 1, g.E)).any(dim=1)
+        choice = torch.where(allowed, choice, torch.full_like(choice, -3e38))
+    top = torch.topk(choice, g.K, dim=-1)[1]                                           # [T, K]
+    onehot = (top.unsqueeze(-1) == experts.reshape(1, 1, g.E)).float()                 # [T, K, E]
+    w = torch.einsum('tke,te->tk', onehot, scores)
     if g.norm_topk:
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
-    return torch.zeros(T, g.E, device=n.device).scatter(1, top, w * g.rscale)
+    return torch.einsum('tke,tk->te', onehot, w * g.rscale)
 
 
 def moe_block(n, t, g, allreduce, mode='all'):
@@ -322,15 +333,15 @@ def moe_block(n, t, g, allreduce, mode='all'):
     shared = lin_partial(bf(silu_limited(lin(n, t, 'sg'), lin(n, t, 'su'), g.limit)), t, 'sd')
     comb = torch.index_select(route(n, t, g), 1, t['eids'])                            # [T, El] local combine weights
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [El, 2EIl, H], [El, EIl, H]
-    if mode == 'gather':
-        slots = min(g.El, g.K * T)
+    if mode == 'gather' and g.K * T < g.El:                                            # else every local expert may be needed
+        slots = g.K * T
         used = (comb > 0).float().amax(dim=0)                                          # [El]
         rank = used - torch.arange(g.El, device=n.device).float() * (0.5 / g.El)        # used first, then low ids
-        idx = torch.topk(rank, slots).indices
+        idx = torch.topk(rank, slots)[1]
         comb = torch.index_select(comb, 1, idx)
-        gu, dw = gu[idx], dw[idx]
-        gus = gus[idx] if gus is not None else None
-        dc = dc[idx] if dc is not None else None
+        gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
+        gus = torch.index_select(gus, 0, idx) if gus is not None else None
+        dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_, EIl = gu.shape[0], g.EIl
     flat = gu.reshape(E_ * 2 * EIl, g.H)
     tt = {'w': flat}
@@ -430,8 +441,12 @@ def state_shapes(kind, g, pages, slots, kv8=False):
 
 
 def step_shapes(kind, R, Q, P, g):
+    """Per-step inputs of a sub-block graph. Only inputs the graph reads: torch_neuronx drops unused ones from the
+    NEFF, which would shift the runtime's name -> input index binding."""
     T = R * Q
-    s = {'x': ((T, g.S * g.H), torch.float32), 'pos': ((T,), torch.int64)}
+    s = {'x': ((T, g.S * g.H), torch.float32)}
+    if kind in ('kda', 'mla'):
+        s['pos'] = ((T,), torch.int64)
     if kind == 'kda':
         s['slot'] = ((R,), torch.int64)
     if kind == 'mla':
@@ -444,6 +459,18 @@ def zeros(shape, dtype):
 
 
 # ---------------------------------------------------------------------------------------------------------------- trace
+def count_hlo_parameters(path):
+    """Entry computation parameter count of a serialized HloModuleProto (None when the proto module is unavailable)."""
+    try:
+        from libneuronxla.proto import hlo_pb2
+    except ImportError:
+        return None
+    module = hlo_pb2.HloModuleProto()
+    module.ParseFromString(Path(path).read_bytes())
+    entry = next(c for c in module.computations if c.id == module.entry_computation_id)
+    return sum(1 for i in entry.instructions if i.opcode == 'parameter')
+
+
 def main():
     workdir, kind = sys.argv[1], sys.argv[2]
     g = geo_from_env()
@@ -507,6 +534,10 @@ def main():
     subprocess.run(['neuronx-cc', 'compile', 'model', '--framework', 'XLA', '--target', 'trn1', '--output', 'graph.neff'] +
                    os.environ.get('NCC_FLAGS', '').split(), cwd=workdir, check=True)
     meta['neff'] = str(Path(workdir) / 'graph.neff')
+    n_params = count_hlo_parameters(m / 'graph.hlo')
+    if n_params is not None and n_params != len(meta['inputs']) + len(meta['states']):
+        raise SystemExit(f'the traced graph has {n_params} parameters, meta lists {len(meta["inputs"]) + len(meta["states"])}: '
+                         'an input is unused (dropped by the tracer) or the order is off')
     Path(workdir, 'meta.json').write_text(json.dumps(meta))
     print(json.dumps(meta))
 

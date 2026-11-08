@@ -163,12 +163,16 @@ struct Engine::Impl {
           eos(model.eos().begin(), model.eos().end()), max_context(size_t(model.max_context())) {
         max_rows = model.max_decode_rows();
         spec_tokens = std::min(env_int("BEHEMOTH_NEURON_SPEC_TOKENS", 7), max_rows - 1);
+        if (model.recurrent()) // a rejected draft row would already have advanced the recurrent state
+            spec_tokens = 0;
         spec_requests = env_int("BEHEMOTH_NEURON_SPEC_REQUESTS", 4);
         spec_rows = std::min(env_int("BEHEMOTH_NEURON_SPEC_ROWS", 8), max_rows);
         spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
         if (const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_PAGE_COST"))
             spec_page_cost = std::atof(v);
-        if (o.prefix_cache.slots && env_int("BEHEMOTH_NEURON_PREFIX_CACHE", 1)) {
+        if (o.prefix_cache.slots && model.recurrent())
+            std::cerr << "Prefix cache: off (the model keeps recurrent state that restored K/V pages do not carry)\n";
+        if (o.prefix_cache.slots && env_int("BEHEMOTH_NEURON_PREFIX_CACHE", 1) && !model.recurrent()) {
             auto co = o.prefix_cache;
             // host tier: --prefix-cache-gb, capped by BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8: the instance's RAM also
             // holds the embeddings and the load-time staging)

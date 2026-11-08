@@ -988,6 +988,58 @@ static void timing_report() {
               << " us/token (allowed()+accepts()+advance(), mask always built)\n";
 }
 
+// GLM format: <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> (strings raw, others JSON)
+static void glm_tool_tests() {
+    using ojson = nlohmann::ordered_json;
+    ToolFormat glm;
+    glm.calls = "<tool_call>";
+    glm.calls_token = 154843;
+    glm.glm = true;
+    glm.markers = {{154843, "<tool_call>"}, {154844, "</tool_call>"}, {154847, "<arg_key>"}, {154848, "</arg_key>"},
+                   {154849, "<arg_value>"}, {154850, "</arg_value>"}};
+    CHECK(glm.marker(154849) && *glm.marker(154849) == "<arg_value>" && !glm.marker(5));
+    const ojson tools = ojson::parse(R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object",
+        "properties":{"city":{"type":"string"},"days":{"type":"integer"},"unit":{"type":"string","enum":["c","f"]}},
+        "required":["city"]}}},{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}])");
+    ojson req = {{"tools", tools}, {"tool_choice", "required"}};
+    const auto r = parse_tools(req);
+    const std::string g = tool_call_grammar(r, glm);
+    GrammarCache cache;
+    auto accepts = [&](const std::string &text) {
+        auto c = std::make_shared<StructuredConstraint>(big_vocab(), cache.acquire(g, true), false, &cache);
+        return feed_text(*c, text) && bit(*c->allowed().mask, 2); // complete: EOS allowed
+    };
+    CHECK(accepts("<tool_call>get_weather<arg_key>city</arg_key><arg_value>New <York></arg_value></tool_call>"));
+    CHECK(accepts("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key>"
+                  "<arg_value>3</arg_value><arg_key>unit</arg_key><arg_value>f</arg_value></tool_call>"));
+    CHECK(accepts("<tool_call>ping</tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>"));
+    CHECK(!accepts("<tool_call>get_weather</tool_call>"));                                                 // city required
+    CHECK(!accepts("<tool_call>get_weather<arg_key>city</arg_key><arg_value>X</arg_value><arg_key>days</arg_key>"
+                   "<arg_value>\"3\"</arg_value></tool_call>"));                                             // days: integer
+    CHECK(!accepts("<tool_call>get_weather<arg_key>town</arg_key><arg_value>X</arg_value></tool_call>"));  // unknown key
+    // parser, one byte at a time: content, then two calls; string values raw, others JSON
+    const std::string out = "Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>New York</arg_value>"
+                            "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>\n<tool_call>ping</tool_call>";
+    ToolCallParser p(glm, &r);
+    std::string content;
+    size_t starts = 0;
+    for (size_t i = 0; i <= out.size(); ++i) {
+        auto d = i < out.size() ? p.feed(out.substr(i, 1)) : p.feed("", true);
+        content += d.content;
+        for (const auto &item : d.tool_calls)
+            starts += item.contains("id");
+    }
+    CHECK(content == "Checking." && p.calls().size() == 2 && starts == 2);
+    CHECK(p.calls()[0].name == "get_weather" && nlohmann::json::parse(p.calls()[0].arguments) == nlohmann::json::parse(R"({"city":"New York","days":3})"));
+    CHECK(p.calls()[1].name == "ping" && p.calls()[1].arguments == "{}");
+    // a string-typed value that looks like JSON stays a string; an answer cut inside a call keeps what was parsed
+    ToolCallParser q(glm, &r);
+    q.feed("<tool_call>get_weather<arg_key>city</arg_key><arg_value>42</arg_value><arg_key>days", true);
+    CHECK(q.calls().size() == 1 && nlohmann::json::parse(q.calls()[0].arguments) == nlohmann::json::parse(R"({"city":"42"})"));
+    ToolCallParser plain(glm);
+    CHECK(plain.feed("no calls <tool", true).content == "no calls <tool" && plain.calls().empty());
+}
+
 int main() {
     try {
         for (auto [name, fn] : std::vector<std::pair<const char *, std::function<void()>>>{
@@ -1003,6 +1055,7 @@ int main() {
                  {"big_vocabulary", big_vocabulary_tests},
                  {"tools", tool_tests},
                  {"tool_fallback", tool_fallback_tests},
+                 {"glm_tools", glm_tool_tests},
                  {"timing", timing_report}}) {
             fn();
             std::cout << "PASS " << name << '\n';

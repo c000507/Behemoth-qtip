@@ -29,12 +29,16 @@ class Tokenizer {
     std::map<std::string, unsigned char> inverse_;
     bool prefix_space_ = false, ignore_merges_ = false;
     void bpe(std::string_view, std::vector<int> &) const;
+    std::string render(const nlohmann::ordered_json &messages, bool generation, const nlohmann::ordered_json &tools) const;
 
   public:
     explicit Tokenizer(const fs::path &);
     std::vector<int> encode(const std::string &) const;
     std::string decode(const std::vector<int> &, bool special = false) const;
     std::string chat(const json &, bool generation = true) const;
+    // OpenAI messages with tool calls / tool results and the offered tools (array or null), rendered by a chat
+    // template that takes them (GLM's): assistant tool_calls arguments given as JSON text are passed as objects.
+    std::string chat_tools(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) const;
     json summary() const;
     size_t size() const { // token ids (highest id + 1)
         return decode_.size();

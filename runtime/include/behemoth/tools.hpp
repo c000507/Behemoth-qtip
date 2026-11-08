@@ -26,13 +26,35 @@
 namespace behemoth {
 
 // How a backend's model writes tool calls. Empty `calls`: the backend offers no tool calling.
+//   Mistral: [TOOL_CALLS]name[ARGS]{json}   (calls = "[TOOL_CALLS]", args = "[ARGS]")
+//   GLM:     <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>, a string value raw, any other
+//            value as JSON (GLM-4.5 .. 5.x chat templates render tools themselves); calls = "<tool_call>", glm = true
 struct ToolFormat {
     std::string calls, args;               // marker texts ("[TOOL_CALLS]", "[ARGS]")
     int calls_token = -1, args_token = -1; // their control-token ids (streamed as the marker text)
+    bool glm = false;
+    // every control token of the format with its text (GLM: <tool_call> </tool_call> <arg_key> </arg_key> <arg_value>
+    // </arg_value>), streamed as text into the parser and the constraints; Mistral: empty (calls / args tokens)
+    std::vector<std::pair<int, std::string>> markers;
     bool supported() const {
         return !calls.empty();
     }
+    // The text a control token stands for in tool calls, else null.
+    const std::string *marker(int token) const {
+        if (token < 0)
+            return nullptr;
+        if (token == calls_token)
+            return &calls;
+        if (token == args_token)
+            return &args;
+        for (const auto &[id, text] : markers)
+            if (id == token)
+                return &text;
+        return nullptr;
+    }
 };
+inline constexpr const char *glm_call_end = "</tool_call>", *glm_key_open = "<arg_key>", *glm_key_close = "</arg_key>",
+                            *glm_value_open = "<arg_value>", *glm_value_close = "</arg_value>";
 
 struct ToolRequest {
     enum Choice { None, Auto, Required, Named } choice = None; // None also when the request has no tools
@@ -49,6 +71,8 @@ ToolRequest parse_tools(const nlohmann::ordered_json &request);
 
 // GBNF of an answer made of tool calls: one call (several with `parallel`) of the offered functions (only `name`
 // for Named), each [calls]name[args] then a JSON value matching that function's parameters schema. JSON mode.
+// GLM: <tool_call>name, then the schema's properties in declared order (required ones mandatory) as
+// <arg_key>key</arg_key><arg_value>value</arg_value> (strings raw, other types as JSON matching their schema), </tool_call>.
 std::string tool_call_grammar(const ToolRequest &, const ToolFormat &);
 
 // Mistral v11 prompt for a conversation with tools and/or tool messages. `system` is the system prompt used when
@@ -98,7 +122,7 @@ class ToolCallParser {
     }
 
   private:
-    enum Mode { Content, Head, Name, Args, List } mode_ = Content;
+    enum Mode { Content, Head, Name, Args, List, GlmName, GlmArgs, GlmKey, GlmValue } mode_ = Content;
     ToolFormat format_;
     std::string buffer_, content_, list_;
     std::vector<ToolCall> calls_;
@@ -109,6 +133,11 @@ class ToolCallParser {
     void start_call(std::string name, Delta &);
     void add_arguments(std::string_view, Delta &);
     void finish_list(Delta &);
+    // GLM calls: the call being parsed (name started, arguments collected until </tool_call>)
+    nlohmann::ordered_json glm_args_;
+    std::string glm_key_;
+    bool glm_step(Delta &, bool finish);
+    nlohmann::json glm_value(const std::string &key, const std::string &text) const;
 };
 
 // Lazy grammar (tool_choice auto): no constraint until `trigger` is sampled, then `inner` (a constraint whose answer

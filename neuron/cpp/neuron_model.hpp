@@ -24,9 +24,28 @@ struct ModelOptions {
     double hbm_gib = 16.0, hbm_reserve_gib = 2.0;
 };
 
+// A model family served behind NeuronModel's contract by its own graphs and runtime (the Llama graphs are Impl).
+// GLM-5.3 (glm5_next: KDA, sparse MLA, mHC, MoE) is one: glm_model.cpp, serving a glm_repack.py prepared directory.
+class Backend {
+  public:
+    virtual ~Backend() = default;
+    virtual int cache_pages() const = 0;
+    virtual int vocab() const = 0;
+    virtual int max_decode_rows() const = 0;
+    virtual int decode_bucket_pages(int pages) const = 0;
+    virtual const std::vector<int> &eos() const = 0;
+    virtual int max_context() const = 0;
+    virtual std::span<const float> forward(const behemoth::InferenceBatch &) = 0;
+    virtual nlohmann::json last_profile() const = 0;
+};
+// options.model is a GLM prepared directory (prepared.json written by neuron/glm_repack.py).
+bool is_glm_prepared(const std::filesystem::path &);
+std::unique_ptr<Backend> make_glm_backend(const ModelOptions &);
+
 class NeuronModel {
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<Backend> backend_; // set instead of impl_ for a non-Llama family (GLM)
 
   public:
     explicit NeuronModel(const ModelOptions &);
@@ -37,6 +56,9 @@ class NeuronModel {
     int decode_bucket_pages(int pages) const; // table pages of the smallest decode bucket covering `pages` (0: none)
     const std::vector<int> &eos() const;
     int max_context() const;
+    // Recurrent state per sequence (GLM's KDA layers): the engine then neither drafts (rejected draft rows would advance
+    // the state) nor uses the prefix cache (restored K/V pages carry no recurrent state).
+    bool recurrent() const;
     // Logits of batch.sample_rows in order: [n_sample][vocab] (valid until the next call).
     std::span<const float> forward(const behemoth::InferenceBatch &);
     nlohmann::json last_profile() const;

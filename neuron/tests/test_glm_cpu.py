@@ -46,11 +46,11 @@ def runner(model, cfg, tp, ep=None, fp8=False, kv8=False, moe='all'):
     return CpuRunner(g, layers, heads, pk.embed(), pages=65, slots=9, kv8=kv8, moe_mode=moe, max_pages_per_seq=4)
 
 
-def run_tokens(r, tokens, chunk=1, seq=0):
+def run_tokens(r, tokens, chunk=1, seq=0, bucket=None):
     out = []
     for s in range(0, len(tokens), chunk):
         toks = tokens[s:s + chunk]
-        out.append(r.step([(seq, toks, s)]).numpy())
+        out.append(r.step([(seq, toks, s)], Q=bucket).numpy()[:len(toks)])
     return np.concatenate(out)
 
 
@@ -121,6 +121,7 @@ def main():
                     check(f'{tag} TP=2 EP=1 (expert TP)', run_tokens(runner(model, cfg, 2, 1), tokens), ref, 2e-2, top, frac)
                     check(f'{tag} MOE=gather', run_tokens(runner(model, cfg, 2, 2, moe='gather'), tokens), ref, 2e-2, top, frac)
                 check(f'{tag} prefill chunks of 4', run_tokens(runner(model, cfg, 2), tokens, chunk=4), ref, 2e-2, top, frac)
+                check(f'{tag} prefill chunks of 5 padded to 8', run_tokens(runner(model, cfg, 2), tokens, chunk=5, bucket=8), ref, 2e-2, top, frac)
                 r = runner(model, cfg, 2)                         # two sequences as rows of one step: slots, page tables
                 other = tokens[::-1]
                 a, b = [], []

@@ -262,8 +262,8 @@ class Session : public std::enable_shared_from_this<Session> {
         if (event.token >= 0) {
             if (!diagnostic_dir_.empty()) diagnostic_["tokens"].push_back(event.token);
             const auto &format = chat_backend().tools;
-            if (markers_ && (event.token == format.calls_token || event.token == format.args_token))
-                emit(text_.append(event.token == format.calls_token ? format.calls : format.args));
+            if (const std::string *marker = markers_ ? format.marker(event.token) : nullptr)
+                emit(text_.append(*marker));
             else
                 emit(text_.append(tokenizer_.piece(event.token, first_piece_)));
             if (text_.stopped()) {

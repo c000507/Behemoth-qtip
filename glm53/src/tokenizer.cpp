@@ -234,6 +234,35 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
               "only text message content is supported (no images or other content parts)");
         check(!message.contains("tool_calls"), "assistant tool_calls are not supported by this chat template");
     }
+    return render(nlohmann::ordered_json::parse(messages.dump()), generation, nullptr);
+}
+std::string Tokenizer::chat_tools(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) const {
+    check(messages.is_array() && !messages.empty(), "messages must be nonempty array");
+    nlohmann::ordered_json m = messages;
+    for (auto &message : m) {
+        check(message.is_object() && message.contains("role"), "every message needs a role");
+        if (message.contains("content") && message.at("content").is_array()) { // text blocks joined
+            std::string text;
+            for (const auto &b : message.at("content")) {
+                check(b.is_object() && b.value("type", "") == "text" && b.contains("text"),
+                      "Only text message content is supported (no images or other content parts)");
+                text += b.at("text").get<std::string>();
+            }
+            message["content"] = text;
+        }
+        if (!message.contains("content") || message.at("content").is_null())
+            message["content"] = "";
+        if (message.contains("tool_calls"))
+            for (auto &call : message.at("tool_calls"))
+                if (call.contains("function") && call.at("function").contains("arguments") && call.at("function").at("arguments").is_string()) {
+                    auto parsed = nlohmann::ordered_json::parse(call.at("function").at("arguments").get<std::string>(), nullptr, false);
+                    check(!parsed.is_discarded() && parsed.is_object(), "tool call arguments must be a JSON object");
+                    call["function"]["arguments"] = parsed;
+                }
+    }
+    return render(m, true, tools.is_array() && !tools.empty() ? tools : nlohmann::ordered_json());
+}
+std::string Tokenizer::render(const nlohmann::ordered_json &messages, bool generation, const nlohmann::ordered_json &tools) const {
     auto source = config_.at("chat_template");
     if (source.is_array()) {
         json chosen;
@@ -251,11 +280,11 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
             return value.get<std::string>();
         return value.at("content").get<std::string>();
     };
-    nlohmann::ordered_json inputs = {{"messages", nlohmann::ordered_json::parse(messages.dump())},
+    nlohmann::ordered_json inputs = {{"messages", messages},
                                      {"bos_token", token("bos_token")},
                                      {"eos_token", token("eos_token")},
                                      {"add_generation_prompt", generation},
-                                     {"tools", nullptr}};
+                                     {"tools", tools}};
     // HF supplies strftime_now; minja does not, so supply date_string for
     // templates that call it. A template with a fixed default date (Anubis)
     // must keep that default, just as it does in Hugging Face.

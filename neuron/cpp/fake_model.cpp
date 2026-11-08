@@ -50,6 +50,7 @@ NeuronModel::NeuronModel(const ModelOptions &o) : impl_(std::make_unique<Impl>()
     m.kv.assign(size_t(m.pages + 1) * 16, -1);
 }
 NeuronModel::~NeuronModel() = default;
+bool NeuronModel::recurrent() const { return env("BEHEMOTH_FAKE_RECURRENT", 0) != 0; }
 int NeuronModel::cache_pages() const { return impl_->pages; }
 int NeuronModel::vocab() const { return impl_->vocab; }
 int NeuronModel::max_decode_rows() const { return impl_->rows; }

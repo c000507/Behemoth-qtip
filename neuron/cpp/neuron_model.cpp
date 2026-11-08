@@ -1425,34 +1425,51 @@ struct NeuronModel::Impl {
     }
 };
 
-NeuronModel::NeuronModel(const ModelOptions &o) : impl_(std::make_unique<Impl>(o)) {}
+NeuronModel::NeuronModel(const ModelOptions &o) {
+    if (is_glm_prepared(o.model))
+        backend_ = make_glm_backend(o);
+    else
+        impl_ = std::make_unique<Impl>(o);
+}
 NeuronModel::~NeuronModel() = default;
-int NeuronModel::cache_pages() const { return impl_->pages_total - 1; }
-int NeuronModel::vocab() const { return impl_->vocab_; }
+bool NeuronModel::recurrent() const { return backend_ != nullptr; }
+int NeuronModel::cache_pages() const { return backend_ ? backend_->cache_pages() : impl_->pages_total - 1; }
+int NeuronModel::vocab() const { return backend_ ? backend_->vocab() : impl_->vocab_; }
 int NeuronModel::max_decode_rows() const {
+    if (backend_)
+        return backend_->max_decode_rows();
     int r = 0;
     for (const auto &b : impl_->decode) r = std::max(r, b.meta.R);
     return r;
 }
 int NeuronModel::decode_bucket_pages(int pages) const {
+    if (backend_)
+        return backend_->decode_bucket_pages(pages);
     int best = 0;
     for (const auto &b : impl_->decode)
         if (b.meta.P >= pages && (!best || b.meta.P < best)) best = b.meta.P;
     return best;
 }
-const std::vector<int> &NeuronModel::eos() const { return impl_->config.eos; }
+const std::vector<int> &NeuronModel::eos() const { return backend_ ? backend_->eos() : impl_->config.eos; }
 int NeuronModel::max_context() const {
+    if (backend_)
+        return backend_->max_context();
     int p = 0;
     for (const auto &b : impl_->decode) p = std::max(p, b.meta.P);
     return std::min(p * PAGE, impl_->config.max_context);
 }
-std::span<const float> NeuronModel::forward(const InferenceBatch &b) { return impl_->forward(b); }
-nlohmann::json NeuronModel::last_profile() const { return impl_->profile; }
-size_t NeuronModel::kv_page_bytes() const { return impl_->kv_page_rank_bytes() * size_t(impl_->tp); }
+std::span<const float> NeuronModel::forward(const InferenceBatch &b) { return backend_ ? backend_->forward(b) : impl_->forward(b); }
+nlohmann::json NeuronModel::last_profile() const { return backend_ ? backend_->last_profile() : impl_->profile; }
+// Prefix-cache copies exist only for the Llama graphs (the engine disables the cache for recurrent models).
+size_t NeuronModel::kv_page_bytes() const { return backend_ ? 0 : impl_->kv_page_rank_bytes() * size_t(impl_->tp); }
 void NeuronModel::kv_save(std::span<const int> device_pages, std::span<const int> host_pages, std::byte *arena) {
+    if (backend_)
+        throw std::logic_error("no prefix cache for this model");
     impl_->kv_copy(device_pages, host_pages, arena, true);
 }
 void NeuronModel::kv_restore(std::span<const int> host_pages, std::span<const int> device_pages, const std::byte *arena) {
+    if (backend_)
+        throw std::logic_error("no prefix cache for this model");
     impl_->kv_copy(device_pages, host_pages, const_cast<std::byte *>(arena), false);
 }
 } // namespace neuron

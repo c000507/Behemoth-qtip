@@ -5,7 +5,8 @@
 // Structured outputs: vocabulary_pieces() gives every id its decoded bytes (the BPE vocabulary as is: no SentencePiece
 // first-piece rule), control tokens marked special, EOS the tokenizer's eos_token.
 //
-// Tool calling (tools.hpp), for Mistral tokenizers (Tekken: [AVAILABLE_TOOLS], [TOOL_CALLS] and [ARGS] control
+// Tool calling (tools.hpp), for GLM tokenizers (<tool_call> / <arg_key> / <arg_value> control tokens, templates that
+// render tools: the conversation and tools go through the checkpoint's own template) and for Mistral tokenizers (Tekken: [AVAILABLE_TOOLS], [TOOL_CALLS] and [ARGS] control
 // tokens; Cydonia / Mistral Small 3.2): their chat templates take no tools, so conversations with tools or tool
 // messages are rendered in Mistral's v11 form (render_mistral_tools) behind the template's own system prompt.
 // BEHEMOTH_TOOLS=0 turns tool calling off. Constrained answers start with an optional <think> block only for templates
@@ -23,7 +24,8 @@ struct Tokenizer::Impl {
     std::string bos, eos;
     int eos_id = -1;
     ToolFormat tools;
-    explicit Impl(const std::filesystem::path &root) : bpe(root) {
+    bool template_source_has_tools = false;
+    explicit Impl(const std::filesystem::path &root, bool has_tools) : bpe(root), template_source_has_tools(has_tools) {
         auto token = [&](const char *key) -> std::string {
             const auto v = bpe.summary().value(key, nlohmann::json(nullptr));
             return v.is_string() ? v.get<std::string>() : v.is_object() ? v.value("content", "") : "";
@@ -32,6 +34,22 @@ struct Tokenizer::Impl {
         eos = token("eos_token");
         eos_id = control(eos);
         const char *enabled = std::getenv("BEHEMOTH_TOOLS");
+        if (enabled && std::atoi(enabled) == 0)
+            return;
+        // GLM (<tool_call> ... </tool_call> with <arg_key> / <arg_value> control tokens; the template renders tools)
+        if (const int open = control("<tool_call>"); open >= 0) {
+            std::vector<std::pair<int, std::string>> markers;
+            for (const char *m : {"<tool_call>", glm_call_end, glm_key_open, glm_key_close, glm_value_open, glm_value_close})
+                if (const int id = control(m); id >= 0)
+                    markers.push_back({id, m});
+            if (markers.size() == 6 && template_source_has_tools) {
+                tools.calls = "<tool_call>";
+                tools.calls_token = open;
+                tools.glm = true;
+                tools.markers = std::move(markers);
+                return;
+            }
+        }
         const int calls = control("[TOOL_CALLS]");
         if ((enabled && std::atoi(enabled) == 0) || calls < 0 || control("[AVAILABLE_TOOLS]") < 0 || control("[TOOL_RESULTS]") < 0)
             return;
@@ -83,7 +101,8 @@ static std::string template_source(const std::filesystem::path &root) {
     std::ifstream jinja(root / "chat_template.jinja");
     return std::string(std::istreambuf_iterator<char>(jinja), {});
 }
-Tokenizer::Tokenizer(const std::filesystem::path &root) : impl_(std::make_unique<Impl>(root)) {
+Tokenizer::Tokenizer(const std::filesystem::path &root)
+    : impl_(std::make_unique<Impl>(root, template_source(root).find("tool_call") != std::string::npos)) {
     auto *impl = impl_.get();
     const char *name = std::getenv("BEHEMOTH_MODEL_NAME");
     ChatBackend backend{name ? name : root.filename().string(),
@@ -91,7 +110,13 @@ Tokenizer::Tokenizer(const std::filesystem::path &root) : impl_(std::make_unique
     // Constrained answers may open with <think> only for templates that know it (reasoning models); others (Cydonia)
     // are constrained from the first token unless the request sets reasoning_effort.
     backend.think = template_source(root).find("<think>") != std::string::npos;
-    if (impl->tools.supported()) {
+    if (impl->tools.glm) {
+        backend.tools = impl->tools;
+        backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
+            return impl->bpe.chat_tools(messages, tools);
+        };
+        std::cerr << "Tool calling: GLM format (<tool_call> " << impl->tools.calls_token << ", chat template renders tools)\n";
+    } else if (impl->tools.supported()) {
         backend.tools = impl->tools;
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
             return render_mistral_tools(messages, tools, impl->tools, impl->bos, impl->eos, impl->default_system());
@@ -117,7 +142,10 @@ std::vector<Vocabulary::Token> vocabulary_pieces(const Tokenizer &tokenizer) {
         t.special = t.rest.empty(); // control tokens and ids without a vocabulary entry
     }
     // the tool-call control tokens are text to the constraints: the server streams them as their marker text
-    for (auto [id, marker] : {std::pair{impl.tools.calls_token, impl.tools.calls}, {impl.tools.args_token, impl.tools.args}})
+    std::vector<std::pair<int, std::string>> markers = impl.tools.markers;
+    markers.push_back({impl.tools.calls_token, impl.tools.calls});
+    markers.push_back({impl.tools.args_token, impl.tools.args});
+    for (const auto &[id, marker] : markers)
         if (id >= 0 && size_t(id) < tokens.size()) {
             tokens[size_t(id)].first = tokens[size_t(id)].rest = marker;
             tokens[size_t(id)].special = false;

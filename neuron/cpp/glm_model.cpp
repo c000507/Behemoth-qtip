@@ -1,0 +1,748 @@
+// GLM-5.3-Flash (glm5_next) on NeuronCores behind NeuronModel's contract: forward(InferenceBatch) -> logits.
+//
+// Weights come from a prepared directory (neuron/glm_repack.py: prepared.json, embed.bin, r<rank>/L<layer>.bin,
+// r<rank>/head.bin), already sharded for the TP ranks / EP groups the graphs were traced for (neuron/glm_graphs.py).
+// A layer is two launches (attention sub-block kda | mla, then MLP sub-block dense | moe), each one NEFF per bucket
+// shared by every layer of that kind, inputs bound by name (meta.json "inputs" + aliased "states"). The host supplies the
+// embeddings (bf16 table, replicated over the mHC streams), positions, write slots, page tables and KDA state slots, and
+// reads back the logits of the sampled rows (head NEFF, vocab-sharded over the ranks).
+//
+// State: the MLA latent / index caches are paged with the server's 16-token pages (page tables from the scheduler, page
+// pages-1 is scratch). KDA recurrent + conv state lives in [slots, ...] tensors per layer, one slot per sequence: a
+// sequence is identified by its first page (stable while it lives; a new or re-prefilled sequence starts at position 0,
+// where the graph zeroes its state). Slots are an LRU cache: an evicted sequence's state is copied to host memory and
+// copied back when it continues, so more sequences may be live than there are slots. The last slot is scratch (padding
+// rows). Padding tokens of a prefill chunk have position -1 (the graph leaves the state untouched).
+#include "neuron_model.hpp"
+#include "behemoth/worker.hpp"
+#include <nrt/nrt.h>
+#include <nrt/nrt_experimental.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <list>
+#include <map>
+#include <set>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+using namespace behemoth;
+
+namespace neuron {
+namespace {
+constexpr int PAGE = 16;
+using Clock = std::chrono::steady_clock;
+using json = nlohmann::json;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+void check(NRT_STATUS status, const std::string &what) {
+    if (status != NRT_SUCCESS)
+        throw std::runtime_error("GLM: " + what + " failed: nrt status " + std::to_string(int(status)));
+}
+struct Dev {
+    nrt_tensor_t *t = nullptr;
+    size_t bytes = 0;
+};
+Dev alloc(int core, size_t bytes, const std::string &name) {
+    Dev d;
+    d.bytes = bytes;
+    check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, core, bytes, name.c_str(), &d.t), "alloc " + name);
+    return d;
+}
+void put(const Dev &d, const void *src, size_t bytes, size_t offset = 0) { check(nrt_tensor_write(d.t, src, offset, bytes), "write"); }
+void zero(const Dev &d) {
+    std::vector<uint8_t> z(std::min<size_t>(d.bytes, 64u << 20), 0);
+    for (size_t off = 0; off < d.bytes; off += z.size())
+        put(d, z.data(), std::min(z.size(), d.bytes - off), off);
+}
+std::vector<char> slurp(const std::filesystem::path &p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f)
+        throw std::runtime_error("cannot read " + p.string());
+    return std::vector<char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+json read_json(const std::filesystem::path &p) {
+    std::ifstream f(p);
+    if (!f)
+        throw std::runtime_error("cannot read " + p.string());
+    return json::parse(f);
+}
+float bf16_to_f32(uint16_t b) {
+    uint32_t u = uint32_t(b) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// One NEFF: a sub-block kind ("kda", "mla", "dense", "moe") or "head", for one bucket.
+struct Graph {
+    std::string kind;
+    int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0, slots = 0;
+    std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
+    std::vector<nrt_model_t *> model;        // [rank]
+    std::vector<size_t> input_bytes;          // by NEFF input index
+    std::vector<size_t> state_bytes;
+    std::filesystem::path neff;
+};
+} // namespace
+
+class GlmModel final : public Backend {
+    ModelOptions options;
+    json prepared;
+    std::filesystem::path root;
+    int tp = 1, hidden = 0, streams = 4, vocab_ = 0, vocab_shard = 0, layers = 0, pages_total = 0, slots_total = 0, max_context_ = 0;
+    std::vector<std::string> attn_kind, mlp_kind;
+    std::vector<int> eos_;
+    // embedding table (bf16 [vocab][hidden]) mapped from embed.bin
+    const uint16_t *embed = nullptr;
+    size_t embed_map_bytes = 0;
+    void *embed_map = nullptr;
+    std::vector<Graph> graphs;
+    struct Rank {
+        std::map<std::string, Dev> t; // "L003.attn.q", "L003.attn.kstate", "head.w"
+    };
+    std::vector<Rank> ranks;
+    std::vector<std::unique_ptr<RankWorker>> workers;
+    // step buffers per (R, Q) group and rank; tables per (R, Q, P)
+    struct Step {
+        Dev x[2], pos, slot, wslot;
+        std::map<int, Dev> table, rows, logits; // table by P; head rows / logits by the head's S
+    };
+    std::map<std::pair<int, int>, std::vector<Step>> steps;
+    // tensor sets per (graph, layer, parity, rank)
+    std::map<std::tuple<const Graph *, int, int, int>, std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *>> sets;
+    std::vector<float> logits;
+    json profile = json::object();
+    // KDA state slots: sequence (first page) -> slot, LRU order; spilled states on the host
+    std::map<int, int> slot_of;
+    std::list<int> lru; // sequences with a slot, most recent last
+    std::map<int, std::vector<std::vector<char>>> spilled; // sequence -> [rank] bytes of every KDA layer's slot
+    uint64_t spills = 0, restores = 0;
+
+  public:
+    explicit GlmModel(const ModelOptions &o) : options(o), root(o.model) {
+        prepared = read_json(root / "prepared.json");
+        const auto &g = prepared.at("geometry");
+        tp = g.at("tp");
+        hidden = g.at("hidden");
+        streams = g.at("streams");
+        vocab_ = g.at("vocab");
+        layers = g.at("layers");
+        if (const char *n = std::getenv("NEURON_LAYERS"))
+            layers = std::min(layers, std::atoi(n));
+        vocab_shard = (vocab_ + tp - 1) / tp;
+        for (const auto &l : prepared.at("layers")) {
+            attn_kind.push_back(l.at("attn"));
+            mlp_kind.push_back(l.at("mlp"));
+        }
+        eos_ = prepared.at("eos").get<std::vector<int>>();
+        max_context_ = prepared.at("max_context");
+        map_embedding();
+        check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
+        ranks.resize(size_t(tp));
+        for (int r = 0; r < tp; ++r)
+            workers.push_back(std::make_unique<RankWorker>());
+        discover();
+        load_graphs();
+        load_weights();
+        if (options.verbose) {
+            size_t w = 0, s = 0;
+            for (const auto &[name, d] : ranks[0].t)
+                (name.find("state") != std::string::npos || name.ends_with(".lat") || name.ends_with(".lsc") || name.ends_with(".idx") ? s : w) += d.bytes;
+            std::cerr << "GLM: " << layers << " layers, TP " << tp << ", " << graphs.size() << " NEFFs, " << pages_total - 1 << " pages, "
+                      << slots_total - 1 << " KDA state slots; per core " << double(w) / (1 << 30) << " GiB weights + " << double(s) / (1 << 30)
+                      << " GiB state\n";
+        }
+    }
+    ~GlmModel() override {
+        if (embed_map)
+            munmap(embed_map, embed_map_bytes);
+    }
+
+    void map_embedding() {
+        const auto &e = prepared.at("files").at("embed.bin").at(0);
+        const auto path = root / "embed.bin";
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            throw std::runtime_error("cannot open " + path.string());
+        embed_map_bytes = std::filesystem::file_size(path);
+        embed_map = mmap(nullptr, embed_map_bytes, PROT_READ, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (embed_map == MAP_FAILED)
+            throw std::runtime_error("mmap embed.bin");
+        if (e.at("dtype") != "bf16" || e.at("shape").at(0) != vocab_ || e.at("shape").at(1) != hidden)
+            throw std::runtime_error("embed.bin is not bf16 [vocab][hidden]");
+        embed = reinterpret_cast<const uint16_t *>(static_cast<const char *>(embed_map) + size_t(e.at("offset")));
+    }
+
+    void discover() {
+        const auto &geo = prepared.at("geometry");
+        for (const auto &dir : std::filesystem::directory_iterator(options.neff_dir)) {
+            const auto meta_path = dir.path() / "meta.json";
+            if (!std::filesystem::exists(meta_path))
+                continue;
+            const json m = read_json(meta_path);
+            const std::string kind = m.value("kind", "");
+            if (kind.rfind("glm_", 0) != 0)
+                continue;
+            const auto &mg = m.at("geometry");
+            for (const char *k : {"hidden", "streams", "vocab", "heads", "linear_heads", "linear_dim", "kv_rank", "q_rank", "experts",
+                                  "expert_intermediate", "intermediate", "tp", "ep"})
+                if (mg.at(k) != geo.at(k))
+                    throw std::runtime_error("NEFF " + dir.path().string() + " was traced for " + std::string(k) + " " + mg.at(k).dump() +
+                                             ", the prepared model has " + geo.at(k).dump() + " (retrace with MODEL=... TP=... EP=...)");
+            Graph gr;
+            gr.kind = kind.substr(4);
+            gr.inputs = m.at("inputs").get<std::vector<std::string>>();
+            gr.states = m.at("states").get<std::vector<std::string>>();
+            gr.neff = dir.path() / "graph.neff";
+            if (gr.kind == "head") {
+                gr.T = m.at("T");
+                gr.S = m.at("S");
+            } else {
+                gr.R = m.at("R");
+                gr.Q = m.at("Q");
+                gr.P = m.at("P");
+                gr.T = gr.R * gr.Q;
+                gr.pages = m.at("pages");
+                gr.slots = m.at("slots");
+                if (gr.kind == "mla") {
+                    if (pages_total && pages_total != gr.pages)
+                        throw std::runtime_error("GLM NEFFs disagree on the page count");
+                    pages_total = gr.pages;
+                }
+                if (gr.kind == "kda") {
+                    if (slots_total && slots_total != gr.slots)
+                        throw std::runtime_error("GLM NEFFs disagree on the KDA slot count");
+                    slots_total = gr.slots;
+                }
+                if (gr.Q > 1 && gr.R != 1)
+                    throw std::runtime_error("GLM prefill buckets must have R = 1");
+            }
+            graphs.push_back(std::move(gr));
+        }
+        if (graphs.empty())
+            throw std::runtime_error("no GLM NEFFs (meta kind glm_*) in " + options.neff_dir.string());
+        if (!pages_total || !slots_total)
+            throw std::runtime_error("GLM NEFFs need mla and kda buckets");
+        // every (R, Q) group needs every sub-block kind the model uses, and a head for its token count
+        std::set<std::pair<int, int>> groups;
+        for (const auto &g : graphs)
+            if (g.kind != "head")
+                groups.insert({g.R, g.Q});
+        std::set<std::string> kinds(attn_kind.begin(), attn_kind.end());
+        kinds.insert(mlp_kind.begin(), mlp_kind.end());
+        for (auto [R, Q] : groups) {
+            for (const auto &k : kinds)
+                if (!find(k, R, Q, k == "mla" ? 1 : 0))
+                    throw std::runtime_error("GLM bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " lacks a " + k + " NEFF");
+            if (!head_for(R * Q, 1))
+                throw std::runtime_error("GLM bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has no head NEFF for " +
+                                         std::to_string(R * Q) + " rows");
+        }
+    }
+    // the cheapest graph of `kind` with exactly (R, Q) and at least P table pages (P ignored except for mla)
+    const Graph *find(const std::string &kind, int R, int Q, int P) const {
+        const Graph *best = nullptr;
+        for (const auto &g : graphs)
+            if (g.kind == kind && g.R == R && g.Q == Q && (kind != "mla" || g.P >= P) && (!best || g.P < best->P))
+                best = &g;
+        return best;
+    }
+    const Graph *head_for(int T, int S) const {
+        const Graph *best = nullptr;
+        for (const auto &g : graphs)
+            if (g.kind == "head" && g.T == T && g.S >= S && (!best || g.S < best->S))
+                best = &g;
+        return best;
+    }
+
+    void load_graphs() {
+        for (auto &gr : graphs) {
+            const auto neff = slurp(gr.neff);
+            gr.model.resize(size_t(tp));
+            std::vector<std::future<void>> jobs;
+            for (int r = 0; r < tp; ++r)
+                jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                    if (tp > 1 && gr.kind != "head")
+                        check(nrt_load_collectives(neff.data(), neff.size(), r, -1, uint32_t(r), uint32_t(tp), &gr.model[size_t(r)]),
+                              "nrt_load_collectives " + gr.neff.string());
+                    else
+                        check(nrt_load(neff.data(), neff.size(), r, -1, &gr.model[size_t(r)]), "nrt_load " + gr.neff.string());
+                }));
+            for (auto &j : jobs)
+                j.get();
+            nrt_tensor_info_array_t *info = nullptr;
+            check(nrt_get_model_tensor_info(gr.model[0], &info), "tensor info");
+            const size_t n = gr.inputs.size() + gr.states.size();
+            gr.input_bytes.assign(n, 0);
+            for (uint64_t i = 0; i < info->tensor_count; ++i) {
+                const auto &t = info->tensor_array[i];
+                if (t.usage != NRT_TENSOR_USAGE_INPUT)
+                    continue;
+                const size_t index = std::stoul(std::string(t.name).substr(5));
+                if (index >= n)
+                    throw std::runtime_error(gr.neff.string() + ": input " + t.name + " beyond meta inputs + states");
+                gr.input_bytes[index] = t.size;
+            }
+            for (size_t s = 0; s < gr.states.size(); ++s)
+                gr.state_bytes.push_back(gr.input_bytes[gr.inputs.size() + s]);
+            nrt_free_model_tensor_info(info);
+            if (options.verbose)
+                std::cerr << "GLM NEFF " << gr.kind << " R=" << gr.R << " Q=" << gr.Q << " P=" << gr.P << " T=" << gr.T << " S=" << gr.S << "\n";
+        }
+        // step buffers per (R, Q) group: residual ping-pong, positions, write slots, state slots, one table per P, head rows / logits
+        for (const auto &gr : graphs) {
+            if (gr.kind == "head")
+                continue;
+            auto &v = steps[{gr.R, gr.Q}];
+            if (v.empty()) {
+                v.resize(size_t(tp));
+                for (int r = 0; r < tp; ++r) {
+                    auto &s = v[size_t(r)];
+                    const size_t T = size_t(gr.T);
+                    s.x[0] = alloc(r, T * size_t(streams * hidden) * 4, "x0");
+                    s.x[1] = alloc(r, T * size_t(streams * hidden) * 4, "x1");
+                    s.pos = alloc(r, T * 8, "pos");
+                    s.wslot = alloc(r, T * 8, "wslot");
+                    s.slot = alloc(r, size_t(gr.R) * 8, "slot");
+                    for (const auto &h : graphs)
+                        if (h.kind == "head" && h.T == gr.T && !s.rows.count(h.S)) {
+                            s.rows[h.S] = alloc(r, size_t(h.S) * 8, "rows");
+                            s.logits[h.S] = alloc(r, size_t(h.S) * size_t(vocab_shard) * 4, "logits");
+                        }
+                }
+            }
+            if (gr.kind == "mla" && !v[0].table.count(gr.P))
+                for (int r = 0; r < tp; ++r)
+                    v[size_t(r)].table[gr.P] = alloc(r, size_t(gr.R) * size_t(gr.P) * 8, "table");
+        }
+    }
+
+    void load_weights() {
+        const auto t0 = Clock::now();
+        const auto &files = prepared.at("files");
+        std::vector<std::future<void>> jobs;
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                auto upload = [&](const std::string &file, const std::string &prefix) {
+                    const auto data = slurp(root / file);
+                    for (const auto &e : files.at(file)) {
+                        const std::string name = prefix + e.at("name").get<std::string>();
+                        const size_t bytes = e.at("bytes"), offset = e.at("offset");
+                        Dev d = alloc(r, bytes, name);
+                        put(d, data.data() + offset, bytes);
+                        ranks[size_t(r)].t[name] = d;
+                    }
+                };
+                upload("r" + std::to_string(r) + "/head.bin", "head.");
+                for (int l = 0; l < layers; ++l)
+                    upload("r" + std::to_string(r) + "/" + layer_file(l), layer_prefix(l));
+                // state tensors, zeroed, sized by the NEFFs
+                for (int l = 0; l < layers; ++l) {
+                    const Graph *g = find(attn_kind[size_t(l)], first_group().first, first_group().second, 1);
+                    for (size_t s = 0; s < g->states.size(); ++s) {
+                        const std::string name = layer_prefix(l) + "attn." + g->states[s];
+                        Dev d = alloc(r, g->state_bytes[s], name);
+                        zero(d);
+                        ranks[size_t(r)].t[name] = d;
+                    }
+                }
+            }));
+        for (auto &j : jobs)
+            j.get();
+        if (options.verbose)
+            std::cerr << "GLM: weights resident in " << ms_since(t0) / 1000 << " s\n";
+    }
+    std::pair<int, int> first_group() const { return steps.begin()->first; }
+    static std::string layer_file(int l) {
+        char b[32];
+        std::snprintf(b, sizeof b, "L%03d.bin", l);
+        return b;
+    }
+    static std::string layer_prefix(int l) {
+        char b[32];
+        std::snprintf(b, sizeof b, "L%03d.", l);
+        return b;
+    }
+
+    // Input / output tensor sets of graph g for layer l reading residual buffer `parity`.
+    std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> layer_set(const Graph &g, int l, int parity, int r) {
+        auto key = std::make_tuple(&g, l, parity, r);
+        if (auto it = sets.find(key); it != sets.end())
+            return it->second;
+        auto &st = steps.at({g.R, g.Q})[size_t(r)];
+        auto &rank = ranks[size_t(r)];
+        const std::string sub = (g.kind == "kda" || g.kind == "mla") ? "attn." : "mlp.";
+        const std::string pre = layer_prefix(l) + sub;
+        auto bind = [&](const std::string &name) -> const Dev & {
+            if (name == "x") return st.x[parity];
+            if (name == "pos") return st.pos;
+            if (name == "slot") return st.slot;
+            if (name == "wslot") return st.wslot;
+            if (name == "table") return st.table.at(g.P);
+            auto it = rank.t.find(pre + name);
+            if (it == rank.t.end())
+                throw std::runtime_error("GLM: layer " + std::to_string(l) + " has no tensor " + pre + name + " for the " + g.kind + " NEFF");
+            return it->second;
+        };
+        nrt_tensor_set_t *in = nullptr, *out = nullptr;
+        check(nrt_allocate_tensor_set(&in), "set");
+        check(nrt_allocate_tensor_set(&out), "set");
+        std::vector<std::string> names = g.inputs;
+        names.insert(names.end(), g.states.begin(), g.states.end());
+        for (size_t i = 0; i < names.size(); ++i) {
+            const Dev &d = bind(names[i]);
+            if (d.bytes != g.input_bytes[i])
+                throw std::runtime_error("GLM: " + g.kind + " input " + names[i] + " of layer " + std::to_string(l) + " expects " +
+                                         std::to_string(g.input_bytes[i]) + " B, has " + std::to_string(d.bytes));
+            check(nrt_add_tensor_to_tensor_set(in, ("input" + std::to_string(i)).c_str(), d.t), "add input");
+        }
+        check(nrt_add_tensor_to_tensor_set(out, "output0", st.x[1 - parity].t), "add output");
+        for (size_t s = 0; s < g.states.size(); ++s)
+            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(s + 1)).c_str(), bind(g.states[s]).t), "add state output");
+        return sets[key] = {in, out};
+    }
+    std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> head_set(const Graph &h, int R, int Q, int r) {
+        auto key = std::make_tuple(&h, R * 1000 + Q, 0, r);
+        if (auto it = sets.find(key); it != sets.end())
+            return it->second;
+        auto &st = steps.at({R, Q})[size_t(r)];
+        auto &rank = ranks[size_t(r)];
+        nrt_tensor_set_t *in = nullptr, *out = nullptr;
+        check(nrt_allocate_tensor_set(&in), "set");
+        check(nrt_allocate_tensor_set(&out), "set");
+        for (size_t i = 0; i < h.inputs.size(); ++i) {
+            const auto &n = h.inputs[i];
+            const Dev &d = n == "x" ? st.x[0] : n == "rows" ? st.rows.at(h.S) : rank.t.at("head." + n);
+            if (d.bytes != h.input_bytes[i])
+                throw std::runtime_error("GLM: head input " + n + " size mismatch");
+            check(nrt_add_tensor_to_tensor_set(in, ("input" + std::to_string(i)).c_str(), d.t), "add head input");
+        }
+        check(nrt_add_tensor_to_tensor_set(out, "output0", st.logits.at(h.S).t), "add head output");
+        return sets[key] = {in, out};
+    }
+
+    // ---- KDA state slots ----------------------------------------------------------------------------------------
+    size_t slot_state_bytes(int l, size_t s) const {
+        const Graph *g = find("kda", first_group().first, first_group().second, 1);
+        return g->state_bytes[s] / size_t(slots_total);
+    }
+    void copy_slot(int seq, int slot, bool save) {
+        auto &blob = spilled[seq];
+        if (save)
+            blob.assign(size_t(tp), {});
+        std::vector<std::future<void>> jobs;
+        const Graph *g = find("kda", first_group().first, first_group().second, 1);
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                size_t at = 0;
+                for (int l = 0; l < layers; ++l) {
+                    if (attn_kind[size_t(l)] != "kda")
+                        continue;
+                    for (size_t s = 0; s < g->states.size(); ++s) {
+                        const Dev &d = ranks[size_t(r)].t.at(layer_prefix(l) + "attn." + g->states[s]);
+                        const size_t n = slot_state_bytes(l, s);
+                        if (save) {
+                            blob[size_t(r)].resize(at + n);
+                            check(nrt_tensor_read(d.t, blob[size_t(r)].data() + at, size_t(slot) * n, n), "read state");
+                        } else
+                            check(nrt_tensor_write(d.t, blob[size_t(r)].data() + at, size_t(slot) * n, n), "write state");
+                        at += n;
+                    }
+                }
+            }));
+        for (auto &j : jobs)
+            j.get();
+        if (!save)
+            spilled.erase(seq);
+    }
+    // The slot of sequence `seq` (its first page) whose chunk starts at `position`; `pinned`: slots of this launch.
+    int acquire_slot(int seq, int position, std::set<int> &pinned) {
+        auto touch = [&](int s) {
+            lru.remove(s);
+            lru.push_back(s);
+        };
+        if (auto it = slot_of.find(seq); it != slot_of.end()) {
+            if (position == 0)
+                spilled.erase(seq);
+            touch(seq);
+            pinned.insert(it->second);
+            return it->second;
+        }
+        if (position > 0 && !spilled.count(seq))
+            throw std::runtime_error("GLM: no KDA state for the sequence on page " + std::to_string(seq) + " at position " +
+                                     std::to_string(position));
+        // a free slot, else evict the least recently used unpinned one (its state goes to the host)
+        std::set<int> used;
+        for (auto [s, sl] : slot_of)
+            used.insert(sl);
+        int slot = -1;
+        for (int sl = 0; sl < slots_total - 1 && slot < 0; ++sl)
+            if (!used.count(sl))
+                slot = sl;
+        if (slot < 0) {
+            for (auto it = lru.begin(); it != lru.end(); ++it) {
+                const int victim = *it, vs = slot_of.at(victim);
+                if (pinned.count(vs))
+                    continue;
+                copy_slot(victim, vs, true);
+                ++spills;
+                slot_of.erase(victim);
+                lru.erase(it);
+                slot = vs;
+                break;
+            }
+            if (slot < 0)
+                throw std::runtime_error("GLM: more sequences in one launch than KDA state slots");
+        }
+        slot_of[seq] = slot;
+        lru.push_back(seq);
+        pinned.insert(slot);
+        if (position > 0) {
+            copy_slot(seq, slot, false);
+            ++restores;
+        } else
+            spilled.erase(seq);
+        return slot;
+    }
+
+    // ---- one launch: R rows x Q tokens through every layer, then the head for the sampled rows ------------------------
+    struct Launch {
+        int R = 0, Q = 0, P = 0;
+        std::vector<float> x;
+        std::vector<int64_t> pos, wslot, table, slot;
+        std::vector<int> head_rows, destination;
+    };
+    Launch fresh(int R, int Q, int P) const {
+        Launch L;
+        L.R = R; L.Q = Q; L.P = P;
+        const size_t T = size_t(R * Q);
+        L.x.assign(T * size_t(streams * hidden), 0.f);
+        L.pos.assign(T, 0);
+        L.wslot.assign(T, int64_t(pages_total - 1) * PAGE);
+        L.table.assign(size_t(R) * size_t(P), pages_total - 1);
+        L.slot.assign(size_t(R), slots_total - 1);
+        return L;
+    }
+    void fill_token(Launch &L, int t, int token, int position, int page) const {
+        if (token < 0 || token >= vocab_)
+            throw std::runtime_error("token outside the vocabulary");
+        float *x = L.x.data() + size_t(t) * size_t(streams * hidden);
+        const uint16_t *e = embed + size_t(token) * size_t(hidden);
+        for (int h = 0; h < hidden; ++h)
+            x[h] = bf16_to_f32(e[h]);
+        for (int s = 1; s < streams; ++s)
+            std::memcpy(x + size_t(s) * size_t(hidden), x, size_t(hidden) * 4);
+        L.pos[size_t(t)] = position;
+        L.wslot[size_t(t)] = int64_t(page) * PAGE + position % PAGE;
+    }
+    double layers_ms = 0, head_ms = 0;
+    int launches = 0;
+    void execute(Launch &L, float *dest) {
+        const Graph *head = nullptr;
+        if (!L.head_rows.empty()) {
+            head = head_for(L.R * L.Q, int(L.head_rows.size()));
+            if (!head)
+                throw std::runtime_error("GLM: no head NEFF for " + std::to_string(L.head_rows.size()) + " rows");
+        }
+        std::vector<const Graph *> attn(static_cast<size_t>(layers)), mlp(static_cast<size_t>(layers));
+        for (int l = 0; l < layers; ++l) {
+            attn[size_t(l)] = find(attn_kind[size_t(l)], L.R, L.Q, L.P);
+            mlp[size_t(l)] = find(mlp_kind[size_t(l)], L.R, L.Q, 0);
+        }
+        const int P = attn_kind.end() != std::find(attn_kind.begin(), attn_kind.end(), "mla") ? find("mla", L.R, L.Q, L.P)->P : L.P;
+        if (P != L.P) { // widen the table to the bucket's page count
+            std::vector<int64_t> t(size_t(L.R) * size_t(P), pages_total - 1);
+            for (int r = 0; r < L.R; ++r)
+                std::copy_n(L.table.begin() + std::ptrdiff_t(r * L.P), L.P, t.begin() + std::ptrdiff_t(r * P));
+            L.table = std::move(t);
+            L.P = P;
+        }
+        std::vector<int64_t> rows(head ? size_t(head->S) : 0, 0);
+        for (size_t i = 0; i < L.head_rows.size(); ++i)
+            rows[i] = L.head_rows[i];
+        std::vector<std::vector<float>> out(static_cast<size_t>(tp));
+        std::vector<std::future<void>> jobs;
+        double t_layers = 0, t_head = 0;
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                auto &st = steps.at({L.R, L.Q})[size_t(r)];
+                const auto t0 = Clock::now();
+                put(st.x[0], L.x.data(), L.x.size() * 4);
+                put(st.pos, L.pos.data(), L.pos.size() * 8);
+                put(st.wslot, L.wslot.data(), L.wslot.size() * 8);
+                put(st.slot, L.slot.data(), L.slot.size() * 8);
+                if (st.table.count(L.P))
+                    put(st.table.at(L.P), L.table.data(), L.table.size() * 8);
+                int parity = 0;
+                for (int l = 0; l < layers; ++l)
+                    for (const Graph *g : {attn[size_t(l)], mlp[size_t(l)]}) {
+                        auto [in, o] = layer_set(*g, l, parity, r);
+                        check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
+                        parity ^= 1;
+                    }
+                const auto t1 = Clock::now();
+                if (head) {
+                    put(st.rows.at(head->S), rows.data(), rows.size() * 8);
+                    auto [in, o] = head_set(*head, L.R, L.Q, r);
+                    check(nrt_execute(head->model[size_t(r)], in, o), "head execute");
+                    out[size_t(r)].resize(size_t(head->S) * size_t(vocab_shard));
+                    check(nrt_tensor_read(st.logits.at(head->S).t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                }
+                if (r == 0) {
+                    t_layers = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    t_head = ms_since(t1);
+                }
+            }));
+        for (auto &j : jobs)
+            j.get();
+        layers_ms += t_layers;
+        head_ms += t_head;
+        ++launches;
+        for (size_t i = 0; i < L.head_rows.size(); ++i) {
+            float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
+            for (int r = 0; r < tp; ++r) {
+                const size_t first = size_t(r) * size_t(vocab_shard);
+                if (first >= size_t(vocab_))
+                    continue;
+                std::copy_n(out[size_t(r)].data() + i * size_t(vocab_shard), std::min(size_t(vocab_) - first, size_t(vocab_shard)), row + first);
+            }
+        }
+    }
+
+    // ---- Backend --------------------------------------------------------------------------------------------------
+    int cache_pages() const override { return pages_total - 1; }
+    int vocab() const override { return vocab_; }
+    int max_decode_rows() const override {
+        int r = 0;
+        for (const auto &g : graphs)
+            if (g.kind == "kda" && g.Q == 1) r = std::max(r, g.R);
+        return std::min(r, slots_total - 1);
+    }
+    int decode_bucket_pages(int pages) const override {
+        int best = 0;
+        for (const auto &g : graphs)
+            if (g.kind == "mla" && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
+        return best;
+    }
+    const std::vector<int> &eos() const override { return eos_; }
+    int max_context() const override {
+        int p = 0;
+        for (const auto &g : graphs)
+            if (g.kind == "mla") p = std::max(p, g.P);
+        return std::min(p * PAGE, max_context_);
+    }
+    json last_profile() const override { return profile; }
+
+    std::span<const float> forward(const InferenceBatch &batch) override {
+        const auto t0 = Clock::now();
+        layers_ms = head_ms = 0;
+        launches = 0;
+        const auto &lay = batch.layout;
+        logits.resize(batch.sample_rows.size() * size_t(vocab_));
+        std::vector<int> sample_of(size_t(lay.queries()), -1);
+        for (size_t s = 0; s < batch.sample_rows.size(); ++s)
+            sample_of[size_t(batch.sample_rows[s])] = int(s);
+        auto pages_needed = [&](int req) { return (lay.lengths[size_t(req)] + PAGE - 1) / PAGE; };
+        auto page_at = [&](int req, int j) { return lay.page_table[size_t(req) * size_t(lay.table_stride) + size_t(j)]; };
+        auto fill_table = [&](Launch &L, int row, int req) {
+            for (int j = 0; j < L.P; ++j) {
+                const int page = j < pages_needed(req) ? page_at(req, j) : -1;
+                L.table[size_t(row) * size_t(L.P) + size_t(j)] = page < 0 ? pages_total - 1 : page;
+            }
+        };
+        // decode rows (one token per request) and prefill requests (several tokens: one R = 1 launch per chunk)
+        std::vector<int> rows, multi;
+        for (int req = 0; req < lay.requests(); ++req) {
+            const int count = lay.query_offsets[size_t(req) + 1] - lay.query_offsets[size_t(req)];
+            (count == 1 ? rows : multi).push_back(req);
+        }
+        std::set<int> decode_R;
+        std::set<int> prefill_Q;
+        for (const auto &g : graphs)
+            if (g.kind == "kda") (g.Q == 1 ? decode_R.insert(g.R) : prefill_Q.insert(g.Q));
+        const int maxR = std::min(decode_R.empty() ? 0 : *decode_R.rbegin(), slots_total - 1);
+        for (size_t at = 0; at < rows.size();) {
+            if (!maxR)
+                throw std::runtime_error("GLM: no decode buckets");
+            size_t n = std::min(rows.size() - at, size_t(maxR));
+            int R = *decode_R.lower_bound(int(n)), pages = 1;
+            for (size_t i = 0; i < n; ++i)
+                pages = std::max(pages, pages_needed(rows[at + i]));
+            const Graph *g = find("mla", R, 1, pages);
+            if (!g)
+                throw std::runtime_error("GLM: no decode bucket R=" + std::to_string(R) + " with " + std::to_string(pages) + " pages");
+            auto L = fresh(R, 1, g->P);
+            std::set<int> pinned;
+            for (size_t i = 0; i < n; ++i) {
+                const int req = rows[at + i], ti = lay.query_offsets[size_t(req)], position = lay.positions[size_t(ti)];
+                fill_token(L, int(i), batch.tokens[size_t(ti)], position, page_at(req, position / PAGE));
+                fill_table(L, int(i), req);
+                L.slot[i] = acquire_slot(page_at(req, 0), position, pinned);
+                if (sample_of[size_t(ti)] >= 0) {
+                    L.head_rows.push_back(int(i));
+                    L.destination.push_back(sample_of[size_t(ti)]);
+                }
+            }
+            execute(L, logits.data());
+            at += n;
+        }
+        for (int req : multi) {
+            const int first = lay.query_offsets[size_t(req)], count = lay.query_offsets[size_t(req) + 1] - first;
+            for (int done = 0; done < count;) {
+                const int left = count - done;
+                // the smallest chunk bucket covering what is left, else the largest
+                int Q = prefill_Q.empty() ? 0 : *prefill_Q.rbegin();
+                if (auto it = prefill_Q.lower_bound(left); it != prefill_Q.end()) Q = *it;
+                if (!Q) { // no prefill buckets: run the prompt as decode rows of one request
+                    Q = 1;
+                }
+                const int take = std::min(left, Q);
+                const Graph *g = find("mla", 1, Q, pages_needed(req));
+                if (!g)
+                    throw std::runtime_error("GLM: no prefill bucket Q=" + std::to_string(Q) + " with " + std::to_string(pages_needed(req)) + " pages");
+                auto L = fresh(1, Q, g->P);
+                std::set<int> pinned;
+                for (int i = 0; i < Q; ++i) {
+                    if (i < take) {
+                        const int ti = first + done + i, position = lay.positions[size_t(ti)];
+                        fill_token(L, i, batch.tokens[size_t(ti)], position, page_at(req, position / PAGE));
+                    } else
+                        L.pos[size_t(i)] = -1; // padding: no state update, scratch write slot
+                }
+                fill_table(L, 0, req);
+                L.slot[0] = acquire_slot(page_at(req, 0), lay.positions[size_t(first + done)], pinned);
+                const int last = first + done + take - 1;
+                if (sample_of[size_t(last)] >= 0) {
+                    L.head_rows.push_back(take - 1);
+                    L.destination.push_back(sample_of[size_t(last)]);
+                }
+                execute(L, logits.data());
+                done += take;
+            }
+        }
+        if (const char *dump = std::getenv("NEURON_LOGITS_DUMP")) {
+            std::ofstream f(dump, std::ios::binary | std::ios::app);
+            f.write(reinterpret_cast<const char *>(logits.data()), std::streamsize(logits.size() * 4));
+        }
+        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"layers_ms", layers_ms}, {"head_ms", head_ms},
+                   {"tokens", batch.tokens.size()}, {"kda_spills", spills}, {"kda_restores", restores}};
+        return logits;
+    }
+};
+
+bool is_glm_prepared(const std::filesystem::path &p) {
+    const auto f = p / "prepared.json";
+    if (!std::filesystem::exists(f))
+        return false;
+    return read_json(f).value("format", "") == "glm53-neuron-prepared";
+}
+std::unique_ptr<Backend> make_glm_backend(const ModelOptions &o) { return std::make_unique<GlmModel>(o); }
+} // namespace neuron

@@ -186,7 +186,76 @@ ToolRequest parse_tools(const ojson &j) {
     return r;
 }
 
+namespace {
+// A property schema whose values GLM writes raw (a plain string; an enum of strings becomes literal alternatives).
+bool glm_raw_string(const ojson &s) {
+    return s.is_object() && s.value("type", ojson()) == "string";
+}
+std::string glm_tool_call_grammar(const ToolRequest &r) {
+    struct Prop { std::string key; const ojson *schema; bool required; int rule; };
+    struct Tool { std::string name; std::vector<Prop> props; };
+    std::vector<Tool> tools;
+    std::vector<ojson> schemas; // the non-string property schemas, compiled to JSON rules
+    for (const auto &t : r.tools) {
+        const auto &fn = t.at("function");
+        if (r.choice == ToolRequest::Named && fn.at("name") != r.name)
+            continue;
+        Tool tool{fn.at("name"), {}};
+        const auto &params = fn.at("parameters");
+        std::set<std::string> required;
+        if (params.contains("required") && params.at("required").is_array())
+            for (const auto &k : params.at("required"))
+                if (k.is_string())
+                    required.insert(k.get<std::string>());
+        if (params.contains("properties") && params.at("properties").is_object())
+            for (auto it = params.at("properties").begin(); it != params.at("properties").end(); ++it) {
+                Prop p{it.key(), &it.value(), required.count(it.key()) > 0, -1};
+                if (!glm_raw_string(it.value())) {
+                    p.rule = int(schemas.size());
+                    schemas.push_back(it.value());
+                }
+                tool.props.push_back(p);
+            }
+        tools.push_back(std::move(tool));
+    }
+    if (tools.empty())
+        throw std::invalid_argument("No tools to call");
+    if (schemas.empty())
+        schemas.push_back(ojson::object()); // json_schemas_grammar needs one schema; this rule stays unused
+    return grammar::json_schemas_grammar(schemas, [&](const std::vector<std::string> &rules) {
+        std::string call = "(";
+        for (size_t i = 0; i < tools.size(); ++i) {
+            call += (i ? " | " : " ") + grammar::gbnf_literal(std::string("<tool_call>") + tools[i].name);
+            for (const auto &p : tools[i].props) {
+                std::string value;
+                if (p.rule >= 0)
+                    value = rules[size_t(p.rule)];
+                else if (p.schema->contains("enum") && p.schema->at("enum").is_array()) {
+                    value = "(";
+                    bool first = true;
+                    for (const auto &e : p.schema->at("enum"))
+                        if (e.is_string()) {
+                            value += (first ? " " : " | ") + grammar::gbnf_literal(e.get<std::string>());
+                            first = false;
+                        }
+                    value += " )";
+                } else
+                    value = "( [^<] | \"<\" [^/] )*"; // raw text up to </arg_value>
+                const std::string kv = grammar::gbnf_literal(std::string(glm_key_open) + p.key + glm_key_close + glm_value_open) + " " +
+                                       value + " " + grammar::gbnf_literal(glm_value_close);
+                call += " " + (p.required ? kv : "( " + kv + " )?");
+            }
+            call += " " + grammar::gbnf_literal(glm_call_end);
+        }
+        call += " )";
+        return r.parallel ? call + " ( " + call + " )*" : call; // back to back: the grammar runs in JSON mode (no whitespace after a complete answer)
+    });
+}
+} // namespace
+
 std::string tool_call_grammar(const ToolRequest &r, const ToolFormat &f) {
+    if (f.glm)
+        return glm_tool_call_grammar(r);
     std::vector<ojson> schemas;
     std::vector<std::string> names;
     for (const auto &t : r.tools) {
@@ -300,10 +369,121 @@ nlohmann::json ToolCall::openai() const {
 }
 
 ToolCallParser::ToolCallParser(ToolFormat format, const ToolRequest *fallback) : format_(std::move(format)) {
-    if (fallback && fallback->choice == ToolRequest::Auto) {
-        fallback_ = true;
-        tools_ = fallback->tools;
+    if (fallback)
+        tools_ = fallback->tools; // GLM values are typed by the tool's parameters schema
+    fallback_ = fallback && fallback->choice == ToolRequest::Auto;
+}
+
+// GLM: a value is raw text when the property's schema is a string, else JSON (raw text when it does not parse).
+nlohmann::json ToolCallParser::glm_value(const std::string &key, const std::string &text) const {
+    for (const auto &t : tools_) {
+        const auto &fn = t.at("function");
+        if (calls_.empty() || fn.at("name") != calls_.back().name)
+            continue;
+        const auto &params = fn.at("parameters");
+        if (params.contains("properties") && params.at("properties").contains(key) && glm_raw_string(params.at("properties").at(key)))
+            return text;
     }
+    auto parsed = nlohmann::json::parse(text, nullptr, false);
+    return parsed.is_discarded() ? nlohmann::json(text) : parsed;
+}
+
+// One step of a GLM call: <tool_call> was consumed; name, then <arg_key>k</arg_key><arg_value>v</arg_value> pairs, then
+// </tool_call>. The arguments go out as one JSON fragment when the call is complete. False: needs more text.
+bool ToolCallParser::glm_step(Delta &d, bool finish) {
+    auto close = [&]() {
+        add_arguments(glm_args_.dump(), d);
+        if (calls_.back().arguments.empty())
+            calls_.back().arguments = "{}";
+        glm_args_ = ojson::object();
+        mode_ = Content;
+    };
+    auto skip_space = [&]() {
+        size_t i = 0;
+        while (i < buffer_.size() && is_space(buffer_[i]))
+            ++i;
+        buffer_.erase(0, i);
+    };
+    switch (mode_) {
+    case GlmName: {
+        const size_t key = buffer_.find(glm_key_open), end = buffer_.find(glm_call_end);
+        const size_t at = std::min(key, end);
+        if (at == std::string::npos) {
+            if (finish && !trim(buffer_).empty()) {
+                start_call(trim(buffer_), d);
+                buffer_.clear();
+                close();
+            }
+            return false;
+        }
+        start_call(trim(std::string_view(buffer_).substr(0, at)), d);
+        glm_args_ = ojson::object();
+        if (at == key) {
+            buffer_.erase(0, at + std::string_view(glm_key_open).size());
+            mode_ = GlmKey;
+        } else {
+            buffer_.erase(0, at + std::string_view(glm_call_end).size());
+            close();
+        }
+        return true;
+    }
+    case GlmKey: {
+        const size_t at = buffer_.find(glm_key_close);
+        if (at == std::string::npos)
+            break;
+        glm_key_ = trim(std::string_view(buffer_).substr(0, at));
+        buffer_.erase(0, at + std::string_view(glm_key_close).size());
+        mode_ = GlmValue;
+        return true;
+    }
+    case GlmValue: {
+        skip_space();
+        const std::string_view open = glm_value_open;
+        if (buffer_.size() < open.size() && open.substr(0, buffer_.size()) == buffer_ && !finish)
+            return false;
+        if (buffer_.compare(0, open.size(), open) != 0) { // a key without a value: null
+            glm_args_[glm_key_] = nullptr;
+            mode_ = GlmArgs;
+            return true;
+        }
+        const size_t at = buffer_.find(glm_value_close, open.size());
+        if (at == std::string::npos)
+            break;
+        glm_args_[glm_key_] = glm_value(glm_key_, buffer_.substr(open.size(), at - open.size()));
+        buffer_.erase(0, at + std::string_view(glm_value_close).size());
+        mode_ = GlmArgs;
+        return true;
+    }
+    case GlmArgs: {
+        skip_space();
+        for (const char *m : {glm_key_open, glm_call_end}) {
+            const std::string_view marker = m;
+            if (buffer_.compare(0, marker.size(), marker) == 0) {
+                buffer_.erase(0, marker.size());
+                if (m == glm_key_open)
+                    mode_ = GlmKey;
+                else
+                    close();
+                return true;
+            }
+            if (!finish && buffer_.size() < marker.size() && marker.substr(0, buffer_.size()) == buffer_)
+                return false;
+        }
+        if (buffer_.empty())
+            break;
+        const size_t next = buffer_.find('<', 1); // stray text between pairs: dropped
+        buffer_.erase(0, next == std::string::npos ? buffer_.size() : next);
+        return !buffer_.empty();
+    }
+    default:
+        break;
+    }
+    if (finish) { // the answer ended inside a call: keep what was parsed
+        if (mode_ == GlmKey || mode_ == GlmValue)
+            buffer_.clear();
+        close();
+    }
+    return false;
 }
 
 // Fallback (tool_choice auto): the answer ends with a JSON tool call written as text, bare or in a ``` fence:
@@ -428,14 +608,15 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
         progress = false;
         switch (mode_) {
         case Content: {
-            // whitespace before anything else is held: dropped when the answer turns out to be calls only
-            const bool leading = content_.empty() && d.content.empty();
+            // whitespace before anything else is held: dropped when the answer turns out to be calls only (and, GLM,
+            // between consecutive calls)
+            const bool leading = (content_.empty() && d.content.empty()) || (format_.glm && !calls_.empty());
             const size_t at = buffer_.find(format_.calls);
             if (at != std::string::npos) {
                 if (!leading || !trim(std::string_view(buffer_).substr(0, at)).empty())
                     d.content += buffer_.substr(0, at);
                 buffer_.erase(0, at + format_.calls.size());
-                mode_ = Head;
+                mode_ = format_.glm ? GlmName : Head;
                 progress = true;
                 break;
             }
@@ -508,6 +689,12 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
             buffer_.clear();
             if (finish)
                 finish_list(d);
+            break;
+        case GlmName:
+        case GlmArgs:
+        case GlmKey:
+        case GlmValue:
+            progress = glm_step(d, finish);
             break;
         }
     }
