@@ -52,6 +52,19 @@ class FakeECS:
             {"type": "ElasticNetworkInterface", "details": [
                 {"name": "subnetId", "value": "subnet-1"}, {"name": "privateIPv4Address", "value": "127.0.0.1"}]}]}]}
 
+    def list_container_instances(self, cluster, status):
+        self.calls.append("list_container_instances")
+        return {"containerInstanceArns": [c["containerInstanceArn"] for c in getattr(self, "cis", []) if c["status"] == status]}
+
+    def describe_container_instances(self, cluster, containerInstances):
+        return {"containerInstances": [c for c in getattr(self, "cis", []) if c["containerInstanceArn"] in containerInstances]}
+
+    def update_container_instances_state(self, cluster, containerInstances, status):
+        for c in getattr(self, "cis", []):
+            if c["containerInstanceArn"] in containerInstances:
+                c["status"] = status
+        self.reactivated = list(containerInstances)
+
     def kill(self):
         with self.lock:
             self.polls_since_up = 0
@@ -212,6 +225,15 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
                 break
         self.assertEqual(asg.unprotected, ["i-1"])
         self.assertEqual(asg.sets[-1], 0)
+
+    async def test_draining_warm_pool_instance_reactivated(self):
+        ecs = FakeECS(boot_polls=3)
+        ecs.cis = [{"containerInstanceArn": "ci-1", "status": "DRAINING", "agentConnected": True, "runningTasksCount": 0, "pendingTasksCount": 0},
+                   {"containerInstanceArn": "ci-2", "status": "DRAINING", "agentConnected": True, "runningTasksCount": 1, "pendingTasksCount": 0}]
+        c = await self.start(ecs)
+        r = await c.post("/v1/chat/completions", json={"model": "cydonia-24b", "messages": []})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(ecs.reactivated, ["ci-1"])  # only the idle one; never touch an instance running tasks
 
     async def test_asg_failure_is_not_fatal(self):
         class Broken(FakeASG):

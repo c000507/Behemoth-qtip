@@ -179,6 +179,17 @@ data "aws_iam_policy_document" "router_task" {
     actions   = ["autoscaling:DescribeAutoScalingGroups"]
     resources = ["*"] # Describe* takes no resource scoping
   }
+  # Warm-pool reuse leaves a restarted instance DRAINING; the router sets idle ones back to ACTIVE during a startup.
+  statement {
+    sid       = "ListContainerInstances"
+    actions   = ["ecs:ListContainerInstances"]
+    resources = [aws_ecs_cluster.this.arn]
+  }
+  statement {
+    sid       = "ReactivateContainerInstances"
+    actions   = ["ecs:DescribeContainerInstances", "ecs:UpdateContainerInstancesState"]
+    resources = ["arn:${local.partition}:ecs:${var.region}:${local.account_id}:container-instance/${aws_ecs_cluster.this.name}/*"]
+  }
   statement {
     sid       = "DescribeBackendTasks"
     actions   = ["ecs:DescribeTasks"]

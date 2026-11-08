@@ -145,6 +145,21 @@ class Backend:
         except Exception as e:  # the capacity provider still scales out on its own
             log.warning("ASG scale-out failed (capacity provider will catch up): %s", e)
 
+    async def reactivate_draining(self) -> int:
+        """Warm-pool reuse: an instance scaled into the warm pool is drained by ECS and keeps status DRAINING when the pool
+        starts it again, so the pending task is never placed (seen: 22 min stuck). Set connected, idle DRAINING container
+        instances of the cluster back to ACTIVE while a startup is waiting for a task."""
+        arns = (await self._call("list_container_instances", cluster=self.cfg.cluster, status="DRAINING")).get("containerInstanceArns", [])
+        if not arns:
+            return 0
+        cis = (await self._call("describe_container_instances", cluster=self.cfg.cluster, containerInstances=arns)).get("containerInstances", [])
+        idle = [c["containerInstanceArn"] for c in cis
+                if c.get("agentConnected") and not c.get("runningTasksCount") and not c.get("pendingTasksCount")]
+        if idle:
+            log.info("reactivating %d DRAINING container instance(s) left over from the warm pool", len(idle))
+            await self._call("update_container_instances_state", cluster=self.cfg.cluster, containerInstances=idle, status="ACTIVE")
+        return len(idle)
+
     async def maybe_asg_scale_in(self) -> bool:
         """After an idle stop: once no backend task is left, drop the ASG to 0 now (managed scaling would wait ~15 min).
         Runs every reaper cycle while stopped: ECS managed termination protection can leave the idle instance protected
@@ -187,6 +202,8 @@ class Backend:
         while time.monotonic() < deadline:
             try:
                 addr = await self._running_address()
+                if not addr:
+                    await self.reactivate_draining()
             except Exception as e:  # transient API errors: keep polling until the deadline
                 log.warning("ECS poll failed: %s", e)
                 addr = None
