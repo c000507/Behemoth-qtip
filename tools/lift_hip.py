@@ -238,10 +238,10 @@ def _generate_oracle_on_box(M, K, N, key):
         "lowered.compiler_ir().operation.write_bytecode(buf)\n"
         "open(d + '/graph.mlirbc', 'wb').write(buf.getvalue())\n"
         "print('gen ok')\n")
-    enc = _b64.b64encode(gen_py.encode()).decode()
-    subprocess.run(["aws", "s3", "cp", "/dev/stdin",
+    open("/tmp/opencode/_gen_cur.b64", "w").write(_b64.b64encode(gen_py.encode()).decode())
+    subprocess.run(["aws", "s3", "cp", "/tmp/opencode/_gen_cur.b64",
                     "s3://912935854432-neuron-build/tools/gen_cur.py.b64"],
-                   input=enc, check=True, capture_output=True, text=True)
+                   check=True, capture_output=True)
     inner = (
         "source /home/ubuntu/work/nenv.sh 2>/dev/null\n"
         "export PATH=/usr/local/bin:$PATH\n"
