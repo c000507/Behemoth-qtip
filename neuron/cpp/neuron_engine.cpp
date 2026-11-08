@@ -5,13 +5,21 @@
 // Prefix cache: the GPU engine's PrefixCache and scheduler hooks unchanged, with synchronous copies on the loop thread
 // (forward() is blocking, so saves and restores run between steps): a finished request's pages stay resident as the
 // cache's device tier (zero-copy hit for the next request with that prefix) and are copied to a host arena when the
-// pool needs them back. Not carried over: structured-output constraints (submit() rejects a constraint).
+// pool needs them back.
+//
+// Structured outputs / tool calls: the GPU engine's per-request TokenConstraint, applied host-side to each sampled row
+// after the logit processing (unconstrained sample first when the constraint allows it, else the allowed-token mask),
+// advanced with every sampled token. Draft rows are sampled in order and only while the drafts match, so a row's
+// constraint state is that of the tokens before it, and the state equals the emitted tokens (rows after a mismatch
+// are discarded unsampled). The state covers generated tokens only: a preempted request re-prefills its history and
+// keeps its constraint, and prefix-cache restores (prompt K/V) do not touch it.
 #include "behemoth/engine.hpp"
 #include "behemoth/prefix_cache.hpp"
 #include "behemoth/constraint.hpp"
 #include "behemoth/sampling.hpp"
 #include "neuron_model.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -115,6 +123,10 @@ struct Engine::Impl {
     double spec_page_cost = 0.01, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
+    // structured outputs: constraints of the constrained requests; per-token cost of the constraint calls
+    std::map<uint64_t, std::shared_ptr<TokenConstraint>> constraints;
+    uint64_t constrained_requests = 0;
+    std::atomic<uint64_t> constraint_ns{0}, constrained_tokens{0}, constraint_fallbacks{0};
     // prefix cache (null when disabled): leases of requests restoring a prefix, requests waiting for their restore
     std::unique_ptr<PrefixCache> cache;
     std::map<uint64_t, PrefixCache::Lease> leases;
@@ -312,6 +324,46 @@ struct Engine::Impl {
         submitted.erase(id);
         last_token.erase(id);
         acceptance.erase(id);
+        constraints.erase(id);
+    }
+
+    // One token of a constrained request from `row` (logits after processing), committed to the constraint.
+    int sample_constrained(std::span<const float> row, TokenConstraint &constraint, const SamplingOptions &sampling,
+                           std::mt19937_64 &generator) {
+        using C = std::chrono::steady_clock;
+        C::duration spent{};
+        int token = -1;
+        if (constraint.accept_first(sampling.temperature == 0)) {
+            token = sample_logits(row, sampling, generator);
+            const auto t0 = C::now();
+            if (!constraint.accepts(token))
+                token = -1;
+            spent += C::now() - t0;
+        }
+        if (token < 0) {
+            const auto t0 = C::now();
+            const auto allowed = constraint.allowed();
+            spent += C::now() - t0;
+            constraint_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            if (allowed.count == 1)
+                token = allowed.single;
+            else {
+                const uint64_t *mask = allowed.mask->data();
+                thread_local std::vector<uint64_t> padded; // an LM head wider than the tokenizer: no ids past it
+                if (allowed.mask->size() * 64 < row.size()) {
+                    padded.assign((row.size() + 63) / 64, 0);
+                    std::copy(allowed.mask->begin(), allowed.mask->end(), padded.begin());
+                    mask = padded.data();
+                }
+                token = sample_logits(row, {}, sampling, generator, mask);
+            }
+        }
+        const auto t0 = C::now();
+        constraint.advance(token);
+        spent += C::now() - t0;
+        constraint_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count()), std::memory_order_relaxed);
+        constrained_tokens.fetch_add(1, std::memory_order_relaxed);
+        return token;
     }
 
     void loop() {
@@ -319,6 +371,7 @@ struct Engine::Impl {
             std::vector<std::pair<GenerationCallback, GenerationEvent>> events;
             ScheduledBatch step;
             InferenceBatch input;
+            std::vector<TokenConstraint *> step_constraints; // per step request (null: unconstrained), taken under the lock
             {
                 std::unique_lock lock(mutex);
                 cv.wait(lock, [&] { return stop || !callbacks.empty() || !cancellations.empty(); });
@@ -376,6 +429,10 @@ struct Engine::Impl {
                             }
                         }
                     input = make_inference_batch(scheduler, step, drafts);
+                    for (const auto &s : step.requests) {
+                        auto c = constraints.find(s.id);
+                        step_constraints.push_back(c == constraints.end() ? nullptr : c->second.get());
+                    }
                 }
             }
             deliver(events);
@@ -412,6 +469,7 @@ struct Engine::Impl {
                         const bool process = has_logit_processing(req.sampling);
                         thread_local std::vector<float> processed;
                         auto d = drafts.find(step.requests[i].id);
+                        TokenConstraint *constraint = step_constraints[i];
                         for (size_t j = 0; j < sampled[i].size(); ++j) {
                             auto row = logits.subspan((logits_row[i] + j) * vocab, vocab);
                             if (process) { // penalties see the tokens before this row: history, then drafts 0 .. j - 1
@@ -422,7 +480,15 @@ struct Engine::Impl {
                                 apply_logit_processing(processed, req.sampling, req.history, req.prompt_size, extra);
                                 row = processed;
                             }
-                            sampled[i][j] = sample_logits(row, req.sampling, rng.at(step.requests[i].id));
+                            if (!constraint) {
+                                sampled[i][j] = sample_logits(row, req.sampling, rng.at(step.requests[i].id));
+                                continue;
+                            }
+                            sampled[i][j] = sample_constrained(row, *constraint, req.sampling, rng.at(step.requests[i].id));
+                            // row j + 1 follows draft j: past a mismatch it is discarded, and the constraint must
+                            // not see it (its state stays that of the emitted tokens)
+                            if (d == drafts.end() || j >= d->second.size() || sampled[i][j] != d->second[j])
+                                break;
                         }
                     } catch (...) {
                         std::lock_guard guard(error_mutex);
@@ -510,8 +576,6 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
         throw std::invalid_argument("Missing generation callback");
     if (!max_new)
         throw std::invalid_argument("max_tokens must be positive");
-    if (constraint)
-        throw std::invalid_argument("structured outputs are not supported by the Neuron backend");
     if (prompt.empty() || prompt.size() + max_new > impl_->max_context)
         throw std::invalid_argument("prompt and completion exceed the Neuron context bucket (" + std::to_string(impl_->max_context) + " tokens)");
     std::lock_guard lock(impl_->mutex);
@@ -526,6 +590,10 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
         }
     impl_->callbacks[id] = std::move(callback);
     impl_->rng.emplace(id, std::mt19937_64(options.seed));
+    if (constraint) {
+        impl_->constraints.emplace(id, std::move(constraint));
+        ++impl_->constrained_requests;
+    }
     impl_->submitted[id] = Impl::Clock::now();
     impl_->cv.notify_one();
     return id;
@@ -566,6 +634,13 @@ nlohmann::json Engine::metrics() const {
             {"itl_ms_p50", percentile(impl_->itl, .5)},
             {"itl_ms_p95", percentile(impl_->itl, .95)},
             {"last_step", impl_->last_profile},
+            {"structured_output", {{"requests", impl_->constrained_requests},
+                                   {"tokens", impl_->constrained_tokens.load()},
+                                   {"mask_fallbacks", impl_->constraint_fallbacks.load()},
+                                   {"constraint_ms_total", double(impl_->constraint_ns.load()) / 1e6},
+                                   {"constraint_us_per_token", impl_->constrained_tokens.load()
+                                                                   ? double(impl_->constraint_ns.load()) / 1e3 / double(impl_->constrained_tokens.load())
+                                                                   : 0.0}}},
             {"prefix_cache", impl_->cache ? nlohmann::json{{"slots", impl_->cache->slots()},
                                                            {"hits", impl_->cache->stats().hits},
                                                            {"misses", impl_->cache->stats().misses},

@@ -193,9 +193,34 @@ recovers slowly to retry. Continuations of up to 8 tokens (draft verification, t
 start in prefill buckets. The step log prints `drafts=` and `tokens=` per step, `/metrics` has `drafted_tokens` and
 `accepted_drafts`.
 
+## Structured outputs and tool calls
+
+`response_format` (`json_object`, `json_schema`), raw GBNF `grammar` and `reasoning_effort` work as on the GPU server (same
+parser, grammar compiler and `StructuredConstraint`); the constraint vocabulary is the checkpoint's BPE vocabulary
+(`llama_text.cpp vocabulary_pieces`, any size, EOS = the tokenizer's `eos_token`). neuron_engine.cpp masks host-side after the
+logit processing, per sampled row: unconstrained sample first where the constraint allows it (greedy), else the allowed-token
+mask. Draft rows are sampled in order and only while the drafts match, so speculation gives the same tokens with or without a
+constraint (greedy and seeded sampling); preemption re-prefills the history and keeps the constraint; prefix-cache restores
+cover prompt K/V only.
+
+OpenAI tool calling (`tools`, `tool_choice` none / auto / required / a function, `parallel_tool_calls`, assistant
+`tool_calls` and `tool` messages in the history, `tool_calls` in the answer and as streaming deltas, `finish_reason`
+`tool_calls`) for Mistral tokenizers with `[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` / `[ARGS]` control tokens (Cydonia /
+Mistral Small 3.2, Tekken v11; the HF export names `[ARGS]` `<SPECIAL_32>`). Cydonia's chat template has no tool support,
+so those conversations are rendered in Mistral's v11 form (runtime/src/tools.cpp `render_mistral_tools`) behind the
+template's own default system prompt. `required` / a function constrain the whole answer to
+`[TOOL_CALLS]name[ARGS]{arguments}` calls whose arguments match the tool's `parameters` schema; `auto` leaves the answer
+free until the model emits `[TOOL_CALLS]`, then the same grammar takes over. The parser also reads the older v7 form
+(`[TOOL_CALLS][{"name": ..., "arguments": ...}]`). Not offered: `tools` together with `response_format` / `grammar`
+(HTTP 400 unless `tool_choice` is `none`). `BEHEMOTH_TOOLS=0` turns tool calling off. `/metrics` `structured_output` has the
+constrained requests, tokens, masked samples and constraint time per token.
+
+Host-side checks without NeuronCores: `neuron/cpp/host_test.sh OUTDIR` builds and runs `neuron_engine_test` (the engine on a CPU
+fake model: validity, speculation, preemption, prefix cache) and builds `neuron_server_fake` (the HTTP server on the fake model,
+for curl tests with the real tokenizer) and `structured_bench MODEL_DIR` (mask exactness and cost on the checkpoint vocabulary).
+
 ## Not carried over
 
-* Prefix cache (KV save/restore) and structured outputs: `Engine::submit` rejects a constraint instead of ignoring it.
 * FP8 K/V (the GPU server's KV format): this backend keeps bf16 K/V; FP8 K/V would double the pool and halve the gather.
 * The numerics of a bucket are not bit-identical to another bucket's (different fusion in neuronx-cc, fp8 rounding
   amplifies it, ~6-8 % relative logit difference between the 1-row and 8-row decode graphs), so greedy text can diverge

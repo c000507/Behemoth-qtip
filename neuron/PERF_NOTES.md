@@ -457,3 +457,13 @@ restore of 486 pages in 205 ms). Host tier capped at BEHEMOTH_NEURON_PREFIX_HOST
 compressed-tensors FP8 exports, per-tensor or per-channel scales); qtip_expand slices E4M3 codes below 256 straight into the per-core
 shards (no f32 pass), the upload transposes / tiles in 64 x 64 blocks over threads. 24B cold start (model resident): NVFP4 ~170 s,
 FP8 136 s, + blocked transpose 89 s (4 load threads), 67.6 s (8, now the default). Decode unchanged (56.0 ms/token, ctx ~400, FP8 KV).
+
+**Structured outputs and tool calls on the 131072-id Tekken vocabulary (host side; SERVING.md).** The constraint runs on the host per
+sampled row (the sampler's OMP thread of the request). `structured_bench` on Cydonia's tokenizer (x86 dev host, one thread; trn1.2xlarge
+vCPUs are slower): vocabulary + byte trie 176 ms at startup (266k trie nodes); `accepts()` 0.3-0.4 us (the greedy fast path: the
+unconstrained argmax checked, no mask); `allowed()` (masked sampling: temperature > 0, or the argmax rejected) 0.18-0.92 ms per token
+averaged over walks with the grammar's mask cache warm, 0.2-3.2 ms cold, a full scan of all ids (answer start, leading whitespace) 6.6 ms,
+worst token 12-20 ms; the masks are exact (mask == accepts() over every id along the walks). Against a 56 ms decode step: greedy
+constrained decoding costs ~nothing, sampled ~1-6 %, plus ~7 ms once at the answer's start. Masks are 16 KiB at this vocabulary; the
+per-grammar mask cache is bounded at 16 MiB (1024 entries). Tool calling adds no per-step cost before a call starts (auto: the
+constraint is only armed by [TOOL_CALLS]).
