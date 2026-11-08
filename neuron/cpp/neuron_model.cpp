@@ -36,6 +36,23 @@ struct Dev {
     nrt_tensor_t *t = nullptr;
     size_t bytes = 0;
 };
+// Streamed loading (deploy/ecs-neuron/backend/entrypoint.sh STREAM_LOAD=1): layer files arrive while the server is
+// already loading; BEHEMOTH_NEURON_WAIT_READY=1 makes every layer open wait for "<file>.ready" (fail on "<file>.failed").
+void wait_ready(const std::filesystem::path &file) {
+    if (!std::getenv("BEHEMOTH_NEURON_WAIT_READY"))
+        return;
+    const char *t = std::getenv("BEHEMOTH_NEURON_WAIT_TIMEOUT_S");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(t ? std::atoi(t) : 1800);
+    const auto ready = file.string() + ".ready", failed = file.string() + ".failed";
+    while (!std::filesystem::exists(ready)) {
+        if (std::filesystem::exists(failed))
+            throw std::runtime_error("download failed: " + file.string());
+        if (std::chrono::steady_clock::now() > deadline)
+            throw std::runtime_error("timed out waiting for " + ready);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
 Dev alloc(int core, size_t bytes, const std::string &name) {
     Dev d;
     d.bytes = bytes;
@@ -520,7 +537,22 @@ struct NeuronModel::Impl {
     void upload_layer(int layer) {
         char name[64];
         std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
-        SafeTensorFile file(options.model / name);
+        wait_ready(options.model / name);
+        upload_layer_file(layer, options.model / name);
+        // streamed loading: tell the downloader this file is consumed, and drop the staged copy if asked (tmpfs staging)
+        if (std::getenv("BEHEMOTH_NEURON_WAIT_READY")) {
+            std::ofstream(options.model / (std::string(name) + ".done")).put('\n');
+            if (std::getenv("BEHEMOTH_NEURON_UNLINK_LAYERS")) {
+                std::error_code ec;
+                const auto target = std::filesystem::canonical(options.model / name, ec);
+                if (!ec)
+                    std::filesystem::remove(target, ec);
+            }
+        }
+    }
+
+    void upload_layer_file(int layer, const std::filesystem::path &path) {
+        SafeTensorFile file(path);
         struct P { const char *name; bool col; int slot; };
         const P projs[] = {{"self_attn.q_proj", true, 0}, {"self_attn.o_proj", false, 2}, {"self_attn.k_proj", true, 4},
                            {"self_attn.v_proj", true, 6}, {"mlp.gate_proj", true, 8}, {"mlp.up_proj", true, 10}, {"mlp.down_proj", false, 12}};
@@ -618,13 +650,33 @@ struct NeuronModel::Impl {
         struct P { const char *name; bool col; int out, in; };
         const P projs[] = {{"self_attn.q_proj", true, H, H}, {"self_attn.o_proj", false, H, H}, {"mlp.gate_proj", true, FF, H},
                            {"mlp.up_proj", true, FF, H}, {"mlp.down_proj", false, H, FF}};
+        // qtip_quant.layer_formats (written by the quantiser and repack_compressed_tensors.py) says which layers are QTIP without
+        // opening the layer files, so a streamed load can start uploading layer 0 while later layers are still downloading
+        std::vector<std::string> formats;
+        try {
+            std::ifstream cf(options.model / "config.json");
+            const auto cj = nlohmann::json::parse(cf);
+            if (cj.contains("qtip_quant") && cj.at("qtip_quant").contains("layer_formats"))
+                for (const auto &f : cj.at("qtip_quant").at("layer_formats"))
+                    formats.push_back(f.get<std::string>());
+        } catch (...) {
+            formats.clear();
+        }
+        if (int(formats.size()) < config.layers + layer_offset())
+            formats.clear();
         for (int layer = 0; layer < config.layers; ++layer) {
-            char name[64];
-            std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
-            SafeTensorFile file(options.model / name);
             bool all = true;
+            if (!formats.empty())
+                all = formats[size_t(layer + layer_offset())] == "qtip";
+            else {
+                char name[64];
+                std::snprintf(name, sizeof name, "model-layer-%05d.safetensors", layer + layer_offset());
+                wait_ready(options.model / name);
+                SafeTensorFile file(options.model / name);
+                for (const auto &p : projs)
+                    all = all && is_qtip_projection(file, layer, p.name);
+            }
             for (const auto &p : projs) {
-                all = all && is_qtip_projection(file, layer, p.name);
                 packed_bytes[size_t(layer)] += qtip_packed_bytes(p.out, p.in, tp, p.col);
                 expanded_bytes[size_t(layer)] += size_t(p.out) * size_t(p.in) / size_t(tp) + size_t(p.col ? p.out / tp : p.out) * 4;
             }
