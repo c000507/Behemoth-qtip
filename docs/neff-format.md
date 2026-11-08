@@ -424,3 +424,17 @@ nrt_execute latency (50-iter avg, µs): shape / emitted / baseline:
 32x512x128: 60.6 / 60.4. Emitted = baseline within noise; both launch-bound
 (~58µs host roundtrip floor; device matmul at these sizes is µs-scale).
 Timing harness: /home/ubuntu/work/nrtd/timing.cpp on box.
+
+## Known issue: DVE elementwise scale drift (0.6x, 2026-11-09)
+
+Both the original ref26bb template container AND a freshly StableHLO-compiled
+elementwise kernel (x*w*const) produce y = 2.0*x*w (ratio 0.6 vs the expected
+constant) on the CURRENT instance boot. The SAME vG container previously
+produced y = 3.32*x*w bit-exact. Root cause: NOT the container (byte-verified
+identical streams, correct DVE tables, correct act LUTs); likely a device or
+runtime state change after multiple stop/start cycles, or a runtime update.
+Fix attempt: restart neuron-rtd daemon — did NOT resolve.
+Possible causes: DVE HW decode tables cached from a prior NEFF load persist
+across nrt_close/init cycles; or the activation engine LUT preload state
+differs after device reinit. Next: terminate + relaunch the instance (full
+EC2-level reset, not just stop/start), or reinstall neuron runtime.
