@@ -304,3 +304,21 @@ maxdiff 0 (A@B). AND my emitter's rebuild (my header/tar/neff.json/def.json/DGE
   byte offset; sem_increment=16; y-out desc waits sem4 GE2 (!; sem4 = dynamic
   scratch slot, outside def queue sets - wait, wait_idx=4 means desc waits on
   sem 4 = ... it's the compiler's internal sem numbering, works as shipped).
+
+## Multi-K-tile GEMM chaining (mm2: 32x256 @ 256x128, trn1 verified)
+
+Compiler structure for K > 128 (PE contraction per instr = 128... in practice
+K chunks): K-loop = N-tile-loop of [LW][op10][MM][op10] groups whose LW/MM
+SB addresses are the SAME every iteration. Chaining works via a
+PRODUCER-CONSUMER RING on the dynamic queue:
+- qPoolDynamic has SB_scratch partition + desc#N (dst SB+0x0, src = next
+  input0 K-chunk, waits sem(GE count)) re-stages the next chunk into the
+  same SB slot after the PE consumed the previous one.
+- op10 byte10 ∈ {0,1,2} selects the ring slot/half being read.
+- pool descs: [input0 tile0 -> SB 0x2fb80 sem8], [input1 tile0 -> 0x2f780
+  sem9], [refill input0 chunk -> SB 0x0 waits 5/4 GE2 sem10].
+Verified: my emitter's byte-copy rebuild of mm2 (K=256, 8 chained groups)
+executes A@B exactly (maxdiff 4e-6).
+Lifter implication: arbitrary K = (K/128 - 1) refill descs + (K/64?) PE
+groups with op10 byte10 alternating ring halves; exact per-group cadence
+still needs one more decode pass (dynamic queue ring semantics).
