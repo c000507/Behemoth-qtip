@@ -1,0 +1,25 @@
+#!/bin/bash
+# trn host bootstrap: mount the NVMe instance store for the pulled model/graph files, then join the ECS cluster.
+# The ECS agent (ecs.service) starts after cloud-init, so the mount exists before any task is placed.
+set -euxo pipefail
+
+MNT=${data_mount}
+mkdir -p "$MNT"
+DEV=$(ls /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* 2>/dev/null | grep -v -- '-ns-' | head -n1 || true)
+if [ -n "$DEV" ]; then
+  DEV=$(readlink -f "$DEV")
+  blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -f "$DEV"
+  mount -o noatime "$DEV" "$MNT"
+  echo "instance store $DEV mounted on $MNT"
+else
+  echo "no instance store found; model files go to the root volume under $MNT"
+fi
+mkdir -p "$MNT/behemoth"
+
+cat >> /etc/ecs/ecs.config <<EOF
+ECS_CLUSTER=${cluster_name}
+ECS_ENABLE_SPOT_INSTANCE_DRAINING=true
+ECS_CONTAINER_STOP_TIMEOUT=60s
+ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+ECS_ENABLE_CONTAINER_METADATA=true
+EOF

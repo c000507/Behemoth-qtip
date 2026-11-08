@@ -1,0 +1,37 @@
+# cp terraform.tfvars.example terraform.tfvars   (terraform.tfvars is gitignored by convention; it holds no secrets)
+region = "us-east-1"
+name   = "behemoth"
+
+vpc_id                              = "vpc-REPLACE_ME" # VPC of subnet-05a70c02d594e2500
+backend_subnet_ids                  = ["subnet-05a70c02d594e2500"] # us-east-1f (trn1)
+router_subnet_ids                   = []                           # default: same as backend
+backend_instance_security_group_ids = ["sg-0264b44fbe050547a"]
+# vpc-050026757f6099d13 already has an S3 gateway endpoint (vpce-07c6158572ce17f29) on rtb-05af3fa1cabeaab8a, the route table of
+# subnet-05a70c02d594e2500; its default route goes through the NAT instance i-00c3e4e9cd77689fe (which does not do NAT64).
+create_s3_gateway_endpoint          = false
+s3_endpoint_route_table_ids         = ["rtb-05af3fa1cabeaab8a"]
+
+backend_instance_types = ["trn1.2xlarge"]
+# backend_ami_id       = "ami-..."   # pin after the first successful run (output backend_ami_id)
+backend_image_tag      = "latest"    # or the git short sha printed by backend/build_and_push.sh
+router_image_tag       = "latest"
+
+model_s3_prefix    = "models/cydonia-24b-fp8"
+graphs_s3_prefix   = "graphs/cydonia-24b-fp8-kv"
+backend_model_name = "cydonia-24b"
+model_ids          = ["cydonia-24b"]
+
+idle_timeout_seconds = 300
+max_wait_seconds     = 900
+cold_nonstream_mode  = "wait"
+
+# Tunnel token: store it once (outside Terraform), reference by ARN only, e.g.
+#   aws secretsmanager create-secret --name behemoth/cloudflared-token --secret-string "$TOKEN"
+enable_cloudflared                 = true
+cloudflare_tunnel_token_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/cloudflared-token-XXXXXX"
+# or an SSM SecureString: "arn:aws:ssm:us-east-1:912935854432:parameter/behemoth/cloudflared-token"
+
+enable_alb = false
+# alb_subnet_ids      = ["subnet-a", "subnet-b"]
+# alb_certificate_arn = "arn:aws:acm:us-east-1:912935854432:certificate/..."
+# router_api_key_secret_arn = "arn:aws:secretsmanager:...:secret:behemoth/router-key-XXXXXX"

@@ -1,0 +1,11 @@
+.git
+**/__pycache__
+**/*.o
+**/build
+training
+docs
+tests
+tools
+src
+deploy/ecs-neuron/router
+deploy/ecs-neuron/.terraform

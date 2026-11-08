@@ -1,0 +1,379 @@
+"""Scale-to-zero router for the Neuron LLM backend on ECS.
+
+* GET  /v1/models            answered locally from MODEL_IDS (never wakes the backend)
+* GET  /health               router liveness + backend state (never wakes the backend)
+* POST <PROXY_PATHS>         wake the backend ECS service if needed (single-flight), wait until the task is RUNNING
+                             and its /health is OK, then proxy (SSE streaming passes through chunk by chunk)
+* idle reaper                desiredCount=0 after IDLE_TIMEOUT_S without requests and none in flight
+
+Backend address: ECS DescribeTasks -> awsvpc ENI attachment -> privateIPv4Address.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
+
+log = logging.getLogger("router")
+
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
+    "transfer-encoding", "upgrade", "host", "content-length",
+}
+
+
+@dataclass
+class Config:
+    cluster: str = "behemoth"
+    service: str = "behemoth-backend"
+    region: str | None = None
+    backend_port: int = 1337
+    listen_port: int = 1337
+    model_ids: list[str] = field(default_factory=lambda: ["cydonia-24b"])
+    owned_by: str = "cgg507"
+    proxy_paths: list[str] = field(default_factory=lambda: ["/v1/chat/completions"])
+    idle_timeout_s: float = 300.0
+    max_wait_s: float = 900.0
+    poll_interval_s: float = 5.0
+    keepalive_interval_s: float = 15.0
+    stream_keepalive: bool = True
+    cold_nonstream_mode: str = "wait"  # wait | reject
+    retry_after_s: int = 120
+    request_timeout_s: float = 1800.0
+    health_ttl_s: float = 10.0
+    api_key: str | None = None
+
+    @classmethod
+    def from_env(cls, env=os.environ) -> "Config":
+        def lst(name, default):
+            v = env.get(name)
+            return [x.strip() for x in v.split(",") if x.strip()] if v else default
+
+        c = cls()
+        c.cluster = env.get("ECS_CLUSTER", c.cluster)
+        c.service = env.get("ECS_SERVICE", c.service)
+        c.region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
+        c.backend_port = int(env.get("BACKEND_PORT", c.backend_port))
+        c.listen_port = int(env.get("LISTEN_PORT", c.listen_port))
+        c.model_ids = lst("MODEL_IDS", c.model_ids)
+        c.owned_by = env.get("MODEL_OWNED_BY", c.owned_by)
+        c.proxy_paths = lst("PROXY_PATHS", c.proxy_paths)
+        c.idle_timeout_s = float(env.get("IDLE_TIMEOUT_S", c.idle_timeout_s))
+        c.max_wait_s = float(env.get("MAX_WAIT_S", c.max_wait_s))
+        c.poll_interval_s = float(env.get("POLL_INTERVAL_S", c.poll_interval_s))
+        c.keepalive_interval_s = float(env.get("KEEPALIVE_INTERVAL_S", c.keepalive_interval_s))
+        c.stream_keepalive = env.get("STREAM_KEEPALIVE", "true").lower() in ("1", "true", "yes")
+        c.cold_nonstream_mode = env.get("COLD_NONSTREAM_MODE", c.cold_nonstream_mode)
+        c.retry_after_s = int(env.get("RETRY_AFTER_S", c.retry_after_s))
+        c.request_timeout_s = float(env.get("REQUEST_TIMEOUT_S", c.request_timeout_s))
+        c.api_key = env.get("ROUTER_API_KEY") or None
+        return c
+
+
+class StartupError(Exception):
+    pass
+
+
+class Backend:
+    """Owns the ECS service's desiredCount and the backend address."""
+
+    def __init__(self, cfg: Config, ecs, http: ClientSession):
+        self.cfg, self.ecs, self.http = cfg, ecs, http
+        self.address: str | None = None  # "ip:port"
+        self.healthy_at = 0.0
+        self.state = "unknown"  # unknown | stopped | starting | ready | failed | stopping
+        self._startup: asyncio.Task | None = None
+        self.inflight = 0
+        self.last_activity = time.monotonic()
+
+    async def _call(self, name, **kw):
+        return await asyncio.to_thread(getattr(self.ecs, name), **kw)
+
+    async def _health(self, address: str) -> bool:
+        try:
+            async with self.http.get(f"http://{address}/health", timeout=ClientTimeout(total=5)) as r:
+                return r.status == 200
+        except (ClientError, asyncio.TimeoutError, OSError):
+            return False
+
+    async def _running_address(self) -> str | None:
+        arns = (await self._call("list_tasks", cluster=self.cfg.cluster, serviceName=self.cfg.service,
+                                 desiredStatus="RUNNING")).get("taskArns", [])
+        if not arns:
+            return None
+        tasks = (await self._call("describe_tasks", cluster=self.cfg.cluster, tasks=arns)).get("tasks", [])
+        for t in tasks:
+            if t.get("lastStatus") != "RUNNING":
+                continue
+            for att in t.get("attachments", []):
+                if att.get("type") != "ElasticNetworkInterface":
+                    continue
+                for d in att.get("details", []):
+                    if d.get("name") == "privateIPv4Address":
+                        return f"{d['value']}:{self.cfg.backend_port}"
+        return None
+
+    async def _set_desired(self, n: int):
+        await self._call("update_service", cluster=self.cfg.cluster, service=self.cfg.service, desiredCount=n)
+
+    async def _start(self) -> str:
+        self.state = "starting"
+        deadline = time.monotonic() + self.cfg.max_wait_s
+        svc = (await self._call("describe_services", cluster=self.cfg.cluster, services=[self.cfg.service]))
+        svcs = svc.get("services", [])
+        if not svcs:
+            raise StartupError(f"service {self.cfg.service} not found")
+        if svcs[0].get("desiredCount", 0) < 1:
+            log.info("scaling %s to 1", self.cfg.service)
+            await self._set_desired(1)
+        while time.monotonic() < deadline:
+            try:
+                addr = await self._running_address()
+            except Exception as e:  # transient API errors: keep polling until the deadline
+                log.warning("ECS poll failed: %s", e)
+                addr = None
+            if addr and await self._health(addr):
+                log.info("backend ready at %s", addr)
+                return addr
+            await asyncio.sleep(self.cfg.poll_interval_s)
+        raise StartupError(f"backend not healthy after {self.cfg.max_wait_s:.0f}s")
+
+    def is_warm(self) -> bool:
+        return self.address is not None and self.state == "ready"
+
+    async def ensure(self) -> str:
+        """Return a healthy backend address, starting the service if needed. Concurrent callers share one startup."""
+        if self.address and time.monotonic() - self.healthy_at < self.cfg.health_ttl_s:
+            return self.address
+        if self.address and await self._health(self.address):
+            self.healthy_at = time.monotonic()
+            return self.address
+        self.address = None
+        if self._startup is None or self._startup.done():
+            self._startup = asyncio.create_task(self._start())
+        try:
+            addr = await asyncio.shield(self._startup)
+        except StartupError:
+            self.state = "failed"
+            raise
+        except Exception as e:
+            self.state = "failed"
+            raise StartupError(str(e)) from e
+        self.address, self.healthy_at, self.state = addr, time.monotonic(), "ready"
+        return addr
+
+    def lost(self):
+        """Backend vanished (spot interruption, crash): forget it; the next request restarts it."""
+        log.warning("backend %s lost", self.address)
+        self.address, self.state = None, "unknown"
+
+    async def maybe_idle_stop(self) -> bool:
+        if self.inflight or (self._startup and not self._startup.done()):
+            return False
+        if time.monotonic() - self.last_activity < self.cfg.idle_timeout_s:
+            return False
+        if self.state == "stopped":
+            return False
+        svcs = (await self._call("describe_services", cluster=self.cfg.cluster,
+                                 services=[self.cfg.service])).get("services", [])
+        if svcs and svcs[0].get("desiredCount", 0) > 0:
+            log.info("idle for %.0fs: scaling %s to 0", self.cfg.idle_timeout_s, self.cfg.service)
+            await self._set_desired(0)
+        self.address, self.state = None, "stopped"
+        return True
+
+
+def _error(status: int, msg: str, retry_after: int | None = None) -> web.Response:
+    headers = {"Retry-After": str(retry_after)} if retry_after else None
+    return web.json_response({"error": {"message": msg, "type": "backend_unavailable"}}, status=status,
+                             headers=headers)
+
+
+def _sse_error(msg: str) -> bytes:
+    return (b"data: " + json.dumps({"error": {"message": msg, "type": "backend_unavailable"}}).encode()
+            + b"\n\ndata: [DONE]\n\n")
+
+
+async def _keepalive_until(resp: web.StreamResponse, fut: asyncio.Future, interval: float):
+    while not fut.done():
+        done, _ = await asyncio.wait({fut}, timeout=interval)
+        if not done:
+            await resp.write(b": waiting for backend to start\n\n")
+
+
+class Router:
+    def __init__(self, cfg: Config, ecs, http: ClientSession | None = None):
+        self.cfg, self.ecs, self._http = cfg, ecs, http
+        self.backend: Backend | None = None
+        self._reaper: asyncio.Task | None = None
+
+    async def on_startup(self, app):
+        if self._http is None:
+            self._http = ClientSession(timeout=ClientTimeout(total=None, sock_connect=10))
+        self.backend = Backend(self.cfg, self.ecs, self._http)
+        self._reaper = asyncio.create_task(self._reap())
+
+    async def on_cleanup(self, app):
+        if self._reaper:
+            self._reaper.cancel()
+        if self._http:
+            await self._http.close()
+
+    async def _reap(self):
+        interval = max(1.0, min(30.0, self.cfg.idle_timeout_s / 5))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.backend.maybe_idle_stop()
+            except Exception as e:
+                log.warning("idle check failed: %s", e)
+
+    def _authorized(self, request: web.Request) -> bool:
+        if not self.cfg.api_key:
+            return True
+        return request.headers.get("Authorization", "") == f"Bearer {self.cfg.api_key}"
+
+    async def models(self, request):
+        now = int(time.time())
+        return web.json_response({"object": "list", "data": [
+            {"id": m, "object": "model", "created": now, "owned_by": self.cfg.owned_by} for m in self.cfg.model_ids]})
+
+    async def health(self, request):
+        b = self.backend
+        return web.json_response({"healthy": True, "backend": b.state, "inflight": b.inflight,
+                                  "idle_s": round(time.monotonic() - b.last_activity, 1)})
+
+    async def proxy(self, request: web.Request):
+        if not self._authorized(request):
+            return web.json_response({"error": {"message": "unauthorized"}}, status=401)
+        b = self.backend
+        body = await request.read()
+        try:
+            stream = bool(json.loads(body or b"{}").get("stream"))
+        except (ValueError, AttributeError):
+            stream = False
+        b.inflight += 1
+        b.last_activity = time.monotonic()
+        try:
+            return await self._proxy(request, body, stream)
+        except _ClientGone as e:
+            log.info("client disconnected mid-response")
+            return e.resp
+        finally:
+            b.inflight -= 1
+            b.last_activity = time.monotonic()
+
+    async def _proxy(self, request, body, stream):
+        b, cfg = self.backend, self.cfg
+        resp: web.StreamResponse | None = None
+        if not b.is_warm() and not stream and cfg.cold_nonstream_mode == "reject":
+            fut = asyncio.ensure_future(b.ensure())  # warm up in the background, tell the client to come back
+            fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+            return _error(503, "backend is starting, retry later", cfg.retry_after_s)
+        ensure = asyncio.ensure_future(b.ensure())
+        if stream and cfg.stream_keepalive and not b.is_warm():
+            # commit to an SSE 200 now so clients/proxies see bytes while the instance boots
+            resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream",
+                                                           "Cache-Control": "no-cache"})
+            await resp.prepare(request)
+            try:
+                await _keepalive_until(resp, ensure, cfg.keepalive_interval_s)
+            except (ConnectionResetError, ClientError):
+                ensure.cancel()
+                raise
+        for attempt in range(2):
+            try:
+                addr = await ensure
+            except StartupError as e:
+                if resp is not None:
+                    await resp.write(_sse_error(f"backend startup failed: {e}"))
+                    await resp.write_eof()
+                    return resp
+                return _error(503, f"backend startup failed: {e}", cfg.retry_after_s)
+            try:
+                return await self._forward(request, body, addr, resp)
+            except _BackendGone as e:
+                b.lost()
+                if e.started or attempt == 1:
+                    if resp is not None:
+                        if not e.started:
+                            await resp.write(_sse_error("backend lost"))
+                        await resp.write_eof()
+                        return resp
+                    return _error(503, "backend lost", cfg.retry_after_s)
+                ensure = asyncio.ensure_future(b.ensure())  # connect failed before any byte: retry once
+                if resp is not None:
+                    await _keepalive_until(resp, ensure, cfg.keepalive_interval_s)
+
+    async def _forward(self, request, body, addr, resp):
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP | {"authorization"}}
+        url = f"http://{addr}{request.path_qs}"
+        started = False
+        try:
+            async with self._http.request(request.method, url, data=body, headers=headers,
+                                          timeout=ClientTimeout(total=self.cfg.request_timeout_s,
+                                                                sock_connect=10)) as up:
+                if resp is None:
+                    out_headers = {k: v for k, v in up.headers.items() if k.lower() not in HOP_BY_HOP}
+                    resp = web.StreamResponse(status=up.status, headers=out_headers)
+                    await resp.prepare(request)
+                elif up.status != 200:
+                    started = True
+                    text = (await up.read()).decode(errors="replace")
+                    await resp.write(_sse_error(f"backend returned {up.status}: {text[:500]}"))
+                    await resp.write_eof()
+                    return resp
+                started = True
+                async for chunk in up.content.iter_any():
+                    try:
+                        await resp.write(chunk)
+                    except (ClientError, OSError) as e:  # the client went away; not a backend failure
+                        raise _ClientGone(resp) from e
+                await resp.write_eof()
+                return resp
+        except (ClientError, asyncio.TimeoutError, OSError) as e:
+            raise _BackendGone(started) from e
+
+
+class _ClientGone(Exception):
+    def __init__(self, resp):
+        super().__init__("client gone")
+        self.resp = resp
+
+
+class _BackendGone(Exception):
+    def __init__(self, started: bool):
+        super().__init__("backend gone")
+        self.started = started
+
+
+def make_app(cfg: Config, ecs, http: ClientSession | None = None) -> web.Application:
+    r = Router(cfg, ecs, http)
+    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app.on_startup.append(r.on_startup)
+    app.on_cleanup.append(r.on_cleanup)
+    app.router.add_get("/v1/models", r.models)
+    app.router.add_get("/health", r.health)
+    for p in cfg.proxy_paths:
+        app.router.add_post(p, r.proxy)
+    return app
+
+
+def main():
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    import boto3  # only needed in production
+
+    cfg = Config.from_env()
+    ecs = boto3.client("ecs", region_name=cfg.region)
+    web.run_app(make_app(cfg, ecs), host="0.0.0.0", port=cfg.listen_port, access_log=None)
+
+
+if __name__ == "__main__":
+    main()
