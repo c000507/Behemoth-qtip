@@ -416,3 +416,11 @@ All 12 shapes K{128,256,512} x M{32,64} x N{128,256} emitted by
 lift_hip.emit_matmul (verified per-shape template set) execute on trn1 with
 numpy x@w agreement (allclose 1e-2, no NaN/zeros): 12 pass, 0 fail.
 templates archived: tools/shape_templates.json (12 buckets).
+
+## Perf: emitted vs neuronx-cc baseline (trn1 2026-11-09)
+
+nrt_execute latency (50-iter avg, µs): shape / emitted / baseline:
+32x128x128: 58.4 / 58.2 | 32x256x128: 58.3 / 57.9 | 64x256x256: 60.4 / 60.1 |
+32x512x128: 60.6 / 60.4. Emitted = baseline within noise; both launch-bound
+(~58µs host roundtrip floor; device matmul at these sizes is µs-scale).
+Timing harness: /home/ubuntu/work/nrtd/timing.cpp on box.
