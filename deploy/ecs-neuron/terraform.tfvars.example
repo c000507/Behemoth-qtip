@@ -24,7 +24,7 @@ model_ids          = ["cydonia-24b"]
 
 idle_timeout_seconds = 300
 max_wait_seconds     = 900
-cold_nonstream_mode  = "wait"
+cold_nonstream_mode  = "keepalive"
 
 # Tunnel token: store it once (outside Terraform), reference by ARN only, e.g.
 #   aws secretsmanager create-secret --name behemoth/cloudflared-token --secret-string "$TOKEN"

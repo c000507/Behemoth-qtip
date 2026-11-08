@@ -128,6 +128,7 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         await self.backend.close()
 
     async def start(self, ecs, asg=None, **kw):
+        kw.setdefault("cold_nonstream_mode", "wait")  # most tests check scaling state right after the response
         cfg = Config(backend_port=self.backend.port, poll_interval_s=0.02, keepalive_interval_s=0.02,
                      max_wait_s=kw.pop("max_wait_s", 5), idle_timeout_s=kw.pop("idle_timeout_s", 60),
                      health_ttl_s=kw.pop("health_ttl_s", 10), **kw)
@@ -172,9 +173,39 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status, 200)
         self.assertEqual(r.headers["Content-Type"], "text/event-stream")
         text = (await r.read()).decode()
-        self.assertIn(": waiting for backend to start", text)
+        # keepalives are empty chunks, so clients waiting for a first data event don't give up
+        self.assertIn('"chatcmpl-wait"', text)
+        self.assertIn('"delta": {"role": "assistant", "content": ""}', text)
+        self.assertNotIn(": waiting", text)
         self.assertIn('"Hel"', text)
         self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    async def test_stream_keepalive_comment_mode(self):
+        c = await self.start(FakeECS(boot_polls=4), stream_keepalive_mode="comment")
+        r = await c.post("/v1/chat/completions", json={"stream": True, "messages": []})
+        text = (await r.read()).decode()
+        self.assertIn(": waiting for backend to start", text)
+        self.assertNotIn("chatcmpl-wait", text)
+        self.assertIn('"Hel"', text)
+
+    async def test_cold_nonstream_keepalive(self):
+        c = await self.start(FakeECS(boot_polls=4), cold_nonstream_mode="keepalive")
+        r = await c.post("/v1/chat/completions", json={"model": "cydonia-24b", "messages": []})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        raw = await r.read()
+        self.assertTrue(raw.startswith(b" "))  # whitespace keepalives before the body
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "Hello")
+        self.assertEqual(self.ecs.updates, [1])
+        # warm: plain passthrough, no leading whitespace
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertFalse((await r.read()).startswith(b" "))
+
+    async def test_cold_nonstream_keepalive_startup_failure(self):
+        c = await self.start(FakeECS(never_start=True), cold_nonstream_mode="keepalive", max_wait_s=0.2)
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(r.status, 200)  # already committed; the error is in the body
+        self.assertIn("backend startup failed", json.loads(await r.read())["error"]["message"])
 
     async def test_warm_stream_passthrough_headers(self):
         c = await self.start(FakeECS())

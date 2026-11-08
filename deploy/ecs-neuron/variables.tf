@@ -310,12 +310,12 @@ variable "max_wait_seconds" {
 }
 
 variable "cold_nonstream_mode" {
-  description = "Non-streaming request on a cold backend: \"wait\" (hold the request up to max_wait_seconds) or \"reject\" (503 + Retry-After immediately, warm up in the background)."
+  description = "Non-streaming request on a cold backend: \"keepalive\" (200 at once, a space every few seconds so Cloudflare's 100 s idle limit never trips, then the JSON body; errors arrive as a 200 with an error body), \"wait\" (hold silently up to max_wait_seconds) or \"reject\" (503 + Retry-After immediately, warm up in the background)."
   type        = string
-  default     = "wait"
+  default     = "keepalive"
   validation {
-    condition     = contains(["wait", "reject"], var.cold_nonstream_mode)
-    error_message = "cold_nonstream_mode must be wait or reject."
+    condition     = contains(["keepalive", "wait", "reject"], var.cold_nonstream_mode)
+    error_message = "cold_nonstream_mode must be keepalive, wait or reject."
   }
 }
 

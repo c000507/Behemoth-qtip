@@ -131,14 +131,18 @@ Terraform ignores later changes to it.
   IP comes from the same call. There is no DNS TTL or stale record after a spot replacement, and no namespace to run.
   The awsvpc network mode puts the IP straight into the task attachment, so `ec2:DescribeNetworkInterfaces` is not
   needed.
-* **Waiting.** Streaming requests (`"stream": true`) get `200 text/event-stream` immediately, then an SSE comment
-  (`: waiting for backend to start`) every 15 s until the backend is ready, then the backend's stream unchanged.
-  Non-streaming requests are held silently by default (`cold_nonstream_mode = "wait"`) for up to `max_wait_seconds`
-  (900). Any proxy in between has to tolerate that silence. Cloudflare closes an origin that sends nothing for 100 s
-  (HTTP 524) on most plans, so behind the tunnel a cold non-streaming request fails at the edge while the warm-up
-  continues, and a client retry a few minutes later succeeds. Set `cold_nonstream_mode = "reject"` to return
-  `503 Retry-After: 120` immediately and warm up in the background instead. The ALB's idle timeout defaults to 1200 s
-  for this reason.
+* **Waiting.** Every request on a cold backend gets a `200` immediately and bytes every 5 s (`KEEPALIVE_INTERVAL_S`)
+  until the backend is ready, so Cloudflare's 100 s idle limit (HTTP 524) never trips.
+  * Streaming (`"stream": true`): `text/event-stream` with an empty `chat.completion.chunk`
+    (`delta: {role: assistant, content: ""}`) as the keepalive, because some clients time out waiting for the first
+    `data:` event and ignore SSE comments. `STREAM_KEEPALIVE_MODE=comment` sends `: waiting for backend to start`
+    instead. Then the backend's stream unchanged.
+  * Non-streaming (`cold_nonstream_mode = "keepalive"`, the default): `application/json` with a space as the keepalive,
+    then the backend's JSON body. JSON parsers skip leading whitespace. The status is committed before the backend
+    answers, so a backend or startup error arrives as `200` with an `{"error": ...}` body.
+  * `cold_nonstream_mode = "wait"` holds non-streaming requests silently for up to `max_wait_seconds` (900), which
+    fails at the Cloudflare edge after 100 s. `"reject"` returns `503 Retry-After: 120` immediately and warms up in the
+    background. The ALB's idle timeout defaults to 1200 s for this reason.
 * **Idle.** Every `min(30 s, idle/5)` the router checks for no request in flight, no startup running and
   `idle_timeout_seconds` (300) since the last request ended. When all hold it sets `desiredCount=0`. The task stops,
   managed scaling scales the ASG to 0 once its scale-in alarm fires (about 15 one-minute datapoints, so the instance
@@ -199,7 +203,8 @@ If spot capacity is short in us-east-1f, the wait has no upper bound and the req
   subnets if more become available, or temporarily switch the ASG to on-demand
   (`on_demand_percentage_above_base_capacity = 100`).
 * **Timeouts during cold start.** See "Waiting". Upstream clients and the beaverai router have their own timeouts,
-  and those are unknown. Streaming plus keepalive is the only path that reliably survives a 5-9 min cold start.
+  and those are unknown: the keepalives keep the connection open, but a client with a total or time-to-first-token
+  deadline below the cold start (about 2 min with the warm pool) still gives up.
 * **Neuron driver vs container runtime.** The host's `aws-neuronx-dkms` comes from the AMI, and `libnrt` /
   collectives come from the image. A new `recommended` AMI can break an older image, and the other way round. Pin
   `backend_ami_id` after the first good run, and pin `NEURON_RUNTIME_VERSION` / `NEURON_COLLECTIVES_VERSION` to the

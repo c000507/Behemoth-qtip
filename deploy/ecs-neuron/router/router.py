@@ -42,9 +42,12 @@ class Config:
     idle_timeout_s: float = 300.0
     max_wait_s: float = 900.0
     poll_interval_s: float = 5.0
-    keepalive_interval_s: float = 15.0
+    keepalive_interval_s: float = 5.0
     stream_keepalive: bool = True
-    cold_nonstream_mode: str = "wait"  # wait | reject
+    stream_keepalive_mode: str = "data"  # data (empty chat.completion.chunk) | comment (": ..." SSE comment)
+    # keepalive: 200 right away, a space every keepalive_interval_s, then the backend's body (errors keep 200)
+    # wait: hold silently up to max_wait_s | reject: 503 + Retry-After at once, warm up in the background
+    cold_nonstream_mode: str = "keepalive"
     retry_after_s: int = 120
     request_timeout_s: float = 1800.0
     health_ttl_s: float = 10.0
@@ -71,6 +74,7 @@ class Config:
         c.poll_interval_s = float(env.get("POLL_INTERVAL_S", c.poll_interval_s))
         c.keepalive_interval_s = float(env.get("KEEPALIVE_INTERVAL_S", c.keepalive_interval_s))
         c.stream_keepalive = env.get("STREAM_KEEPALIVE", "true").lower() in ("1", "true", "yes")
+        c.stream_keepalive_mode = env.get("STREAM_KEEPALIVE_MODE", c.stream_keepalive_mode)
         c.cold_nonstream_mode = env.get("COLD_NONSTREAM_MODE", c.cold_nonstream_mode)
         c.retry_after_s = int(env.get("RETRY_AFTER_S", c.retry_after_s))
         c.request_timeout_s = float(env.get("REQUEST_TIMEOUT_S", c.request_timeout_s))
@@ -264,16 +268,33 @@ def _error(status: int, msg: str, retry_after: int | None = None) -> web.Respons
                              headers=headers)
 
 
+def _held_error(msg: str, stream: bool) -> bytes:
+    if stream:
+        return _sse_error(msg)
+    return json.dumps({"error": {"message": msg, "type": "backend_unavailable"}}).encode()
+
+
 def _sse_error(msg: str) -> bytes:
     return (b"data: " + json.dumps({"error": {"message": msg, "type": "backend_unavailable"}}).encode()
             + b"\n\ndata: [DONE]\n\n")
 
 
-async def _keepalive_until(resp: web.StreamResponse, fut: asyncio.Future, interval: float):
+def _keepalive_bytes(stream: bool, mode: str, model: str) -> bytes:
+    if not stream:
+        return b" "  # leading whitespace before the JSON body
+    if mode == "comment":
+        return b": waiting for backend to start\n\n"
+    # a real (empty) chunk: clients that time out on the first data event, not on bytes, keep waiting
+    chunk = {"id": "chatcmpl-wait", "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+             "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
+    return b"data: " + json.dumps(chunk).encode() + b"\n\n"
+
+
+async def _keepalive_until(resp: web.StreamResponse, fut: asyncio.Future, interval: float, payload: bytes):
     while not fut.done():
         done, _ = await asyncio.wait({fut}, timeout=interval)
         if not done:
-            await resp.write(b": waiting for backend to start\n\n")
+            await resp.write(payload)
 
 
 class Router:
@@ -325,13 +346,14 @@ class Router:
         b = self.backend
         body = await request.read()
         try:
-            stream = bool(json.loads(body or b"{}").get("stream"))
+            req = json.loads(body or b"{}")
+            stream, model = bool(req.get("stream")), str(req.get("model") or self.cfg.model_ids[0])
         except (ValueError, AttributeError):
-            stream = False
+            stream, model = False, self.cfg.model_ids[0]
         b.inflight += 1
         b.last_activity = time.monotonic()
         try:
-            return await self._proxy(request, body, stream)
+            return await self._proxy(request, body, stream, model)
         except _ClientGone as e:
             log.info("client disconnected mid-response")
             return e.resp
@@ -339,21 +361,23 @@ class Router:
             b.inflight -= 1
             b.last_activity = time.monotonic()
 
-    async def _proxy(self, request, body, stream):
+    async def _proxy(self, request, body, stream, model):
         b, cfg = self.backend, self.cfg
         resp: web.StreamResponse | None = None
+        keepalive = _keepalive_bytes(stream, cfg.stream_keepalive_mode, model)
         if not b.is_warm() and not stream and cfg.cold_nonstream_mode == "reject":
             fut = asyncio.ensure_future(b.ensure())  # warm up in the background, tell the client to come back
             fut.add_done_callback(lambda f: f.cancelled() or f.exception())
             return _error(503, "backend is starting, retry later", cfg.retry_after_s)
         ensure = asyncio.ensure_future(b.ensure())
-        if stream and cfg.stream_keepalive and not b.is_warm():
-            # commit to an SSE 200 now so clients/proxies see bytes while the instance boots
-            resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream",
-                                                           "Cache-Control": "no-cache"})
+        hold = cfg.stream_keepalive if stream else cfg.cold_nonstream_mode == "keepalive"
+        if hold and not b.is_warm():
+            # commit to a 200 now so clients/proxies (Cloudflare: 100 s without bytes) see bytes while the instance boots
+            ctype = "text/event-stream" if stream else "application/json"
+            resp = web.StreamResponse(status=200, headers={"Content-Type": ctype, "Cache-Control": "no-cache"})
             await resp.prepare(request)
             try:
-                await _keepalive_until(resp, ensure, cfg.keepalive_interval_s)
+                await _keepalive_until(resp, ensure, cfg.keepalive_interval_s, keepalive)
             except (ConnectionResetError, ClientError):
                 ensure.cancel()
                 raise
@@ -362,26 +386,26 @@ class Router:
                 addr = await ensure
             except StartupError as e:
                 if resp is not None:
-                    await resp.write(_sse_error(f"backend startup failed: {e}"))
+                    await resp.write(_held_error(f"backend startup failed: {e}", stream))
                     await resp.write_eof()
                     return resp
                 return _error(503, f"backend startup failed: {e}", cfg.retry_after_s)
             try:
-                return await self._forward(request, body, addr, resp)
+                return await self._forward(request, body, addr, resp, stream)
             except _BackendGone as e:
                 b.lost()
                 if e.started or attempt == 1:
                     if resp is not None:
                         if not e.started:
-                            await resp.write(_sse_error("backend lost"))
+                            await resp.write(_held_error("backend lost", stream))
                         await resp.write_eof()
                         return resp
                     return _error(503, "backend lost", cfg.retry_after_s)
                 ensure = asyncio.ensure_future(b.ensure())  # connect failed before any byte: retry once
                 if resp is not None:
-                    await _keepalive_until(resp, ensure, cfg.keepalive_interval_s)
+                    await _keepalive_until(resp, ensure, cfg.keepalive_interval_s, keepalive)
 
-    async def _forward(self, request, body, addr, resp):
+    async def _forward(self, request, body, addr, resp, stream):
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP | {"authorization"}}
         url = f"http://{addr}{request.path_qs}"
         started = False
@@ -393,12 +417,13 @@ class Router:
                     out_headers = {k: v for k, v in up.headers.items() if k.lower() not in HOP_BY_HOP}
                     resp = web.StreamResponse(status=up.status, headers=out_headers)
                     await resp.prepare(request)
-                elif up.status != 200:
+                elif up.status != 200 and stream:
                     started = True
                     text = (await up.read()).decode(errors="replace")
                     await resp.write(_sse_error(f"backend returned {up.status}: {text[:500]}"))
                     await resp.write_eof()
                     return resp
+                # held non-stream response: the status is already 200, the backend's JSON body (or error) follows
                 started = True
                 async for chunk in up.content.iter_any():
                     try:
