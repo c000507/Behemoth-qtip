@@ -322,3 +322,22 @@ executes A@B exactly (maxdiff 4e-6).
 Lifter implication: arbitrary K = (K/128 - 1) refill descs + (K/64?) PE
 groups with op10 byte10 alternating ring halves; exact per-group cadence
 still needs one more decode pass (dynamic queue ring semantics).
+
+## K=512 cadence (mm3 oracle, trn1 2026-11-09)
+
+K=512, N=128, M=32: PE stream = 80 slots:
+1. Identity/A phase (slots 6-37): 16 [LW desc][MM] pairs; LW srcs cycle 4 chunk
+   addrs (0x2f7fc/0x2f9fc/0x2fbfc/0x2fdfc, step -1) each used TWICE; MM A =
+   identity 0x2fe00, dst PSUM 0x2001000/0x2001080/0x2001100/0x2001180 (4
+   output sub-tiles, stride 0x80 = 128B); op10 b1: 1 at each 4-chunk group
+   start, 2 else; op10 "addr" field = PSUM tick target, byte10 = 32.
+2. B/PV phase (slots 40-71): 16 pairs, LW srcs cycle 0x2effc/0x2f1fc/0x2f3fc/
+   0x2f5fc; MM dst PSUM 0x4000/0x4080/0x4100/0x4180; op10 b1=3 (SINGLE per
+   pair), byte10 = 32.
+3. PV pass (slots 72-79): 2 pairs num=128, dst PSUM 0x800; LW src 0x427c.
+4. Event sems bracket phases: wait 5/24 (identity), 5/8, 5/9, upd 19/5 at
+   group boundaries (slots 36, 70, 78).
+mm3.neff + full mm3_x extracted streams = /tmp/opencode/neff/mm3.neff +
+/tmp/opencode/mm3_x/ (volatile). Ring/chunk cadence per pool descs still to
+be decoded locally from mm3_x/sg00/Pool0.bin (my hand-parse on box used wrong
+struct offsets; use tools/neff_isa.py decode).
