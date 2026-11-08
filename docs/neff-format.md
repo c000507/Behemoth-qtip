@@ -269,3 +269,38 @@ Working reference streams live in /tmp/opencode/ref26bb/sg00/ and
   Next step: compile trivial torch.matmul via torch_neuronx.trace on the box
   (nki-cache kernels are mostly elementwise; only cache kernel with PE =
   complex attention) -> clean minimal PE ucode oracle with known shapes.
+
+## PE matmul numerics proven (2026-11-09, trace-matmul oracle)
+
+Generated a minimal matmul NEFF by hand-writing serialized StableHLO
+(`jax.jit(lambda a,b: a@b).lower(...).compiler_ir().operation.write_bytecode()`
+-> `neuronx-cc compile graph.mlirbc --framework XLA --target trn1`).
+`graph.hlo` from torch_neuronx.trace is a SERIALIZED HloProto (binary), not text.
+
+The resulting NEFF (32x128 @ 128x128 f32) executes on trn1 via neff_io2 with
+maxdiff 0 (A@B). AND my emitter's rebuild (my header/tar/neff.json/def.json/DGE
++ compiler streams + identity npy file var) also executes A@B correctly
+(maxdiff 2e-6 = f32 noise). Template decoded:
+
+- def vars: SB 0, input0 1, input1 2, output0 3, identity file var 4
+  (value_sg0000_identity_N_CRSM.npy shipped in tar), DGETable0 5 = [1,2,3].
+- dma_queue: qPoolDynamic sems [8,9,10], qSPSpillReload0 [24,25,26].
+- SP0.json dma: ONE desc: identity file -> SB 196480, sem 24 (qSPSpillReload0).
+- Pool0: [177][0][204][0][op212 input0 16KB -> SB 0x2fd80 sem8][0-pads? no:
+  op212 descs also carry implicit pads? NO - pool stream dense 64B instrs,
+  no 32B pads: op212@2, op212@3, op212@4, op164 NOP@5].
+- PE0 (32B slots, every instr + pad): [177][0][204][0][160 wait 5/24 GE16][0]
+  [LW wait 5/8 GE16 src=SB 0x2ff7c step-1 num128][op10 b1=1]
+  [MM A=SB 0x2ff80 (identity tile) dst PSUM 0x2000000 upd 19/5][op10 b1=2]
+  [LW src 0x2ff7c no wait][op10 b1=2]
+  [MM same upd 19/5][op10 b1=3 SINGLE]
+  [160 wait 5/9 GE16][0][LW wait 5/4 ...][op10(1)][MM][op10(2)][LW][op10(2)]
+  [MM upd 19/5][op10(3)].
+- The compiler lowers x@w as identity-tile matmuls on partitions (A operand =
+  identity staged tile; B operand = LW-loaded reversed input tile); groups
+  chain: first op10 after LW = b1=1 (MULTI_START), between groups b1=2
+  (MULTI_MID/END), final group ends b1=3 (SINGLE).
+- op212 pool descs here: marker32 src = HBM var (DGE idx), dst marker16 = SB
+  byte offset; sem_increment=16; y-out desc waits sem4 GE2 (!; sem4 = dynamic
+  scratch slot, outside def queue sets - wait, wait_idx=4 means desc waits on
+  sem 4 = ... it's the compiler's internal sem numbering, works as shipped).
