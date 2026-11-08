@@ -395,21 +395,46 @@ def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> P
     return out / f"{name}.neff"
 
 
-def emit_elementwise_4096(outdir: Path, name: str = "elementwise") -> Path:
-    """Emit an elementwise y = f(x)*g(w) NEFF (4096 elements) using the
-    verified ref26bb DVE+activation pipeline (pool op212 staging -> DVE mul
-    -> activation scale -> pool y-out). Template: /tmp/opencode/ref26bb.
-    Streams are shape-fixed (4096 elements, 32x128 lanes); extension to
-    arbitrary n = more DVE passes (next session)."""
-    import io as _io
+def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise") -> Path:
+    """Emit y = scale*x*w elementwise NEFF over n f32 elements via the
+    ref26bb DVE+activation pipeline (pool op212 staging -> DVE mul -> act
+    -> y-out). n <= 16383 (pool desc elem_size u16 limit); larger n = more
+    DVE passes (undecoded). Stream template: /tmp/opencode/ref26bb."""
     ref = Path("/tmp/opencode/ref26bb")
     if not ref.exists():
-        raise FileNotFoundError("ref26bb elementwise template not extracted; "
-                                 "pull from nki-cache kernel-26bb on box")
+        raise FileNotFoundError("ref26bb elementwise template not extracted")
+    if not (0 < n <= 16383):
+        raise ValueError(f"n={n} out of range (1..16383)")
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
     shutil.copytree(ref, out)
-    # my container pieces: header/tar via packer, neff.json/info/kelf from template
+    sg = out / "sg00"
+    dve = bytearray(sg / "DVE0.bin".replace("DVE0.bin","DVE0.bin").read()
+                    if False else open(sg / "DVE0.bin","rb").read())
+    # patch element count u16 @26 in both op65 mul instrs (slots 4 and 10)
+    for slot in (4, 10):
+        off = slot * 32
+        assert dve[off] == 65
+        struct.pack_into("<H", dve, off + 26, n)
+    (sg / "DVE0.bin").write_bytes(bytes(dve))
+    # patch pool desc elem sizes (u16 at offsets 36 and 60 within each desc)
+    pool = bytearray(open(sg / "Pool0.bin","rb").read())
+    nbytes = n * 4
+    for di in (2, 3, 4):
+        base = di * 64
+        if pool[base] != 212:
+            continue  # y-out desc uses op67, not op212 - skip elem patch
+        struct.pack_into("<H", pool, base + 36, nbytes)
+        struct.pack_into("<H", pool, base + 60, nbytes)
+    (sg / "Pool0.bin").write_bytes(bytes(pool))
+    # def.json + neff.json tensor sizes
+    for jf in ("sg00/def.json", "neff.json"):
+        p = out / jf
+        txt = p.read_text()
+        for old, new in (('"size": 16384', f'"size": {nbytes}'),
+                         ('[1, 4096]', f'[1, {n}]'), ('[4096]', f'[{n}]')):
+            txt = txt.replace(old, new)
+        p.write_text(txt)
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
