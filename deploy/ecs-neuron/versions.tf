@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.10.0" # S3 backend use_lockfile
 
   required_providers {
     aws = {
@@ -8,14 +8,10 @@ terraform {
     }
   }
 
-  # Optional remote state (create the bucket/table first, then `terraform init -migrate-state`):
-  # backend "s3" {
-  #   bucket         = "behemoth-tfstate-912935854432"
-  #   key            = "ecs-neuron/terraform.tfstate"
-  #   region         = "us-east-1"
-  #   encrypt        = true
-  #   use_lockfile   = true            # Terraform >= 1.10; or dynamodb_table = "terraform-locks"
-  # }
+  # Remote state in S3 with native locking (no DynamoDB), partial config: the values come from backend.hcl
+  # (see backend.hcl.example; the bucket is created by pipeline/). One-time migration from the local state:
+  #   terraform init -migrate-state -backend-config=backend.hcl
+  backend "s3" {}
 }
 
 provider "aws" {

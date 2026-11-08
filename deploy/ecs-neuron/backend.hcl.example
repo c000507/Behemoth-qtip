@@ -1,0 +1,7 @@
+# cp backend.hcl.example backend.hcl   (gitignored), then: terraform init -backend-config=backend.hcl
+# The bucket is created by pipeline/ (output state_bucket). The CodeBuild plan/apply builds write the same file.
+bucket       = "behemoth-tfstate-912935854432"
+key          = "ecs-neuron/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true # S3 native lock object ecs-neuron/terraform.tfstate.tflock (Terraform >= 1.10), no DynamoDB

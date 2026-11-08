@@ -4,3 +4,7 @@
 terraform.tfvars
 backend/bin/
 __pycache__/
+backend.hcl
+tfplan
+*.tfplan
+tf.plan

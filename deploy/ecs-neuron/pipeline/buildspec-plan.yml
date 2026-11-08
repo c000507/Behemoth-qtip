@@ -1,0 +1,55 @@
+# CodeBuild: terraform plan of the main stack with the image tags from the BuildImages stage.
+# Inputs (action env): COMMIT_ID, BACKEND_TAG, ROUTER_TAG. Project env: TF_VERSION, TF_SHA256, TF_STATE_*, TF_CONFIG_KEY,
+# STACK_DIR. Config: terraform.tfvars is fetched from s3://$TF_STATE_BUCKET/$TF_CONFIG_KEY (it never enters the repo);
+# the image tags are -var overrides on top of it.
+# Output artifact PlanOutput: tfplan (binary, applied as-is), plan.txt (human-readable), plan-meta.env.
+version: 0.2
+
+env:
+  shell: bash
+  exported-variables:
+    - PLAN_SUMMARY
+    - PLAN_LOG_URL
+
+phases:
+  install:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/$STACK_DIR/pipeline/scripts/install-terraform.sh"
+  pre_build:
+    commands:
+      - D="$CODEBUILD_SRC_DIR/$STACK_DIR"; OUT="$CODEBUILD_SRC_DIR/plan-out"; mkdir -p "$OUT"
+      - |
+        for t in "$BACKEND_TAG" "$ROUTER_TAG"; do
+          [[ "$t" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { echo "invalid image tag '$t'"; exit 1; }
+        done
+      # guard: a missing state object (migration not done yet) would plan to re-create the whole stack
+      - |
+        if ! aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$TF_STATE_KEY" >/dev/null 2>&1 \
+           && [ "${ALLOW_EMPTY_STATE:-false}" != true ]; then
+          echo "s3://$TF_STATE_BUCKET/$TF_STATE_KEY not found: migrate the local state first (pipeline/README.md)"; exit 1
+        fi
+      - bash "$CODEBUILD_SRC_DIR/$STACK_DIR/pipeline/scripts/tf-init.sh"
+      - aws s3 cp --only-show-errors "s3://$TF_STATE_BUCKET/$TF_CONFIG_KEY" "$D/terraform.tfvars"
+      - terraform -chdir="$D" validate -no-color
+  build:
+    commands:
+      - D="$CODEBUILD_SRC_DIR/$STACK_DIR"; OUT="$CODEBUILD_SRC_DIR/plan-out"
+      - >-
+        terraform -chdir="$D" plan -input=false -no-color -lock-timeout=5m -out=tfplan
+        -var "backend_image_tag=$BACKEND_TAG" -var "router_image_tag=$ROUTER_TAG"
+      - terraform -chdir="$D" show -no-color tfplan > "$OUT/plan.txt"
+      - cp "$D/tfplan" "$OUT/tfplan"
+      - printf 'COMMIT_ID=%s\nBACKEND_TAG=%s\nROUTER_TAG=%s\n' "$COMMIT_ID" "$BACKEND_TAG" "$ROUTER_TAG" > "$OUT/plan-meta.env"
+      - PLAN_SUMMARY=$(grep -m1 -E '^(Plan:|No changes\.|Changes to Outputs:)' "$OUT/plan.txt" || echo "Plan summary not found; read the log.")
+      - PLAN_LOG_URL="$CODEBUILD_BUILD_URL"
+      - echo "$PLAN_SUMMARY"
+  post_build:
+    commands:
+      - rm -f "$CODEBUILD_SRC_DIR/$STACK_DIR/terraform.tfvars"
+
+artifacts:
+  base-directory: plan-out
+  files:
+    - tfplan
+    - plan.txt
+    - plan-meta.env

@@ -1,0 +1,23 @@
+# CodeBuild (privileged, x86_64): build + push the backend and router images, skipping tags already in ECR.
+# Logic and tag scheme: scripts/build-images.sh. Exports BACKEND_TAG / ROUTER_TAG to the pipeline (namespace
+# BuildVariables) for the Plan stage.
+version: 0.2
+
+env:
+  shell: bash
+  exported-variables:
+    - BACKEND_TAG
+    - ROUTER_TAG
+    - BACKEND_BUILT
+    - ROUTER_BUILT
+
+phases:
+  pre_build:
+    commands:
+      - docker version
+      - git log -1 --format='%H %an %s'
+  build:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/$STACK_DIR/pipeline/scripts/build-images.sh" "$CODEBUILD_SRC_DIR/images.env"
+      - set -a && . "$CODEBUILD_SRC_DIR/images.env" && set +a
+      - echo "backend=$BACKEND_TAG (built=$BACKEND_BUILT) router=$ROUTER_TAG (built=$ROUTER_BUILT)"

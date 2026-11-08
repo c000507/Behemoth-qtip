@@ -39,7 +39,7 @@ assumption still has to be checked against the account (see "Unverified").
 
 | path | what |
 |---|---|
-| `versions.tf` | provider, default tags, commented S3 remote-state example |
+| `versions.tf` | provider, default tags, `backend "s3" {}` (partial config: `backend.hcl`, see `backend.hcl.example`) |
 | `variables.tf` | all inputs with descriptions |
 | `network.tf` | router / backend-task SGs (router -> backend:1337), S3 gateway endpoint |
 | `s3.tf` | model bucket: public access blocked, SSE-S3 or KMS, TLS-only policy, optional versioning |
@@ -55,6 +55,7 @@ assumption still has to be checked against the account (see "Unverified").
 | `backend/build_and_push.sh` | build, ECR login, push `<sha>` + `latest` |
 | `router/router.py`, `router/test_router.py` | router service and its tests |
 | `scripts/upload_to_s3.sh` | upload model + graphs from the current instance (symlinks dereferenced) |
+| `pipeline/` | separate bootstrap root: state/config bucket, GitHub connection, CodePipeline V2 + CodeBuild (build images, plan, approve, apply). See `pipeline/README.md` |
 
 ## Prerequisites
 
@@ -108,8 +109,12 @@ user credentials.
 ```sh
 cd deploy/ecs-neuron
 cp terraform.tfvars.example terraform.tfvars    # fill vpc_id, s3_endpoint_route_table_ids, secret ARN
-terraform init && terraform plan && terraform apply
+cp backend.hcl.example backend.hcl                # remote state in S3 (bucket created by pipeline/)
+terraform init -backend-config=backend.hcl && terraform plan && terraform apply
 ```
+Once `pipeline/` is bootstrapped, changes go through CodePipeline (push to `rocm-to-neff`, approve the plan), and
+`terraform.tfvars` lives in `s3://behemoth-tfstate-912935854432/ecs-neuron/terraform.tfvars`. See
+[pipeline/README.md](pipeline/README.md) for the one-time state migration, rollback and costs.
 To get the bucket name for step 2 before anything else exists, apply the bucket first with
 `-target=aws_s3_bucket.models`, or set `s3_bucket_name`. The backend service is created with `desiredCount=0`, and
 Terraform ignores later changes to it.

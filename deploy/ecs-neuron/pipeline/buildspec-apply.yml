@@ -1,0 +1,28 @@
+# CodeBuild: apply EXACTLY the approved saved plan (no re-plan, no tfvars needed: the values are inside the plan).
+# Inputs: SourceOutput (primary, same commit as the plan) and PlanOutput at $CODEBUILD_SRC_DIR_PlanOutput.
+# Terraform refuses the plan if the state changed since it was made ("Saved plan is stale"): re-run the pipeline then.
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/$STACK_DIR/pipeline/scripts/install-terraform.sh"
+  pre_build:
+    commands:
+      - D="$CODEBUILD_SRC_DIR/$STACK_DIR"; P="$CODEBUILD_SRC_DIR_PlanOutput"
+      - test -s "$P/tfplan"
+      - cat "$P/plan-meta.env"
+      - |
+        planned=$(sed -n 's/^COMMIT_ID=//p' "$P/plan-meta.env")
+        [ "$planned" = "$COMMIT_ID" ] || { echo "plan was made for $planned, source is $COMMIT_ID"; exit 1; }
+      - bash "$CODEBUILD_SRC_DIR/$STACK_DIR/pipeline/scripts/tf-init.sh"
+  build:
+    commands:
+      - D="$CODEBUILD_SRC_DIR/$STACK_DIR"; P="$CODEBUILD_SRC_DIR_PlanOutput"
+      - terraform -chdir="$D" apply -input=false -no-color -lock-timeout=5m "$P/tfplan"
+  post_build:
+    commands:
+      - if [ "$CODEBUILD_BUILD_SUCCEEDING" = 1 ]; then terraform -chdir="$CODEBUILD_SRC_DIR/$STACK_DIR" output -no-color; fi
