@@ -363,3 +363,16 @@ K-chunk. Cadence per K:
   consistent with M=32: PE contraction chunk = 128, M=32 x passes... exact
   pair-count formula still needs one more shape (e.g. K=512 M=64) but the
   streaming-DMA mechanism is now fully identified.
+
+Confirmed cadence (mm/mm2/mm3):
+- A-desc elem_size = (K/128) x 512B staged per ring pass; B-desc = 512B+
+  (B-side reads may route via DGE/HBM at K>=256: mm2 B-side LW addrs were
+  DGE-range, mm3 B-side = SB slots)
+- y-out desc src = PSUM base (0x4080/0x4100/0x4280 - varies w/ N tiles),
+  waits 5/4 GE (num phases).
+NEXT SESSION (implementation, decode done): write general emitter in
+lift_hip.py/tile_ir.py emitting: 3 pool descs (A ring, B ring, y-out),
+identity refill SP dma, PE stream = phase cadence per mm/mm2/mm3 templates
+(pair counts: K128=2, K256=8, K512=32; b1 modes 1=start-of-chunk-group,
+2=mid, 3=per-pair-single at K>=512 B-side; upd 19/5 at group ends),
+validate x@w vs numpy for K in {128,256,512}, M in {32,64}, N in {128,256}.
