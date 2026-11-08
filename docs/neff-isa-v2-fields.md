@@ -1,0 +1,1278 @@
+# Neuron v2 ISA field map (trn1/sunda) — EXTRACTED, machine-verified
+
+Source: neuron-dbg cgo accessors (get_v2_NEURON_ISA_TPB_*), offsets via tools/isa_fields.py.
+Fields with off<0 are unresolved union/complex accessors (ignore).
+
+Common prologue (all instrs): header @0: opcode u8 @0, inst_word_len u8 @1 (16), debug_cmd @2, debug_hint @3.
+Events block: wait_mode u8 @4, wait_idx u8 @5, update_mode u8 @6, update_idx u8 @7, semaphore_value u32 @8.
+
+See docs/neff-isa.md for opcode enum + geometry.
+
+## NEURON_ISA_TPB_CTRL_AL (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B op
+- @13  1B dtype
+- @14  1B src1_datasrc
+- @15  1B dst_dtype
+- @16  1B src0_lo
+- @17  1B src0_hi
+- @18  1B src1_lo
+- @19  1B src1_hi
+- @20  1B dst_lo
+- @21  1B dst_hi
+- @24  8B immediate
+
+## NEURON_ISA_TPB_CTRL_BR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B cmp_op
+- @13  1B cmp_dtype
+- @14  1B br_target_mode
+- @16  4B cmp_immediate
+- @32  1B cmp_reg0
+- @33  1B cmp_reg1
+- @34  1B target_reg_lo
+- @35  1B target_reg_hi
+- @48  8B br_immediate
+
+## NEURON_ISA_TPB_CTRL_ES (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B setter_signature
+- @32  1B events_extended_wait_mode
+- @33  1B events_extended_wait_idx
+- @34  1B events_extended_update_mode
+- @35  1B events_extended_update_idx
+- @36  4B events_extended_sem_wait_value
+- @40  4B events_extended_sem_update_value
+
+## NEURON_ISA_TPB_CTRL_NO (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  4B cycle_cnt
+- @35  1B act_tbl_sel
+- @36  2B debug_hint_ext
+- @38  1B interrupt_en
+- @39  1B notification_kind
+- @40  1B hint_or_notific_drain_flags_evsem_is_reset
+- @40  1B hint_or_notific_inst_flush_flags_flush_mode
+- @40  4B hint_or_notific_custom_notific_metadata_lo
+- @44  2B hint_or_notific_custom_notific_metadata_hi
+- @46  1B hint_or_notific_custom_notific_lo_src
+- @47  1B hint_or_notific_custom_notific_hi_src
+
+## NEURON_ISA_TPB_CTRL_OM (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B ordering_mode
+
+## NEURON_ISA_TPB_CTRL_RS (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B start_reg_id
+
+## NEURON_ISA_TPB_CTRL_WR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+
+## NEURON_ISA_TPB_CUSTOM_OP_HEADER (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  2B num_payloads
+- @14  1B function_id
+- @15  1B num_arguments
+- @16  1B has_scratch_space
+- @20  4B scratch_space_addr
+- @24  4B scratch_space_size
+- @28  1B scratch_space_num_partitions
+
+## NEURON_ISA_TPB_CUSTOM_OP_PAYLOAD (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @15  1B arg_type
+- @16  1B arg_tensor_location
+- @16  4B arg_array_of_tensor_num_objects
+- @17  1B arg_tensor_framework_shape_type
+- @18  1B arg_tensor_dtype
+- @24  4B arg_tensor_framework_shape_out_of_line_shape_addr
+- @24  8B arg_tensor_framework_shape
+- @40  4B arg_tensor_storage_tpb_addr
+- @40  8B arg_tensor_storage_hbm
+- @40  8B arg_tensor_storage_hbm_addr
+- @44  4B arg_tensor_storage_tpb_num_elem
+- @48  1B arg_tensor_storage_tpb_num_partitions
+- @48  4B arg_tensor_storage_hbm_num_elem
+- @52  4B arg_tensor_storage_tpb_num_elem_per_block
+
+## NEURON_ISA_TPB_D4_IOTA (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  4B src_data_pattern_base
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @36  4B channel_multiplier
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_D4_MR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @28  4B dst_element_count
+- @32  1B dtype
+- @34  1B num_active_channels
+- @36  1B serialization_mode
+- @40  4B set_value
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_D4_RAND (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B rand_algorithm
+- @13  1B rand_num_steps
+- @14  1B post_process
+- @15  1B rand_generator
+- @32  1B dtype
+- @34  1B num_active_channels
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_DMA_DIRECT2D (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B dma_configs
+- @12  1B dma_configs_reserved_bitfield
+- @13  1B semaphore
+- @14  1B sem_increment
+- @15  1B compute_op
+- @16  1B src_start_addr_addr_reg_reg_lo
+- @16  1B src_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @16  4B src_start_addr_addr_table_offset
+- @16  4B src_start_addr_addr_tbl_offs_offset_immediate
+- @16  8B src_start_addr_addr_immediate
+- @16  8B src_start_addr_addr_table
+- @17  1B src_start_addr_addr_reg_reg_hi
+- @20  2B src_start_addr_addr_table_table_index
+- @20  2B src_start_addr_addr_tbl_offs_table_index
+- @23  1B src_start_addr_addr_reg_marker
+- @23  1B src_start_addr_addr_table_marker
+- @23  1B src_start_addr_addr_tbl_offs_marker
+- @36  2B src_elem_size
+- @38  1B src_bound_reg
+- @38  1B src_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @38  1B src_bound_reg_bc_enabled >>7
+- @38  1B src_bound_reg_bc_reg &0x3f
+- @39  1B dst_bound_reg
+- @39  1B dst_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @39  1B dst_bound_reg_bc_enabled >>7
+- @39  1B dst_bound_reg_bc_reg &0x3f
+- @40  1B dst_start_addr_addr_reg_reg_lo
+- @40  1B dst_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @40  4B dst_start_addr_addr_table_offset
+- @40  4B dst_start_addr_addr_tbl_offs_offset_immediate
+- @40  8B dst_start_addr_addr_immediate
+- @40  8B dst_start_addr_addr_table
+- @41  1B dst_start_addr_addr_reg_reg_hi
+- @44  2B dst_start_addr_addr_table_table_index
+- @44  2B dst_start_addr_addr_tbl_offs_table_index
+- @47  1B dst_start_addr_addr_reg_marker
+- @47  1B dst_start_addr_addr_table_marker
+- @47  1B dst_start_addr_addr_tbl_offs_marker
+- @60  2B dst_elem_size
+- @62  1B in_dtype
+- @63  1B out_dtype
+
+## NEURON_ISA_TPB_DMA_INDIRECT1D (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B semaphore
+- @13  1B sem_increment
+- @14  1B idx_num_active_channels
+- @15  1B flags
+- @15  1B flags_gather_dim >>4 &0x3
+- @15  1B flags_idx_bound_is_err >>2 &0x1
+- @15  1B flags_indirect_mode &0x3
+- @15  1B flags_non_unique_dst_idx >>3 &0x1
+- @15  1B flags_scatter_dim >>6
+- @16  1B src_start_addr_addr_reg_reg_lo
+- @16  1B src_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @16  4B src_start_addr_addr_table_offset
+- @16  4B src_start_addr_addr_tbl_offs_offset_immediate
+- @16  8B src_start_addr_addr_immediate
+- @16  8B src_start_addr_addr_table
+- @17  1B src_start_addr_addr_reg_reg_hi
+- @20  2B src_start_addr_addr_table_table_index
+- @20  2B src_start_addr_addr_tbl_offs_table_index
+- @23  1B src_start_addr_addr_reg_marker
+- @23  1B src_start_addr_addr_table_marker
+- @23  1B src_start_addr_addr_tbl_offs_marker
+- @24  4B src_step_elem
+- @28  2B src_num_elem
+- @30  2B src_elem_size
+- @32  1B dst_start_addr_addr_reg_reg_lo
+- @32  1B dst_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @32  4B dst_start_addr_addr_table_offset
+- @32  4B dst_start_addr_addr_tbl_offs_offset_immediate
+- @32  8B dst_start_addr_addr_immediate
+- @32  8B dst_start_addr_addr_table
+- @33  1B dst_start_addr_addr_reg_reg_hi
+- @36  2B dst_start_addr_addr_table_table_index
+- @36  2B dst_start_addr_addr_tbl_offs_table_index
+- @39  1B dst_start_addr_addr_reg_marker
+- @39  1B dst_start_addr_addr_table_marker
+- @39  1B dst_start_addr_addr_tbl_offs_marker
+- @40  4B dst_step_elem
+- @44  2B dst_num_elem
+- @46  2B dst_elem_size
+- @48  1B src_idx_start_addr_addr_reg_regnum
+- @48  4B src_idx_start_addr
+- @48  4B src_idx_start_addr_addr_immediate
+- @48  4B src_idx_start_addr_addr_reg
+- @51  1B src_idx_start_addr_addr_reg_marker
+- @52  1B dst_idx_start_addr_addr_reg_regnum
+- @52  4B dst_idx_start_addr
+- @52  4B dst_idx_start_addr_addr_immediate
+- @52  4B dst_idx_start_addr_addr_reg
+- @55  1B dst_idx_start_addr_addr_reg_marker
+- @56  1B in_dtype
+- @57  1B out_dtype
+- @58  1B src_idx_bound_reg
+- @58  1B src_idx_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @58  1B src_idx_bound_reg_bc_enabled >>7
+- @58  1B src_idx_bound_reg_bc_reg &0x3f
+- @59  1B dst_idx_bound_reg
+- @59  1B dst_idx_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @59  1B dst_idx_bound_reg_bc_enabled >>7
+- @59  1B dst_idx_bound_reg_bc_reg &0x3f
+- @60  1B compute_op
+- @61  1B dma_configs
+- @61  1B dma_configs_reserved_bitfield
+
+## NEURON_ISA_TPB_MODIFY_POOL_CONFIG (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B modify_op
+- @13  1B core_mask
+- @16  8B soc_addr
+- @24  4B library_index
+- @28  4B library_size
+- @32  4B library_header_size
+
+## NEURON_ISA_TPB_PSEUDO_BRANCH_LABEL (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  4B label_id
+- @16  1B cache_align
+
+## NEURON_ISA_TPB_PSEUDO_DMA_BARRIER (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  4B barrier_metadata
+
+## NEURON_ISA_TPB_PSEUDO_DMA_DIRECT2D (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B dma_configs
+- @12  1B dma_configs_reserved_bitfield
+- @13  1B semaphore
+- @14  1B sem_increment
+- @15  1B dge_op
+- @16  1B src_start_addr_addr_reg_reg_lo
+- @16  1B src_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @16  4B src_start_addr_addr_table_offset
+- @16  4B src_start_addr_addr_tbl_offs_offset_immediate
+- @16  4B src_start_addr_addr_var_offset
+- @16  8B src_start_addr_addr_immediate
+- @16  8B src_start_addr_addr_table
+- @16  8B src_start_addr_addr_var
+- @17  1B src_start_addr_addr_reg_reg_hi
+- @20  2B src_start_addr_addr_table_table_index
+- @20  2B src_start_addr_addr_tbl_offs_table_index
+- @20  2B src_start_addr_addr_var_var_id_lo
+- @22  1B src_start_addr_addr_var_var_id_hi
+- @23  1B src_start_addr_addr_reg_marker
+- @23  1B src_start_addr_addr_table_marker
+- @23  1B src_start_addr_addr_tbl_offs_marker
+- @23  1B src_start_addr_addr_unknown_marker
+- @23  1B src_start_addr_addr_var_marker
+- @36  2B src_elem_size
+- @38  1B src_bound_reg
+- @38  1B src_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @38  1B src_bound_reg_bc_enabled >>7
+- @38  1B src_bound_reg_bc_reg &0x3f
+- @39  1B dst_bound_reg
+- @39  1B dst_bound_reg_bc_disable_oob_error_notif >>6 &0x1
+- @39  1B dst_bound_reg_bc_enabled >>7
+- @39  1B dst_bound_reg_bc_reg &0x3f
+- @40  1B dst_start_addr_addr_reg_reg_lo
+- @40  1B dst_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @40  4B dst_start_addr_addr_table_offset
+- @40  4B dst_start_addr_addr_tbl_offs_offset_immediate
+- @40  4B dst_start_addr_addr_var_offset
+- @40  8B dst_start_addr_addr_immediate
+- @40  8B dst_start_addr_addr_table
+- @40  8B dst_start_addr_addr_var
+- @41  1B dst_start_addr_addr_reg_reg_hi
+- @44  2B dst_start_addr_addr_table_table_index
+- @44  2B dst_start_addr_addr_tbl_offs_table_index
+- @44  2B dst_start_addr_addr_var_var_id_lo
+- @46  1B dst_start_addr_addr_var_var_id_hi
+- @47  1B dst_start_addr_addr_reg_marker
+- @47  1B dst_start_addr_addr_table_marker
+- @47  1B dst_start_addr_addr_tbl_offs_marker
+- @47  1B dst_start_addr_addr_unknown_marker
+- @47  1B dst_start_addr_addr_var_marker
+- @60  2B dst_elem_size
+- @62  1B in_dtype
+- @63  1B out_dtype
+
+## NEURON_ISA_TPB_PSEUDO_DMA_EXT (64B)
+- @0   1B opcode
+- @1   1B flags
+- @1   1B flags_gather_dim >>4 &0x3
+- @1   1B flags_idx_bound_is_err >>2 &0x1
+- @1   1B flags_indirect_mode &0x3
+- @1   1B flags_non_unique_dst_idx >>3 &0x1
+- @1   1B flags_scatter_dim >>6
+- @2   1B idx_num_active_channels
+- @3   1B compute_op
+- @4   1B src_idx_start_addr_addr_reg_regnum
+- @4   4B src_idx_start_addr
+- @4   4B src_idx_start_addr_addr_immediate
+- @4   4B src_idx_start_addr_addr_reg
+- @7   1B src_idx_start_addr_addr_reg_marker
+- @8   1B dst_idx_start_addr_addr_reg_regnum
+- @8   4B dst_idx_start_addr
+- @8   4B dst_idx_start_addr_addr_immediate
+- @8   4B dst_idx_start_addr_addr_reg
+- @11  1B dst_idx_start_addr_addr_reg_marker
+- @12  4B src_bound_size_bytes
+- @16  4B dst_bound_size_bytes
+- @56  4B src_bound_size_bytes_upper
+- @60  4B dst_bound_size_bytes_upper
+
+## NEURON_ISA_TPB_PSEUDO_DMA_REARM (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+
+## NEURON_ISA_TPB_PSEUDO_DMA_TRIGGER (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @44  4B use_raw_count
+- @48  4B count_union
+- @48  4B count_union_block_id
+- @48  4B count_union_count
+
+## NEURON_ISA_TPB_PSEUDO_LOAD_ACT_FUNC_SET (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+
+## NEURON_ISA_TPB_PSEUDO_SEMAPHORE_SET (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @44  2B update_value
+- @46  1B update_type
+
+## NEURON_ISA_TPB_PSEUDO_SENDRECV (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  4B tensor_id
+- @16  8B peer_id
+- @24  1B is_send
+- @48  8B offset_bytes
+- @56  8B size_bytes
+
+## NEURON_ISA_TPB_PSEUDO_SET_RNG_SEED (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B seed_src
+- @16  1B seed_imm_reg_regnum
+- @16  4B seed_imm_bitvec_int32
+- @16  4B seed_imm_bitvec_uint32
+- @16  4B seed_imm_ptr
+
+## NEURON_ISA_TPB_PSEUDO_TRIGGER_ALL_REDUCE (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B op
+- @13  1B dtype
+- @16  4B input_tensor_id
+- @20  4B output_tensor_id
+- @24  8B num_elements
+
+## NEURON_ISA_TPB_PSEUDO_TRIGGER_COLLECTIVE2_EXT (64B)
+- @0   1B opcode
+- @1   1B instr_chaining
+- @2   2B group_id
+- @4   2B channel_id
+- @6   2B stream_id
+- @8   1B dst_start_addr_addr_reg_reg_lo
+- @8   1B dst_start_addr_addr_tbl_offs_offset_regs_reg_lo
+- @8   4B dst_start_addr_addr_table_offset
+- @8   4B dst_start_addr_addr_tbl_offs_offset_immediate
+- @8   4B dst_start_addr_addr_var_offset
+- @8   8B dst_start_addr_addr_immediate
+- @8   8B dst_start_addr_addr_table
+- @8   8B dst_start_addr_addr_var
+- @9   1B dst_start_addr_addr_reg_reg_hi
+- @12  2B dst_start_addr_addr_table_table_index
+- @12  2B dst_start_addr_addr_tbl_offs_table_index
+- @12  2B dst_start_addr_addr_var_var_id_lo
+- @14  1B dst_start_addr_addr_var_var_id_hi
+- @15  1B dst_start_addr_addr_reg_marker
+- @15  1B dst_start_addr_addr_table_marker
+- @15  1B dst_start_addr_addr_tbl_offs_marker
+- @15  1B dst_start_addr_addr_unknown_marker
+- @15  1B dst_start_addr_addr_var_marker
+- @32  1B cc_buf_start_addr_addr_reg_regnum
+- @32  4B cc_buf_start_addr
+- @32  4B cc_buf_start_addr_addr_immediate
+- @32  4B cc_buf_start_addr_addr_reg
+- @35  1B cc_buf_start_addr_addr_reg_marker
+- @36  4B cc_buf_size_per_partition
+- @40  1B cc_buf_num_partitions
+- @41  1B dma_configs
+- @41  1B dma_configs_reserved_bitfield
+- @42  1B unique_tensors
+- @43  1B permute_chain
+- @44  1B src1_bitmap
+- @45  1B cross_sb_output_transfer
+- @46  1B prepare_op_id
+- @47  1B reserved1
+- @48  8B max_block_size
+
+## NEURON_ISA_TPB_S1_RAND (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B rand_algorithm
+- @13  1B num_active_channels
+- @14  1B update_state
+- @15  1B in_dtype
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @16  8B src_mem_pattern
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @24  1B rand_generator
+
+## NEURON_ISA_TPB_S2D2_TS_AS (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B num_active_channels
+- @13  1B in_out_dtype
+- @13  1B in_out_dtype_dtype_hi >>4
+- @13  1B in_out_dtype_dtype_lo &0xf
+- @14  1B fill_mode
+- @15  1B fill_reg
+- @16  4B mask_pattern_base
+- @36  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @36  4B src_mem_pattern_start_addr
+- @36  4B src_mem_pattern_start_addr_addr_immediate
+- @36  4B src_mem_pattern_start_addr_addr_reg
+- @39  1B src_mem_pattern_start_addr_addr_reg_marker
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+- @60  4B channel_multiplier
+
+## NEURON_ISA_TPB_S2_BNPL2 (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @28  1B element_count_imm_reg_regnum
+- @28  4B element_count_imm_bitvec_int32
+- @28  4B element_count_imm_bitvec_uint32
+- @28  4B element_count_imm_ptr
+- @32  1B src_dtype
+- @33  1B immediate_dtype
+- @34  1B num_active_channels
+- @40  1B imm0_ptr_imm_reg_regnum
+- @40  4B imm0_ptr_imm_bitvec_int32
+- @40  4B imm0_ptr_imm_bitvec_uint32
+- @40  4B imm0_ptr_imm_ptr
+- @44  1B imm1_ptr_imm_reg_regnum
+- @44  4B imm1_ptr_imm_bitvec_int32
+- @44  4B imm1_ptr_imm_bitvec_uint32
+- @44  4B imm1_ptr_imm_ptr
+- @48  1B imm0_src
+- @49  1B imm1_src
+
+## NEURON_ISA_TPB_S3D3_AC (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B imm_src
+- @13  1B scale_src
+- @14  1B accumulator_cmd
+- @15  1B bias_src
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_bias_dtype
+- @32  1B in_bias_dtype_dtype_hi >>4
+- @32  1B in_bias_dtype_dtype_lo &0xf
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @35  1B activation_func
+- @36  1B scale_value_imm_reg_regnum
+- @36  4B scale_value_imm_ptr
+- @40  1B bias_imm_reg_regnum
+- @40  4B bias_imm_ptr
+- @44  1B imm_imm_reg_regnum
+- @44  4B imm_imm_ptr
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3D3_AQ (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_bias_dtype
+- @32  1B in_bias_dtype_dtype_hi >>4
+- @32  1B in_bias_dtype_dtype_lo &0xf
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @35  1B activation_func
+- @40  4B bias_addr
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3D3_CP_PRED_SCALAR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @16  1B pred_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B pred_mem_pattern_start_addr
+- @16  4B pred_mem_pattern_start_addr_addr_immediate
+- @16  4B pred_mem_pattern_start_addr_addr_reg
+- @19  1B pred_mem_pattern_start_addr_addr_reg_marker
+- @32  1B pred_dtype
+- @33  1B reversed_pred
+- @34  1B num_active_channels
+- @41  1B in_dtype
+- @42  1B out_dtype
+- @43  1B src0_imm_src
+- @44  1B src0_imm_imm_reg_regnum
+- @44  4B src0_imm_imm_bitvec_int32
+- @44  4B src0_imm_imm_bitvec_uint32
+- @44  4B src0_imm_imm_ptr
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3D3_DROPOUT (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @35  1B threshold_src
+- @36  1B threshold_dtype
+- @43  1B threshold_type
+- @44  1B threshold_imm_reg_regnum
+- @44  4B threshold_imm_bitvec_int32
+- @44  4B threshold_imm_bitvec_uint32
+- @44  4B threshold_imm_ptr
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3D3_MM (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B fp32_mode
+- @35  1B perf_opt
+- @36  2B quant_offset
+- @36  2B quant_offset_quant_offset_uint16
+- @38  1B num_active_rows
+- @39  1B num_active_cols
+- @43  1B psum_accumulate_flags
+- @44  1B row_grp
+- @45  1B col_grp
+- @46  1B xbus_sel
+- @47  1B psum_zero_region
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3D3_TS (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B accumulator_cmd
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @35  1B imm0_src
+- @36  1B op0
+- @37  1B op1
+- @38  1B reverse_operands
+- @39  1B imm1_src
+- @40  1B imm0_imm_reg_regnum
+- @40  4B imm0_imm_bitvec_int32
+- @40  4B imm0_imm_bitvec_uint32
+- @40  4B imm0_imm_ptr
+- @44  1B imm1_imm_reg_regnum
+- @44  4B imm1_imm_bitvec_int32
+- @44  4B imm1_imm_bitvec_uint32
+- @44  4B imm1_imm_ptr
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S3S3D1_BN (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B imm0_imm_reg_regnum
+- @12  4B imm0_imm_bitvec_int32
+- @12  4B imm0_imm_bitvec_uint32
+- @12  4B imm0_imm_ptr
+- @16  1B src0_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src0_mem_pattern_start_addr
+- @16  4B src0_mem_pattern_start_addr_addr_immediate
+- @16  4B src0_mem_pattern_start_addr_addr_reg
+- @19  1B src0_mem_pattern_start_addr_addr_reg_marker
+- @32  1B src1_mem_pattern_start_addr_addr_reg_regnum
+- @32  4B src1_mem_pattern_start_addr
+- @32  4B src1_mem_pattern_start_addr_addr_immediate
+- @32  4B src1_mem_pattern_start_addr_addr_reg
+- @35  1B src1_mem_pattern_start_addr_addr_reg_marker
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @48  8B dst_mem_pattern
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+- @56  1B imm1_imm_reg_regnum
+- @56  4B imm1_imm_bitvec_int32
+- @56  4B imm1_imm_bitvec_uint32
+- @56  4B imm1_imm_ptr
+- @60  1B in0_in1_dtype
+- @60  1B in0_in1_dtype_dtype_hi >>4
+- @60  1B in0_in1_dtype_dtype_lo &0xf
+- @61  1B immediate_dtype
+- @62  1B out_dtype
+- @63  1B num_active_channels
+
+## NEURON_ISA_TPB_S3S3D1_BN2 (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B imm0_imm_reg_regnum
+- @12  4B imm0_imm_bitvec_int32
+- @12  4B imm0_imm_bitvec_uint32
+- @12  4B imm0_imm_ptr
+- @16  1B src0_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src0_mem_pattern_start_addr
+- @16  4B src0_mem_pattern_start_addr_addr_immediate
+- @16  4B src0_mem_pattern_start_addr_addr_reg
+- @19  1B src0_mem_pattern_start_addr_addr_reg_marker
+- @32  1B src1_mem_pattern_start_addr_addr_reg_regnum
+- @32  4B src1_mem_pattern_start_addr
+- @32  4B src1_mem_pattern_start_addr_addr_immediate
+- @32  4B src1_mem_pattern_start_addr_addr_reg
+- @35  1B src1_mem_pattern_start_addr_addr_reg_marker
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @48  8B dst_mem_pattern
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+- @56  1B imm1_imm_reg_regnum
+- @56  4B imm1_imm_bitvec_int32
+- @56  4B imm1_imm_bitvec_uint32
+- @56  4B imm1_imm_ptr
+- @60  1B in0_in1_dtype
+- @60  1B in0_in1_dtype_dtype_hi >>4
+- @60  1B in0_in1_dtype_dtype_lo &0xf
+- @61  1B immediate_out_dtype
+- @61  1B immediate_out_dtype_dtype_hi >>4
+- @61  1B immediate_out_dtype_dtype_lo &0xf
+- @62  1B imm0_imm1_src
+- @62  1B imm0_imm1_src_imm_src_hi >>4
+- @62  1B imm0_imm1_src_imm_src_lo &0xf
+- @63  1B num_active_channels
+
+## NEURON_ISA_TPB_S3_LW (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @16  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @16  4B src_mem_pattern_start_addr
+- @16  4B src_mem_pattern_start_addr_addr_immediate
+- @16  4B src_mem_pattern_start_addr_addr_reg
+- @19  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B fp32_mode
+- @35  1B perf_opt
+- @36  2B quant_offset
+- @36  2B quant_offset_quant_offset_uint16
+- @38  1B num_active_rows
+- @39  1B num_active_cols
+- @44  1B row_grp
+- @45  1B col_grp
+- @46  1B xbus_sel
+
+## NEURON_ISA_TPB_S4D2_BN (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @48  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @48  4B dst_mem_pattern_start_addr
+- @48  4B dst_mem_pattern_start_addr_addr_immediate
+- @48  4B dst_mem_pattern_start_addr_addr_reg
+- @51  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S4D4_CR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @35  1B reduce_op
+- @36  1B reduce_axis
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S4D4_GT (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @36  1B index_miss_behavior
+- @37  1B free_pool_buffer
+- @40  1B immediate_imm_reg_regnum
+- @40  4B immediate_imm_bitvec_int32
+- @40  4B immediate_imm_bitvec_uint32
+- @40  4B immediate_imm_ptr
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S4D4_MR (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S4D4_PL (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @33  1B out_dtype
+- @34  1B num_active_channels
+- @36  1B pool_func
+- @37  1B pool_dim
+- @44  1B dst_mem_pattern_start_addr_addr_reg_regnum
+- @44  4B dst_mem_pattern_start_addr
+- @44  4B dst_mem_pattern_start_addr_addr_immediate
+- @44  4B dst_mem_pattern_start_addr_addr_reg
+- @47  1B dst_mem_pattern_start_addr_addr_reg_marker
+
+## NEURON_ISA_TPB_S4_PB (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @34  1B num_active_channels
+- @40  4B start_index
+- @44  4B mask
+
+## NEURON_ISA_TPB_S4_RL (64B)
+- @0   1B header_opcode
+- @0   4B header
+- @1   1B header_inst_word_len
+- @2   1B header_debug_cmd
+- @3   1B header_debug_hint
+- @4   1B events_wait_mode
+- @4   8B events
+- @5   1B events_wait_idx
+- @6   1B events_update_mode
+- @7   1B events_update_idx
+- @8   4B events_semaphore_value
+- @12  1B src_mem_pattern_start_addr_addr_reg_regnum
+- @12  4B src_mem_pattern_start_addr
+- @12  4B src_mem_pattern_start_addr_addr_immediate
+- @12  4B src_mem_pattern_start_addr_addr_reg
+- @15  1B src_mem_pattern_start_addr_addr_reg_marker
+- @32  1B in_dtype
+- @34  1B num_active_channels
+- @36  1B serialization_mode
