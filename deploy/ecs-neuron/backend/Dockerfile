@@ -62,7 +62,7 @@ ARG S5CMD_VERSION=2.2.2
 ARG S5CMD_SHA256=""
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libgomp1 libpcre2-8-0 \
- && curl -fsSL -o /tmp/s5cmd.tgz \
+ && curl -fsSL --retry 10 --retry-all-errors --retry-delay 20 -o /tmp/s5cmd.tgz \
       "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
  && if [ -n "${S5CMD_SHA256}" ]; then echo "${S5CMD_SHA256}  /tmp/s5cmd.tgz" | sha256sum -c -; fi \
  && tar -xzf /tmp/s5cmd.tgz -C /usr/local/bin s5cmd && rm /tmp/s5cmd.tgz \
