@@ -7,10 +7,12 @@
 //   BEHEMOTH_FAKE_VOCAB (default: config.json vocab_size, else 131072), BEHEMOTH_FAKE_PAGES (KV pages, 256),
 //   BEHEMOTH_FAKE_ROWS (largest decode bucket rows, 8), BEHEMOTH_FAKE_CONTEXT (4096); EOS from config.json (else 2).
 #include "neuron_model.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 namespace neuron {
 namespace {
@@ -72,6 +74,8 @@ std::span<const float> NeuronModel::forward(const behemoth::InferenceBatch &batc
     auto &m = *impl_;
     const auto &l = batch.layout;
     ++m.steps;
+    if (const int ms = env("BEHEMOTH_FAKE_STEP_MS", 0); ms > 0) // a slow device (stream keepalive tests)
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     std::vector<int> request_of(batch.tokens.size());
     auto slot = [&](int r, int position) -> int & {
         const int page = l.page_table.at(size_t(r) * size_t(l.table_stride) + size_t(position / 16));

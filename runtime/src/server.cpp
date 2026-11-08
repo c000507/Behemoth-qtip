@@ -57,6 +57,8 @@ class Session : public std::enable_shared_from_this<Session> {
     TextStream text_;
     std::deque<std::string> queue_;
     size_t queued_ = 0;
+    asio::steady_timer heartbeat_;
+    std::chrono::steady_clock::time_point last_sent_ = std::chrono::steady_clock::now();
     std::array<char, 1> disconnect_{};
     http::response<http::empty_body> header_{http::status::ok, 11};
     std::unique_ptr<http::response_serializer<http::empty_body>> serializer_;
@@ -76,6 +78,7 @@ class Session : public std::enable_shared_from_this<Session> {
         if (closed_)
             return;
         closed_ = true;
+        heartbeat_.cancel();
         if (id_ && !finished_)
             engine_.cancel(id_);
         beast::error_code ec;
@@ -130,12 +133,25 @@ class Session : public std::enable_shared_from_this<Session> {
             wire = prefix.str() + "\r\n" + data + "\r\n";
         }
         queued_ += wire.size();
+        last_sent_ = std::chrono::steady_clock::now();
         if (queued_ > 1024 * 1024) {
             close();
             return;
         }
         queue_.push_back(std::move(wire));
         write_next();
+    }
+    // A stream silent for 2 s (a long prefill, a tool call held until it parses) gets an empty chunk: clients
+    // with an idle timeout (OpenCode: 5 s) otherwise drop the request and retry it from scratch.
+    void heartbeat() {
+        heartbeat_.expires_after(std::chrono::seconds(1));
+        heartbeat_.async_wait([self = shared_from_this()](beast::error_code ec) {
+            if (ec || self->closed_ || self->finished_)
+                return;
+            if (std::chrono::steady_clock::now() - self->last_sent_ >= std::chrono::seconds(2))
+                self->enqueue("data: " + self->chunk(json::object()).dump() + "\n\n");
+            self->heartbeat();
+        });
     }
     // Answer text: content, or with tools the parser's content and tool_calls deltas.
     void answer(const std::string &text, bool finish) {
@@ -403,6 +419,7 @@ class Session : public std::enable_shared_from_this<Session> {
                                              self->write_next();
                                          });
                 enqueue("data: " + chunk({{"role", "assistant"}}).dump() + "\n\n");
+                heartbeat();
             }
         } catch (const RequestError &e) {
             respond(http::status::bad_request,
@@ -417,7 +434,8 @@ class Session : public std::enable_shared_from_this<Session> {
 
   public:
     Session(tcp::socket socket, Engine &engine, const Tokenizer &tokenizer, StructuredContext &structured)
-        : stream_(std::move(socket)), engine_(engine), tokenizer_(tokenizer), structured_(structured) {
+        : stream_(std::move(socket)), engine_(engine), tokenizer_(tokenizer), structured_(structured),
+          heartbeat_(stream_.get_executor()) {
         parser_.body_limit(4 * 1024 * 1024);
     }
     void run() {
