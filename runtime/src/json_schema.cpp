@@ -1,6 +1,8 @@
 #include "behemoth/json_schema.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -243,6 +245,546 @@ std::string integer_range_gbnf(long long lo, bool has_lo, long long hi, bool has
 
 namespace {
 
+constexpr int max_repeat = 4096; // = the GBNF parser's cap
+
+std::string repeat(const std::string &item, int min_n, int max_n) {
+    if (min_n > max_repeat || max_n > max_repeat)
+        throw SchemaError("minLength/maxLength/minItems/maxItems bound " + std::to_string(std::max(min_n, max_n)) +
+                          " exceeds the supported " + std::to_string(max_repeat));
+    if (max_n < 0) {
+        if (min_n == 0)
+            return item + "*";
+        if (min_n == 1)
+            return item + "+";
+        return item + "{" + std::to_string(min_n) + ",}";
+    }
+    if (min_n == max_n) {
+        if (min_n == 0)
+            return "";
+        if (min_n == 1)
+            return item;
+        return item + "{" + std::to_string(min_n) + "}";
+    }
+    if (min_n == 0 && max_n == 1)
+        return item + "?";
+    return item + "{" + std::to_string(min_n) + "," + std::to_string(max_n) + "}";
+}
+
+// ---------------------------------------------------------------------------
+// pattern: ECMA-262 regular expression -> GBNF
+// ---------------------------------------------------------------------------
+// `pattern` constrains the decoded string and the grammar the JSON text between
+// the quotes, so every character set becomes its raw characters plus the
+// escaped spelling of `"`, `\` and the control characters (one spelling each,
+// the one nlohmann::json writes). A pattern searches, it does not have to
+// match the whole string: a top-level alternative without a leading ^ or a
+// trailing $ gets `char*` on that side.
+constexpr uint32_t max_codepoint = 0x10FFFF;
+
+struct CharSet {
+    std::vector<std::pair<uint32_t, uint32_t>> ranges; // sorted and disjoint once normalized
+
+    CharSet() = default;
+    CharSet(uint32_t lo, uint32_t hi) : ranges{{lo, hi}} {}
+    CharSet &add(uint32_t lo, uint32_t hi) {
+        ranges.push_back({lo, hi});
+        return *this;
+    }
+    CharSet &add(const CharSet &o) {
+        ranges.insert(ranges.end(), o.ranges.begin(), o.ranges.end());
+        return *this;
+    }
+    CharSet &normalize() {
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<std::pair<uint32_t, uint32_t>> out;
+        for (auto [lo, hi] : ranges)
+            if (!out.empty() && lo <= out.back().second + 1)
+                out.back().second = std::max(out.back().second, hi);
+            else
+                out.push_back({lo, hi});
+        ranges = std::move(out);
+        return *this;
+    }
+    // Both operate on normalized sets and return normalized sets.
+    CharSet complement() const {
+        CharSet c;
+        uint32_t next = 0;
+        for (auto [lo, hi] : ranges) {
+            if (lo > next)
+                c.add(next, lo - 1);
+            next = hi + 1;
+        }
+        if (next <= max_codepoint)
+            c.add(next, max_codepoint);
+        return c;
+    }
+    CharSet intersect(const CharSet &o) const {
+        CharSet c;
+        size_t i = 0, j = 0;
+        while (i < ranges.size() && j < o.ranges.size()) {
+            uint32_t lo = std::max(ranges[i].first, o.ranges[j].first);
+            uint32_t hi = std::min(ranges[i].second, o.ranges[j].second);
+            if (lo <= hi)
+                c.add(lo, hi);
+            if (ranges[i].second < o.ranges[j].second)
+                ++i;
+            else
+                ++j;
+        }
+        return c;
+    }
+    bool contains(uint32_t c) const {
+        for (auto [lo, hi] : ranges)
+            if (c >= lo && c <= hi)
+                return true;
+        return false;
+    }
+};
+
+const CharSet &digit_set() {
+    static const CharSet s = CharSet('0', '9');
+    return s;
+}
+const CharSet &word_set() {
+    static const CharSet s = CharSet('0', '9').add('A', 'Z').add('_', '_').add('a', 'z').normalize();
+    return s;
+}
+const CharSet &space_set() { // ECMA-262 WhiteSpace and LineTerminator
+    static const CharSet s = CharSet(0x09, 0x0D)
+                                 .add(0x20, 0x20)
+                                 .add(0xA0, 0xA0)
+                                 .add(0x1680, 0x1680)
+                                 .add(0x2000, 0x200A)
+                                 .add(0x2028, 0x2029)
+                                 .add(0x202F, 0x202F)
+                                 .add(0x205F, 0x205F)
+                                 .add(0x3000, 0x3000)
+                                 .add(0xFEFF, 0xFEFF)
+                                 .normalize();
+    return s;
+}
+const CharSet &dot_set() { // everything but line terminators
+    static const CharSet s = CharSet(0x0A, 0x0A).add(0x0D, 0x0D).add(0x2028, 0x2029).normalize().complement();
+    return s;
+}
+const CharSet &scalar_set() { // code points UTF-8 can carry (no surrogates)
+    static const CharSet s = CharSet(0, 0xD7FF).add(0xE000, max_codepoint);
+    return s;
+}
+
+std::string gbnf_codepoint(uint32_t c) {
+    char buf[12];
+    if (c <= 0xFF)
+        std::snprintf(buf, sizeof buf, "\\x%02X", c);
+    else if (c <= 0xFFFF)
+        std::snprintf(buf, sizeof buf, "\\u%04X", c);
+    else
+        std::snprintf(buf, sizeof buf, "\\U%08X", c);
+    return buf;
+}
+
+// GBNF for one JSON string character whose decoded value is in `s` (normalized, non-empty).
+std::string json_char_in(const CharSet &s) {
+    static const CharSet raw =
+        CharSet(0x20, 0x21).add(0x23, 0x5B).add(0x5D, 0x7E).add(0x80, 0xD7FF).add(0xE000, max_codepoint);
+    std::vector<std::string> alts;
+    CharSet r = s.intersect(raw);
+    if (r.ranges.size() == 1 && r.ranges[0].first == r.ranges[0].second && r.ranges[0].first < 0x80)
+        alts.push_back(literal(std::string(1, static_cast<char>(r.ranges[0].first))));
+    else if (!r.ranges.empty()) {
+        std::string cls = "[";
+        for (auto [lo, hi] : r.ranges)
+            cls += gbnf_codepoint(lo) + (lo == hi ? "" : "-" + gbnf_codepoint(hi));
+        alts.push_back(cls + "]");
+    }
+    for (uint32_t c = 0; c <= 0x7F; ++c) {
+        if ((c >= 0x20 && c != '"' && c != '\\' && c != 0x7F) || !s.contains(c))
+            continue;
+        std::string esc;
+        switch (c) {
+        case '"': esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\b': esc = "\\b"; break;
+        case '\f': esc = "\\f"; break;
+        case '\n': esc = "\\n"; break;
+        case '\r': esc = "\\r"; break;
+        case '\t': esc = "\\t"; break;
+        default: {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\u%04x", c);
+            esc = buf;
+        }
+        }
+        alts.push_back(literal(esc));
+    }
+    return join_alternatives(alts);
+}
+
+// Supported: literals, `.`, classes [...] and [^...] with ranges, \d \D \w \W
+// \s \S, \t \n \r \v \f \0 \cX \xHH \uHHHH (and surrogate pairs) \u{H...},
+// identity escapes, groups ( ) (?: ) (?<name> ), alternation, * + ? {n} {n,}
+// {n,m} (lazy forms accept the same language). Rejected (SchemaError naming
+// the pattern): lookaround, backreferences, \b \B, \p{...}, and ^ / $ anywhere
+// but the start / end of a top-level alternative.
+class PatternCompiler {
+  public:
+    static constexpr size_t max_bytes = 16384;
+    static constexpr int max_depth = 64;
+
+    // `rule` turns a GBNF body into a rule name (deduplicated), so a character
+    // set spelled with several alternatives is written out once.
+    PatternCompiler(const std::string &pattern, std::function<std::string(const std::string &)> rule)
+        : source(pattern), rule(std::move(rule)) {
+        if (pattern.size() > max_bytes)
+            throw SchemaError("'pattern' is longer than " + std::to_string(max_bytes) + " bytes");
+        decode();
+    }
+
+    // GBNF for the JSON string body (between the quotes) of every string the pattern matches.
+    std::string compile() {
+        std::vector<std::string> alts;
+        do {
+            const bool head = eat('^');
+            std::string body = sequence();
+            const bool tail = eat('$');
+            if (!done() && peek() != '|')
+                peek() == ')' ? fail("unmatched ')'") : reject("'$' before the end of the pattern");
+            std::vector<std::string> parts;
+            if (!head)
+                parts.push_back("char*");
+            if (body != "\"\"" || parts.empty())
+                parts.push_back(body);
+            if (!tail && (head || body != "\"\""))
+                parts.push_back("char*");
+            std::string alt;
+            for (const auto &p : parts)
+                alt += (alt.empty() ? "" : " ") + p;
+            alts.push_back(alt);
+        } while (eat('|'));
+        return join_alternatives(alts);
+    }
+
+  private:
+    std::string source;
+    std::function<std::string(const std::string &)> rule;
+    std::vector<uint32_t> cps;
+    size_t i = 0;
+    int depth = 0;
+
+    [[noreturn]] void fail(const std::string &why) const {
+        throw SchemaError("invalid 'pattern' " + literal(source) + ": " + why);
+    }
+    [[noreturn]] void reject(const std::string &what) const {
+        unsupported("'pattern' " + literal(source) + " uses " + what);
+    }
+
+    void decode() {
+        const auto *s = reinterpret_cast<const unsigned char *>(source.data());
+        const size_t n = source.size();
+        for (size_t k = 0; k < n;) {
+            const unsigned char b = s[k];
+            const size_t len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+            if (len == 0 || k + len > n)
+                fail("not valid UTF-8");
+            uint32_t c = len == 1 ? b : b & (0x7Fu >> len);
+            for (size_t m = 1; m < len; ++m) {
+                if ((s[k + m] & 0xC0) != 0x80)
+                    fail("not valid UTF-8");
+                c = (c << 6) | (s[k + m] & 0x3Fu);
+            }
+            cps.push_back(c);
+            k += len;
+        }
+    }
+
+    bool done() const {
+        return i >= cps.size();
+    }
+    uint32_t peek(size_t ahead = 0) const {
+        return i + ahead < cps.size() ? cps[i + ahead] : 0xFFFFFFFF;
+    }
+    uint32_t next() {
+        if (done())
+            fail("unexpected end");
+        return cps[i++];
+    }
+    bool eat(uint32_t c) {
+        if (peek() != c)
+            return false;
+        ++i;
+        return true;
+    }
+
+    // One character from `s`, or a rule for it when its spelling has alternatives.
+    std::string char_in(CharSet s) {
+        s.normalize();
+        s = s.intersect(scalar_set());
+        if (s.ranges.empty())
+            reject("a character class that matches no character");
+        std::string body = json_char_in(s);
+        return body.rfind("( ", 0) == 0 ? rule(body) : body;
+    }
+
+    // Alternatives inside a group.
+    std::string alternation() {
+        std::vector<std::string> alts{sequence()};
+        while (eat('|'))
+            alts.push_back(sequence());
+        return join_alternatives(alts);
+    }
+
+    std::string sequence() {
+        std::string out;
+        while (!done() && peek() != '|' && peek() != ')' && peek() != '$') {
+            std::string item = quantified(atom());
+            if (!item.empty())
+                out += (out.empty() ? "" : " ") + item;
+        }
+        return out.empty() ? "\"\"" : out;
+    }
+
+    // {n}, {n,} or {n,m} at the cursor; anything else leaves `{` a literal (Annex B).
+    bool brace_quantifier(int &lo, int &hi, bool consume) {
+        size_t k = i;
+        auto number = [&](int &v) {
+            size_t start = k;
+            long long x = 0;
+            while (k < cps.size() && cps[k] >= '0' && cps[k] <= '9') {
+                x = std::min<long long>(x * 10 + (cps[k] - '0'), 1LL << 30);
+                ++k;
+            }
+            v = static_cast<int>(x);
+            return k > start;
+        };
+        if (k >= cps.size() || cps[k++] != '{' || !number(lo))
+            return false;
+        hi = lo;
+        if (k < cps.size() && cps[k] == ',') {
+            ++k;
+            if (!number(hi))
+                hi = -1;
+        }
+        if (k >= cps.size() || cps[k++] != '}')
+            return false;
+        if (consume)
+            i = k;
+        return true;
+    }
+    bool at_quantifier() {
+        int lo, hi;
+        return peek() == '*' || peek() == '+' || peek() == '?' || brace_quantifier(lo, hi, false);
+    }
+
+    std::string quantified(const std::string &item) {
+        int lo = 0, hi = 0;
+        if (eat('*'))
+            hi = -1;
+        else if (eat('+'))
+            lo = 1, hi = -1;
+        else if (eat('?'))
+            hi = 1;
+        else if (!brace_quantifier(lo, hi, true))
+            return item;
+        if (hi >= 0 && hi < lo)
+            fail("numbers out of order in {} quantifier");
+        if (lo > max_repeat || hi > max_repeat)
+            reject("a repetition count above " + std::to_string(max_repeat));
+        eat('?'); // lazy: same language
+        if (at_quantifier())
+            fail("nothing to repeat");
+        return repeat(item, lo, hi);
+    }
+
+    std::string atom() {
+        const uint32_t c = next();
+        switch (c) {
+        case '(':
+            return group();
+        case '[':
+            return char_in(char_class());
+        case '.':
+            return char_in(dot_set());
+        case '\\':
+            return escape();
+        case '*':
+        case '+':
+        case '?':
+            fail("nothing to repeat");
+        case '{': {
+            --i;
+            if (at_quantifier())
+                fail("nothing to repeat");
+            ++i;
+            return char_in(CharSet(c, c));
+        }
+        case '^':
+            reject("'^' other than at the start of the pattern or of a top-level alternative");
+        default:
+            return char_in(CharSet(c, c));
+        }
+    }
+
+    std::string group() {
+        if (eat('?')) {
+            if (eat(':')) {
+            } else if (peek() == '<' && peek(1) != '=' && peek(1) != '!') {
+                ++i;
+                while (!done() && peek() != '>')
+                    ++i;
+                if (!eat('>'))
+                    fail("unterminated group name");
+            } else
+                reject("a lookahead or lookbehind assertion");
+        }
+        if (++depth > max_depth)
+            reject("groups nested deeper than " + std::to_string(max_depth));
+        std::string body = alternation();
+        --depth;
+        if (peek() == '$')
+            reject("'$' other than at the end of the pattern or of a top-level alternative");
+        if (!eat(')'))
+            fail("missing ')'");
+        return "( " + body + " )";
+    }
+
+    // Shorthand class (\d \D \w \W \s \S) for `e`, if it is one.
+    static bool class_escape(uint32_t e, CharSet &out) {
+        switch (e) {
+        case 'd': out = digit_set(); return true;
+        case 'D': out = digit_set().complement(); return true;
+        case 'w': out = word_set(); return true;
+        case 'W': out = word_set().complement(); return true;
+        case 's': out = space_set(); return true;
+        case 'S': out = space_set().complement(); return true;
+        default: return false;
+        }
+    }
+
+    uint32_t hex(int n) {
+        uint32_t v = 0;
+        for (int k = 0; k < n; ++k) {
+            const uint32_t c = next();
+            const int d = c >= '0' && c <= '9' ? int(c - '0') : c >= 'a' && c <= 'f' ? int(c - 'a' + 10)
+                        : c >= 'A' && c <= 'F' ? int(c - 'A' + 10) : -1;
+            if (d < 0)
+                fail("bad hex digit in escape");
+            v = v * 16 + static_cast<uint32_t>(d);
+        }
+        return v;
+    }
+
+    // The character a (non-class) escape `\e` stands for; `e` has been consumed.
+    uint32_t char_escape(uint32_t e) {
+        switch (e) {
+        case 't': return '\t';
+        case 'n': return '\n';
+        case 'r': return '\r';
+        case 'v': return 0x0B;
+        case 'f': return 0x0C;
+        case '0':
+            if (peek() >= '0' && peek() <= '9')
+                reject("an octal escape");
+            return 0;
+        case 'c': {
+            const uint32_t l = next();
+            if (!((l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z')))
+                fail("\\c must be followed by a letter");
+            return l % 32;
+        }
+        case 'x': return hex(2);
+        case 'u': {
+            if (eat('{')) {
+                uint32_t v = 0;
+                int digits = 0;
+                while (!eat('}')) {
+                    v = v * 16 + hex(1);
+                    if (++digits > 6 || v > max_codepoint)
+                        fail("\\u{...} beyond U+10FFFF");
+                }
+                if (digits == 0)
+                    fail("empty \\u{}");
+                return v;
+            }
+            uint32_t v = hex(4);
+            if (v >= 0xD800 && v <= 0xDBFF && peek() == '\\' && peek(1) == 'u') {
+                const size_t save = i;
+                i += 2;
+                uint32_t low = hex(4);
+                if (low >= 0xDC00 && low <= 0xDFFF)
+                    return 0x10000 + ((v - 0xD800) << 10) + (low - 0xDC00);
+                i = save;
+            }
+            return v;
+        }
+        case 'b':
+        case 'B': reject("a word boundary assertion (\\b, \\B)");
+        case 'k': reject("a named backreference (\\k)");
+        case 'p':
+        case 'P': reject("a Unicode property escape (\\p, \\P)");
+        default:
+            if (e >= '1' && e <= '9')
+                reject("a backreference");
+            if ((e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z'))
+                fail(std::string("unknown escape \\") + static_cast<char>(e));
+            return e; // identity escape
+        }
+    }
+
+    std::string escape() {
+        const uint32_t e = next();
+        CharSet s;
+        if (class_escape(e, s))
+            return char_in(s);
+        const uint32_t c = char_escape(e);
+        return char_in(CharSet(c, c));
+    }
+
+    // A class member: a shorthand class (returns true, fills `set`) or one character.
+    bool class_atom(uint32_t &c, CharSet &set) {
+        c = next();
+        if (c != '\\')
+            return false;
+        const uint32_t e = next();
+        if (class_escape(e, set))
+            return true;
+        if (e == 'b')
+            c = '\b';
+        else if (e == '-')
+            c = '-';
+        else
+            c = char_escape(e);
+        return false;
+    }
+
+    CharSet char_class() {
+        const bool negated = eat('^');
+        CharSet s;
+        while (!eat(']')) {
+            if (done())
+                fail("missing ']'");
+            uint32_t lo, hi;
+            CharSet a, b;
+            if (class_atom(lo, a)) {
+                s.add(a);
+                continue;
+            }
+            if (peek() == '-' && peek(1) != ']' && peek(1) != 0xFFFFFFFF) {
+                ++i;
+                if (class_atom(hi, b)) { // [a-\d]: '-' is a literal (Annex B)
+                    s.add(lo, lo).add('-', '-').add(b);
+                    continue;
+                }
+                if (hi < lo)
+                    fail("range out of order in character class");
+                s.add(lo, hi);
+            } else
+                s.add(lo, lo);
+        }
+        s.normalize();
+        return negated ? s.complement() : s;
+    }
+};
+
 struct Compiler {
     // Bounds, all -> SchemaError (a 400): schema nesting depth (visit is
     // recursive and runs on the HTTP handler thread), generated rule count
@@ -251,7 +793,6 @@ struct Compiler {
     static constexpr int max_depth = 64;
     static constexpr size_t max_rules = 65536;
     static constexpr size_t max_grammar_bytes = 2u << 20;
-    static constexpr int max_repeat = 4096; // = the GBNF parser's cap
     static constexpr size_t max_properties = 1024;
 
     const json *root; // the schema being compiled ($ref "#" and "#/..." resolve against it)
@@ -312,30 +853,6 @@ struct Compiler {
 
     static std::string json_literal(const json &v) {
         return literal(v.dump());
-    }
-
-    static std::string repeat(const std::string &item, int min_n, int max_n) {
-        if (min_n > max_repeat || max_n > max_repeat)
-            throw SchemaError("minLength/maxLength/minItems/maxItems bound " +
-                              std::to_string(std::max(min_n, max_n)) + " exceeds the supported " +
-                              std::to_string(max_repeat));
-        if (max_n < 0) {
-            if (min_n == 0)
-                return item + "*";
-            if (min_n == 1)
-                return item + "+";
-            return item + "{" + std::to_string(min_n) + ",}";
-        }
-        if (min_n == max_n) {
-            if (min_n == 0)
-                return "";
-            if (min_n == 1)
-                return item;
-            return item + "{" + std::to_string(min_n) + "}";
-        }
-        if (min_n == 0 && max_n == 1)
-            return item + "?";
-        return item + "{" + std::to_string(min_n) + "," + std::to_string(max_n) + "}";
     }
 
     const json *resolve_ref(const std::string &ref) {
@@ -400,7 +917,7 @@ struct Compiler {
         static const std::set<std::string> known = {
             "type", "properties", "required", "additionalProperties", "items", "prefixItems",
             "additionalItems", "minItems", "maxItems", "enum", "const", "anyOf", "oneOf", "allOf", "$ref",
-            "nullable", "minLength", "maxLength", "format", "minimum", "maximum", "exclusiveMinimum",
+            "nullable", "minLength", "maxLength", "format", "pattern", "minimum", "maximum", "exclusiveMinimum",
             "exclusiveMaximum"};
         for (auto it = s.begin(); it != s.end(); ++it)
             if (!known.count(it.key()) && !annotation(it.key()))
@@ -594,8 +1111,19 @@ struct Compiler {
             if (!fmt.empty()) {
                 if (s.contains("minLength") || s.contains("maxLength"))
                     unsupported("minLength/maxLength combined with format '" + f + "'");
+                if (s.contains("pattern"))
+                    unsupported("pattern combined with format '" + f + "'");
                 return add_rule(name, "\"\\\"\" " + fmt + " \"\\\"\" space");
             }
+        }
+        if (s.contains("pattern")) {
+            if (!s["pattern"].is_string())
+                throw SchemaError("'pattern' must be a string");
+            if (s.contains("minLength") || s.contains("maxLength"))
+                unsupported("minLength/maxLength combined with pattern");
+            PatternCompiler p(s["pattern"].get<std::string>(),
+                              [&](const std::string &body) { return add_rule(name + "-char", body); });
+            return add_rule(name, "\"\\\"\" " + p.compile() + " \"\\\"\" space");
         }
         if (min_len == 0 && max_len < 0)
             return "string";
@@ -777,7 +1305,7 @@ struct Compiler {
             return visit_object(s, name);
         if (s.contains("items") || s.contains("prefixItems"))
             return visit_array(s, name);
-        for (const char *k : {"minLength", "maxLength", "format", "minimum", "maximum", "exclusiveMinimum",
+        for (const char *k : {"minLength", "maxLength", "format", "pattern", "minimum", "maximum", "exclusiveMinimum",
                               "exclusiveMaximum", "minItems", "maxItems"})
             if (s.contains(k))
                 unsupported(std::string("'") + k + "' without 'type'");

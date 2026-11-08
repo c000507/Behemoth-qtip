@@ -229,7 +229,11 @@ curl http://127.0.0.1:1337/v1/chat/completions -H 'Content-Type: application/jso
 `allOf` with one schema, `$ref` to `#`, `#/$defs/...` or `#/definitions/...` (recursion
 allowed), `nullable` (OpenAPI), `minLength`/`maxLength` (codepoints; an escape counts as
 one), `format` `date`, `time`, `date-time`, `uuid` (enforced; other formats such as `email`
-or `uri` are annotations and pass through unchecked), integer
+or `uri` are annotations and pass through unchecked), `pattern` (ECMA-262 regex compiled
+into the grammar and matched against the decoded string, unanchored unless `^`/`$`:
+literals, `.`, classes and ranges, `\d\w\s` and negations, `\t\n\r\v\f\0\cX\xHH\uHHHH\u{...}`,
+groups including `(?:...)` and `(?<name>...)`, alternation, `* + ? {n} {n,} {n,m}` and their
+lazy forms; generated text uses one escape spelling per character), integer
 `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum` (exact digit-range grammars,
 draft-4 boolean exclusive form too), number bounds with integer-valued limits (bounded
 numbers are written without exponent). Annotations (`title`, `description`, `default`,
@@ -240,7 +244,9 @@ indentation columns).
 
 **Rejected with HTTP 400** (`{"error":{"message":..., "type":"invalid_request_error",
 "param":"response_format.json_schema.schema", "code":null}}`, the message names the
-keyword): `pattern`, `patternProperties`, `propertyNames`, `multipleOf`, `uniqueItems`,
+keyword): `pattern` with lookaround, backreferences, `\b`/`\B`, `\p{...}`, `^`/`$` other
+than at the ends of a top-level alternative, or combined with `minLength`/`maxLength` or an
+enforced `format`; `patternProperties`, `propertyNames`, `multipleOf`, `uniqueItems`,
 `contains`, `minProperties`/`maxProperties`, `dependent*`, `unevaluated*`, `not`,
 `if`/`then`/`else`, `allOf` with several schemas, non-local `$ref`, schema `false`,
 number bounds that are not integers, `$ref`/`anyOf`/`oneOf`/`allOf`/`enum`/`const`

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <regex>
 
 using namespace behemoth;
 using namespace structured_test;
@@ -249,7 +250,7 @@ static void json_schema_tests() {
 
     // Rejected features name the keyword.
     for (const char *bad :
-         {R"({"type":"string","pattern":"^a"})", R"({"type":"number","multipleOf":2})", R"({"not":{"type":"null"}})",
+         {R"({"type":"string","pattern":"\\bx"})", R"({"type":"number","multipleOf":2})", R"({"not":{"type":"null"}})",
           R"({"type":"object","minProperties":1})", R"({"type":"array","uniqueItems":true})",
           R"({"type":"object","patternProperties":{}})", R"({"if":{},"then":{}})", R"({"type":"string","foo":1})",
           R"({"type":"object","properties":{"a":{"type":"string"}},"anyOf":[{"required":["a"]}]})",
@@ -262,7 +263,7 @@ static void json_schema_tests() {
         auto msg = rejects([&] { grammar::json_schema_grammar(schema(bad)); });
         CHECK(!msg.empty());
     }
-    CHECK(rejects([] { grammar::json_schema_grammar(schema(R"({"type":"string","pattern":"a"})")); })
+    CHECK(rejects([] { grammar::json_schema_grammar(schema(R"({"type":"string","pattern":"(a)\\1"})")); })
               .find("pattern") != std::string::npos);
     // Annotations are accepted.
     grammar::json_schema_grammar(schema(R"({"title":"t","description":"d","$schema":"x","type":"object","examples":[{}],
@@ -272,6 +273,78 @@ static void json_schema_tests() {
     for (int i = 0; i < 80; ++i)
         deep = "{\"type\":\"array\",\"items\":" + deep + "}";
     rejects([&] { grammar::json_schema_grammar(ojson::parse(deep)); });
+}
+
+// `pattern` against std::regex (ECMAScript, regex_search) on the decoded string,
+// the grammar on its JSON spelling as nlohmann::json writes it.
+static void pattern_tests() {
+    auto grammar_for = [](const std::string &pattern) {
+        ojson s = {{"type", "string"}, {"pattern", pattern}};
+        return grammar::json_schema_grammar(s);
+    };
+    const std::string alphabet = std::string("ab c-x0Z1_.@{}]\"\\\n\t\r\x01\x1f", 22);
+    std::mt19937_64 rng(11);
+    std::vector<std::string> samples = {"", "a", "ab", "abc", "\"", "\\", "\"\\", "a\n", "x{}", "]"};
+    for (int i = 0; i < 1500; ++i) {
+        std::string s;
+        for (int n = std::uniform_int_distribution<int>(0, 7)(rng); n > 0; --n)
+            s += alphabet[std::uniform_int_distribution<size_t>(0, alphabet.size() - 1)(rng)];
+        samples.push_back(s);
+    }
+    for (int i = 0; i < 300; ++i) { // words the patterns below are about
+        static const char *parts[] = {"a", "b", "ab", "c", "x", "0", "12", "_", ".", "@", "-", "Z", "{}", "\""};
+        std::string s;
+        for (int n = std::uniform_int_distribution<int>(0, 5)(rng); n > 0; --n)
+            s += parts[std::uniform_int_distribution<size_t>(0, 13)(rng)];
+        samples.push_back(s);
+    }
+    for (const char *p :
+         {"^[a-z]+$", "abc", "ab", "^a|b$", "^(?:ab|c)*$", "^\\d{2,4}-\\w?$", "[^a-c]", "^.{3}$", "^\"\\\\$", "^[\\s\\S]*x",
+          "^a{2}$", "^(a|)b$", "x$", "^$", "", "^[\\x00-\\x1f]+$", "^[^\"]*$", "^\\W+$", "^a+?b{1,}$", "^[-a]$", "^[a-]$",
+          "^[\\w.-]+@[\\w-]+\\.[a-z]{2,3}$", "^\\D\\S\\s$", "^[\\]\\\\]$", "^\\{\\}$", "^a{1}b{0,2}$", "^[^\\n]*$",
+          "^(a(b|c)?)+$", "^\\t\\n\\r$", "^[A-Z_][A-Z0-9_]*$", "^[a-c\\d]{1,3}$", "a.c", "^\\.$"}) {
+        std::regex re(p, std::regex::ECMAScript);
+        grammar::Grammar gr = grammar::ParseGbnf(grammar_for(p));
+        grammar::Matcher m(gr);
+        for (const auto &s : samples) {
+            const bool want = std::regex_search(s, re);
+            if (m.Matches(ojson(s).dump()) != want)
+                throw std::runtime_error(std::string("pattern ") + p + " on " + ojson(s).dump() + ": want " +
+                                         (want ? "match" : "no match"));
+            ++assertions;
+        }
+    }
+    // Non-ASCII: code points, surrogate pairs, \u{...}, '.' and \s on Unicode line terminators.
+    auto ok = [&](const char *p, const std::string &s) { return matches(grammar_for(p), ojson(s).dump()); };
+    CHECK(ok("^\xc3\xa9+$", "\xc3\xa9\xc3\xa9") && !ok("^\xc3\xa9+$", "e"));
+    CHECK(ok("^\\u00e9$", "\xc3\xa9") && ok("^\\u{1F600}$", "\xf0\x9f\x98\x80") && ok("^\\uD83D\\uDE00$", "\xf0\x9f\x98\x80"));
+    CHECK(ok("^[^a]$", "\xe2\x82\xac") && !ok("^.$", "\xe2\x80\xa8") && ok("^\\s$", "\xe2\x80\xa8"));
+    CHECK(ok("^[\\u0100-\\u{10FFFF}]+$", "\xc4\x80\xf4\x8f\xbf\xbf") && !ok("^[\\u0100-\\u{10FFFF}]+$", "\xc3\xbf"));
+    CHECK(ok("^\\x7f$", "\x7f") == false); // DEL is spelled \u007f, as in the plain string rule
+    CHECK(matches(grammar_for("^\\x7f$"), "\"\\u007f\""));
+    // Beyond libstdc++ std::regex: [\cA] (it gets it wrong) and named groups.
+    CHECK(ok("^[\\cA]$", "\x01") && !ok("^[\\cA]$", "A"));
+    CHECK(ok("^(?<n>ab)+$", "abab") && !ok("^(?<n>ab)+$", "aba"));
+    // In objects, beside other properties, and nullable / type lists.
+    auto obj = schema(R"({"type":"object","properties":{"id":{"type":"string","pattern":"^[A-Z]{3}-\\d+$"},
+        "tag":{"type":["string","null"],"pattern":"^#"}},"required":["id"],"additionalProperties":false})");
+    CHECK(schema_matches(obj, R"({"id":"ABC-42","tag":"#x"})") && schema_matches(obj, R"({"id":"XYZ-0","tag":null})"));
+    CHECK(!schema_matches(obj, R"({"id":"AB-42"})") && !schema_matches(obj, R"({"id":"ABC-42","tag":"x#"})"));
+    // pattern applies to strings only
+    CHECK(schema_matches(schema(R"({"type":["integer","string"],"pattern":"^a"})"), "7"));
+
+    // Rejections name the pattern.
+    for (const char *bad : {"(?=a)", "(?!a)", "(?<=a)b", "(?<!a)b", "(a)\\1", "\\bfoo", "\\Bx", "\\p{L}", "\\k<n>", "a^b",
+                            "(^a)", "a$b", "(a$)", "*a", "a**", "a{2}{3}", "[z-a]", "(a", "a)", "[]", "[a", "\\", "a{5000}",
+                            "a{3,1}", "\\q", "\\012", "\\u{110000}", "\\xZZ"}) {
+        auto msg = rejects([&] { grammar_for(bad); });
+        CHECK(msg.find("pattern") != std::string::npos);
+    }
+    for (const char *bad : {R"({"type":"string","pattern":"a","maxLength":3})", R"({"type":"string","pattern":1})",
+                            R"({"type":"string","pattern":"a","format":"date"})", R"({"pattern":"a"})"})
+        CHECK(!rejects([&] { grammar::json_schema_grammar(schema(bad)); }).empty());
+    // Annotation formats still combine with pattern.
+    CHECK(schema_matches(schema(R"({"type":"string","format":"email","pattern":"@"})"), "\"a@b\""));
 }
 
 static void splitter_tests() {
@@ -559,7 +632,7 @@ static void protocol_tests() {
     CHECK(param(bad) == "response_format.type");
     bad["response_format"] = {{"type", "json_schema"}};
     CHECK(param(bad) == "response_format.json_schema");
-    bad["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "x"}, {"schema", {{"type", "string"}, {"pattern", "a"}}}}}};
+    bad["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "x"}, {"schema", {{"type", "string"}, {"pattern", "(?=a)"}}}}}};
     CHECK(param(bad) == "response_format.json_schema.schema");
     bad["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "bad name!"}, {"schema", nlohmann::json::object()}}}};
     CHECK(param(bad) == "response_format.json_schema.name");
@@ -732,6 +805,12 @@ static void tool_tests() {
         "type":"object","properties":{"v":{"$ref":"#/$defs/x"}},"required":["v"],"additionalProperties":false}}}])");
     const auto gd = tool_call_grammar(parse_tools({{"tools", defs}}), mistral_tools);
     CHECK(matches(gd, R"([TOOL_CALLS]a[ARGS]{"v":1}[TOOL_CALLS]b[ARGS]{"v":"s"})"));
+    // pattern in tool parameters
+    ojson pat = ojson::parse(R"([{"type":"function","function":{"name":"fetch","parameters":{"type":"object",
+        "properties":{"url":{"type":"string","pattern":"^https?://"}},"required":["url"],"additionalProperties":false}}}])");
+    const auto gp = tool_call_grammar(parse_tools({{"tools", pat}}), mistral_tools);
+    CHECK(matches(gp, R"([TOOL_CALLS]fetch[ARGS]{"url":"https://example.com"})"));
+    CHECK(!matches(gp, R"([TOOL_CALLS]fetch[ARGS]{"url":"ftp://example.com"})"));
     CHECK(!matches(gd, R"([TOOL_CALLS]a[ARGS]{"v":"s"})") && !matches(gd, R"([TOOL_CALLS]b[ARGS]{"v":1})"));
 
     // constraint on the 131072-id vocabulary: control tokens 9 / 32 carry the markers
@@ -856,7 +935,7 @@ static void tool_tests() {
             CHECK(e.param == "tool_choice");
         }
         body.erase("response_format");
-        body["tools"][0]["function"]["parameters"] = {{"type", "string"}, {"pattern", "a+"}};
+        body["tools"][0]["function"]["parameters"] = {{"type", "string"}, {"pattern", "(?=a)+"}};
         try {
             chat(body);
             CHECK(false);
@@ -1046,6 +1125,7 @@ int main() {
                  {"gbnf", gbnf_tests},
                  {"json_object", json_object_tests},
                  {"json_schema", json_schema_tests},
+                 {"pattern", pattern_tests},
                  {"think_splitter", splitter_tests},
                  {"constraint", constraint_tests},
                  {"random_walk", random_walk_tests},

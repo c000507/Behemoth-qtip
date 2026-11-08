@@ -5,7 +5,9 @@
 // items/prefixItems/minItems/maxItems, enum/const, anyOf/oneOf (oneOf is
 // treated as anyOf), allOf with one schema, $ref to "#", #/$defs/...,
 // #/definitions/..., nullable (OpenAPI), minLength/maxLength, format (date,
-// time, date-time, uuid enforced; other formats are annotations), integer
+// time, date-time, uuid enforced; other formats are annotations), pattern
+// (ECMA-262 regex compiled to grammar; not combined with minLength/maxLength
+// or an enforced format; no lookaround, backreferences or \b), integer
 // minimum/maximum/exclusiveMinimum/exclusiveMaximum (exact digit-range
 // grammars), number bounds with integer-valued limits. Annotation keywords
 // (title, description, default, examples, $schema, $id, $comment, ...) are

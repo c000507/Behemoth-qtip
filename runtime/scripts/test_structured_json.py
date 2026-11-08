@@ -269,6 +269,12 @@ class Runner:
                        + ("" if ok else f" ({why})"))
         except Exception as e:  # noqa: BLE001
             self.check("streaming json_schema", False, repr(e))
+        ticket = {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[A-Z]{3}-\\d{4}$"},
+                                                   "url": {"type": "string", "pattern": "^https://"}},
+                  "required": ["id", "url"], "additionalProperties": False}
+        self.answer("json_schema pattern (anchored regex, prefix)",
+                    chat("Make up a support ticket with an id and a link. Reply in JSON.", max_tokens=mt,
+                         response_format=schema_format("ticket", ticket)), ticket)
         # Raw grammar extension.
         status, r = self.c.post(chat("Is the sky blue? Answer yes or no.", max_tokens=mt, reasoning_effort="none",
                                      grammar='root ::= "yes" | "no"'))
@@ -276,7 +282,7 @@ class Runner:
                    status == 200 and r["choices"][0]["message"]["content"] in ("yes", "no"),
                    str(r["choices"][0]["message"]["content"] if status == 200 else r))
         # Rejections.
-        for name, rf in [("pattern", schema_format("x", {"type": "string", "pattern": "^a"})),
+        for name, rf in [("pattern lookahead", schema_format("x", {"type": "string", "pattern": "(?=a)"})),
                          ("multipleOf", schema_format("x", {"type": "integer", "multipleOf": 3})),
                          ("unknown type", {"type": "xml"}),
                          ("missing schema", {"type": "json_schema", "json_schema": {"name": "x"}})]:
