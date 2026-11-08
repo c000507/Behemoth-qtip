@@ -40,3 +40,9 @@ enable_alb = false
 # Streamed load (entrypoint STREAM_LOAD=1, default): layer files download while the server loads. Optional RAM staging:
 # backend_shm_size_mib = 6144
 # backend_extra_env = { STAGE_DIR = "/dev/shm/layers", STREAM_UNLINK = "1", STREAM_AHEAD = "8" }
+
+# Prepared shards (written once with neuron_server BEHEMOTH_NEURON_WRITE_PREPARED=<dir>, uploaded under this prefix): the
+# backend streams them instead of the safetensors layer files and skips the expansion pass (model resident 74 s -> 34 s).
+# prepared_s3_prefix = "prepared/cydonia-24b-fp8-tp2-wt-mlptiled"
+# On-demand only: a stopped, pre-initialised instance in an ASG warm pool (cold start 149 s -> 107 s end to end).
+# backend_warm_pool = true
