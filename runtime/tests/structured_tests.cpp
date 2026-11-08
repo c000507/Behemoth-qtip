@@ -907,6 +907,21 @@ static void tool_tests() {
     CHECK(render_mistral_tools(messages, tools, mistral_tools, "<s>", "</s>", "")
               .rfind("<s>[SYSTEM_PROMPT]" + tool_instruction(mistral_tools) + "[/SYSTEM_PROMPT]", 0) == 0);
     CHECK(tool_instruction(mistral_tools).find("[TOOL_CALLS]function_name[ARGS]{") != std::string::npos);
+    // Tekken v13 (Devstral 2507): tools once after the system prompt, no instruction; the expected text is
+    // mistral_common 1.x encode_chat_completion on the same conversation with Devstral's tekken.json
+    ToolFormat v13 = mistral_tools;
+    v13.tools_first = true;
+    const auto v13_messages = ojson::parse(R"([{"role":"system","content":"SYS"},{"role":"user","content":"list"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"abcdefghi","type":"function",
+          "function":{"name":"bash","arguments":"{\"command\": \"ls\"}"}}]},
+        {"role":"tool","tool_call_id":"abcdefghi","content":"a b"},{"role":"user","content":"next"}])");
+    const ojson bash = ojson::parse(R"([{"type":"function","function":{"name":"bash","description":"run",
+        "parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}])");
+    CHECK(render_mistral_tools(v13_messages, bash, v13, "<s>", "</s>", "Default.") ==
+          "<s>[SYSTEM_PROMPT]SYS[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": "
+          "\"bash\", \"description\": \"run\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": "
+          "{\"type\": \"string\"}}}}}][/AVAILABLE_TOOLS][INST]list[/INST][TOOL_CALLS]bash[ARGS]{\"command\": \"ls\"}</s>"
+          "[TOOL_RESULTS]a b[/TOOL_RESULTS][INST]next[/INST]");
     rejects([&] { render_mistral_tools(ojson::parse(R"([{"role":"robot","content":"x"}])"), ojson(), mistral_tools, "", "", ""); });
     CHECK(python_json(ojson::parse(R"({"a":[1,"é\n",{"b":null}],"c":true})")) == "{\"a\": [1, \"\xc3\xa9\\n\", {\"b\": null}], \"c\": true}");
 

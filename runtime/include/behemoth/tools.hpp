@@ -33,6 +33,9 @@ struct ToolFormat {
     std::string calls, args;               // marker texts ("[TOOL_CALLS]", "[ARGS]")
     int calls_token = -1, args_token = -1; // their control-token ids (streamed as the marker text)
     bool glm = false;
+    // Mistral Tekken v13+ (Devstral 2507, Magistral): [AVAILABLE_TOOLS] once after the system prompt, not before the
+    // last [INST] (v11), and no tool_instruction(): the checkpoint was trained on this format
+    bool tools_first = false;
     // every control token of the format with its text (GLM: <tool_call> </tool_call> <arg_key> </arg_key> <arg_value>
     // </arg_value>), streamed as text into the parser and the constraints; Mistral: empty (calls / args tokens)
     std::vector<std::pair<int, std::string>> markers;

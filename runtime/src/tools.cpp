@@ -307,13 +307,17 @@ std::string render_mistral_tools(const ojson &messages, const ojson &tools, cons
         prompt = text_content(messages[0], false);
         begin = 1;
     }
-    if (tools.is_array() && !tools.empty()) // fine-tunes of tool-trained bases may need telling (tool_instruction)
+    const bool offered = tools.is_array() && !tools.empty();
+    if (offered && !f.tools_first) // fine-tunes of tool-trained bases may need telling (tool_instruction)
         prompt += (prompt.empty() ? "" : "\n\n") + tool_instruction(f);
     if (!prompt.empty())
         out += "[SYSTEM_PROMPT]" + prompt + "[/SYSTEM_PROMPT]";
-    for (size_t i = begin; i < messages.size(); ++i)
-        if (messages[i].is_object() && messages[i].value("role", "") == "user")
-            last_user = i;
+    if (offered && f.tools_first)
+        out += "[AVAILABLE_TOOLS]" + python_json(tools) + "[/AVAILABLE_TOOLS]";
+    else
+        for (size_t i = begin; i < messages.size(); ++i)
+            if (messages[i].is_object() && messages[i].value("role", "") == "user")
+                last_user = i;
     for (size_t i = begin; i < messages.size(); ++i) {
         const auto &m = messages[i];
         if (!m.is_object() || !m.contains("role") || !m.at("role").is_string())
