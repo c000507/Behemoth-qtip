@@ -376,3 +376,36 @@ identity refill SP dma, PE stream = phase cadence per mm/mm2/mm3 templates
 (pair counts: K128=2, K256=8, K512=32; b1 modes 1=start-of-chunk-group,
 2=mid, 3=per-pair-single at K>=512 B-side; upd 19/5 at group ends),
 validate x@w vs numpy for K in {128,256,512}, M in {32,64}, N in {128,256}.
+
+## General matmul emitter rules (decoded from 6 oracles: K{128,256,512} x M{32,64} x N{128,256})
+
+Params: KS=K/64 k-step pairs per pass; AS=K/128 ring slots (512B each);
+NT=N/64 PSUM sub-tiles (64B stride); passes: A-phase then B-phase then PV
+(PV only when NT>2? K128/N128 has no PV: mm 2 pairs total = 1 pass each).
+
+Observed sequences (k = 0..KS-1, s = 0..AS-1 = k//2, tile = 0..NT-1):
+- A-phase pairs (NT x KS): LW src = SB A_ring[s] end (0x?fc), step=-1, num=128,
+  wait 5/8 GE16 only on k=0 of tile 0 (sem8 = A stage desc); MM A=identity
+  0x2fe00 step1 num=M, dst PSUM 0x2000000, upd 19/5 on last k of tile;
+  op10 b1 = 1 if k==0 else 2, after LW AND after MM (b1 same).
+  PSUM dst during A-phase = 0x2fe00?? NO: mm_32_512_256 A-phase MM dst
+  pattern = identity 0x2fe00 (A operand!), dst PSUM 0x2000000 fixed.
+  LW addrs cycle s=0,0,1,1,2,2,3,3 for K512 (2 k-steps per slot); s=k//2.
+  For K256: slots at 0x2fc00+, K128: 0x2fe00-512 slot.
+- B-phase (NT x KS): LW src = SB B_ring[b] end, step=-1, num=128 (b = k//2
+  offset by NT? mm_32_512_256: B slots 0x2ee00+0x200*b+0x1fc for b in
+  0..3 first NT-pass, then 0x2ee00+2048+... second pass); MM A = SB
+  scratch tile (0x4000 + 0x80*tile for K512N256; 0x2f980 for N256K128 -
+  scratch tile addrs live ABOVE 0x4000 when NT>2, below when small);
+  dst PSUM sub-tile 0x4000+0x80*tile (K512N256) / SB scratch (K128N256);
+  upd 19/5 at last k of tile.
+- PV phase (only NT>=4? K512 shapes): LW = PSUM 0x427c/0x42fc... descending
+  reads of the B-phase PSUM tiles, num = 32/64; MM A = identity, num=128
+  cols, dst PSUM 0x800. Two pairs per N-tile-half.
+- y-out pool desc: src SB PV PSUM (0x4280/0x42fc...), dst HBM var, waits
+  5/4 GE (num phases = 3).
+
+IMPLEMENTATION NOTE: exact scratch tile placement (0x4000 vs 0x2f980 base)
+= compiler allocator choice; any free SB region works as long as LW/MM
+addresses are consistent. Emitter validates byte-exactly against the six
+archived oracle streams (oracles_x/mm_*).
