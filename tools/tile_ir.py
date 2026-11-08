@@ -60,8 +60,10 @@ class Events:
 
 @dataclass
 class LdWeights:
-    tile_var: str
+    addr: int                      # SB address of weight tile
     events: Events = field(default_factory=Events)
+    rows: int = 128
+    cols: int = 128
 
 
 @dataclass
@@ -74,6 +76,7 @@ class Matmul:
     row_grp: int = 15
     col_grp: int = 15
     events: Events = field(default_factory=Events)
+    accum: int = 0                 # 1 = zero-dest, 2 = accumulate
 
 
 @dataclass
@@ -91,29 +94,58 @@ PROLOGUE = bytes([177, 16, 0, 0]) + bytes(60)     # BRANCH_PREFETCH_HINT, len16
 
 # --------------------------------------------------------- PE stream emit
 
+# mem-pattern element: {u24 addr + u8 space marker @+0, step@+4, num@+10,
+#                       flags@+12,@+14}; space: 0=SB, 2=PSUM
+SB_SPACE = 0
+PSUM_SPACE = 2
+
+
+def _pat(addr: int, space: int, step: int = 1, num: int = 128,
+         f1: int = 1, f2: int = 1) -> bytes:
+    return (struct.pack("<I", (addr & 0xFFFFFF) | (space << 24))
+            + struct.pack("<HHHH", step & 0xFFFF, 0, 0, num)
+            + struct.pack("<HH", f1, f2))
+
+
 def enc_mm(src: int, dst: int, rows: int, cols: int, dt: int, ev: Events,
-           row_grp=15, col_grp=15) -> bytes:
+           row_grp=15, col_grp=15, src_space=SB_SPACE, dst_space=PSUM_SPACE,
+           accum: int = 0, fp32_mode: int = 2, xbus_sel: int = 16) -> bytes:
     vals = {
-        "src_mem_pattern_start_addr0": src,
-        "dst_mem_pattern_start_addr0": dst,
         "in_dtype": dt,
         "num_active_rows": rows,
         "num_active_cols": cols,
         "row_grp": row_grp,
         "col_grp": col_grp,
+        "xbus_sel": xbus_sel,
+        "psum_accumulate_flags": accum,
+        "fp32_mode": fp32_mode,
         "events": ev.pack(),
         "events_semaphore_value": ev.semaphore_value,
     }
-    return isa.encode("NEURON_ISA_TPB_S3D3_MM", vals, 2, 16)
+    buf = bytearray(isa.encode("NEURON_ISA_TPB_S3D3_MM", vals, 2, 16))
+    buf[16:32] = _pat(src, src_space)
+    buf[48:64] = _pat(dst, dst_space)
+    return bytes(buf)
 
 
-def enc_lw(var_addr: int, ev: Events = None) -> bytes:
-    # S3_LW: src_mem_pattern_start_addr @16, in_dtype @32, rows/cols @38/39
-    vals = {"src_mem_pattern_start_addr": var_addr}
+def enc_lw(var_addr: int, ev: Events = None, rows: int = 128, cols: int = 128,
+           dt: int = 10, fp32_mode: int = 2, xbus_sel: int = 2,
+           src_space: int = SB_SPACE) -> bytes:
+    vals = {
+        "in_dtype": dt,
+        "num_active_rows": rows,
+        "num_active_cols": cols,
+        "row_grp": 15,
+        "col_grp": 15,
+        "xbus_sel": xbus_sel,
+        "fp32_mode": fp32_mode,
+    }
     if ev:
         vals["events"] = ev.pack()
         vals["events_semaphore_value"] = ev.semaphore_value
-    return isa.encode("NEURON_ISA_TPB_S3_LW", vals, 1, 16)
+    buf = bytearray(isa.encode("NEURON_ISA_TPB_S3_LW", vals, 1, 16))
+    buf[16:32] = _pat(var_addr, src_space)
+    return bytes(buf)
 
 
 def enc_semaphore(update_mode: int, update_idx: int, value: int,
@@ -130,19 +162,46 @@ def enc_semaphore(update_mode: int, update_idx: int, value: int,
 
 
 def emit_pe_stream(ops: list) -> bytes:
+    # reference layout: [prologue 177][PSEUDO_TENSOR_STORE 204 marker][compute...]
     out = bytearray(PROLOGUE)
+    out += op204()
     for op in ops:
         if isinstance(op, LdWeights):
-            out += enc_lw(0)  # addr patched by caller when known
+            out += enc_lw(op.addr, ev=op.events, rows=op.rows, cols=op.cols)
         elif isinstance(op, Matmul):
             out += enc_mm(op.src_addr, op.dst_addr, op.rows, op.cols,
-                          op.in_dtype, op.events, op.row_grp, op.col_grp)
+                          op.in_dtype, op.events, op.row_grp, op.col_grp,
+                          accum=op.accum)
         elif isinstance(op, SemUpdate):
             out += enc_semaphore(op.mode, op.sem, op.value)
         elif isinstance(op, SemWait):
             out += enc_semaphore(0, 0, 0, op.mode, op.sem)
         else:
             raise TypeError(op)
+    return bytes(out)
+
+
+def enc_dmatrigger(queue_name: str) -> bytes:
+    """PSEUDO_DMATRIGGER (op 193): queue name as ASCII at +0x0C (TDRV reads there)."""
+    b = bytearray(64)
+    b[0] = 193; b[1] = 16
+    nm = queue_name.encode() + b"\0"
+    b[0x0C:0x0C + len(nm)] = nm
+    return bytes(b)
+
+
+def op204() -> bytes:
+    """PSEUDO_TENSOR_STORE placeholder: header only (runtime patches it)."""
+    b = bytearray(64)
+    b[0] = 204; b[1] = 16
+    return bytes(b)
+
+
+def emit_sp_stream(triggers: list[str]) -> bytes:
+    out = bytearray(PROLOGUE)
+    out += op204()
+    for q in triggers:
+        out += enc_dmatrigger(q)
     return bytes(out)
 
 
@@ -211,6 +270,14 @@ def build_def_json(name: str, tensors: list[Tensor], consts: dict,
         "version": "0.6",
     }
 
+
+
+@dataclass
+class Plan:
+    tensors: list
+    dma: list
+    pe_ops: list
+    notes: list
 
 # ------------------------------------------------------------ demo graph
 

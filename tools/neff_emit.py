@@ -22,7 +22,7 @@ def build_tar(src: Path) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         for p in sorted(src.rglob("*")):
-            if p.is_file():
+            if p.is_file() and p.suffix != ".neff":
                 tf.add(p, arcname=str(p.relative_to(src)), recursive=False)
     return buf.getvalue()
 

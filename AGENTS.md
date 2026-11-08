@@ -8,8 +8,9 @@ Full reverse-engineering chain WORKS: NEFF container ↔ ISA decode ↔ ISA enco
 2. ISA: complete v2 field maps extracted from neuron-dbg cgo accessors (tools/isa_fields.py → tools/neff-isa-fields.json, 4389 fields, 46 v2 structs).
 3. Encoder: tools/neff_isa.py round-trips ALL 6144 MATMUL instrs in ffn1 PE0.bin byte-identical.
 4. DEVICE CONTROL PROVEN: patched all 6144 matmuls (num_active_rows 128→64), re-emitted, ran on trn1 via neff_io2 harness — output differs from reference exactly as expected (all 4096 outputs differ).
-5. Harness: /tmp/nrtd on box has neff_info + neff_io2 (generic single-rank runner, inputs by order dir/in0.., outputs dir/out0..). neff_io2.cpp source also at s3://912935854432-neuron-build/tools/neff_io2.b64.
-6. OPCODE→STRUCT DISPATCH: automated search (try-decode-encode all 46 v2 structs per instr) encodes 16765/19391 instrs across all engine streams. Caveat: sparse structs (DMA_INDIRECT1D/CTRL_AL) false-match; v2-only ops 212=PSEUDO_DMA_DIRECT2D likely, 10/8/128 still unknown. Prologue=64B opcode-177 everywhere, no terminators.
+5. Harness: /tmp/nrtd on box has neff_info + neff_io2 (generic single-rank runner, inputs by order dir/in0.., outputs dir/out0..). neff_io2.cpp source also at s3://912935854432-neuron-build/tools/neff_io2.b64. NOTE /tmp on box is wiped on reboot — rebuild harnesses from b64 files (info.c inline needed too, transport via b64 not heredoc).
+6. OPCODE→STRUCT DISPATCH: op1=LDWEIGHTS→v2.S3_LW (6402/6402 byte-identical), op2=MATMUL→v2.S3D3_MM (6402/6402). DVE arith (65/66/67/107) + CTRL (160/204) v2 layouts NOT in accessor set — live in libnrt add_* builders (SP/CTRL done in docs/neff-isa-sp.md) and hwdecode tables (DVE TODO). v2-only real opcode = 212 (Pool, PSEUDO_DMA_DIRECT2D likely).
+7. SYNTHETIC NEFF ON DEVICE: tools/tile_ir.py + tools/lift_hip.py emit a from-scratch graph (lifted tiled_projection) that passes nrt_load on trn1 — tensors w/x/y correct. Schema fixes learned: kelf-0.json graphs[].definition="sg00/def.json"; def.json needs var/dma_queue sets (qSPIO0 type=in sem 40-55, qPoolIO0 56-71, qPoolDynamic 8-23, qSPSpillReload0 24-39); IO inputs ARE valid DMA sources but only on IO queues; DVE tables must be embedded (copied from reference); neff.json needs one shape per node output.
 
 ## Goal
 ROCm/HIP kernels (runtime/src/*.hip) → better Neuron kernels/graphs → direct NEFF emission, bypassing neuronx-cc frontends. Repo = BEHEMOTH-REVERSE.
@@ -43,14 +44,18 @@ ROCm/HIP kernels (runtime/src/*.hip) → better Neuron kernels/graphs → direct
 - tools/: neff_unpack.py, dwarf_extract.py, dwarf_resolve.py, isa_fields.py.
 
 ## Todo list (live in session tracker; mirror here)
-1. [HIGH] v2 encoder generalize (ACTIVATE/LDWEIGHTS/DVE ops round-trip like MATMUL); MEM_PATTERN full dims; opcode→struct dispatch table
-2. [HIGH] Emit modified stream (change matmul geometry) → nrt_load + neff_io numeric check on trn1
-3. [HIGH] Prologue/boilerplate from scratch: minimal reference graph (flash_mh) streams per engine
-4. [HIGH] Semaphore scheduling contract (def.json semaphore_set + runtime_semaphore_count semantics)
-5. [HIGH] Tile-loop IR from HIP kernels (TRANSLATION.md scoped subset) + lowering to engine streams
-6. [MED] SB/HBM allocator rules, DGE tables, collectives cc_streams, header tail+digest B, LLVM vs MLIR decision
-7. [MED] GPSIMD/Xtensa path eval; Perf vs neuronx-cc/NKI baselines
-8. NOTE: trn1 i-0d79198d32a0df40f started by me, RUNNING (billing). Stop when idle: aws ec2 stop-instances --instance-ids i-0d79198d32a0df40f
+1. [HIGH] Make synthetic lifted graph EXECUTE with correct numerics on trn1 (PE compute path: DMA staging order, PE addressing of w/x/y via mem patterns vs IO ring offsets, SP prologue/PSEUDO_TENSOR_STORE epilogue semantics)
+2. [HIGH] Generalize encoder: DVE arith (65/66/67/107) + CTRL (160/204) v2 layouts via libnrt add_* disasm + hwdecode tables; then norm/silu lowering completes ops.hip subset
+3. [HIGH] Semaphore scheduling contract details (runtime_semaphore_count semantics, which sems for PE<->DMA handoff)
+4. [HIGH] Tile-loop IR generalization: lift more projection.hip/qtip.hip kernels (fused_projection, dequant GEMM), bounds/tail handling
+5. [MED] GPSIMD/Xtensa path eval (custom C++ ops) as alternative for dequant/attention glue
+6. [MED] Perf vs neuronx-cc/NKI baselines; collectives cc_streams for TP
+7. [MED] LLVM/MLIR decision for scalar/control-flow frontend
+8. NOTE: trn1 i-0d79198d32a0df40f STOPPED (I stopped it after validation). Start: aws ec2 start-instances --instance-ids i-0d79198d32a0df40f (~60s to SSM-ready)
+
+## Committed (branch rocm-to-neff)
+- d9285e7: RE foundation (format+ISA+encoder+device round-trip)
+- 4bf59cf: tile-IR + lifter + first synthetic NEFF loading on device
 
 ## Conventions
 - Caveman terse (per user config), but code/docs normal.

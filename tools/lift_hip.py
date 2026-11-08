@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import tile_ir as ir  # noqa: E402
 import neff_isa as isa  # noqa: E402
 
-SB = {"act_in": 0x00000, "act_out": 0x08000, "psum": 0x2000000}
+SB = {"x": 179712, "w": 212224, "psum": 0x2000000}  # IO window 179712..262143
 
 
 @dataclass
@@ -32,44 +32,50 @@ class Plan:
 
 
 def lift_tiled_projection(rows: int, in_features: int, out_features: int,
-                          ktile: int = 128, sem_base: int = 8) -> Plan:
+                          ktile: int = 128, sem_base: int = 40) -> Plan:
     """projection.hip tiled_projection: y[rows,out] = x[rows,in] @ W[in,out].
 
-    Neuron mapping: partition dim = 128 lanes; each PE instr computes a
-    128x128 tile. Weights stream LDWEIGHTS per K-tile, activations resident in
-    SB (DMA in once), PSUM rows accumulate per output tile, semaphores chain
-    K-tiles exactly like ffn1_full does (UPDATE every 2nd matmul).
+    Neuron mapping (single m-tile, k-tile loop):
+      - DMA stages x and W tiles into SB via qSPIO0 (sem 40/41 fire on arrival)
+      - LDWEIGHTS pulls the W tile from SB into PE weight regs (waits sem>=2)
+      - MATMUL computes 128x128 tile into PSUM
+      - PSEUDO_TENSOR_STORE (op 204, runtime-patched) drains PSUM to y
     """
     k_tiles = in_features // ktile
-    out_tiles = out_features // 128
     tensors = [
-        ir.Tensor("x", in_features * 4, "input"),
+        ir.Tensor("x", rows * in_features * 4, "input"),
         ir.Tensor("w", in_features * out_features * 4, "input"),
         ir.Tensor("y", rows * out_features * 4, "output"),
     ]
-    dma = [{
-        "id": 0, "queue": "qSPIO0", "semaphore": 40,
-        "desc": [{"op": "copy", "from": "x", "from_dtype": "float32",
-                  "from_off": 0, "from_sizes": [in_features, 1],
-                  "from_steps": [1, 1],
-                  "to": "SB", "to_dtype": "float32", "to_off": SB["act_in"],
-                  "to_sizes": [in_features, 1], "to_steps": [1, 1],
-                  "num_tiling_dimensions": 1}],
-        "#comment": "IO staging: x -> SB",
-    }]
+    dma = [
+        {"id": 0, "queue": "qSPIO0", "semaphore": 40,
+         "desc": [{"op": "copy", "from": "x", "from_dtype": "float32",
+                   "from_off": 0, "from_sizes": [rows * in_features, 1],
+                   "from_steps": [1, 1],
+                   "to": "SB", "to_dtype": "float32", "to_off": SB["x"],
+                   "to_sizes": [rows * in_features, 1], "to_steps": [1, 1],
+                   "num_tiling_dimensions": 1}],
+         "#comment": "IO staging: x -> SB"},
+        {"id": 1, "queue": "qSPIO0", "semaphore": 41,
+         "desc": [{"op": "copy", "from": "w", "from_dtype": "float32",
+                   "from_off": 0, "from_sizes": [in_features * out_features, 1],
+                   "from_steps": [1, 1],
+                   "to": "SB", "to_dtype": "float32", "to_off": SB["w"],
+                   "to_sizes": [in_features * out_features, 1], "to_steps": [1, 1],
+                   "num_tiling_dimensions": 1}],
+         "#comment": "IO staging: w -> SB"},
+    ]
     pe_ops = []
     notes = []
-    ev_none = ir.Events()
-    ev_inc = ir.Events(update_mode=19, update_idx=sem_base)  # SEM_ADD_IMM_COMPLETE
-    for ot in range(out_tiles):
-        for kt in range(k_tiles):
-            pe_ops.append(ir.LdWeights("w"))
-            pe_ops.append(ir.Matmul(
-                src_addr=SB["act_in"] + kt * ktile * 4,
-                dst_addr=SB["psum"] + ot * 128 * 128 * 4,
-                rows=128, cols=128, in_dtype=10,
-                events=(ev_inc if kt % 2 else ev_none)))
-        notes.append(f"out tile {ot}: {k_tiles} K-tiles")
+    for kt in range(k_tiles):
+        pe_ops.append(ir.LdWeights(SB["w"], events=ir.Events(
+            wait_mode=5, wait_idx=40, semaphore_value=2)))  # WAIT sem40 >= 2 (both DMAs)
+        pe_ops.append(ir.Matmul(
+            src_addr=SB["x"] + kt * ktile * 4,
+            dst_addr=SB["psum"],
+            rows=128, cols=128, in_dtype=10,
+            events=ir.Events(update_mode=19, update_idx=5)))  # SEM_ADD_IMM_COMPLETE sem5
+        notes.append(f"k-tile {kt}: LW(w@{SB['w']:#x}) MM(x@{SB['x']:#x}->PSUM)")
     return Plan(tensors=tensors, dma=dma, pe_ops=pe_ops, notes=notes)
 
 
@@ -111,8 +117,13 @@ def emit_graph(plan: Plan, outdir: Path, name: str = "graph") -> Path:
                 shutil.copy(p, sg / tbl)
     (sg / "PE0.bin").write_bytes(ir.emit_pe_stream(plan.pe_ops) if plan.pe_ops
                                   else ir.PROLOGUE)
-    # minimal boilerplate engine streams = prologue only
-    for eng in ("DVE0", "Activation0", "Pool0", "SP0"):
+    # SP: prologue + TENSOR_STORE + DMA triggers for queues that have descriptors
+    queues = []
+    for d in plan.dma:
+        if d.get("queue") and d["queue"] not in queues:
+            queues.append(d["queue"])
+    (sg / "SP0.bin").write_bytes(ir.emit_sp_stream(queues))
+    for eng in ("DVE0", "Activation0", "Pool0"):
         (sg / f"{eng}.bin").write_bytes(ir.PROLOGUE)
     # engine JSONs mirror reference graphs
     (sg / "PE0.json").write_text(json.dumps(
@@ -160,13 +171,12 @@ def emit_graph(plan: Plan, outdir: Path, name: str = "graph") -> Path:
         "arg_nodes": [i for i, t in enumerate(plan.tensors) if t.kind == 'input'],
         "heads": [[len(plan.tensors), 0, 0]],
         "attrs": {"shape": ["list_shape", shapes], "dltype": ["list_str", dltype],
-                   "storage_id": ["list_int", list(range(len(plan.tensors)))]},
-        "node_row_ptr": list(range(len(plan.tensors) + 1)),
+                   "storage_id": ["list_int", list(range(len(plan.tensors) + 1))]},
+        "node_row_ptr": list(range(len(plan.tensors) + 2)),
         "metadata": {"signatures": {"default": {
             "inputs": {t.name: {"id": i, "dtype": "float32", "shape": [t.size // 4]}
-                       for i, t in enumerate(plan.tensors) if t.kind == 'input'},
-            "outputs": {t.name: {"dtype": "float32", "shape": [t.size // 4]}
-                        for t in plan.tensors if t.kind == 'output'}}}},
+                       for i, t in enumerate(plan.tensors)},
+            "outputs": {}}}},
     }
     (outdir / "neff.json").write_text(json.dumps(neff_json))
     (outdir / "kelf-0.json").write_text(json.dumps(

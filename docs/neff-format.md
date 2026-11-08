@@ -185,3 +185,30 @@ NEFF. `exp_and_others.json` shows the per-function control record layout
 - dlopen of libnrtucode_extisa.so hangs on this box (constructor waits for
   hardware); its API must be studied statically or driven on the trn1
   instance.
+
+## Graph semantics (from working minimal reference, nki-cache kernel-26bb)
+
+Verified 2026-11-08 on trn1: emitter-rebuilt container (own header/tar/json +
+reference engine streams) produces BIT-IDENTICAL output to the original.
+
+- DMA staging is done by COMPILED descriptors in Pool0.bin (op 212
+  PSEUDO_DMA_DIRECT2D), NOT by SP0.json dma entries (those were empty in the
+  minimal reference). SP0.json dma appears to serve spill/reload only.
+- op212 addressing: src/dst start_addr = u64 {marker<<56 | payload}.
+  marker 32 (0x20) = HBM var reference (payload = ioq mr/DGE-table lookup);
+  marker 16 (0x10) = scratch address (payload = byte offset, e.g. 0x82c000).
+  The DGE table (def.json var DGETable0, type "dge-table") is the IO VAR-ID
+  LIST in input/output order (e.g. [1,2,3] for vars x=1,weights=2,y=3).
+  WRONG DGE list = "Failed to find io name for mr N" at execute.
+  MISSING DGE table = "Address from table is not allowed" at load.
+- op212 has sem_increment=16 and `semaphore` field = the DESCRIPTOR's
+  completion semaphore; descriptor block index byte @0x0A corresponds to the
+  pool-dynamic semaphore slot (first descriptors use sems 8,9,10...).
+- waits: WAIT_SEM_GE_IMM(5) in the events block (@4 mode, @5 idx, @8 value).
+- Engine program layout: [177 prologue][204 PSEUDO_TENSOR_STORE marker][ops...];
+  Pool adds trailing 164 NOP; compute in DVE (ops 65/66 + EVENT_SEMAPHORE 160)
+  and Activation (ops 35/33) with function-set LUTs (act_info.json +
+  <set>.json + _bkt.bin/_ctrl.bin MUST be shipped complete - a truncated LUT
+  yields all-NaN outputs).
+- neff.json: heads points at the tvm_op NODE INDEX; node_row_ptr has
+  len(nodes)+1 entries; shapes/storage cover all node outputs.
