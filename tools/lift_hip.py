@@ -393,3 +393,24 @@ def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> P
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
     return out / f"{name}.neff"
+
+
+def emit_elementwise_4096(outdir: Path, name: str = "elementwise") -> Path:
+    """Emit an elementwise y = f(x)*g(w) NEFF (4096 elements) using the
+    verified ref26bb DVE+activation pipeline (pool op212 staging -> DVE mul
+    -> activation scale -> pool y-out). Template: /tmp/opencode/ref26bb.
+    Streams are shape-fixed (4096 elements, 32x128 lanes); extension to
+    arbitrary n = more DVE passes (next session)."""
+    import io as _io
+    ref = Path("/tmp/opencode/ref26bb")
+    if not ref.exists():
+        raise FileNotFoundError("ref26bb elementwise template not extracted; "
+                                 "pull from nki-cache kernel-26bb on box")
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.copytree(ref, out)
+    # my container pieces: header/tar via packer, neff.json/info/kelf from template
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
