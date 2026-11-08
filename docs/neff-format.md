@@ -341,3 +341,25 @@ mm3.neff + full mm3_x extracted streams = /tmp/opencode/neff/mm3.neff +
 /tmp/opencode/mm3_x/ (volatile). Ring/chunk cadence per pool descs still to
 be decoded locally from mm3_x/sg00/Pool0.bin (my hand-parse on box used wrong
 struct offsets; use tools/neff_isa.py decode).
+
+## mm3 pool descs decoded (tools/neff_isa.py, 2026-11-09)
+
+K=512/N=128/M=32 pool = only 3 descs (no explicit refill descs!):
+- @2 sem8: src HBM var0 (A, DGE ti0, offset 0) -> SB 0x2f600, 2D transfer
+  covering 4 ring slots of 512B (0x2f600..0x2f7ff; LW A-side addrs = slot
+  ends 0x2f7fc/0x2f9fc/0x2fbfc/0x2fdfc, step -1 = slot-read reversed).
+- @3 sem9: src HBM var1 (B, ti1) -> SB 0x2ee00, 4 slots (B-side LW ends
+  0x2effc/0x2f1fc/0x2f3fc/0x2f5fc).
+- @4 sem10: src SB 0x4280 -> HBM var2 (y-out, ti2), waits 5/4 GE 3.
+
+KEY: qPoolDynamic (type=dynamic) RE-EXECUTES the desc set per cycle with the
+HBM src offset AUTO-ADVANCING (streaming DMA) - that is the entire refill
+ring. LW addrs repeat because the same SB slots are re-staged with the next
+K-chunk. Cadence per K:
+- slots = K/128 ring slots (K=128:1 @0x2ff80-area, 256:2, 512:4)
+- pairs: K128=2, K256=8, K512=32 (A-phase + B-phase split appears at K>=512
+  with 4 PSUM sub-tiles + PV pass; K<=256 = single-phase, no PV)
+- passes over the ring: K512 uses each slot 2x (chunk128 × 2 halves?) -
+  consistent with M=32: PE contraction chunk = 128, M=32 x passes... exact
+  pair-count formula still needs one more shape (e.g. K=512 M=64) but the
+  streaming-DMA mechanism is now fully identified.
