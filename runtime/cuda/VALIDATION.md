@@ -50,6 +50,10 @@ Rayleigh-scattering explanation (51 tokens). Decode ran at 0.93 tok/s with
 19 GB of weights still streaming per token next to the co-tenant; prefill is the
 same per-token cost, since GLM prefill replays tokens.
 
+Pending on this hardware: the tensor-parallel path (`--tp 2`, added after this
+run; `scripts/glm_tp2_validate.sh MODEL_DIR` runs the tests, the teacher-forced
+comparison against `--layer-split 2` and the decode rates on two GPUs).
+
 Not verified on this hardware: the original GLM-5.3-Flash 320B MoE checkpoint
 (no disk space; MoE routing, routed/shared experts and NVFP4 experts are covered
 by the tiny-model GPU-vs-CPU tests and the Transformers oracle only), HIP

@@ -11,8 +11,10 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i += 2) {
             if (std::string(argv[i]) == "--help") {
                 std::cout << "behemoth_cuda --model DIR [--prompt TEXT | --messages CHAT.json | --tokens "
-                             "TOKENS.json] [--max-tokens 64] [--context 4096] [--device 0] [--tp 1|2] "
-                             "[--trace TRACE.json]\n";
+                             "TOKENS.json] [--max-tokens 64] [--context 4096] [--device 0] [--tp N | --layer-split N] "
+                             "[--trace TRACE.json]\n"
+                             "GLM: --tp N shards every layer over N GPUs (tensor parallelism); --layer-split N "
+                             "runs contiguous layer ranges on N GPUs instead.\n";
                 return 0;
             }
             check(i + 1 < argc && a.emplace(argv[i], argv[i + 1]).second, "Missing/duplicate argument");
@@ -21,7 +23,7 @@ int main(int argc, char **argv) {
             (void)v;
             check(k == "--model" || k == "--prompt" || k == "--messages" || k == "--tokens" ||
                       k == "--max-tokens" || k == "--context" || k == "--device" || k == "--trace" ||
-                      k == "--tp",
+                      k == "--tp" || k == "--layer-split",
                   "Unknown argument " + k);
         }
         auto number = [&](const char *key, int fallback) {
@@ -69,7 +71,9 @@ int main(int argc, char **argv) {
             check(p >= 0 && size_t(p) < ids.size(), "Invalid trace position");
         if (a.contains("--trace"))
             check(!fs::exists(a.at("--trace")), "Trace output already exists");
-        Model model(a.at("--model"), device, context, number("--tp", 1));
+        int tp = number("--tp", 1), split = number("--layer-split", 0);
+        check(tp >= 1 && split >= 0 && (tp == 1 || split <= 1), "Use --tp N or --layer-split N, not both");
+        Model model(a.at("--model"), device, context, split > 1 ? split : tp, 1, split > 1);
         Vec logits;
         std::map<int, Vec> captured;
         auto start = std::chrono::steady_clock::now();

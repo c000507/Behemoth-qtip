@@ -370,12 +370,12 @@ struct Model::Impl {
         }
     }
 };
-Model::Model(const fs::path &p, int device, int context, int tp, int max_batch) {
+Model::Model(const fs::path &p, int device, int context, int tp, int max_batch, bool layer_split) {
     auto raw = read(p / "config.json");
     auto kind = raw.value("model_type", "");
     if (kind == "glm5_next" || kind == "glm5_next_text") {
-        // GLM runs its layers split over `tp` consecutive GPUs (a layer pipeline, not tensor
-        // parallelism) with resident weights up to the per-device budget; see glm53/README.md.
+        // GLM over `tp` consecutive GPUs: tensor parallelism (heads, MLP widths and the vocabulary sharded,
+        // one all-reduce per block) or, with layer_split, the layer pipeline; see glm53/README.md.
         check(tp >= 1, "GLM needs at least one GPU");
         glm53::Config c(raw);
         check(context > 0 && context <= c.max_context, "Invalid GLM context limit");
@@ -384,8 +384,10 @@ Model::Model(const fs::path &p, int device, int context, int tp, int max_batch) 
         options.device = device;
         options.devices = tp;
         options.context = context;
+        options.tensor_parallel = !layer_split;
         backend_ = glm53::gpu_backend(p, options);
     } else {
+        check(!layer_split, "--layer-split applies to GLM checkpoints only");
         // Llama/Mistral-layout QTIP checkpoint: geometry and stop tokens come from config.json
         // (behemoth::ModelConfig::read also validates the quip_params QTIP format).
         auto cfg = behemoth::ModelConfig::read(p / "config.json");

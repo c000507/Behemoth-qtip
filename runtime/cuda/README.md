@@ -106,12 +106,19 @@ N NVFP4 layers adds roughly 1.3 GiB per NVFP4 layer over the all-QTIP size.
 GLM uses the [shared GLM kernels](../../glm53/README.md), with GPU attention and
 recurrent state. Linear weights stay resident up to a per-device budget derived
 from the free memory at load (`GLM53_RESIDENT_GIB` overrides it; `0` streams every
-projection as before) and stream otherwise. `--tp N` splits the GLM layers into
-contiguous ranges over N consecutive GPUs starting at `--device` (a layer
-pipeline: one 64 KB activation hand-off per boundary, no tensor parallelism), so
-the bf16 dense 70B (161 GB) fits two 96 GB GPUs fully resident. Its prefill
-replays tokens in order (no batched GEMM), which bounds long prompts: see the
-Blackwell measurements in [VALIDATION.md](VALIDATION.md).
+projection as before) and stream otherwise. `--tp N` runs every GLM layer
+tensor-parallel over N consecutive GPUs starting at `--device`: KDA and MLA
+heads, MLP/expert intermediate channels and `lm_head` rows are sharded, mHC, the
+norms, the MLA latent cache and the indexer are replicated, and each attention
+and MLP block ends in one FP32 all-reduce (NCCL when available, else copy
+engines; `GLM53_TP_TRANSPORT`). `--layer-split N` keeps the earlier layer
+pipeline (contiguous layer ranges, one 64 KB hand-off per boundary) for
+comparison. Either way the bf16 dense 70B (161 GB) fits two 96 GB GPUs fully
+resident (about 76 GiB per GPU at TP2; 38 GiB with NVFP4 MLPs). The sharding
+table is in [glm53/README.md](../../glm53/README.md). Its prefill replays tokens
+in order (no batched GEMM), which bounds long prompts: see the Blackwell
+measurements in [VALIDATION.md](VALIDATION.md); `scripts/glm_tp2_validate.sh`
+compares TP2 with the layer split on two GPUs.
 
 The fast Behemoth backend shards QTIP rows in the rotated basis and KV heads
 between GPUs. It reconstructs the global output Hadamard transform after each

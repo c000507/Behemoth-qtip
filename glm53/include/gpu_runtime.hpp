@@ -43,6 +43,21 @@ inline auto copy_peer(void *d, int dd, const void *a, int ad, size_t n, Stream s
     return cudaMemcpyPeerAsync(d, dd, a, ad, n, s);
 }
 inline auto memory_info(size_t *free, size_t *total) { return cudaMemGetInfo(free, total); }
+inline auto h2d_2d(void *d, size_t dpitch, const void *h, size_t spitch, size_t width, size_t height, Stream s) {
+    return cudaMemcpy2DAsync(d, dpitch, h, spitch, width, height, cudaMemcpyHostToDevice, s);
+}
+// Enables direct access from the current device to `peer` when the hardware allows it (false otherwise;
+// copies then fall back to host staging inside the runtime).
+inline bool enable_peer(int peer) {
+    int current = -1, supported = 0;
+    if (cudaGetDevice(&current) != cudaSuccess || current == peer)
+        return (void)cudaGetLastError(), current == peer;
+    if (cudaDeviceCanAccessPeer(&supported, current, peer) != cudaSuccess || !supported)
+        return (void)cudaGetLastError(), false;
+    auto e = cudaDeviceEnablePeerAccess(peer, 0);
+    (void)cudaGetLastError();
+    return e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled;
+}
 } // namespace glm53::gpu
 #else
 #include <hip/hip_runtime.h>
@@ -82,6 +97,21 @@ inline auto copy_peer(void *d, int dd, const void *a, int ad, size_t n, Stream s
     return hipMemcpyPeerAsync(d, dd, a, ad, n, s);
 }
 inline auto memory_info(size_t *free, size_t *total) { return hipMemGetInfo(free, total); }
+inline auto h2d_2d(void *d, size_t dpitch, const void *h, size_t spitch, size_t width, size_t height, Stream s) {
+    return hipMemcpy2DAsync(d, dpitch, h, spitch, width, height, hipMemcpyHostToDevice, s);
+}
+// Enables direct access from the current device to `peer` when the hardware allows it (false otherwise;
+// copies then fall back to host staging inside the runtime).
+inline bool enable_peer(int peer) {
+    int current = -1, supported = 0;
+    if (hipGetDevice(&current) != hipSuccess || current == peer)
+        return (void)hipGetLastError(), current == peer;
+    if (hipDeviceCanAccessPeer(&supported, current, peer) != hipSuccess || !supported)
+        return (void)hipGetLastError(), false;
+    auto e = hipDeviceEnablePeerAccess(peer, 0);
+    (void)hipGetLastError();
+    return e == hipSuccess || e == hipErrorPeerAccessAlreadyEnabled;
+}
 } // namespace glm53::gpu
 #endif
 namespace glm53::gpu {

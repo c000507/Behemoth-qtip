@@ -42,7 +42,9 @@ class Model {
         int vocab = 32768, max_context;
         std::vector<int> eos{2};
     } config;
-    explicit Model(const fs::path &, int device = 0, int context = 4096, int tp = 1, int max_batch = 1);
+    // GLM: `tp` GPUs run tensor-parallel unless layer_split asks for the layer pipeline over them.
+    explicit Model(const fs::path &, int device = 0, int context = 4096, int tp = 1, int max_batch = 1,
+                   bool layer_split = false);
     ~Model();
     Vec step(int token);
     Vec prefill(const std::vector<int> &tokens);

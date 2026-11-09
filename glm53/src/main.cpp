@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
 glm53 tokenize --model DIR --input TEXT_FILE --out TOKENS.json
 glm53 render --model DIR --messages CHAT.json --out PROMPT.txt
 glm53 quantize --model SOURCE --out NEW_DIR
-glm53 generate --model DIR --tokens TOKENS.json [--steps 32] [--arithmetic bf16|fp32] [--device cpu|0]
+glm53 generate --model DIR --tokens TOKENS.json [--steps 32] [--arithmetic bf16|fp32] [--device cpu|0] [--tp N | --layer-split N]
 glm53 generate --model DIR --input RENDERED_TEXT_FILE [--steps 32]
 glm53 generate --model DIR --messages CHAT.json [--steps 32]
 glm53 trace --model DIR --tokens REQUEST.json --out TRACE.json [--arithmetic bf16|fp32]
@@ -29,7 +29,8 @@ Generate uses greedy decoding and preserves recurrent state. The HTTP executable
         for (const auto &[k, v] : a) {
             (void)v;
             check(k == "--model" || k == "--input" || k == "--out" || k == "--steps" || k == "--arithmetic" ||
-                      k == "--tokens" || k == "--messages" || k == "--device",
+                      k == "--tokens" || k == "--messages" || k == "--device" || k == "--tp" ||
+                      k == "--layer-split",
                   "unknown option " + k);
         }
         fs::path path = a.at("--model");
@@ -110,7 +111,22 @@ Generate uses greedy decoding and preserves recurrent state. The HTTP executable
             size_t used = 0;
             int device = std::stoi(a.at("--device"), &used);
             check(used == a.at("--device").size() && device >= 0, "invalid GPU device");
-            model.set_backend(gpu_backend(path, device));
+            auto integer = [&](const char *key, int fallback) {
+                if (!a.contains(key))
+                    return fallback;
+                size_t n = 0;
+                int v = std::stoi(a.at(key), &n);
+                check(n == a.at(key).size() && v >= 0, std::string("invalid ") + key);
+                return v;
+            };
+            // --tp N: tensor parallelism over N GPUs from --device; --layer-split N: the layer pipeline.
+            int tp = integer("--tp", 1), split = integer("--layer-split", 0);
+            check(tp >= 1 && (tp == 1 || split <= 1), "use --tp N or --layer-split N, not both");
+            GpuOptions options;
+            options.device = device;
+            options.devices = split > 1 ? split : tp;
+            options.tensor_parallel = split <= 1;
+            model.set_backend(gpu_backend(path, options));
 #else
             throw std::runtime_error("rebuild with -DGLM53_HIP=ON or -DGLM53_CUDA=ON for GPU inference");
 #endif

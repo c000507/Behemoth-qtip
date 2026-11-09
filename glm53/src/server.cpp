@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
             if (std::string(argv[i]) == "--help") {
                 std::cout << (behemoth_cuda ? "behemoth_cuda_server" : "glm53_server")
                           << " --model DIR [--host 127.0.0.1] [--port 8080] [--name MODEL] [--device 0]"
-                          << (behemoth_cuda ? " [--context 4096] [--tp 1|2]\n" : "\n");
+                          << (behemoth_cuda ? " [--context 4096] [--tp N | --layer-split N]\n" : "\n");
                 return 0;
             }
             check(i + 1 < argc && args.emplace(argv[i], argv[i + 1]).second, "missing/duplicate argument");
@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
         for (const auto &[k, v] : args) {
             (void)v;
             check(k == "--model" || k == "--host" || k == "--port" || k == "--name" || k == "--device" ||
-                      (behemoth_cuda && (k == "--context" || k == "--tp")),
+                      (behemoth_cuda && (k == "--context" || k == "--tp" || k == "--layer-split")),
                   "unknown option " + k);
         }
 #if defined(BEHEMOTH_QTIP_CUDA)
@@ -118,8 +118,10 @@ int main(int argc, char **argv) {
             check(used == args.at(key).size(), "invalid integer option");
             return value;
         };
+        int tp = integer("--tp", 1), split = integer("--layer-split", 0);
+        check(tp >= 1 && split >= 0 && (tp == 1 || split <= 1), "use --tp N or --layer-split N, not both");
         Model model(args.at("--model"), integer("--device", 0), integer("--context", 4096),
-                    integer("--tp", 1));
+                    split > 1 ? split : tp, 1, split > 1);
         Tokenizer tokenizer(args.at("--model"));
 #else
         Model model(args.at("--model"));

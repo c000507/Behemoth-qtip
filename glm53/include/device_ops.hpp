@@ -19,6 +19,11 @@ void mean_streams(const B16 *, B16 *, int hidden, int streams, Stream);
 void norm(const B16 *, const float *, const float *, B16 *, int n, float eps, bool centered, Stream);
 void swiglu(B16 *, const B16 *, int n, float limit, Stream);
 void axpy(float *, const B16 *, int n, float alpha, Stream);
+// out[i] = sum over ranks r of slots[r * n + i]; fixed summation order, so every rank agrees bitwise.
+void sum_slots(const float *slots, int ranks, int n, float *out, Stream);
+// MoE combination from the reduced expert outputs [shared, routed 0..experts-1] (each n floats):
+// out = bf16(bf16(shared) + sum_e factors[e] * bf16(routed_e)).
+void combine_experts(const float *outputs, const float *factors, int experts, int n, B16 *out, Stream);
 void float_matvec(const float *, const B16 *, float *, int rows, int cols, Stream);
 void hc_pre(const B16 *, const float *, const float *, const float *, B16 *, float *, float *, float *,
             int hidden, int streams, int iters, float eps, float hc_eps, Stream);

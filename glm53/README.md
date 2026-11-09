@@ -19,12 +19,47 @@ the requested context, the decoded MLA expansions, constants and a 4 GiB margin)
 `GLM53_RESIDENT_GIB=<GiB>` sets it explicitly (`0` streams everything, the
 original behaviour). Weights become resident in execution order on the first
 token, so for a MoE checkpoint that does not fit, the experts hit first stay and
-the rest stream. The layers can be split into contiguous ranges over consecutive
-GPUs (`--tp N` of the shared CUDA CLI/server: a layer pipeline with one
-activation hand-off per boundary, not tensor parallelism; a shared indexer stays
-with its full indexer). Small constants and MLA expansion weights are retained on
-the GPU. The CPU schedules layers and experts, samples tokens, and reads logits;
-MoE routing transfers only the selected IDs and weights for expert loading.
+the rest stream. Small constants and MLA expansion weights are retained on the
+GPU. The CPU schedules layers and experts, samples tokens, and reads logits; MoE
+routing transfers only the selected IDs and weights for expert loading.
+
+### Several GPUs
+
+`--tp N` (the standalone CLI with `--device 0`, and the shared `behemoth_cuda` /
+`behemoth_cuda_server`) runs every layer on N consecutive GPUs with
+Megatron-style **tensor parallelism**; `--layer-split N` instead keeps the earlier
+**layer pipeline** (contiguous layer ranges per GPU, one 64 KB residual hand-off
+per boundary, a shared indexer stays with its full indexer) for comparison. The
+tensor split shards:
+
+| Block | Sharded over ranks | Replicated | Exchange |
+|---|---|---|---|
+| Dense MLP, shared and routed experts | `gate_proj`/`up_proj` rows and `down_proj` columns (intermediate channels) | router (FP32, run on rank 0; expert IDs reach the host once per layer) | one FP32 all-reduce per MLP block; for MoE the shared and routed partials travel side by side in that one all-reduce, then each expert output is rounded to bf16 and weighted exactly as on one GPU |
+| KDA | `q/k/v_proj`, `f_b/g_b_proj`, `b_proj` rows, conv taps, `dt_bias`, `A_log`, the recurrent and convolution state, `o_proj` columns (whole heads) | `f_a/g_a_proj` (128-wide low-rank inputs), `o_norm` | one all-reduce after `o_proj` |
+| Sparse MLA | `q_b_proj` rows, the decoded `kv_b_proj` expansion, scores, `o_proj` columns (whole heads) | `q_a_proj`, `kv_a_proj_with_mqa`, their norms, the latent cache and the whole indexer (keys, gates, pools, top-k) | one all-reduce after `o_proj` |
+| mHC, norms, residual streams | - | everything (the streams are 64 KB; mixing is 24 dot products) | - |
+| `lm_head` | vocabulary rows (uneven shares allowed) | final norm | none: the host concatenates each rank's logits |
+| Embeddings | - | host-side row lookup, uploaded to every rank | - |
+
+The latent cache and indexer are replicated rather than sharded because the
+latent is one 512-wide vector per token (0.6 GiB per rank at 32k context for the
+70B) while sharding it would add an all-gather of the latent and a broadcast of
+the top-k ids per MLA layer; replicated ranks compute identical selections since
+their inputs are bitwise equal (the all-reduce result is identical on every rank)
+and the kernels are deterministic. Partial sums are exchanged in FP32 and rounded
+to bf16 once, so a tensor-parallel rank differs from the single-GPU path only by
+the FP32 summation order inside the row-parallel projections. Heads and MLP
+widths must divide by the rank count (the 70B and 320B geometries divide by 2, 4
+and 8; NVFP4 column slices need 16-channel alignment, FP8 block scales
+128-channel alignment). Collectives use NCCL when the build found it
+(`GLM53_NCCL`, default ON) and otherwise a copy-engine all-reduce (peer or
+host-staged copies into per-rank slots, summed in a fixed order);
+`GLM53_TP_TRANSPORT=copy|nccl` overrides. `GLM53_TP_SAME_DEVICE=1` puts every
+rank on `--device` as separate streams, which is how the tests exercise TP2 and
+TP4 on one GPU (NCCL refuses a repeated device, so this always uses the copy
+collective). Memory per GPU for the dense 70B at TP2 is about 76 GiB bf16 and
+38 GiB with NVFP4 MLPs (2.8 GiB of that replicated), plus the latent cache
+(0.6 GiB at 32k context) and scratch.
 
 CUDA targets **RTX 2080 Ti / Turing (sm_75)** and newer NVIDIA devices. HIP targets
 **R9700 / gfx1201**, using wave32. Fused GEMV decodes BF16/F16/F32, channel/block
@@ -97,12 +132,18 @@ Choose one GPU provider per build. Both expose the same `--device 0` CLI/server
 interface; `--device cpu` (the default) uses the CPU reference. For other NVIDIA
 devices, set `CMAKE_CUDA_ARCHITECTURES` accordingly: `120` for RTX PRO 6000
 Blackwell (CUDA 12.8 builds this tree for sm_120 without changes; the kernels use
-no architecture-specific intrinsics). The standalone CLI runs on one GPU; the
-shared `behemoth_cuda` / `behemoth_cuda_server` add the `--tp N` layer split.
+no architecture-specific intrinsics). `--tp N` / `--layer-split N` select tensor
+parallelism or the layer pipeline over N GPUs (see above).
 
 The GPU tests compare F32/BF16 and FP8/NVFP4 projections with CPU widening, test
 KDA recurrence, check sparse top-k ordering, partial pools and causal tails, and
 compare tiny dense/MoE source and NVFP4 models over 33 tokens with state reset.
+They also check row and column slices of every weight format against the full
+projection, and run TP2 and TP4 on tiny dense and MoE models (ranks emulated on
+one GPU when fewer are present) against the CPU reference and the single-GPU
+path. `scripts/glm_tp2_validate.sh MODEL_DIR` runs the two-GPU validation on a
+real checkpoint (tests, teacher-forced logits of TP2 vs the layer split, decode
+rate).
 They return CTest skip code 77 without an available GPU. Numerical BF16 model
 checks allow relative L2 error below 2% and maximum absolute logit error below
 0.03 per position; these thresholds are test criteria, not measured results.

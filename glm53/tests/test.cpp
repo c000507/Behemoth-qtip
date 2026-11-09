@@ -55,10 +55,21 @@ json tiny(bool dense = false) {
           {"bos_token_id", 1},
           {"swiglu_limit", 10.f}}}};
 }
-void fixture(const fs::path &path, bool dense, bool server = false) {
+// tp: geometry divisible by 2 and 4 ranks (heads, MLP widths; NVFP4 column slices need 16-wide blocks).
+void fixture(const fs::path &path, bool dense, bool server = false, bool tp = false) {
     fs::create_directories(path);
     auto cfg = tiny(dense);
-    if (dense) {
+    if (tp) {
+        cfg["text_config"]["num_attention_heads"] = 4;
+        cfg["text_config"]["num_key_value_heads"] = 4;
+        cfg["text_config"]["qk_nope_head_dim"] = 6;
+        cfg["text_config"]["v_head_dim"] = 8;
+        cfg["text_config"]["linear_attn_config"]["num_heads"] = 4;
+        cfg["text_config"]["intermediate_size"] = 64;
+        cfg["text_config"]["moe_intermediate_size"] = 64;
+        cfg["text_config"]["vocab_size"] = 37; // uneven vocabulary shards
+        cfg["text_config"]["eos_token_id"] = {35, 36};
+    } else if (dense) {
         cfg["text_config"]["q_lora_rank"] = 16;
         cfg["text_config"]["qk_nope_head_dim"] = 6;
         cfg["text_config"]["v_head_dim"] = 8;
@@ -275,6 +286,14 @@ int main(int argc, char **argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--dense-fixture") {
             fixture(argv[2], true);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--tp-fixture") {
+            fixture(argv[2], false, false, true);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--tp-dense-fixture") {
+            fixture(argv[2], true, false, true);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--server-fixture") {

@@ -167,6 +167,24 @@ __global__ void axpy_kernel(float *out, const B16 *x, int n, float alpha) {
     if (i < n)
         out[i] += alpha * f32(x[i]);
 }
+__global__ void sum_slots_kernel(const float *slots, int ranks, int n, float *out) {
+    int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float a = 0;
+        for (int r = 0; r < ranks; ++r)
+            a += slots[size_t(r) * n + i];
+        out[i] = a;
+    }
+}
+__global__ void combine_kernel(const float *outputs, const float *factors, int experts, int n, B16 *out) {
+    int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float a = f32(b16(outputs[i]));
+        for (int e = 0; e < experts; ++e)
+            a += factors[e] * f32(b16(outputs[size_t(e + 1) * n + i]));
+        out[i] = b16(a);
+    }
+}
 __global__ void float_matvec_kernel(const float *w, const B16 *x, float *y, int rows, int cols) {
     int r = int(blockIdx.x) * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
     float sum = 0;
@@ -565,6 +583,14 @@ void swiglu(B16 *a, const B16 *b, int n, float l, Stream s) {
 }
 void axpy(float *a, const B16 *b, int n, float k, Stream s) {
     axpy_kernel<<<(n + 255) / 256, 256, 0, s>>>(a, b, n, k);
+    launched();
+}
+void sum_slots(const float *slots, int ranks, int n, float *out, Stream s) {
+    sum_slots_kernel<<<(n + 255) / 256, 256, 0, s>>>(slots, ranks, n, out);
+    launched();
+}
+void combine_experts(const float *outputs, const float *factors, int experts, int n, B16 *out, Stream s) {
+    combine_kernel<<<(n + 255) / 256, 256, 0, s>>>(outputs, factors, experts, n, out);
     launched();
 }
 void float_matvec(const float *w, const B16 *x, float *y, int r, int c, Stream s) {

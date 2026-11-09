@@ -131,15 +131,26 @@ class Model {
     void reset();
 };
 std::function<Vec(const Weights &, const std::string &, const Vec &)> gpu_projector(int device);
+// Projection through a row (dim 0) or column (dim 1) slice of a linear weight, as the tensor-parallel ranks
+// load it; a column slice takes the matching slice of `x`. For tests of the sliced uploads.
+std::function<Vec(const Weights &, const std::string &, const Vec &, int dim, int begin, int count)>
+gpu_slice_projector(int device);
 std::shared_ptr<InferenceBackend> gpu_backend(const fs::path &, int device);
-// GPU execution options. Layers are split into contiguous ranges over `devices` consecutive GPUs
-// starting at `device` (activations cross between GPUs, weights do not). Linear weights stay resident
-// on their GPU up to `resident_bytes` per device (<0: automatic from free memory at load, leaving room
-// for the attention caches at `context` tokens; 0: stream every projection as before). The
+// GPU execution options over `devices` consecutive GPUs starting at `device`.
+//   tensor_parallel: every GPU runs every layer on its shard of the weights (Megatron-style: heads for KDA
+//     and MLA, intermediate channels for MLPs and experts, vocabulary rows for lm_head) with one all-reduce
+//     per attention and per MLP block; the residual streams, mHC, norms, routing and the MLA latent cache
+//     are replicated. Needs heads and MLP widths divisible by `devices`.
+//   otherwise: a layer pipeline (contiguous layer ranges per GPU, one activation hand-off per boundary).
+// same_device places every tensor-parallel rank on `device` (streams on one GPU), for tests without a
+// second GPU; GLM53_TP_SAME_DEVICE=1 does the same. GLM53_TP_TRANSPORT=copy|nccl selects the collective.
+// Linear weights stay resident on their GPU up to `resident_bytes` per device (<0: automatic from free memory
+// at load, leaving room for the attention caches at `context` tokens; 0: stream every projection). The
 // GLM53_RESIDENT_GIB environment variable overrides the automatic budget.
 struct GpuOptions {
     int device = 0, devices = 1, context = 0;
     long long resident_bytes = -1;
+    bool tensor_parallel = false, same_device = false;
 };
 std::shared_ptr<InferenceBackend> gpu_backend(const fs::path &, const GpuOptions &);
 } // namespace glm53

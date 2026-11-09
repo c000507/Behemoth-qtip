@@ -8,36 +8,68 @@
 #include <iostream>
 #include <unistd.h>
 using namespace glm53;
-void compare_model(const fs::path &path) {
+// Relative L2 and max-abs distance of `actual` from `expected`, which must be finite.
+std::pair<double, double> distance(const Vec &expected, const Vec &actual) {
+    check(expected.size() == actual.size(), "GPU model vocabulary mismatch");
+    double error = 0, signal = 0, maximum = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        check(std::isfinite(actual[i]), "nonfinite GPU model output");
+        error += std::pow(double(expected[i]) - actual[i], 2);
+        signal += double(expected[i]) * expected[i];
+        maximum = std::max(maximum, std::abs(double(expected[i]) - actual[i]));
+    }
+    return {std::sqrt(error / std::max(signal, 1e-30)), maximum};
+}
+// CPU reference against the GPU path; with tp > 1 the tensor-parallel path, also held against the
+// single-GPU path (same model, same tokens): they differ only by FP32 summation order inside the
+// row-parallel projections, so the bound there is far tighter than the CPU/GPU bf16 tolerance.
+void compare_model(const fs::path &path, int tp) {
     Model cpu(path), device(path);
-    device.set_backend(gpu_backend(path, 0));
+    GpuOptions options;
+    options.devices = tp;
+    options.tensor_parallel = tp > 1;
+    int count = 0;
+    gpu::checked(gpu::device_count(&count), "count GPUs");
+    options.same_device = tp > count; // emulate the ranks with streams on one GPU
+    device.set_backend(gpu_backend(path, options));
+    std::unique_ptr<Model> single;
+    if (tp > 1) {
+        single = std::make_unique<Model>(path);
+        single->set_backend(gpu_backend(path, 0));
+    }
     std::vector<Vec> replay;
-    double total_error = 0, total_signal = 0;
+    double total_error = 0, total_signal = 0, worst_single = 0;
     for (int t = 0; t < 33; ++t) {
         int token = 1 + t % 25;
         auto expected = cpu.step(token), actual = device.step(token);
-        check(expected.size() == actual.size(), "GPU model vocabulary mismatch");
-        double error = 0, signal = 0, maximum = 0;
-        for (size_t i = 0; i < actual.size(); ++i) {
-            check(std::isfinite(actual[i]), "nonfinite GPU model output");
-            error += std::pow(double(expected[i]) - actual[i], 2);
-            signal += double(expected[i]) * expected[i];
-            maximum = std::max(maximum, std::abs(double(expected[i]) - actual[i]));
-        }
-        double relative = std::sqrt(error / std::max(signal, 1e-30));
+        auto [relative, maximum] = distance(expected, actual);
+        double signal = 0;
+        for (float v : expected)
+            signal += double(v) * v;
         if (relative >= .02 || maximum >= .03)
             std::cerr << path << " position " << t << " relative L2 " << relative << " max absolute "
                       << maximum << '\n';
         check(relative < .02 && maximum < .03, "GPU/CPU BF16 model logits differ");
-        total_error += error;
+        total_error += relative * relative * signal;
         total_signal += signal;
+        if (single) {
+            auto [rel1, max1] = distance(single->step(token), actual);
+            worst_single = std::max(worst_single, max1);
+            if (rel1 >= 2e-3 || max1 >= 4e-3)
+                std::cerr << path << " position " << t << " TP" << tp << " vs single GPU relative L2 " << rel1
+                          << " max absolute " << max1 << '\n';
+            check(rel1 < 2e-3 && max1 < 4e-3, "tensor-parallel logits differ from the single-GPU path");
+        }
         replay.push_back(actual);
     }
     device.reset();
     for (int t = 0; t < 33; ++t)
         check(device.step(1 + t % 25) == replay[t], "GPU state leaked across reset");
-    std::cout << "PASS GPU model " << path << " relative L2 " << std::sqrt(total_error / total_signal)
-              << '\n';
+    std::cout << "PASS GPU model " << path << (tp > 1 ? " TP" + std::to_string(tp) : "") << " relative L2 "
+              << std::sqrt(total_error / total_signal);
+    if (single)
+        std::cout << ", max |TP - single GPU| " << worst_single << (options.same_device ? " (ranks on one GPU)" : "");
+    std::cout << '\n';
 }
 void select_test() {
     using namespace gpu;
@@ -151,11 +183,17 @@ int main(int argc, char **argv) {
     }
     auto root = fs::temp_directory_path() / ("glm53-gpu-" + std::to_string(getpid()));
     try {
-        if (argc == 3 && std::string(argv[1]) == "--model") {
-            compare_model(argv[2]);
+        if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--model") {
+            int tp = 1;
+            if (argc == 5) {
+                check(std::string(argv[3]) == "--tp", "expected --tp N");
+                tp = std::stoi(argv[4]);
+                check(tp >= 1 && tp <= 8, "invalid rank count");
+            }
+            compare_model(argv[2], tp);
             return 0;
         }
-        check(argc == 1, "expected --model CHECKPOINT or no arguments");
+        check(argc == 1, "expected --model CHECKPOINT [--tp N] or no arguments");
         select_test();
         kda_test();
         kda_test(128, 2);
@@ -226,8 +264,46 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        {
+            // Tensor-parallel slices: row ranges (output channels) and column ranges (input channels) of
+            // every format must reproduce the matching part of the full projection exactly.
+            Weights w(root);
+            auto project = gpu_projector(0);
+            auto sliced = gpu_slice_projector(0);
+            Vec x(cols);
+            for (int i = 0; i < cols; ++i)
+                x[i] = float(i % 29 - 14) / 16;
+            for (auto base : {"probe.f32", "probe.bf16", "probe.f16", "probe.channel", "probe.block", "probe.nv"}) {
+                auto full = project(w, base, x);
+                auto cpu = w.linear(base);
+                bool block = std::string(base) == "probe.block"; // 128x128 scales: slices align to 128
+                std::vector<std::pair<int, int>> ranges = {{0, 65}, {65, 65}, {128, 2}};
+                if (block)
+                    ranges = {{0, 128}, {128, 2}};
+                for (auto [begin, count] : ranges) {
+                    auto part = sliced(w, base, x, 0, begin, count);
+                    check(part.size() == size_t(count), "row slice size");
+                    for (int r = 0; r < count; ++r)
+                        check(part[r] == full[begin + r], "GPU row slice differs from the full projection: " +
+                                                              std::string(base));
+                }
+                // Column halves: the two partial products sum to the full result (the block and NVFP4
+                // formats split at 128, a multiple of their scale blocks; the others at the half).
+                int split = block || std::string(base) == "probe.nv" ? 128 : cols / 2;
+                Vec left(x.begin(), x.begin() + split), right(x.begin() + split, x.end());
+                auto a = sliced(w, base, left, 1, 0, split), b = sliced(w, base, right, 1, split, cols - split);
+                for (int r = 0; r < rows; ++r) {
+                    double expected = 0;
+                    for (int c = 0; c < cols; ++c)
+                        expected += double(float(behemoth::BFloat16(cpu.data[size_t(r) * cols + c]))) *
+                                    float(behemoth::BFloat16(x[c]));
+                    check(std::abs(double(a[r]) + b[r] - expected) < 2e-5 * std::max(1., std::abs(expected)),
+                          "GPU column slices do not sum to the full projection: " + std::string(base));
+                }
+            }
+        }
         fs::remove_all(root);
-        std::cout << "PASS GPU BF16/F32/FP8-channel/FP8-block/NVFP4 streamed projections\n";
+        std::cout << "PASS GPU BF16/F32/FP8-channel/FP8-block/NVFP4 streamed projections and TP slices\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << " fixture " << root << '\n';
         return 1;
