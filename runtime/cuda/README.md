@@ -104,7 +104,14 @@ context allocation; a 32k cache adds about 9.6 GiB. An adaptive checkpoint with
 N NVFP4 layers adds roughly 1.3 GiB per NVFP4 layer over the all-QTIP size.
 
 GLM uses the [shared GLM kernels](../../glm53/README.md), with GPU attention and
-recurrent state and streamed large weights. Its prefill replays tokens in order.
+recurrent state. Linear weights stay resident up to a per-device budget derived
+from the free memory at load (`GLM53_RESIDENT_GIB` overrides it; `0` streams every
+projection as before) and stream otherwise. `--tp N` splits the GLM layers into
+contiguous ranges over N consecutive GPUs starting at `--device` (a layer
+pipeline: one 64 KB activation hand-off per boundary, no tensor parallelism), so
+the bf16 dense 70B (161 GB) fits two 96 GB GPUs fully resident. Its prefill
+replays tokens in order (no batched GEMM), which bounds long prompts: see the
+Blackwell measurements in [VALIDATION.md](VALIDATION.md).
 
 The fast Behemoth backend shards QTIP rows in the rotated basis and KV heads
 between GPUs. It reconstructs the global output Hadamard transform after each

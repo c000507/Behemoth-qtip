@@ -10,12 +10,21 @@ MLP-only NVFP4 conversion, incremental generation, logit traces, and a small HTT
 server. It does not use the Mistral-specific GQA engine in `runtime/`.
 
 The optional CUDA and HIP backends execute KDA, sparse MLA, mHC, routing,
-normalization, SwiGLU, and weight-decode GEMV on one GPU. Activations, KDA state,
-compressed MLA latents, and pooled index keys stay on the device. Large linear
-weights stream from the mmap-backed host checkpoint for each projection. Small
-constants and MLA expansion weights are retained on the GPU. The CPU schedules
-layers and experts, samples tokens, and reads logits; MoE routing transfers only
-the selected IDs and weights for expert loading.
+normalization, SwiGLU, and weight-decode GEMV on the GPU. Activations, KDA state,
+compressed MLA latents, and pooled index keys stay on the device. Linear weights
+are kept resident on their GPU up to a per-device budget and are otherwise
+streamed from the mmap-backed host checkpoint for each projection. The budget is
+derived from the free memory at load (leaving room for the attention caches at
+the requested context, the decoded MLA expansions, constants and a 4 GiB margin);
+`GLM53_RESIDENT_GIB=<GiB>` sets it explicitly (`0` streams everything, the
+original behaviour). Weights become resident in execution order on the first
+token, so for a MoE checkpoint that does not fit, the experts hit first stay and
+the rest stream. The layers can be split into contiguous ranges over consecutive
+GPUs (`--tp N` of the shared CUDA CLI/server: a layer pipeline with one
+activation hand-off per boundary, not tensor parallelism; a shared indexer stays
+with its full indexer). Small constants and MLA expansion weights are retained on
+the GPU. The CPU schedules layers and experts, samples tokens, and reads logits;
+MoE routing transfers only the selected IDs and weights for expert loading.
 
 CUDA targets **RTX 2080 Ti / Turing (sm_75)** and newer NVIDIA devices. HIP targets
 **R9700 / gfx1201**, using wave32. Fused GEMV decodes BF16/F16/F32, channel/block
@@ -25,10 +34,11 @@ FP8, or FP4 tensor-core instructions are needed on Turing. There is no FP16
 substitution that would narrow BF16's exponent range. The standalone GPU build
 requires the CUDA/HIP runtime, without a BLAS dependency.
 
-This is a first implementation: weights are not fully resident, execution is
-single-GPU, prefill replays tokens sequentially, and requests are serialized.
-Host-to-device weight transfers can dominate runtime. Full-size GLM performance
-and model quality have not been measured.
+Prefill replays tokens sequentially (one GEMV pass per token, no batched GEMM)
+and requests are serialized. When the budget does not cover the weights,
+host-to-device transfers dominate: the bf16 dense 70B streamed entirely ran at
+3.2 s/token on an RTX PRO 6000 Blackwell. GLM-5.3-Flash (320B MoE) performance
+and quality have not been measured on a real checkpoint.
 
 | Configuration | Original MoE | Supplied dense |
 |---|---:|---:|
@@ -85,7 +95,10 @@ ctest --test-dir build-glm53-cuda --output-on-failure
 
 Choose one GPU provider per build. Both expose the same `--device 0` CLI/server
 interface; `--device cpu` (the default) uses the CPU reference. For other NVIDIA
-devices, set `CMAKE_CUDA_ARCHITECTURES` accordingly.
+devices, set `CMAKE_CUDA_ARCHITECTURES` accordingly: `120` for RTX PRO 6000
+Blackwell (CUDA 12.8 builds this tree for sm_120 without changes; the kernels use
+no architecture-specific intrinsics). The standalone CLI runs on one GPU; the
+shared `behemoth_cuda` / `behemoth_cuda_server` add the `--tp N` layer split.
 
 The GPU tests compare F32/BF16 and FP8/NVFP4 projections with CPU widening, test
 KDA recurrence, check sparse top-k ordering, partial pools and causal tails, and

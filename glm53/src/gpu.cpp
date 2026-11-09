@@ -156,7 +156,8 @@ struct Context {
             held.matrix = m;
             resident.emplace(base, std::move(held));
             resident_used += total;
-        } else {
+        } else if (keep) {
+            // One-shot uploads (keep == false, e.g. the decoded MLA expansion) are not per-token traffic.
             ++streamed_count;
             streamed_bytes += total;
         }

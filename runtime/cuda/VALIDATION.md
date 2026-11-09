@@ -1,5 +1,61 @@
 # CUDA execution validation
 
+## RTX PRO 6000 Blackwell, GLM-5.3 dense 70B — 2026-11-09
+
+Two RTX PRO 6000 Blackwell (96 GB, sm_120) on a RunPod host, driver 595.91.07,
+CUDA 12.8.93, GCC 11.4, CMake 4.4. A llama.cpp evaluation shared both GPUs
+during every measurement below (26-45 GB and 20-90% utilization each), so the
+timings are approximate upper bounds.
+
+Build: `-DBEHEMOTH_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120` and the standalone
+`glm53` CUDA build both compile without source changes (one glibc
+`-Wstringop-overflow` note from `string_fortified.h`, no CUDA warnings). The
+kernels carry no `__CUDA_ARCH__` guards or tensor-core paths that depend on the
+architecture; FP8/NVFP4 are decoded with integer arithmetic.
+
+Tests: all 8 runtime CTests pass (`cuda_qtip_correctness`, `cuda_llama_correctness`,
+`cuda_batch_correctness`, `cuda_architecture_dispatch`, core, structured; the two
+peer-collective tests skip with one visible device) and all 4 standalone GLM
+tests pass (`glm53_gpu`, `glm53_gpu_models` incl. tiny dense/MoE source and
+NVFP4 models GPU vs CPU, HTTP). The Transformers 5.22.2 oracle
+(`glm53/tests/hf_parity.py`) passes for tiny dense and MoE models before and
+after NVFP4 conversion (relative L2 below 6e-7).
+
+Real checkpoint: the bf16 `glm5_next_text` conversion of Llama-3.3-70B (80
+layers, KDA + NoPE sparse MLA every fourth layer, mHC, Llama-3 vocabulary,
+161 GB) loads with `--tp 2` as layers 0-39 / 40-79. With the shared GPUs the
+automatic budget held 64 GiB of weights per device and streamed 19 GB per token
+(the whole checkpoint streamed from host ran at 3.2 s/token before the residency
+change).
+
+Teacher-forced logits (`--trace`, every position) against an independent fp32
+CPU reference (Transformers `Glm5NextForConditionalGeneration` eager full-sequence
+forward, chunked KDA and dense masked attention, on the same checkpoint):
+
+| Prompt | Positions | Top-1 agreement | KL(ref‖CUDA) mean / max | max abs logit diff |
+|---|---:|---:|---:|---:|
+| Llama-3 chat (system + question) | 53 | 51/53 (96.2%) | 0.0014 / 0.025 | 1.59 |
+| PG-19 prose (BOS + 60 tokens) | 61 | 60/61 (98.4%) | 0.0003 / 0.0011 | 0.26 |
+
+The chat mismatches are near-ties in the reference (top-2 gaps 0.051 and 0.012
+logits); the PG-19 mismatch has a gap of 0.084. Both implementations predict
+`Paris` after the assistant header.
+The Llama-3 chat template rendered by the runtime's Minja tokenizes to the same
+ids as the HF tokenizer's rendering of the same messages (53 identical ids).
+
+Greedy generation through the Llama-3 template, `--tp 2`: "What is the capital
+of France? Answer in one word." gives `Paris.` and stops on `<|eot_id|>`;
+"Explain in two sentences why the sky is blue." gives a correct two-sentence
+Rayleigh-scattering explanation (51 tokens). Decode ran at 0.93 tok/s with
+19 GB of weights still streaming per token next to the co-tenant; prefill is the
+same per-token cost, since GLM prefill replays tokens.
+
+Not verified on this hardware: the original GLM-5.3-Flash 320B MoE checkpoint
+(no disk space; MoE routing, routed/shared experts and NVFP4 experts are covered
+by the tiny-model GPU-vs-CPU tests and the Transformers oracle only), HIP
+compilation of the layer split, and throughput without a co-tenant.
+
+
 ## RTX A6000 fast backend — 2026-11-05
 
 Two RTX A6000s on a RunPod US-TX-1 host, driver 595.91.07, CUDA 12.4.131,
