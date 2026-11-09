@@ -141,3 +141,39 @@ Interim verdict: **NVFP4 = go, FP8 = trivial go, QTIP = go with the two
 risks above to be measured, AQLM/sorted = no-go.** The decisive
 measurement is DVE BITVEC throughput (item 1) — it sets whether decode
 keeps up with the 220 GB/s plateau or DVE becomes the bottleneck.
+
+## Measured results (device, this session)
+
+- **BITVEC ops EXECUTE on trn1, bit-exact**: compiler-oracle graphs for
+  `a&b`, `a|b`, `a^b` (op81 TT-BITVEC), `a<<4`, `a>>4`, `a&15` (op83
+  TS-BITVEC + op8 scalar-operand loader) and `jnp.take` (GATHER via pool
+  indirect machinery op218/op167) all ran bit-exact on the device. Opcode
+  names are chip-implemented, not enum fiction.
+- **Field layouts decoded** (64B DVE instrs; slot pairs = head/tail):
+  - op81 (TENSOR_TENSOR_BITVEC): src0 addr u16@12, src0 ALU u16@14
+    (0x800A = AND, 0x800B = OR, 0x800C = XOR); src1 @32; dst @48;
+    wait/upd events as usual. ALU codes 0x8006 = MUL on the arith twin
+    (op65) — same pattern field, different opcode.
+  - op83 (TENSOR_SCALAR_BITVEC): tensor @12; scalar pattern @32..: mode
+    u16@36 (3 = SHR, 10 = AND, 16 = SHL), immediate value @40 (4 = shift
+    amount, 15 = mask). op8 = scalar-operand carrier instr (value @10)
+    observed before the bitvec ops.
+- **Throughput** (compiler oracles, `(a&b)^((a<<3)&b)`, 4 int ops/elem):
+  n=131072 = 68.4 µs, n=1048576 = 133.3 µs → marginal 12.6 MB / 64.9 µs
+  = 194 GB/s (≈ DMA plateau) and ≥ 48 Gop/s DVE bitvec. **The bitvec
+  decode is DMA-bound at 1M elements — DVE keeps up with HBM.**
+- **PE in_dtype probe** (32×128×128 synth container, weights as 16-bit):
+  - MM in_dtype @32 = 7 (FP16) with fp32-side LW: finite but wrong
+    (rel 1.84) — the fp16 path engages, but 16-bit weight staging needs
+    the full 16-bit geometry (LW step/num semantics + pool desc spacing
+    + the fp32 regs hold 2 fp16 lanes), not just desc size halving.
+  - Both-16-bit patches (LW+MM = 6/7): NaN — LW in_dtype @32 is not
+    simply "the dtype of the loaded weights".
+  - Conclusion: bf16/fp8 PE consumption is REAL but needs a dedicated
+    16-bit staging decode session (expected: 1-2 h of probe work).
+- **op123 TENSOR_DEQUANTIZE / op104 GATHER**: GATHER proven working
+  (through pool indirect DMA, not a bare op104 — the compiler lowers
+  jnp.take to pool descs + op83 index math + op3 PE_REG_WRITE). No
+  compiler-emitted bare op123/op104 seen yet; their on-chip status stays
+  unproven. The dequant path we need (LUT/nibble/scale) is covered by
+  op81+op83+ACT regardless.
