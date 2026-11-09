@@ -633,3 +633,60 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
     return out / f"{name}.neff"
+
+
+RMS_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
+    (128, 128): "/tmp/opencode/oracle_rms128/sg00",
+    (256, 128): "/tmp/opencode/oracle_rms256/sg00",
+}
+
+
+def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
+                 name: str = "rmsnorm") -> Path:
+    """Emit y = x * rsqrt(mean(x^2, axis=-1) + eps) for x [M, K] f32.
+
+    Compiler-lowering oracle byte-copy (no PE: DVE MEMSET(73) +
+    TENSOR_REDUCE_ARITH_OP(66) into PSUM bank0 via DVE marker 8, then a
+    3-pass ACTIVATE(33) chain for sqrt/div/y-mul). eps = f32 @360 in
+    Activation0.bin (verified: 1e-6 vs 1e-3 differ only there).
+    Weighted rms (x * w * rs) = compose with emit_elementwise on the host.
+    """
+    import struct as _s
+    if (M, K) not in RMS_ORACLE_DIRS:
+        raise ValueError(f"no rms oracle for ({M},{K}); buckets: {list(RMS_ORACLE_DIRS)}")
+    sg_src = Path(RMS_ORACLE_DIRS[(M, K)])
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sg00").mkdir(parents=True)
+    for f in sg_src.iterdir():
+        shutil.copy(f, out / "sg00" / f.name)
+    act = bytearray((out / "sg00" / "Activation0.bin").read_bytes())
+    _s.pack_into("<f", act, 360, eps)
+    (out / "sg00" / "Activation0.bin").write_bytes(bytes(act))
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    nj = {"nodes": [
+        {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+        {"op": "tvm_op", "name": "sg_coreV10",
+         "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "1",
+                   "kelf": "kelf-0.json", "num_outputs": "1"},
+         "inputs": [[0, 0, 0]], "output_names": ["output0"]}],
+        "arg_nodes": [0], "heads": [[1, 0, 0]],
+        "attrs": {"shape": ["list_shape", [[M, K], [M, K]]],
+                  "dltype": ["list_str", ["float32", "float32"]],
+                  "storage_id": ["list_int", [0, 1]]},
+        "node_row_ptr": [0, 1, 2],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [M, K]}},
+            "outputs": {}}}}}
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
