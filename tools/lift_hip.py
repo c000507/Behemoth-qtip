@@ -929,15 +929,9 @@ def emit_rmsnorm_gen(outdir: Path, M: int, K: int, eps: float = 1e-6,
             f"lowered = jax.jit(f).lower(jnp.zeros(({M},{K}), jnp.float32))")
     gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
     sg = gen_oracle_custom(key, gen_py)
-    p = _wrap_graph(Path(outdir), sg, [("float32", [M, K])], name)
-    act = bytearray((Path(outdir) / "sg00" / "Activation0.bin").read_bytes())
-    import struct as _s
-    _s.pack_into("<f", act, 360, eps)
-    (Path(outdir) / "sg00" / "Activation0.bin").write_bytes(bytes(act))
-    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
-                    str(outdir), str(p), "--name", f"{name}.neff"],
-                   check=True, capture_output=True)
-    return p
+    # eps is baked into the compiled graph via codegen; do NOT patch ACT
+    # (@360 is a bucket-path-only offset and corrupts fresh layouts).
+    return _wrap_graph(Path(outdir), sg, [("float32", [M, K])], name)
 
 
 def emit_softmax_gen(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
@@ -969,3 +963,14 @@ def emit_rmsnorm_fused(outdir: Path, M: int, K: int, eps: float = 1e-6,
     gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
     sg = gen_oracle_custom(key, gen_py)
     return _wrap_graph(Path(outdir), sg, [("float32", [M, K]), ("float32", [K])], name)
+
+
+def emit_matmul_gen(outdir: Path, M: int, K: int, N: int, name: str = "matmul") -> Path:
+    """Arbitrary-shape matmul y = x[M,K] @ w[K,N] via on-box oracle gen."""
+    key = f"mm_{M}x{K}x{N}"
+    body = (f"lowered = jax.jit(lambda a, b: a @ b).lower("
+            f"jnp.zeros(({M},{K}), jnp.float32), jnp.zeros(({K},{N}), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg, [("float32", [M, K]), ("float32", [K, N])], name,
+                       out_shape=[M, N])
