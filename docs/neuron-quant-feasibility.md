@@ -351,3 +351,71 @@ at n = 131k (P = 1024). Per-pass cost over a whole tensor = one op.
   LW/desc staging decode = the gating probe session), (b) GPSIMD
   Xtensa glue (deferred), or (c) staying in fp32/bf16 with the 40%
   compiler headroom already measured.
+
+## PE-native low-bit weights (measured, 2026-11-10)
+
+Method: compiler (neuronx-cc 2.26) jax oracles at 32x128x128 with
+bfloat16 / float16 / float8_e4m3fn inputs, byte-diffed against the
+fp32 twin; probe containers = patched streams + jsons + identity npy.
+
+**bf16 and f16 weights WORK (the open door opens for 16-bit):**
+- both-bf16 32x128x128 compiler container = **BIT-EXACT** vs torch
+  bf16 matmul (maxdiff 0.0). f16 GEMV M1 K4096 N4096 = f16-level
+  numerics (rel 4.9e-4 vs torch f16) and runs.
+- in_dtype byte = @+32 of the 64B LW(op1)/MM(op2) instr (10 = FP32,
+  6 = BFLOAT16, 14 = FP8_EXP4). LW head@16 addr/step pseudo-fields
+  scale as f32_value/(elem/4) (e.g. B-LW = 0x4000 + (M-1)*elem).
+- **Uniform-dtype pipeline law**: in_dtype = the dtype of the data IN
+  SB/PSUM at that pipeline point. The compiler's own mixed lowering
+  (x f32 x w bf16) produces NaN on device; a w-only-16bit patch of the
+  f32 container = NaN too (the B-phase LW re-reads the A-phase x-temps
+  through a 16-bit window from an f32 PSUM). 16-bit = all-or-nothing
+  (or needs a dtype-conversion stage that the compiler doesn't emit).
+- Pool w-desc (desc1): rel{24,36,60} stride fields 0x0200 -> 0x0100
+  (f32 -> bf16); rel62 = dtype marker pair 0x0a0a/0x0606.
+- def.json var sizes = bytes; identity npy = eye(128).reshape(
+  128,128,1,1) in the compute dtype (f32 descr <f4, bf16 descr <V2).
+- LOADER FINDINGS (nrt_load 2.33.10): def.json is ORDER-SENSITIVE
+  (popping + re-adding the identity var key = load fail 2 with
+  identical content); the identity npy reader accepts descr <f4/<V2
+  but REJECTS <u8/<V1 (u8 fp8 eye = load fail on the bf16 base).
+
+**GEMV weight-streaming measurements** (compiler containers, M in
+{1,4,8}, square K=N in {4096,12288}, 200-iter timing avg):
+
+| shape | fp32 us | bf16 us | speedup | w GB/s f32 | w GB/s bf16 |
+|---|---|---|---|---|---|
+| M1 4096x4096   | 405.7  | 208.2  | 1.95x | 41 | 40 |
+| M4 4096x4096   | 363.7  | 221.0  | 1.65x | 45 | 37 |
+| M8 4096x4096   | 356.1  | 215.9  | 1.65x | 46 | 38 |
+| M1 12288x12288 | 2778.4 | 1300.2 | 2.14x | 218 | 232 |
+| M4 12288x12288 | 2553.8 | 1294.7 | 1.97x | 237 | 234 |
+| M8 12288x12288 | 2558.4 | 1300.2 | 1.97x | 236 | 234 |
+
+- fp32 GEMV numerics = exact vs numpy (<= 2.1e-6 rel); bf16 = bf16-
+  level (rel 2e-4..2e-3 vs fp32 torch ref, accumulation-order noise).
+- **Weight streaming is byte-bound: halving weight bytes = ~2x
+  latency at every M tested.** The compiler's stream saturates the
+  ~220-230 GB/s plateau only at K,N = 12288; at 4096x4096 it streams
+  at only ~40 GB/s (schedule not overlapping enough at small sizes —
+  headroom OUR emitter could claim: a synth bf16 stream at the
+  220 GB/s plateau would be ~5x faster than the compiler at 4096^2).
+
+**FP8_EXP4 (in_dtype 14): EXECUTES but numerics = open (negative
+so far).** A fully-patched fp8 container (all four core instrs
+in_dtype = 14, desc markers 0x0e0e + /4 strides, fp8 input files,
+fp8 dltype) LOADS and RUNS on device — the opcode-level dtype is
+accepted at execute. Numerics = garbage (maxdiff ~46), unchanged when
+the identity-npy byte layout + A-MM stride are adjusted — the
+mismatch sits deeper (w-side B-phase pattern/desc strides for 1B/elem
+and/or the identity-dtype wall above). fp8 GEMV speedup = NOT yet
+measurable. Residual decode work: B-phase w-pattern stride/num fields
+for 1B elements + a loader-legal identity in an 8-bit pipeline
+(craft V2-npy bytes that the 1B read pattern sees as an fp8 eye).
+
+Verdict update: **bf16/f16 weight-streaming = GO (2x measured, bit-
+exact)**; **fp8 = blocked on data plumbing, opcode accepted** (promising
+but unproven); NVFP4/QTIP via DVE/ACT = NO-GO (measured, previous
+section). Our-emitter priority: synth bf16 weight path at the 220 GB/s
+plateau (big win over the compiler's 40 GB/s at 4096^2), then fp8
+plumbing probes if the win justifies it.
