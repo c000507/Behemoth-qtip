@@ -974,3 +974,21 @@ def emit_matmul_gen(outdir: Path, M: int, K: int, N: int, name: str = "matmul") 
     sg = gen_oracle_custom(key, gen_py)
     return _wrap_graph(Path(outdir), sg, [("float32", [M, K]), ("float32", [K, N])], name,
                        out_shape=[M, N])
+
+
+def emit_sdpa_gen(outdir: Path, h: int, M: int, S: int, d: int, scale: float,
+                  name: str = "sdpa") -> Path:
+    """Attention through proven paths: y = softmax(q@k^T*scale)@v per head.
+    q[h,M,d], k[h,S,d], v[h,S,d] -> y[h,M,d]. Single graph, on-box gen."""
+    key = f"sdpa_{h}_{M}_{S}_{d}"
+    body = (f"def f(q, k, v):\n"
+            f"    a = jnp.einsum('hmd,hsd->hms', q, k) * {scale!r}\n"
+            f"    p = jax.nn.softmax(a, axis=-1)\n"
+            f"    return jnp.einsum('hms,hsd->hmd', p, v)\n"
+            f"lowered = jax.jit(f).lower(jnp.zeros(({h},{M},{d}), jnp.float32), "
+            f"jnp.zeros(({h},{S},{d}), jnp.float32), jnp.zeros(({h},{S},{d}), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg,
+                       [("float32", [h, M, d]), ("float32", [h, S, d]), ("float32", [h, S, d])],
+                       name, out_shape=[h, M, d])
