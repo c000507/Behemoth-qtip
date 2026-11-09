@@ -438,3 +438,58 @@ Possible causes: DVE HW decode tables cached from a prior NEFF load persist
 across nrt_close/init cycles; or the activation engine LUT preload state
 differs after device reinit. Next: terminate + relaunch the instance (full
 EC2-level reset, not just stop/start), or reinstall neuron runtime.
+
+## PE phase model (matmul streams, 2026-11-09, 18-oracle decode)
+
+Full structural decode of all 18 shape_templates.json buckets
+(M{32,64,96,128} x K{128,256,512,640,1024} x N{128,192,256,512,640}).
+Raw dumps: /tmp/opencode/mm_decode.txt + mm_slots.json + mm_seq.json
+(volatile - regenerate with the slot parser in tools/mm_synth.py header).
+
+### Slot grammar (32B slots, v2 PE stream)
+- [177][pad][204][pad] prologue; EV(160) phase brackets.
+- LW(op1) then op10 slot; MM(op2) then op10 slot. op10 = chaining marker:
+  byte0=10, byte1=b1 (1=multi_start at chunk-group starts, 2=cont,
+  3=single/B-phase), u16@6 = 32800 (A/B ring phases; 8320 when B MM A
+  operand in low scratch), u16@10 = 3855 const, byte11 = ring select 0/1/2.
+- MM dst pattern lives INSIDE the following op10 slot: bytes 16..19 = PSUM
+  dst u32, u16@20=512, u16@22=1, u16@30=1 (my earlier "dst @48" reads were
+  this slot).
+- LW: src u32 @16 = ring slot end - 4, step u16@20 = -1, u16@26 = num
+  (128 in A phase = k-tile elems; M in B phase), ev @4..8.
+- MM: A operand u32 @16 (identity tile in A phase, B scratch tile in B
+  phase), num cols u16@26 = 128; upd event 19/5 (0x5130 u16@8) on the last
+  pair of each accumulate group.
+
+### Address map (SB, all top-down)
+- identity tile: ends 0x30000; A_addr = 0x30000 - 4*M (M=32:0x2ff80,
+  64:0x2ff00, 96:0x2fe80, 128:0x2fe00). LW src = A_addr - 4.
+- x ring: AS = K/128 slots x 512B directly below identity; slot s (0-based)
+  end = A_addr - 512*(AS-1-s); LW src = end-4, each slot read twice (2
+  pairs/slot) in A phase.
+- w ring: AS slots x 512B below x ring; same LW formula in B phase.
+- B scratch tiles (MM A operand, B phase): K<=128 -> single w tile staged
+  by pool desc2 (addr ~0x2f980 region, bucket-specific); K>=256 -> ring at
+  0x4000 + 4*M*t streamed via dynamic pool desc (matches x ring streaming).
+
+### Phases
+- A: 2*AS pairs (dst = PSUM-A area, stride 4*M per slot).
+- B: 2*AS pairs per N-half (NT = N/128 halves; dst const within a half =
+  accumulate), b1=3 slots, ring byte11 mostly 0 (2 at last pair).
+- PV (combine halves -> final y): present iff K>=512 (M32) or N>=256;
+  LW src = SB 0x4000-region scratch end-4, num=M; MM A = identity tile;
+  num=128.
+- y-out pool desc: src = scratch 0x4280-region (marker16), waits 5/4 GE 3.
+
+### OPEN (blocks synthesis): PSUM dst map
+Observed A-phase dst bases: 0x0 / 0x800 / 0x1000 across buckets without a
+fit formula yet (32_512_128: 0x1000, 64_512_128: 0x800, 96_512_256: 0x800,
+32_512_256: 0x0, 32_1024_128: 0x1000). B dsts (N256): halves at 0x1000 then
+0x800 (descending); PV dsts: {0x800} (N128) / {0x1800, 0xa00} (N256).
+Hypothesis: PSUM banked in 0x800-granule partitions (bank = row-block x
+col-block index), layout = compiler allocator; NOT y-linear. Resolving needs
+one device perturbation run: emit container with known x,w, patch y-out desc
+to drain a WIDE PSUM window, inspect which PSUM addrs hold which y coords.
+Alternative pragmatic path: keep per-shape oracle templates (emit_matmul
+already auto-compiles missing shapes on box) and use synthesis only for
+sub-tile parameter sweeps of a FIXED bucket layout.
