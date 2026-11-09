@@ -831,10 +831,15 @@ def gen_oracle_custom(key: str, gen_py: str, timeout: int = 300) -> Path:
         "PYEOF\n"
         "/opt/aws_neuronx_venv_jax_0_9/bin/python /tmp/fb3.py")
     open('/tmp/opencode/_gc_inner.sh', 'w').write(inner)
-    r = subprocess.run(["bash", _SSM_RUN, '/tmp/opencode/_gc_inner.sh', str(timeout)],
-                       capture_output=True, text=True, timeout=timeout + 30)
-    m = re.search(r'NB:(\d+)', r.stdout)
-    assert m, f"gen failed {key}: {r.stdout[-300:]}"
+    m = None
+    r = None
+    for attempt in range(3):
+        r = subprocess.run(["bash", _SSM_RUN, '/tmp/opencode/_gc_inner.sh', str(timeout)],
+                           capture_output=True, text=True, timeout=timeout + 30)
+        m = re.search(r'NB:(\d+)', r.stdout)
+        if m:
+            break
+    assert m, f"gen failed {key}: {r.stdout[-300:] if r else 'no run'}"
     nb, n = int(m.group(1)), (int(m.group(1)) + 7999) // 8000
     have = {}
     for rnd in range(15):
