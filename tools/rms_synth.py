@@ -15,7 +15,8 @@ Activation0: prologue [177][204][160][35] + pairs:
     u16@316 = 0x4008, f32@292 = 1.0;
   sqrt/div (op33+op170): u16@330 = P, u16@336 = 0x4000+4M+8,
     f32@356 = 1/K, f32@360 = eps, u16@368 = 0x4000+4M+0x10, @374 = P;
-  y-passes j = 0..P-1 (see _y_pair; P==1 -> rms128 form exactly).
+  y-passes j = 0..P-1 (see _y_pair; family constants A/B/C verified on
+  oracles M in {128,256,384,512,640-fallback}; M640 = preload-split family).
 Pool0: [op212 d0 sem8][op128][op67+op10][op212 d1 sem9][op128][op164]:
   u16@152/164/188 = 2P, @168 = -4M, @218/250 = P, @272 = 0x4000+4M+8,
   @292/304/316 = 2P.
@@ -49,20 +50,40 @@ def synth_dve(M: int, K: int) -> bytes:
 
 
 def _y_pair(j, P, M, K):
-    """(op33, op170) 64B for y-pass j (0-based), cloned from rms128 y0."""
+    """(op33, op170) 64B for y-pass j (0-based), cloned from rms128 y0.
+
+    Verified against oracles M in {128,256,384,512} (P = M/128):
+      y_j op33: wait (5,3) if j==0 else (0,0); const (13,04) iff P==1 or
+        j == P-1; phase 1 if j==0 else 0; u16@16 = -4M + 4K*j; @26 = K.
+      op170: u16@4 = 0x4000 + 4M + C4 + 4j with
+        C4 = 0x18 + 0x10*((P-1)//2)  for P > 1, else 0x18 (P==1: 0x4218
+        base at M=128 = 4M + 0x18 fits the same formula);
+        u16@16 = 0x4000 + 4M + C4 + 8*ceil(P/2) + 4K*j;  @26 = K.
+    """
     last = (j == P - 1) and P > 1
     first = (j == 0)
     a = bytearray(_ACT_BASE[384:448])     # rms128 y0 pair = clone base
-    if last:
+    if first:
+        struct.pack_into("<H", a, 4, 0x0305)                 # wait (5,3)
+        struct.pack_into("<H", a, 8, 1)                      # phase 1
+        if P > 1:
+            struct.pack_into("<H", a, 6, 0)                  # const ->0
+    elif last:
         struct.pack_into("<H", a, 4, 0)                      # wait (0,0)
         struct.pack_into("<H", a, 8, 0)                      # phase 0
-    elif not (first and P == 1):
-        struct.pack_into("<H", a, 6, 0)                      # const (13,04)->0
-    _p(a, 16, (-4 * M) if first else (-4 * K))
+    else:  # intermediate
+        a[4:8] = b"\x00\x00\x00\x00"
+        struct.pack_into("<H", a, 8, 0)
+    _p(a, 16, -4 * M + 4 * K * j)
     _p(a, 26, K)
-    _p(a, 32 + 4, 0x4000 + 4 * M + 0x18 + 4 * j)             # op170@4
-    _p(a, 32 + 16, 0x4000 + 4 * M + 0x20 + 4 * K * j)        # op170@16
-    _p(a, 32 + 26, K)                                        # op170@26
+    g = (P - 1) // 2
+    q = (P + 1) // 2
+    A = 0x10 + 8 * g                     # sqrt-div / pool @208 step
+    B = A + 8 * q                        # op170@4 base / pool @240
+    C = A + 0x10 * q                     # op170@16 base / pool @272
+    _p(a, 32 + 4, 0x4000 + 4 * M + B + 4 * j)                  # op170@4
+    _p(a, 32 + 16, 0x4000 + 4 * M + C + 4 * K * j)             # op170@16
+    _p(a, 32 + 26, K)
     return bytes(a)
 
 
@@ -78,7 +99,7 @@ def synth_act(M: int, K: int, eps: float) -> bytes:
     _p(a, 378, P)                     # pair2 op170@26
     struct.pack_into("<f", a, 356, 1.0 / K)
     struct.pack_into("<f", a, 360, eps)
-    _p(a, 368, 0x4000 + 4 * M + 0x10)  # pair2 op170@16
+    _p(a, 368, 0x4000 + 4 * M + 0x10 + 8 * ((P - 1) // 2))  # pair2 op170@16
     head = bytes(a[:384])
     out = bytearray(head)
     for j in range(P):
@@ -95,9 +116,11 @@ def synth_pool(M: int, K: int) -> bytes:
     _p(p, 188, 4 * M)
     _p(p, 218, P)
     _p(p, 250, P)
-    _p(p, 208, 0x4000 + 4 * M + 0x10)
-    _p(p, 240, 0x4000 + 4 * M + 0x18)
-    _p(p, 272, 0x4000 + 4 * M + 0x20)
+    g = (P - 1) // 2
+    q = (P + 1) // 2
+    _p(p, 208, 0x4000 + 4 * M + 0x10 + 8 * g)
+    _p(p, 240, 0x4000 + 4 * M + 0x10 + 8 * g + 8 * q)
+    _p(p, 272, 0x4000 + 4 * M + 0x10 + 8 * g + 0x10 * q)
     _p(p, 292, 4 * M)
     _p(p, 304, 4 * M)
     _p(p, 316, 4 * M)
@@ -117,4 +140,8 @@ PROLOGUE = bytes.fromhex("".join([
 
 # Domains with device-verified numerics (stream bytes = oracle-equal at these
 # points; see AGENTS.md item 29 for the M384/K256 probe evidence).
-VALIDATED = {(128, 128), (256, 128)}
+VALIDATED = {(M, 128) for M in range(128, 513, 128)}
+# K in {256,+} unprobed: device K256 = wrong values (reduce may need K/128
+# sub-passes and per-pass row caps not visible in the two K=128 oracles).
+# Find the K-clamped oracle when generalizing; VALIDATED = device green:
+# M in {128,256,384,512} K=128 incl eps 1e-6/1e-3 (AGENTS.md item 29/30).

@@ -1,0 +1,36 @@
+{
+    "input0": {
+        "dtype": "float32",
+        "is_const": false,
+        "kind": "input",
+        "layer_name": "input0",
+        "sim_format": "NC",
+        "sim_shape": [
+            640,
+            128
+        ],
+        "tf_file": "value_input0.npy",
+        "tf_format": "NC",
+        "tf_shape": [
+            640,
+            128
+        ]
+    },
+    "output0": {
+        "dtype": "float32",
+        "is_const": false,
+        "kind": "output",
+        "layer_name": "output0",
+        "sim_format": "NC",
+        "sim_shape": [
+            640,
+            128
+        ],
+        "tf_file": "value_output0.npy",
+        "tf_format": "NC",
+        "tf_shape": [
+            640,
+            128
+        ]
+    }
+}
