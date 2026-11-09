@@ -992,3 +992,38 @@ def emit_sdpa_gen(outdir: Path, h: int, M: int, S: int, d: int, scale: float,
     return _wrap_graph(Path(outdir), sg,
                        [("float32", [h, M, d]), ("float32", [h, S, d]), ("float32", [h, S, d])],
                        name, out_shape=[h, M, d])
+
+
+def emit_block_gen(outdir: Path, M: int, K: int, H: int, h: int, d: int,
+                   eps: float = 1e-6, name: str = "block") -> Path:
+    """Full decoder block in ONE graph:
+    y = ffn(rms(x + o(sdpa(rms(x)*g1) @ wo)) * g2)
+    qkv fused proj, h=h heads of dim d (K = h*d for qkv split).
+    Inputs: x[M,K] g1[K] wqkv[K,3K] wo[K,K] w1[K,H] w2[H,K] g2[K]
+    """
+    key = f"block_{M}_{K}_{H}_{h}_{d}"
+    body = (
+        f"def f(x, g1, wqkv, wo, w1, w2, g2):\n"
+        f"    def rms(v, g):\n"
+        f"        return v * g * (1.0 / jnp.sqrt(jnp.mean(v*v, axis=-1, keepdims=True) + {eps!r}))\n"
+        f"    qkv = rms(x, g1) @ wqkv\n"
+        f"    q, k, v = qkv[..., :{K}], qkv[..., {K}:2*{K}], qkv[..., 2*{K}:]\n"
+        f"    q = q.reshape({M}, {h}, {d}).transpose(1, 0, 2)\n"
+        f"    k = k.reshape({M}, {h}, {d}).transpose(1, 0, 2)\n"
+        f"    v = v.reshape({M}, {h}, {d}).transpose(1, 0, 2)\n"
+        f"    a = jnp.einsum('hmd,hnd->hmn', q, k) * {1.0 / d**0.5:.8f}\n"
+        f"    p = jax.nn.softmax(a, axis=-1)\n"
+        f"    o = jnp.einsum('hmn,hnd->hmd', p, v)\n"
+        f"    o = o.transpose(1, 0, 2).reshape({M}, {K}) @ wo\n"
+        f"    t = rms(x + o, g2)\n"
+        f"    return (jax.nn.gelu(t @ w1) @ w2)\n"
+        f"lowered = jax.jit(f).lower(jnp.zeros(({M},{K}), jnp.float32), jnp.zeros(({K},), jnp.float32), "
+        f"jnp.zeros(({K},{3*K}), jnp.float32), jnp.zeros(({K},{K}), jnp.float32), "
+        f"jnp.zeros(({K},{H}), jnp.float32), jnp.zeros(({H},{K}), jnp.float32), jnp.zeros(({K},), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg,
+                       [("float32", [M, K]), ("float32", [K]), ("float32", [K, 3 * K]),
+                        ("float32", [K, K]), ("float32", [K, H]), ("float32", [H, K]),
+                        ("float32", [K])],
+                       name, out_shape=[M, K])
