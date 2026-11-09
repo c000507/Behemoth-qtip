@@ -395,46 +395,104 @@ def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> P
     return out / f"{name}.neff"
 
 
-def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise") -> Path:
-    """Emit y = scale*x*w elementwise NEFF over n f32 elements via the
-    ref26bb DVE+activation pipeline (pool op212 staging -> DVE mul -> act
-    -> y-out). n <= 16383 (pool desc elem_size u16 limit); larger n = more
-    DVE passes (undecoded). Stream template: /tmp/opencode/ref26bb."""
-    ref = Path("/tmp/opencode/ref26bb")
-    if not ref.exists():
-        raise FileNotFoundError("ref26bb elementwise template not extracted")
-    if not (0 < n <= 16383):
-        raise ValueError(f"n={n} out of range (1..16383)")
+def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
+                     scale: float = 1.0) -> Path:
+    """Emit y = scale*x*w elementwise NEFF over n f32 elements.
+
+    Template = freshly compiled neuronx-cc 2.28 oracles (tools/ew_templates/),
+    NOT the old ref26bb template: the old compiler's final ACTIVATE reads its
+    scale from a reg/ptr that is never staged (per-boot garbage scale - the
+    "0.6x drift"); the new template carries the scale as an inline f32 imm in
+    the op170 continuation (@228), patchable per-call.
+
+    Structure (decoded from 4 oracles n in {100, 2048, 6144, 8192}):
+      P = ceil(n/128) DVE channel passes; per-channel count = P everywhere.
+      n <= 128: template B (DVE op67 + op10, no activation engine pass);
+      n > 128:  template A (DVE op65, ACTIVATE op33/op170 with f32 scale imm).
+    All n-dependence is u16 - patched offsets verified against all 4 oracles.
+    """
+    TPL = Path(__file__).parent / "ew_templates"
+    tpl = TPL / ("B" if n <= 128 else "A")
+    if n <= 0 or (n > 128 and (n + 127) // 128 > 16383):
+        raise ValueError(f"n={n} out of supported range (1..2098176)")
+    P = (n + 127) // 128
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
-    shutil.copytree(ref, out)
+    shutil.copytree(tpl, out)
     sg = out / "sg00"
-    dve = bytearray(sg / "DVE0.bin".replace("DVE0.bin","DVE0.bin").read()
-                    if False else open(sg / "DVE0.bin","rb").read())
-    # patch element count u16 @26 in both op65 mul instrs (slots 4 and 10)
-    for slot in (4, 10):
-        off = slot * 32
-        assert dve[off] == 65
-        struct.pack_into("<H", dve, off + 26, n)
-    (sg / "DVE0.bin").write_bytes(bytes(dve))
-    # patch pool desc elem sizes (u16 at offsets 36 and 60 within each desc)
-    pool = bytearray(open(sg / "Pool0.bin","rb").read())
+
+    def u16(buf, off, val):
+        struct.pack_into("<H", buf, off, val & 0xFFFF)
+
+    if n > 128:
+        neg4P, neg8P = 65536 - 4 * P, 65536 - 8 * P
+        dve = bytearray(open(sg / "DVE0.bin", "rb").read())
+        assert dve[192] == 65  # op170 cont slot opcode byte varies (128/0)
+        u16(dve, 192 + 26, P)
+        u16(dve, 224 + 0, neg8P)
+        u16(dve, 224 + 10, P)
+        u16(dve, 224 + 26, P)
+        (sg / "DVE0.bin").write_bytes(bytes(dve))
+        act = bytearray(open(sg / "Activation0.bin", "rb").read())
+        assert act[192] == 33 and act[224] == 170
+        struct.pack_into("<f", act, 224 + 4, scale)
+        u16(act, 192 + 16, neg4P)
+        u16(act, 192 + 26, P)
+        u16(act, 224 + 26, P)
+        (sg / "Activation0.bin").write_bytes(bytes(act))
+        pool = bytearray(open(sg / "Pool0.bin", "rb").read())
+        assert pool[128] == 212 and pool[192] == 212 and pool[256] == 212
+        u16(pool, 128 + 24, 4 * P)                       # x-in desc
+        u16(pool, 160 + 4, 4 * P); u16(pool, 160 + 8, neg4P); u16(pool, 160 + 28, 4 * P)
+        u16(pool, 192 + 24, 4 * P)                       # w-in desc
+        u16(pool, 224 + 4, 4 * P); u16(pool, 224 + 8, neg8P); u16(pool, 224 + 28, 4 * P)
+        u16(pool, 288 + 4, 4 * P)                        # y-out desc + rearm
+        u16(pool, 288 + 16, 4 * P); u16(pool, 288 + 28, 4 * P)
+        (sg / "Pool0.bin").write_bytes(bytes(pool))
+    else:
+        dve = bytearray(open(sg / "DVE0.bin", "rb").read())
+        assert dve[224] == 10
+        u16(dve, 224 + 2, n)
+        struct.pack_into("<f", dve, 224 + 8, scale)  # scale imm inside op10
+        (sg / "DVE0.bin").write_bytes(bytes(dve))
+        pool = bytearray(open(sg / "Pool0.bin", "rb").read())
+        assert pool[128] == 212 and pool[192] == 212 and pool[256] == 212
+        for base in (160, 224, 288):                     # rearm pseudo: opcode=n
+            u16(pool, base + 0, n); u16(pool, base + 24, n)
+        (sg / "Pool0.bin").write_bytes(bytes(pool))
+
     nbytes = n * 4
-    for di in (2, 3, 4):
-        base = di * 64
-        if pool[base] != 212:
-            continue  # y-out desc uses op67, not op212 - skip elem patch
-        struct.pack_into("<H", pool, base + 36, nbytes)
-        struct.pack_into("<H", pool, base + 60, nbytes)
-    (sg / "Pool0.bin").write_bytes(bytes(pool))
-    # def.json + neff.json tensor sizes
-    for jf in ("sg00/def.json", "neff.json"):
-        p = out / jf
-        txt = p.read_text()
-        for old, new in (('"size": 16384', f'"size": {nbytes}'),
-                         ('[1, 4096]', f'[1, {n}]'), ('[4096]', f'[{n}]')):
-            txt = txt.replace(old, new)
-        p.write_text(txt)
+    d = _json.loads((sg / "def.json").read_text())
+    for vn in ("input0", "input1", "output0"):
+        d["var"][vn]["size"] = nbytes
+    (sg / "def.json").write_text(_json.dumps(d))
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    nj = {
+        "nodes": [
+            {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+            {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
+            {"op": "tvm_op", "name": "sg_coreV10",
+             "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "2",
+                        "kelf": "kelf-0.json", "num_outputs": "1"},
+             "inputs": [[0, 0, 0], [1, 0, 0]], "output_names": ["output0"]}],
+        "arg_nodes": [0, 1], "heads": [[2, 0, 0]],
+        "attrs": {"shape": ["list_shape", [[1, n]] * 3],
+                   "dltype": ["list_str", ["float32"] * 3],
+                   "storage_id": ["list_int", [0, 1, 2]]},
+        "node_row_ptr": [0, 1, 2, 3],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [1, n]},
+                        "input1": {"id": 1, "dtype": "float32", "shape": [1, n]}},
+            "outputs": {}}}},
+    }
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
