@@ -237,3 +237,95 @@ ACT-LUT(16-entry E2M1) + TT-mul by block-scale = 1-input-shaped ops.
 
 Device-proven bit-exact single ops (for the record): a&b, a|b, a^b
 (op81), a<<4, a>>4, a&15 (op83+op8), jnp.take. Rate 57 Gop/s resident.
+
+## P-scaling, ACT rate, op123/op104 hw tests (2026-11-10, device)
+
+**P-scaling test** (tools/bv_pscale.py; n = 4096 fixed, R = 64 rounds of
+[shr1->y][shl1->y], P decoupled from n by patching the P fields; 200-iter
+timing; baseline single-op container = 61.5 us avg / 57.3 min):
+
+| P | avg us | min us | per-op incremental (vs baseline, /128 ops) | rate at n=4096 |
+|---|---|---|---|---|
+| 8   | 66.5 | 64.8 | ~58 ns | 70 Gop/s |
+| 16  | 67.4 | 65.3 | ~62 ns | 65 Gop/s |
+| 32  | 68.5 | 65.9 | ~67 ns | 61 Gop/s |
+| 64  | 71.2 | 68.8 | ~90 ns | 45 Gop/s |
+| 128 | 77.7 | 74.2 | ~132 ns | 31 Gop/s |
+
+- **Rate FALLS with P at fixed n** (per-op ~= 54 ns + 0.61 ns x P). The
+  "num_active_channels parallelism buys 4x at P=128" hypothesis is DEAD:
+  P = per-channel overhead, not a parallelism knob, at fixed n.
+- All P values (incl. P = 128) EXECUTE on the 2-desc pool with rel48 =
+  4P = 512 — the earlier translate failure ("dst pseudo addr8") was
+  specific to the 3-desc ew pool layout, not a general P limit.
+- P is not a coverage gate either: P = 8 still processed all 4096
+  elements (y = 2x everywhere from the shl op).
+- Numerics of chained [shr][shl] on a shared dst buffer = y = 2x at ALL
+  P (adjacent-slot write->read race on 0x4000; the shr result is not
+  visible to the next op). Timing unaffected; long-chain bit-exact
+  numerics stay OPEN (ping-pong dst buffers = the obvious next fix).
+- Field map for n/P scaling extracted from fresh shr oracles
+  (n = 2048/4096/8192, all neuronx-cc 2.26): pool is n-INDEPENDENT
+  (tensor sizes live in the DGE/shape side) — only 4P fields scale:
+  desc0 rel{24,36,60} = 4P, rel40 = -4P; desc1 rel{36,48,60} = 4P;
+  DVE op83 head rel16 = -4P, rel26 = P; op8 carrier rel26 = P.
+  SP0/PE0/Activation streams are constant across n.
+
+**ACT engine rate** (compiler oracles, exp vs mul x1.0 at same shapes,
+same wrapper — marginal isolates the ACT LUT pass):
+
+| n | mul x1.0 | exp | exp - mul | ACT marginal |
+|---|---|---|---|---|
+| 131072  | 62.0 us | 65.1 us | 3.1 us  | 42 G exp/s |
+| 1048576 | 80.6 us | 91.3 us | 10.7 us | 98 G exp/s |
+
+Fit: ACT exp ~= 2 us fixed + 8.3 ns/elem -> **~121 G exp/s marginal**
+(917504 extra elems / 7.6 us extra). Supersedes the 17 G/s softmax-based
+guess — the ACT LUT pipeline is ~7x faster than feared. Pool/DMA
+marginal in the compiler mul containers = 7.34 MB / 18.6 us = ~395 GB/s
+(our synth-desc plateau = 220 GB/s; compiler desc granularity is better).
+
+**op123 TENSOR_DEQUANTIZE: NO** (does not execute on trn1 in any tested
+placement). 64B instr built per v3.NEURON_ISA_TPB_S3D3_TENS_DEQUANT
+fields + is_valid_s3d3_tens_dequant constraints (wl = 0x10, nac > 0,
+dequant_fmt 1..4, group_size {0..7,8}); variants: fmt 1..4, in/out
+dtype FP32/INT8/UINT8/FP16, group 0/8, step 1/0xFFF0, dst@44/@48.
+Placements: DVE stream, POOL stream (between descs), ACT stream, PE
+stream — ALL return `execute failed: 1004` (NRT_EXEC_COMPLETED_WITH_ERR).
+Corroborating: the DVE hwdecode table (default_opcode_table.bin) has no
+0x7b entry (has 0x68 = 104). op123 = dead on trn1; dequant goes through
+op81/op83 + ACT LUT as designed.
+
+**op104 GATHER (bare): NO** (no numerics-positive execution found).
+DVE/ACT placements = 1004. POOL placement (op104 between descs)
+COMPLETES CLEAN but y is all zeros — with dst@40 AND dst@44 variants,
+idx = x-region self-indexing (expected y = x[x] check) — i.e. the pool
+engine tolerates/skips it without producing values. The compiler never
+emits bare op104 (it lowers gathers to the pool indirect DMA machinery
++ op83 + op3), which is the proven usable path.
+
+## Updated go/no-go arithmetic (all engines, measured)
+
+Need at the 220 GB/s synth plateau: NVFP4 = 2 values/byte ->
+**440 G values/s**; fp8 = 1 value/byte -> 220 G values/s; fp32
+baseline = 55 G values/s.
+
+- DVE bitvec decode ceiling (measured, worst case at fixed n):
+  **57-70 G elem-ops/s, falling with P**. NVFP4 unpack = >=1 op/value
+  -> 57-70 G values/s = **6-8x short of 440**. NO-GO via DVE decode.
+- ACT LUT pass (measured): ~121 G/s marginal — above fp32 parity
+  (55 G/s), below fp8 (220) and NVFP4 (440) needs. As a PIPELINE stage
+  after DVE unpack the min rate still binds at DVE 57-70.
+- OPEN rate-law question that could still move the DVE number: the
+  n-sweep at decoupled small P (n = 16384 x P in {32,64,128}) — if
+  per-op time is latency-dominated (54 ns + 0.61 P) at LARGE n, the DVE
+  ceiling rises to ~220-280 Gop/s and fp8-via-DVE reaches parity; if
+  time = (n/P) x 0.5625 ns + const, P-scaling is dead permanently.
+- PE-native packed dtypes remain the only measured-free GO candidate:
+  in_dtype FP8_EXP4 = 14 exists; 16-bit staging geometry decode is the
+  gating item (dedicated probe session).
+- Revised verdicts: **NVFP4-via-DVE/ACT decode = NO-GO (measured)**;
+  fp8 = GO only via PE in_dtype (pending); QTIP = NO-GO via DVE/ACT
+  (per-value ~2 DVE + 1 ACT ops -> ~28 G values/s, DVE-bound) — both
+  flip only if the open rate-law test lands in the latency-dominated
+  regime, or via the PE-native path.
