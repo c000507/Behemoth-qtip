@@ -501,10 +501,9 @@ def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
     buf = _io.BytesIO()
     _np.save(buf, idata)
     (sg / ifn).write_bytes(buf.getvalue())
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     nj = {
         "nodes": [
             {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
@@ -605,10 +604,9 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     for vn in ("input0", "input1", "output0"):
         d["var"][vn]["size"] = nbytes
     (sg / "def.json").write_text(_json.dumps(d))
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     nj = {
         "nodes": [
             {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
@@ -657,10 +655,9 @@ def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
     (out / "sg00").mkdir(parents=True)
     for f in sg_src.iterdir():
         shutil.copy(f, out / "sg00" / f.name)
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
@@ -705,10 +702,9 @@ def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
     (out / "sg00").mkdir(parents=True)
     for f in sg_src.iterdir():
         shutil.copy(f, out / "sg00" / f.name)
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
@@ -764,10 +760,9 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
     act = bytearray((out / "sg00" / "Activation0.bin").read_bytes())
     _s.pack_into("<f", act, 360, eps)
     (out / "sg00" / "Activation0.bin").write_bytes(bytes(act))
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
@@ -882,25 +877,25 @@ def _wrap_graph(outdir: Path, sg_src: Path, inputs, name: str = "graph",
     nodes = [{"op": "null", "name": f"input{i}", "inputs": [],
               "output_names": [f"input{i}"], "is_param": "0"} for i in range(nin)]
     sg_idx = nin
+    nout = len(out_shape) if (out_shape and isinstance(out_shape[0], list)) else 1
     nodes.append({"op": "tvm_op", "name": "sg_coreV10",
                   "attrs": {"func_name": "__kelf", "flatten_data": "0",
                             "num_inputs": str(nin), "kelf": "kelf-0.json",
-                            "num_outputs": "1"},
+                            "num_outputs": str(nout)},
                   "inputs": [[i, 0, 0] for i in range(nin)],
-                  "output_names": ["output0"]})
-    (out / "info.json").write_text(_json.dumps({
-        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
-        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
-        "num_tpb_per_node": [1] + [0] * 63}))
+                  "output_names": [f"output{i}" for i in range(nout)]})
+    if nout > 1:
+        # compiler tars carry no info.json; keep it for single-output wrappers
+        pass
     shapes = [[d for d in dims] for _, dims in inputs]
-    osh = out_shape or list(inputs[0][1])
-    shapes.append(osh)
+    outs = out_shape if (out_shape and isinstance(out_shape[0], list)) else [out_shape or list(inputs[0][1])]
+    shapes.extend(outs)
     nj = {"nodes": nodes, "arg_nodes": list(range(nin)),
-          "heads": [[sg_idx, 0, 0]],
+          "heads": [[sg_idx, i, 0] for i in range(len(outs))],
           "attrs": {"shape": ["list_shape", shapes],
-                    "dltype": ["list_str", [dt for dt, _ in inputs] + ["float32"]],
-                    "storage_id": ["list_int", list(range(nin + 1))]},
-          "node_row_ptr": list(range(nin + 2)),
+                    "dltype": ["list_str", [dt for dt, _ in inputs] + ["float32"] * len(outs)],
+                    "storage_id": ["list_int", list(range(nin + len(outs)))]},
+          "node_row_ptr": list(range(nin + 1)) + [nin + len(outs)],
           "metadata": {"signatures": {"default": {
               "inputs": {f"input{i}": {"id": i, "dtype": dt, "shape": dims}
                          for i, (dt, dims) in enumerate(inputs)},
@@ -1032,3 +1027,60 @@ def emit_block_gen(outdir: Path, M: int, K: int, H: int, h: int, d: int,
                         ("float32", [K, K]), ("float32", [K, H]), ("float32", [H, K]),
                         ("float32", [K])],
                        name, out_shape=[M, K])
+
+
+def emit_be_block_gen(outdir: Path, K: int = 12288, hq: int = 96, hkv: int = 8,
+                      d: int = 128, H: int = 28672, theta: float = 1e6,
+                      eps: float = 1e-5, S: int = 1, name: str = "beblock") -> Path:
+    """Behemoth decode block (runtime/src arch): post-norm, RoPE pair(d,d+64)
+    theta 1e6, GQA, SwiGLU, RMSNorm eps 1e-5. M=1 decode step w/ KV cache.
+    Inputs: x[K] w_in[K] wq[K,hq*d] wk[K,hkv*d] wv[K,hkv*d] wo[hq*d,K]
+            w_post[K] wg[K,H] wu[K,H] wd[H,K] kc[hkv,S,d] vc[hkv,S,d] pos(i32)
+    Outputs: y[K] k_new[hkv,d] v_new[hkv,d]
+    """
+    key = f"beblk_{K}_{hq}_{hkv}_{d}_{H}_{S}"
+    body = (
+        f"def f(x, w_in, wq, wk, wv, wo, w_post, wg, wu, wd, kc, vc, pos):\n"
+        f"    def rms(v, g):\n"
+        f"        return v * g * (1.0 / jnp.sqrt(jnp.mean(v*v) + {eps!r}))\n"
+        f"    xn = rms(x, w_in)\n"
+        f"    q = (xn @ wq).reshape({hq}, {d})\n"
+        f"    k = (xn @ wk).reshape({hkv}, {d})\n"
+        f"    v = (xn @ wv).reshape({hkv}, {d})\n"
+        f"    inv = {theta!r} ** (-jnp.arange({d//2}) * 2.0 / {d})\n"
+        f"    ang = pos[0] * inv\n"
+        f"    c, s = jnp.cos(ang), jnp.sin(ang)\n"
+        f"    def rope(t):\n"
+        f"        a, b = t[:, :{d//2}], t[:, {d//2}:]\n"
+        f"        return jnp.concatenate([a*c - b*s, b*c + a*s], -1)\n"
+        f"    q, k = rope(q), rope(k)\n"
+        f"    Kall = jnp.concatenate([kc, k[:, None]], 1)\n"
+        f"    Vall = jnp.concatenate([vc, v[:, None]], 1)\n"
+        f"    Kr = jnp.repeat(Kall, {hq//hkv}, 0)\n"
+        f"    Vr = jnp.repeat(Vall, {hq//hkv}, 0)\n"
+        f"    sc = jnp.einsum('md,msd->ms', q, Kr) * {1.0/d**0.5:.8f}\n"
+        f"    p = jax.nn.softmax(sc, -1)\n"
+        f"    o = (jnp.einsum('ms,msd->md', p, Vr).reshape({hq*d},) @ wo)\n"
+        f"    res = x + o\n"
+        f"    t = rms(res, w_post)\n"
+        f"    g = t @ wg\n"
+        f"    u = t @ wu\n"
+        f"    h = g / (1.0 + jnp.exp(-g)) * u\n"
+        f"    return res + h @ wd, k, v\n"
+        f"lowered = jax.jit(f).lower(\n"
+        f"    jnp.zeros(({K},), jnp.float32), jnp.zeros(({K},), jnp.float32),\n"
+        f"    jnp.zeros(({K},{hq*d}), jnp.float32), jnp.zeros(({K},{hkv*d}), jnp.float32),\n"
+        f"    jnp.zeros(({K},{hkv*d}), jnp.float32), jnp.zeros(({hq*d},{K}), jnp.float32),\n"
+        f"    jnp.zeros(({K},), jnp.float32), jnp.zeros(({K},{H}), jnp.float32),\n"
+        f"    jnp.zeros(({K},{H}), jnp.float32), jnp.zeros(({H},{K}), jnp.float32),\n"
+        f"    jnp.zeros(({hkv},{S},{d}), jnp.float32), jnp.zeros(({hkv},{S},{d}), jnp.float32),\n"
+        f"    jnp.zeros((1,), jnp.int32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py, timeout=600)
+    ins = [("float32", [K]), ("float32", [K]), ("float32", [K, hq * d]),
+           ("float32", [K, hkv * d]), ("float32", [K, hkv * d]),
+           ("float32", [hq * d, K]), ("float32", [K]), ("float32", [K, H]),
+           ("float32", [K, H]), ("float32", [H, K]),
+           ("float32", [hkv, S, d]), ("float32", [hkv, S, d]), ("int32", [1])]
+    return _wrap_graph(Path(outdir), sg, ins, name,
+                       out_shape=[[K], [hkv, d], [hkv, d]])
