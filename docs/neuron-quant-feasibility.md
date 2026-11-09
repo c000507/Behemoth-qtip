@@ -221,3 +221,19 @@ Chain-semantics gotchas (device-proven):
 - The R-sweep numerics mismatch at imm=1/self-dst (y<<1→y) is OPEN:
   timing unaffected (dst-chain is data-flow independent); bit-exact
   validation of long chains pending (imm=4 validated single-op).
+
+## Chain numerics status (open, scoped)
+
+Multi-op TS chains inside the 2-input and-oracle container run + scale
+linearly but produce wrong values even for a single [ashr 4 src=0x888]
+op that is byte-identical to the validated shr-oracle op except the src
+address. The DVE-address <-> SB-staging mapping is therefore
+container-shape dependent (2-input 3-desc containers differ from
+1-input 2-desc ones). RESOLUTION PATH (next session): build the NVFP4
+decode chain in the **1-input container shape** (the shr-oracle
+structure: in0 at DVE-0, y at 0x4000, pool = 2 descs) which is fully
+validated end-to-end; the decode = [shr4][and 15] nibble streams +
+ACT-LUT(16-entry E2M1) + TT-mul by block-scale = 1-input-shaped ops.
+
+Device-proven bit-exact single ops (for the record): a&b, a|b, a^b
+(op81), a<<4, a>>4, a&15 (op83+op8), jnp.take. Rate 57 Gop/s resident.
