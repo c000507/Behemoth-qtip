@@ -594,9 +594,6 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     for vn in ("input0", "input1", "output0"):
         d["var"][vn]["size"] = nbytes
     (sg / "def.json").write_text(_json.dumps(d))
-    if nout > 1:
-        # compiler tars carry no info.json; keep it for single-output wrappers
-        pass
     nj = {
         "nodes": [
             {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
@@ -626,8 +623,8 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     return out / f"{name}.neff"
 
 
-SOFTMAX_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
-    (128, 128): "/tmp/opencode/oracle_softmax128/sg00",
+SOFTMAX_ORACLE_DIRS = {  # (M, K) -> frozen oracle sg00 dir (tools/)
+    (128, 128): str(Path(__file__).parent / "oracle_sg00" / "softmax128"),
 }
 
 
@@ -645,9 +642,6 @@ def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
     (out / "sg00").mkdir(parents=True)
     for f in sg_src.iterdir():
         shutil.copy(f, out / "sg00" / f.name)
-    if nout > 1:
-        # compiler tars carry no info.json; keep it for single-output wrappers
-        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
@@ -673,8 +667,8 @@ def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
     return out / f"{name}.neff"
 
 
-DEQUANT_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
-    (128, 128): "/tmp/opencode/oracle_dequant128/sg00",
+DEQUANT_ORACLE_DIRS = {  # (M, K) -> frozen oracle sg00 dir (tools/)
+    (128, 128): str(Path(__file__).parent / "oracle_sg00" / "dequant128"),
 }
 
 
@@ -692,9 +686,6 @@ def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
     (out / "sg00").mkdir(parents=True)
     for f in sg_src.iterdir():
         shutil.copy(f, out / "sg00" / f.name)
-    if nout > 1:
-        # compiler tars carry no info.json; keep it for single-output wrappers
-        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
@@ -722,9 +713,9 @@ def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
     return out / f"{name}.neff"
 
 
-RMS_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
-    (128, 128): "/tmp/opencode/oracle_rms128/sg00",
-    (256, 128): "/tmp/opencode/oracle_rms256/sg00",
+RMS_ORACLE_DIRS = {  # (M, K) -> frozen oracle sg00 dir (tools/)
+    (128, 128): str(Path(__file__).parent / "rms_oracles" / "rms128"),
+    (256, 128): str(Path(__file__).parent / "oracle_sg00" / "rms256"),
 }
 
 
@@ -750,9 +741,6 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
     act = bytearray((out / "sg00" / "Activation0.bin").read_bytes())
     _s.pack_into("<f", act, 360, eps)
     (out / "sg00" / "Activation0.bin").write_bytes(bytes(act))
-    if nout > 1:
-        # compiler tars carry no info.json; keep it for single-output wrappers
-        pass
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
