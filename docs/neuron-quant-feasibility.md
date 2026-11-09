@@ -381,25 +381,32 @@ fp32 twin; probe containers = patched streams + jsons + identity npy.
   but REJECTS <u8/<V1 (u8 fp8 eye = load fail on the bf16 base).
 
 **GEMV weight-streaming measurements** (compiler containers, M in
-{1,4,8}, square K=N in {4096,12288}, 200-iter timing avg):
+{1,4,8}, square K=N in {4096,12288}, 200-iter timing avg; w = KxN
+weight bytes; "marginal" = w/(latency - 56us launch floor)):
 
-| shape | fp32 us | bf16 us | speedup | w GB/s f32 | w GB/s bf16 |
+| shape | fp32 us | bf16 us | speedup | f32 GB/s (marg) | bf16 GB/s (marg) |
 |---|---|---|---|---|---|
-| M1 4096x4096   | 405.7  | 208.2  | 1.95x | 41 | 40 |
-| M4 4096x4096   | 363.7  | 221.0  | 1.65x | 45 | 37 |
-| M8 4096x4096   | 356.1  | 215.9  | 1.65x | 46 | 38 |
-| M1 12288x12288 | 2778.4 | 1300.2 | 2.14x | 218 | 232 |
-| M4 12288x12288 | 2553.8 | 1294.7 | 1.97x | 237 | 234 |
-| M8 12288x12288 | 2558.4 | 1300.2 | 1.97x | 236 | 234 |
+| M1 4096x4096   | 405.7  | 208.2  | 1.95x | 165 (192) | 161 (220) |
+| M4 4096x4096   | 363.7  | 221.0  | 1.65x | 185 (218) | 152 (203) |
+| M8 4096x4096   | 356.1  | 215.9  | 1.65x | 188 (224) | 155 (210) |
+| M1 12288x12288 | 2778.4 | 1300.2 | 2.14x | 217 (222) | 232 (243) |
+| M4 12288x12288 | 2553.8 | 1294.7 | 1.97x | 237 (242) | 233 (244) |
+| M8 12288x12288 | 2558.4 | 1300.2 | 1.97x | 236 (241) | 232 (243) |
+
+CORRECTION (was mis-reported as ~40 GB/s at 4096^2): the first table
+divided by elems-as-bytes instead of KxNxelem (4096^2 f32 w = 67.1 MB,
+not 16.8 MB). Recomputed: the compiler streams at 190-243 GB/s
+marginal at EVERY shape = already at/near the DMA plateau. There is
+NO 5x emitter headroom at small shapes; the compiler schedule is
+near-optimal for weight streaming and the **2x bf16 byte win = the
+entire available win** (plus the 56us launch floor, which fusion
+removes — the proven 5.8x lever stays multi-op fusion, not streaming
+efficiency).
 
 - fp32 GEMV numerics = exact vs numpy (<= 2.1e-6 rel); bf16 = bf16-
   level (rel 2e-4..2e-3 vs fp32 torch ref, accumulation-order noise).
 - **Weight streaming is byte-bound: halving weight bytes = ~2x
-  latency at every M tested.** The compiler's stream saturates the
-  ~220-230 GB/s plateau only at K,N = 12288; at 4096x4096 it streams
-  at only ~40 GB/s (schedule not overlapping enough at small sizes —
-  headroom OUR emitter could claim: a synth bf16 stream at the
-  220 GB/s plateau would be ~5x faster than the compiler at 4096^2).
+  latency at every M tested.**
 
 **FP8_EXP4 (in_dtype 14): EXECUTES but numerics = open (negative
 so far).** A fully-patched fp8 container (all four core instrs
@@ -416,6 +423,8 @@ for 1B elements + a loader-legal identity in an 8-bit pipeline
 Verdict update: **bf16/f16 weight-streaming = GO (2x measured, bit-
 exact)**; **fp8 = blocked on data plumbing, opcode accepted** (promising
 but unproven); NVFP4/QTIP via DVE/ACT = NO-GO (measured, previous
-section). Our-emitter priority: synth bf16 weight path at the 220 GB/s
-plateau (big win over the compiler's 40 GB/s at 4096^2), then fp8
-plumbing probes if the win justifies it.
+section). Emitter priority re-ranked after the streaming correction:
+the compiler's weight streaming is already plateau-bound, so a synth
+bf16 stream buys nothing on bandwidth — the emitter wins are (a) the
+launch floor via fusion (proven 5.8x), (b) fp8's additional 2x IF the
+plumbing decodes, (c) NVFP4's 4x only via PE-native paths.
