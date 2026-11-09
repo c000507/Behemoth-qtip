@@ -395,6 +395,134 @@ def emit_matmul(M: int, K: int, N: int, outdir: Path, name: str = "matmul") -> P
     return out / f"{name}.neff"
 
 
+def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
+                      name: str = "matmul") -> Path:
+    """Emit a matmul NEFF for arbitrary (M,K,N) via mm_synth synthesis.
+
+    PE0.bin = mm_synth.synth (byte-exact model vs 18 oracle streams),
+    Pool0.bin = mm_synth.synth_pool, SP/DVE = universal templates.
+    ACTIVATE stream = nearest oracle bucket by (K-class, NT).
+    Literal tables (d0/d1 descs) fall back to interpolated formulas.
+    """
+    import mm_synth as _ms
+    tpls = _json.loads(_SHAPE_TPL.read_text())
+    NT = (N + 127) // 128
+    kc = 0 if K <= 128 else (1 if K <= 512 else 2)
+    # nearest bucket: same K-class and NT, else any with matching NT then K-class
+    def score(bm, bk, bn):
+        bnt = (bn + 127) // 128
+        bkc = 0 if bk <= 128 else (1 if bk <= 512 else 2)
+        return (abs(bnt - NT), abs(bkc - kc), abs(bm - M))
+    best = min(tpls, key=lambda k: score(*map(int, k.split("_"))))
+    t = tpls[best]
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    sg = out / "sg00"
+    sg.mkdir(parents=True, exist_ok=True)
+    (sg / "PE0.bin").write_bytes(_ms.synth(M, K, N))
+    (sg / "Pool0.bin").write_bytes(_ms.synth_pool(M, K, N))
+    (sg / "DVE0.bin").write_bytes(bytes.fromhex(t["dve_hex"]))
+    (sg / "Activation0.bin").write_bytes(bytes.fromhex(t["act_hex"]))
+    (sg / "SP0.bin").write_bytes(bytes.fromhex(t["sp_hex"]))
+    for j in ("PE0.json", "Pool0.json", "DVE0.json", "Activation0.json",
+              "SP0.json", "act_info.json", "exp_and_others.json",
+              "exp_and_others_bkt.bin", "exp_and_others_ctrl.bin",
+              "default_opcode_table.bin", "default_control_table.bin",
+              "default_datapath_table.bin"):
+        srcp = Path("/tmp/opencode/mm_x/sg00") / j
+        if srcp.exists():
+            shutil.copy(srcp, sg / j)
+    ivn, ifn, isz, ivid = t["identity_var"]
+    A, B, Y = M * K * 4, K * N * 4, M * N * 4
+    sets = t["queue_sets"]
+    pv = t["sp_dma"]
+    # identity refill desc: [512 if pv-kind else 4M, 128] rows, to_off = tof
+    kind, fdst, fdn = _ms.final_scheme(M, K, N)
+    is_pv = kind == "pv" or (kind == "col" and len(fdst) > 1)
+    rows = 512 if is_pv else 4 * M
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": [], "act_dbg": [],
+        "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {}, "dma_dbg": [],
+        "dma_queue": {q: ({"dynamic_dma": {"SB_scratch_partition_offset": 0,
+                                           "SB_scratch_partition_size": 16384},
+                           "fabric_path": "main", "num_queues": 16, "owner": "pool",
+                           "semaphore_set": s, "type": "dynamic"}
+                         if q == "qPoolDynamic" else
+                         {"fabric_path": "main", "num_queues": 16,
+                          "owner": q.startswith("qSP") and "sp" or "pool",
+                          "semaphore_set": s, "type": "data"})
+                      for q, s in sets.items()},
+        "dve": "DVE0.json", "dve_asm_dbg": [], "dve_dbg": [], "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": [], "pe_dbg": [], "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": [], "pool_dbg": [], "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json",
+        "sp_asm_dbg": [], "sp_dbg": [], "sp_instr": "SP0.bin",
+        "var": {"SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": A, "type": "input", "var_id": 1},
+                "input1": {"ops": [], "size": B, "type": "input", "var_id": 2},
+                "output0": {"ops": [], "size": Y, "type": "output", "var_id": 3},
+                ivn: {"alignment": 65536, "fabric_path": "main", "file_name": ifn,
+                      "ops": [], "size": isz, "type": "file", "var_id": ivid},
+                "DGETable0": {"list": [1, 2, 3], "type": "dge-table", "var_id": 5}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
+    sp = {"dma": t["sp_dma"], "engine_id": 0, "instr": "SP0.bin",
+          "name": "SP0.json"}
+    # patch identity desc sizes for the new shape
+    import copy as _copy
+    sp = _copy.deepcopy(sp)
+    for desc in sp["dma"]:
+        for dd in desc.get("desc", []):
+            if str(dd.get("to_off", 0)).startswith("196") or dd.get("to") == "SB":
+                dd["from_sizes"] = [rows, 128]
+                dd["to_sizes"] = [rows, 128]
+    (sg / "SP0.json").write_text(_json.dumps(sp))
+    import numpy as _np, io as _io
+    idata = _np.eye(128, dtype=_np.float32).reshape(128, 128, 1, 1)
+    buf = _io.BytesIO()
+    _np.save(buf, idata)
+    (sg / ifn).write_bytes(buf.getvalue())
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    nj = {
+        "nodes": [
+            {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+            {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
+            {"op": "tvm_op", "name": "sg_coreV10",
+             "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "2",
+                       "kelf": "kelf-0.json", "num_outputs": "1"},
+             "inputs": [[0, 0, 0], [1, 0, 0]], "output_names": ["output0"]}],
+        "arg_nodes": [0, 1], "heads": [[2, 0, 0]],
+        "attrs": {"shape": ["list_shape", [[M, K], [K, N], [M, N]]],
+                  "dltype": ["list_str", ["float32"] * 3],
+                  "storage_id": ["list_int", [0, 1, 2]]},
+        "node_row_ptr": [0, 1, 2, 3],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [M, K]},
+                       "input1": {"id": 1, "dtype": "float32", "shape": [K, N]}},
+            "outputs": {}}}},
+    }
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
+
+
 def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
                      scale: float = 1.0) -> Path:
     """Emit y = scale*x*w elementwise NEFF over n f32 elements.

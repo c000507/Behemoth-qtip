@@ -369,6 +369,45 @@ def _desc(sem, w_size, x_size, extra, drain):
     return bytes(s)
 
 
+def d0_rearm(M, K, N):
+    if (M, K, N) in D0_REARM:
+        return D0_REARM[(M, K, N)]
+    return 4 * K + 4 * M
+
+
+def d1_fields(M, K, N):
+    """desc1 fields for shapes outside the oracle set (interpolated)."""
+    AS, NT = K // 128, (N + 127) // 128
+    tof = to_off(M, K, N)
+    x_bottom = tof - 512 * AS
+    if K <= 128:
+        kcls = 0
+    elif K <= 512:
+        kcls = 1
+    else:
+        kcls = 2
+    f = [0] * 11
+    f[0] = 4 * K if kcls == 0 else 0          # @24
+    f[1] = 0 if AS == 1 else (NT if kcls >= 1 else 1)   # @26 chunks
+    f[2] = 1 if kcls == 0 else 4 * N          # @28
+    f[3] = 128 if kcls == 0 else AS           # @32
+    f[4] = 1 if kcls == 0 else 128            # @34
+    f[5] = 0 if kcls == 0 else 4 * N          # @48
+    f[6] = 4 if kcls == 0 else 0              # @50
+    f[7] = 1 if kcls == 0 else 0              # @52
+    f[8] = 0 if kcls == 0 else 4              # @54
+    f[9] = 128 if kcls == 0 else AS           # @56
+    f[10] = 1 if kcls == 0 else 128           # @58
+    if kcls == 0:
+        addr = x_bottom - 4 * N
+    elif kcls == 1:
+        addr = x_bottom - AS * 4 * N - 4 * M
+    else:
+        addr = x_bottom - AS * 4 * N
+    f.append(addr)
+    return f
+
+
 def synth_pool(M, K, N):
     """Generate Pool0.bin bytes (3 DMA descs + final event)."""
     AS, NT = K // 128, (N + 127) // 128
@@ -381,7 +420,7 @@ def synth_pool(M, K, N):
     out += bytes([204, 16] + [0] * 30)
     out += bytes([0] * 32)
     # desc0: x in, sem 8
-    d0r = D0_REARM[(M, K, N)]
+    d0r = d0_rearm(M, K, N)
     out += _desc(8, 4 * K, 4 * K, (0, M, d0r, M), 0)
     # desc1: w in, sem 9
     if pv:
@@ -389,7 +428,7 @@ def synth_pool(M, K, N):
         drain = pv0 + 4 * M * (NT - 1)
     else:
         drain = 0x4000 + 4 * M * AS
-    f = D1_FIELDS[(M, K, N)]
+    f = D1_FIELDS.get((M, K, N)) or d1_fields(M, K, N)
     d1 = bytearray(64)
     d1[0] = 212
     d1[1] = 16
