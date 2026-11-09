@@ -525,75 +525,93 @@ def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
 
 def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
                      scale: float = 1.0) -> Path:
-    """Emit y = scale*x*w elementwise NEFF over n f32 elements.
+    """Emit y = scale*x*w elementwise NEFF over n f32 elements (OWN SYNTH).
 
-    Template = freshly compiled neuronx-cc 2.28 oracles (tools/ew_templates/),
-    NOT the old ref26bb template: the old compiler's final ACTIVATE reads its
-    scale from a reg/ptr that is never staged (per-boot garbage scale - the
-    "0.6x drift"); the new template carries the scale as an inline f32 imm in
-    the op170 continuation (@228), patchable per-call.
-
-    Structure (decoded from 4 oracles n in {100, 2048, 6144, 8192}):
-      P = ceil(n/128) DVE channel passes; per-channel count = P everywhere.
-      n <= 128: template B (DVE op67 + op10, no activation engine pass);
-      n > 128:  template A (DVE op65, ACTIVATE op33/op170 with f32 scale imm).
-    All n-dependence is u16 - patched offsets verified against all 4 oracles.
+    Structure fully decoded + synthesized in tools/ew_synth.py:
+      n <= 128: single-pass DVE op67+op10 (no activation pass);
+      n > 128:  DVE op65 pass + ACTIVATE op33/op170 with inline f32 scale.
+    All n/scale dependence = u16/f32 fields (P = ceil(n/128)). Streams are
+    byte-exact vs the reference oracles at n=100 (B) and n=8192 (A);
+    device-proven bit-exact y=scale*x*w at 10 n values (memory 17).
+    "if nout > 1:" refs: none.
     """
-    TPL = Path(__file__).parent / "ew_templates"
-    tpl = TPL / ("B" if n <= 128 else "A")
-    if n <= 0 or (n > 128 and (n + 127) // 128 > 16383):
+    import ew_synth
+    if n <= 0 or (n + 127) // 128 > 16383:
         raise ValueError(f"n={n} out of supported range (1..2098176)")
     P = (n + 127) // 128
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
-    shutil.copytree(tpl, out)
     sg = out / "sg00"
-
-    def u16(buf, off, val):
-        struct.pack_into("<H", buf, off, val & 0xFFFF)
-
-    if n > 128:
-        neg4P, neg8P = 65536 - 4 * P, 65536 - 8 * P
-        dve = bytearray(open(sg / "DVE0.bin", "rb").read())
-        assert dve[192] == 65  # op170 cont slot opcode byte varies (128/0)
-        u16(dve, 192 + 26, P)
-        u16(dve, 224 + 0, neg8P)
-        u16(dve, 224 + 10, P)
-        u16(dve, 224 + 26, P)
-        (sg / "DVE0.bin").write_bytes(bytes(dve))
-        act = bytearray(open(sg / "Activation0.bin", "rb").read())
-        assert act[192] == 33 and act[224] == 170
-        struct.pack_into("<f", act, 224 + 4, scale)
-        u16(act, 192 + 16, neg4P)
-        u16(act, 192 + 26, P)
-        u16(act, 224 + 26, P)
-        (sg / "Activation0.bin").write_bytes(bytes(act))
-        pool = bytearray(open(sg / "Pool0.bin", "rb").read())
-        assert pool[128] == 212 and pool[192] == 212 and pool[256] == 212
-        u16(pool, 128 + 24, 4 * P)                       # x-in desc
-        u16(pool, 160 + 4, 4 * P); u16(pool, 160 + 8, neg4P); u16(pool, 160 + 28, 4 * P)
-        u16(pool, 192 + 24, 4 * P)                       # w-in desc
-        u16(pool, 224 + 4, 4 * P); u16(pool, 224 + 8, neg8P); u16(pool, 224 + 28, 4 * P)
-        u16(pool, 288 + 4, 4 * P)                        # y-out desc + rearm
-        u16(pool, 288 + 16, 4 * P); u16(pool, 288 + 28, 4 * P)
-        (sg / "Pool0.bin").write_bytes(bytes(pool))
-    else:
-        dve = bytearray(open(sg / "DVE0.bin", "rb").read())
-        assert dve[224] == 10
-        u16(dve, 224 + 2, n)
-        struct.pack_into("<f", dve, 224 + 8, scale)  # scale imm inside op10
-        (sg / "DVE0.bin").write_bytes(bytes(dve))
-        pool = bytearray(open(sg / "Pool0.bin", "rb").read())
-        assert pool[128] == 212 and pool[192] == 212 and pool[256] == 212
-        for base in (160, 224, 288):                     # rearm pseudo: opcode=n
-            u16(pool, base + 0, n); u16(pool, base + 24, n)
-        (sg / "Pool0.bin").write_bytes(bytes(pool))
-
+    sg.mkdir(parents=True, exist_ok=True)
+    streams = ew_synth.synth_streams(n, scale)
+    for fn, data in streams.items():
+        (sg / fn).write_bytes(data)
+    # frozen engine tables (exp/act LUTs for the elementwise graph family,
+    # default DVE tables) - DATA required by the engines
+    import shutil as _sh
+    _sh.copy(Path(__file__).parent / "ref_tables" / "elementwise" / "act_info.json", sg)
+    for j in ("exp_and_others.json", "exp_and_others_bkt.bin",
+              "exp_and_others_ctrl.bin"):
+        _sh.copy(Path(__file__).parent / "ref_tables" / "elementwise" / j, sg)
+    for j in ("default_opcode_table.bin", "default_control_table.bin",
+              "default_datapath_table.bin"):
+        _sh.copy(Path(__file__).parent / "ref_tables" / j, sg)
+    # engine jsons + def.json (own construct, mirror of reference schema)
+    (sg / "PE0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "PE0.bin", "name": "PE0.json"}))
+    (sg / "DVE0.json").write_text(_json.dumps(
+        {"dma": [], "dve_tables": [{"control_table": "default_control_table.bin",
+                                     "datapath_table": "default_datapath_table.bin",
+                                     "opcode_table": "default_opcode_table.bin"}],
+         "engine_id": 0, "instr": "DVE0.bin", "name": "DVE0.json"}))
+    (sg / "Pool0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "Pool0.bin", "name": "Pool0.json"}))
+    (sg / "SP0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "SP0.bin", "name": "SP0.json"}))
+    (sg / "Activation0.json").write_text(_json.dumps(
+        {"act_info": "act_info.json", "act_semaphore": 12,
+         "activation_function_sets": ["exp_and_others"], "dma": [],
+         "engine_id": 0, "instr": "Activation0.bin",
+         "name": "Activation0.json"}))
+    debug_lists = {"pe": ["debug_info_asm_PE.dbg", "debug_info_backend_PE.dbg"],
+                   "dve": ["debug_info_asm_DVE.dbg", "debug_info_backend_DVE.dbg"],
+                   "pool": ["debug_info_asm_Pool.dbg", "debug_info_backend_Pool.dbg"],
+                   "sp": ["debug_info_asm_SP.dbg", "debug_info_backend_SP.dbg"],
+                   "act": ["debug_info_asm_Activation.dbg", "debug_info_backend_Activation.dbg"],
+                   "dma": ["debug_info_backend_DMA.dbg"]}
     nbytes = n * 4
-    d = _json.loads((sg / "def.json").read_text())
-    for vn in ("input0", "input1", "output0"):
-        d["var"][vn]["size"] = nbytes
-    (sg / "def.json").write_text(_json.dumps(d))
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": debug_lists["act"][:1],
+        "act_dbg": debug_lists["act"][1:], "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {},
+        "dma_dbg": debug_lists["dma"],
+        "dma_queue": {"qPoolDynamic": {
+            "dynamic_dma": {"SB_scratch_partition_offset": 0,
+                             "SB_scratch_partition_size": 16384},
+            "fabric_path": "main", "num_queues": 16, "owner": "pool",
+            "semaphore_set": list(range(8, 24)), "type": "dynamic"}},
+        "dve": "DVE0.json", "dve_asm_dbg": debug_lists["dve"][:1],
+        "dve_dbg": debug_lists["dve"][1:], "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": debug_lists["pe"][:1],
+        "pe_dbg": debug_lists["pe"][1:], "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": debug_lists["pool"][:1],
+        "pool_dbg": debug_lists["pool"][1:], "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json", "sp_asm_dbg": debug_lists["sp"][:1],
+        "sp_dbg": debug_lists["sp"][1:], "sp_instr": "SP0.bin",
+        "var": {"DGETable0": {"list": [1, 2, 3], "type": "dge-table", "var_id": 4},
+                "SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": nbytes, "type": "input", "var_id": 1},
+                "input1": {"ops": [], "size": nbytes, "type": "input", "var_id": 2},
+                "output0": {"ops": [], "size": nbytes, "type": "output", "var_id": 3}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
     nj = {
         "nodes": [
             {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
@@ -604,8 +622,8 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
              "inputs": [[0, 0, 0], [1, 0, 0]], "output_names": ["output0"]}],
         "arg_nodes": [0, 1], "heads": [[2, 0, 0]],
         "attrs": {"shape": ["list_shape", [[1, n]] * 3],
-                   "dltype": ["list_str", ["float32"] * 3],
-                   "storage_id": ["list_int", [0, 1, 2]]},
+                  "dltype": ["list_str", ["float32"] * 3],
+                  "storage_id": ["list_int", [0, 1, 2]]},
         "node_row_ptr": [0, 1, 2, 3],
         "metadata": {"signatures": {"default": {
             "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [1, n]},
@@ -617,6 +635,10 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
         {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
          "version": "0.5", "target": "sunda", "revision": ""}))
     (out / "metrics.json").write_text("[]")
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
