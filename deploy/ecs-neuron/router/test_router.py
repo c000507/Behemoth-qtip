@@ -391,6 +391,17 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         self.assertEqual((await c.post("/v1/chat/completions", json={"messages": []}, headers=h)).status, 401)
 
+    async def test_models_need_key(self):
+        self.dynamo = FakeDynamo({"good": ("ada@example.com", "Ada", True)})
+        c = await self.start(FakeECS(), allow_anonymous=False, api_keys_table="keys")
+        self.assertEqual((await c.get("/v1/models")).status, 401)
+        self.assertEqual((await c.get("/v1/models", headers={"Authorization": "Bearer bad"})).status, 401)
+        r = await c.get("/v1/models", headers={"Authorization": "Bearer good"})
+        self.assertEqual(r.status, 200)
+        self.assertEqual([m["id"] for m in (await r.json())["data"]], ["cydonia-24b"])
+        self.assertEqual((await c.get("/health")).status, 200)  # the ECS health check stays open
+        self.assertEqual(self.ecs.calls, [])
+
     async def test_no_key_fails_closed(self):
         c = await self.start(FakeECS(), allow_anonymous=False)
         r = await c.post("/v1/chat/completions", json={"messages": []})

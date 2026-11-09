@@ -1,7 +1,7 @@
 """Scale-to-zero router for the Neuron LLM backend on ECS.
 
-* GET  /v1/models            answered locally from MODEL_IDS (never wakes the backend)
-* GET  /health               router liveness + backend state (never wakes the backend)
+* GET  /v1/models            answered locally from MODEL_IDS (needs a key; never wakes the backend)
+* GET  /health               router liveness + backend state (no key: the ECS health check; never wakes the backend)
 * POST <PROXY_PATHS>         wake the backend ECS service if needed (single-flight), wait until the task is RUNNING
                              and its /health is OK, then proxy (SSE streaming passes through chunk by chunk)
 * idle reaper                desiredCount=0 after IDLE_TIMEOUT_S without requests and none in flight
@@ -412,6 +412,8 @@ class Router:
         return None
 
     async def models(self, request):
+        if await self._caller(request) is None:
+            return web.json_response({"error": {"message": "unauthorized", "type": "invalid_api_key"}}, status=401)
         now = int(time.time())
         return web.json_response({"object": "list", "data": [
             {"id": m, "object": "model", "created": now, "owned_by": self.cfg.owned_by} for m in self.cfg.model_ids]})

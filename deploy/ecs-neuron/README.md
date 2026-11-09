@@ -124,7 +124,8 @@ Terraform ignores later changes to it.
 Callers send `Authorization: Bearer <key>`. Approved keys live in the `<name>-api-keys` DynamoDB table, one item per
 key holding only the key's SHA-256 (`key_hash`) with the owner's `email`, `name` and an `enabled` flag. The router
 looks a key up on first use and caches the answer for `KEY_CACHE_S` (60 s), so a revocation takes effect within a
-minute. Each proxied request is logged with its key's owner. Without any key source the router refuses to start
+minute. Each proxied request is logged with its key's owner. `/v1/models` needs a key too; only `/health` (the ECS
+health check) is open. Without any key source the router refuses to start
 (`router_allow_anonymous = true` opts out, only for an ingress that authenticates callers itself).
 
 ```sh
