@@ -177,3 +177,47 @@ keeps up with the 220 GB/s plateau or DVE becomes the bottleneck.
   compiler-emitted bare op123/op104 seen yet; their on-chip status stays
   unproven. The dequant path we need (LUT/nibble/scale) is covered by
   op81+op83+ACT regardless.
+
+## DVE engine-rate measurement (resident-data microbench)
+
+Method: TS-BITVEC shift chains over RESIDENT SB data (staged once, no
+per-round DMA), n = 4096, P = 32, R rounds of [ashr 1 -> y][shl 1 -> y],
+our own synthesized stream (tools/bv_synth.py) inside the validated
+and-oracle container:
+
+| rounds | elem-ops (2/elem/round) | mean us | min us |
+|---|---|---|---|
+| 16  | 131072  | 59.3 | 57.6 |
+| 64  | 524288  | 66.5 | 64.7 |
+| 256 | 2097152 | 93.8 | 91.9 |
+
+Slope = 143.75 ns/round → **DVE TS-BITVEC rate = 57 G elem-ops/s**
+(engine-bound, data resident). Matches the compiler's own 4-op TT chain
+at n = 1M (55 Gop/s marginal). The earlier "48+ Gop/s DMA-bound" number
+was a lower bound; this is the engine rate.
+
+Latency structure: ~36 ns per 32B slot (72 ns per op83+op8 pair
+covering 4096 elements at P = 32). Whether the rate is per-instr latency
+(rate would scale with P: 227 Gop/s at P = 128) or fixed throughput is
+OPEN — the P = 128 test hits an undecoded pool-desc tiling field
+("Failed to translate dst pseudo addr8 for pseudo dma direct 2d" at
+desc2 rel48 = 4P = 512; 128/4096 both valid, 512 rejected).
+
+Decode-implication at 57 Gop/s: NVFP4 needs ~2 DVE ops/weight → ~110
+Gop/s to keep up with the 220 GB/s plateau at 4 values/byte → DVE-side
+decode alone would cap effective streaming at ~26 Gweight/s = HALF the
+fp32 rate (55 Gw/s) → NVFP4 loses UNLESS (a) the per-instr-latency
+hypothesis holds (P-scaling buys 4x) or (b) the LUT+scale half of the
+decode moves to the ACT engine (parallel) or (c) the PE consumes packed
+fp8 directly (in_dtype path, pending 16-bit staging decode).
+
+Chain-semantics gotchas (device-proven):
+- upd u16 = (idx<<8)|mode; byte-swapped (mode<<8)|idx runs but notifies
+  the wrong semaphore class → silently wrong numerics (observed).
+- upd = 0 on the final DVE op = y-out drain never fires = execute
+  timeout (status 5).
+- op8 = the op83 scalar-carrier (same 64B fetch pair), NOT a separate
+  instruction stream element.
+- The R-sweep numerics mismatch at imm=1/self-dst (y<<1→y) is OPEN:
+  timing unaffected (dst-chain is data-flow independent); bit-exact
+  validation of long chains pending (imm=4 validated single-op).
