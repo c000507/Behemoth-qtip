@@ -645,8 +645,119 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     return out / f"{name}.neff"
 
 
+def emit_rms_g(outdir: Path, M: int, K: int, eps: float = 1e-6,
+               name: str = "rmsg") -> Path:
+    """Emit TWO outputs from one rms graph: y0 = rms(x) (unit norm),
+    y1 = x*g*rsqrt(mean(x^2)+eps) (weighted). Reuses rms_synth streams
+    (rms and g-mul run on the same staged x); container owns 2 real
+    outputs via core num_outputs=2 + heads->core (ref pattern)."""
+    import rms_synth
+    if (M, K) not in rms_synth.VALIDATED:
+        raise ValueError("rms synth validated only for "
+                         f"{rms_synth.VALIDATED}; got ({M},{K})")
+    out = Path(outdir)
+    sg = out / "sg00"
+    shutil.rmtree(out, ignore_errors=True)
+    sg.mkdir(parents=True)
+    streams = rms_synth.synth_streams(M, K, eps)
+    (sg / "DVE0.bin").write_bytes(streams["DVE0.bin"])
+    (sg / "Activation0.bin").write_bytes(streams["Activation0.bin"])
+    (sg / "Pool0.bin").write_bytes(streams["Pool0.bin"])
+    (sg / "PE0.bin").write_bytes(rms_synth.PROLOGUE)
+    (sg / "SP0.bin").write_bytes(rms_synth.PROLOGUE)
+    for f in ("act_info.json", "exp_and_others.json", "exp_and_others_bkt.bin",
+              "exp_and_others_ctrl.bin"):
+        shutil.copy(Path(__file__).parent / "ref_tables" / "elementwise" / f, sg)
+    for f in ("default_opcode_table.bin", "default_control_table.bin",
+              "default_datapath_table.bin"):
+        shutil.copy(Path(__file__).parent / "ref_tables" / f, sg)
+    (sg / "PE0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "PE0.bin", "name": "PE0.json"}))
+    (sg / "SP0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "SP0.bin", "name": "SP0.json"}))
+    (sg / "Pool0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "Pool0.bin", "name": "Pool0.json"}))
+    (sg / "DVE0.json").write_text(_json.dumps(
+        {"dma": [], "dve_tables": [{"control_table": "default_control_table.bin",
+                                     "datapath_table": "default_datapath_table.bin",
+                                     "opcode_table": "default_opcode_table.bin"}],
+         "engine_id": 0, "instr": "DVE0.bin", "name": "DVE0.json"}))
+    (sg / "Activation0.json").write_text(_json.dumps(
+        {"act_info": "act_info.json", "act_semaphore": 12,
+         "activation_function_sets": ["exp_and_others"], "dma": [],
+         "engine_id": 0, "instr": "Activation0.bin", "name": "Activation0.json"}))
+    dbg = {"pe": ["debug_info_asm_PE.dbg"], "dve": ["debug_info_asm_DVE.dbg"],
+           "pool": ["debug_info_asm_Pool.dbg"], "act": ["debug_info_asm_Activation.dbg"],
+           "dma": ["debug_info_backend_DMA.dbg"]}
+    nb = M * K * 4
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": dbg["act"], "act_dbg": [],
+        "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {},
+        "dma_dbg": dbg["dma"],
+        "dma_queue": {"qPoolDynamic": {
+            "dynamic_dma": {"SB_scratch_partition_offset": 0,
+                             "SB_scratch_partition_size": 16384},
+            "fabric_path": "main", "num_queues": 16, "owner": "pool",
+            "semaphore_set": list(range(8, 24)), "type": "dynamic"}},
+        "dve": "DVE0.json", "dve_asm_dbg": dbg["dve"], "dve_dbg": [],
+        "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": dbg["pe"], "pe_dbg": [],
+        "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": dbg["pool"], "pool_dbg": [],
+        "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json", "sp_asm_dbg": [], "sp_dbg": [], "sp_instr": "SP0.bin",
+        "var": {"DGETable0": {"list": [1, 2, 3, 4], "type": "dge-table",
+                               "var_id": 5},
+                "SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": nb, "type": "input", "var_id": 1},
+                "input1": {"ops": [], "size": K * 4, "type": "input", "var_id": 2},
+                "output0": {"ops": [], "size": nb, "type": "output", "var_id": 3},
+                "output1": {"ops": [], "size": nb, "type": "output", "var_id": 4}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
+    nj = {"nodes": [
+        {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+        {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
+        {"op": "tvm_op", "name": "sg_coreV10",
+         "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "2",
+                    "kelf": "kelf-0.json", "num_outputs": "2"},
+         "inputs": [[0, 0, 0], [1, 0, 0]],
+         "output_names": ["output0", "output1"]}],
+        "arg_nodes": [0, 1], "heads": [[2, 0, 0], [2, 1, 0]],
+        "attrs": {"shape": ["list_shape", [[M, K], [K], [M, K], [M, K]]],
+                  "dltype": ["list_str", ["float32"] * 4],
+                  "storage_id": ["list_int", [0, 1, 2, 3]]},
+        "node_row_ptr": [0, 1, 2, 3, 5],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [M, K]},
+                        "input1": {"id": 1, "dtype": "float32", "shape": [K]}},
+            "outputs": {}}}}}
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
+
+
 SOFTMAX_ORACLE_DIRS = {  # frozen sg00 dirs (ground truth + tables)
     (128, 128): str(Path(__file__).parent / "oracle_sg00" / "softmax128"),
+    (96, 384): str(Path(__file__).parent / "oracle_sg00" / "softmax96x384"),
 }
 
 
@@ -758,25 +869,85 @@ def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
     return out / f"{name}.neff"
 
 
-DEQUANT_ORACLE_DIRS = {  # (M, K) -> frozen oracle sg00 dir (tools/)
-    (128, 128): str(Path(__file__).parent / "oracle_sg00" / "dequant128"),
-}
 
 
 def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
     """Emit y = q.cast(f32) * s[None, :] for q uint8 [M,K], s f32 [K].
 
-    Compiler-lowering oracle byte-copy (cast happens on PE, scale on DVE).
+    OWN SYNTHESIS (tools/deq_synth.py, M128 family): PE u8->f32 cast,
+    DVE s-broadcast, all K/M dependence = u16 fields. Streams byte-exact
+    vs compiler oracles at (128,128), (128,192), (128,256).
     Input file order: in0 = q (uint8), in1 = s (f32 K), output = f32.
     """
-    if (M, K) not in DEQUANT_ORACLE_DIRS:
-        raise ValueError(f"no dequant oracle for ({M},{K})")
-    sg_src = Path(DEQUANT_ORACLE_DIRS[(M, K)])
+    import deq_synth
+    if M != 128 or K < 64 or K > 256 or K % 64:
+        raise ValueError(f"dequant synth validated for M=128, K in 64..256 "
+                         f"mult 64; got ({M},{K})")
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
-    (out / "sg00").mkdir(parents=True)
-    for f in sg_src.iterdir():
-        shutil.copy(f, out / "sg00" / f.name)
+    sg = out / "sg00"
+    sg.mkdir(parents=True)
+    streams = deq_synth.synth_streams(M, K)
+    for fn, data in streams.items():
+        (sg / fn).write_bytes(data)
+    _sh = shutil
+    _sh.copy(Path(__file__).parent / "ref_tables" / "elementwise" / "act_info.json", sg)
+    for j in ("default_opcode_table.bin", "default_control_table.bin",
+              "default_datapath_table.bin"):
+        _sh.copy(Path(__file__).parent / "ref_tables" / j, sg)
+    (sg / "PE0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "PE0.bin", "name": "PE0.json"}))
+    (sg / "DVE0.json").write_text(_json.dumps(
+        {"dma": [], "dve_tables": [{"control_table": "default_control_table.bin",
+                                     "datapath_table": "default_datapath_table.bin",
+                                     "opcode_table": "default_opcode_table.bin"}],
+         "engine_id": 0, "instr": "DVE0.bin", "name": "DVE0.json"}))
+    (sg / "Pool0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "Pool0.bin", "name": "Pool0.json"}))
+    (sg / "SP0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "SP0.bin", "name": "SP0.json"}))
+    (sg / "Activation0.json").write_text(_json.dumps(
+        {"act_info": "act_info.json", "act_semaphore": 12,
+         "activation_function_sets": [], "dma": [],
+         "engine_id": 0, "instr": "Activation0.bin",
+         "name": "Activation0.json"}))
+    dbg = {"pe": ["debug_info_asm_PE.dbg"], "dve": ["debug_info_asm_DVE.dbg"],
+           "pool": ["debug_info_asm_Pool.dbg"], "sp": ["debug_info_asm_SP.dbg"],
+           "act": ["debug_info_asm_Activation.dbg"],
+           "dma": ["debug_info_backend_DMA.dbg"]}
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": dbg["act"], "act_dbg": [],
+        "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {},
+        "dma_dbg": dbg["dma"],
+        "dma_queue": {"qPoolDynamic": {
+            "dynamic_dma": {"SB_scratch_partition_offset": 0,
+                             "SB_scratch_partition_size": 16384},
+            "fabric_path": "main", "num_queues": 16, "owner": "pool",
+            "semaphore_set": list(range(8, 24)), "type": "dynamic"}},
+        "dve": "DVE0.json", "dve_asm_dbg": dbg["dve"], "dve_dbg": [],
+        "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": dbg["pe"], "pe_dbg": [],
+        "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": dbg["pool"], "pool_dbg": [],
+        "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json", "sp_asm_dbg": dbg["sp"], "sp_dbg": [],
+        "sp_instr": "SP0.bin",
+        "var": {"DGETable0": {"list": [2, 1, 3], "type": "dge-table",
+                               "var_id": 4},
+                "SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": M * K, "type": "input", "var_id": 1},
+                "input1": {"ops": [], "size": K * 4, "type": "input", "var_id": 2},
+                "output0": {"ops": [], "size": M * K * 4, "type": "output", "var_id": 3}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
@@ -798,6 +969,10 @@ def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
         {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
          "version": "0.5", "target": "sunda", "revision": ""}))
     (out / "metrics.json").write_text("[]")
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
