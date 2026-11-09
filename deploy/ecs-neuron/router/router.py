@@ -6,12 +6,17 @@
                              and its /health is OK, then proxy (SSE streaming passes through chunk by chunk)
 * idle reaper                desiredCount=0 after IDLE_TIMEOUT_S without requests and none in flight
 
+Callers need `Authorization: Bearer $ROUTER_API_KEY`; without a key the router refuses to start unless ALLOW_ANONYMOUS
+opts in. Unauthorized, malformed (not a JSON object, unknown model, non-boolean stream), oversized (MAX_BODY_BYTES)
+and excess (MAX_INFLIGHT) requests are answered before anything can wake the backend.
+
 Backend address: ECS DescribeTasks -> awsvpc ENI attachment -> privateIPv4Address.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -52,6 +57,9 @@ class Config:
     request_timeout_s: float = 1800.0
     health_ttl_s: float = 10.0
     api_key: str | None = None
+    allow_anonymous: bool = False  # no ROUTER_API_KEY: refuse to start (and answer 401) unless this opts in
+    max_body_bytes: int = 4 * 1024 * 1024  # the backend's own body limit: larger bodies get 413 before any wake-up
+    max_inflight: int = 256  # requests proxied or waiting for the backend at once; more get 429
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Config":
@@ -79,7 +87,14 @@ class Config:
         c.retry_after_s = int(env.get("RETRY_AFTER_S", c.retry_after_s))
         c.request_timeout_s = float(env.get("REQUEST_TIMEOUT_S", c.request_timeout_s))
         c.api_key = env.get("ROUTER_API_KEY") or None
+        c.allow_anonymous = env.get("ALLOW_ANONYMOUS", "false").lower() in ("1", "true", "yes")
+        c.max_body_bytes = int(env.get("MAX_BODY_BYTES", c.max_body_bytes))
+        c.max_inflight = int(env.get("MAX_INFLIGHT", c.max_inflight))
         return c
+
+    def check(self):
+        if not self.api_key and not self.allow_anonymous:
+            raise SystemExit("ROUTER_API_KEY is not set: set it, or ALLOW_ANONYMOUS=true to serve without authentication")
 
 
 class StartupError(Exception):
@@ -262,10 +277,10 @@ class Backend:
         return True
 
 
-def _error(status: int, msg: str, retry_after: int | None = None) -> web.Response:
+def _error(status: int, msg: str, retry_after: int | None = None, kind: str | None = None) -> web.Response:
     headers = {"Retry-After": str(retry_after)} if retry_after else None
-    return web.json_response({"error": {"message": msg, "type": "backend_unavailable"}}, status=status,
-                             headers=headers)
+    kind = kind or ("backend_unavailable" if status >= 500 else "rate_limited" if status == 429 else "invalid_request_error")
+    return web.json_response({"error": {"message": msg, "type": kind}}, status=status, headers=headers)
 
 
 def _held_error(msg: str, stream: bool) -> bytes:
@@ -327,8 +342,9 @@ class Router:
 
     def _authorized(self, request: web.Request) -> bool:
         if not self.cfg.api_key:
-            return True
-        return request.headers.get("Authorization", "") == f"Bearer {self.cfg.api_key}"
+            return self.cfg.allow_anonymous
+        return hmac.compare_digest(request.headers.get("Authorization", "").encode(),
+                                   f"Bearer {self.cfg.api_key}".encode())
 
     async def models(self, request):
         now = int(time.time())
@@ -344,12 +360,25 @@ class Router:
         if not self._authorized(request):
             return web.json_response({"error": {"message": "unauthorized"}}, status=401)
         b = self.backend
-        body = await request.read()
+        if b.inflight >= self.cfg.max_inflight:
+            return _error(429, "too many requests in flight, retry later", 5)
+        # everything that can be rejected is rejected here, before a request can wake (and pay for) the backend
         try:
-            req = json.loads(body or b"{}")
-            stream, model = bool(req.get("stream")), str(req.get("model") or self.cfg.model_ids[0])
-        except (ValueError, AttributeError):
-            stream, model = False, self.cfg.model_ids[0]
+            body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return _error(413, f"request body exceeds {self.cfg.max_body_bytes} bytes")
+        try:
+            req = json.loads(body)
+        except ValueError:
+            return _error(400, "request body is not valid JSON")
+        if not isinstance(req, dict):
+            return _error(400, "request body must be a JSON object")
+        model = req.get("model", self.cfg.model_ids[0])
+        if not isinstance(model, str) or model not in self.cfg.model_ids:
+            return _error(404, f"model {model!r} is not served here", kind="model_not_found")
+        stream = req.get("stream", False)
+        if not isinstance(stream, bool):
+            return _error(400, "'stream' must be a boolean")
         b.inflight += 1
         b.last_activity = time.monotonic()
         try:
@@ -450,7 +479,7 @@ class _BackendGone(Exception):
 
 def make_app(cfg: Config, ecs, http: ClientSession | None = None, asg=None) -> web.Application:
     r = Router(cfg, ecs, http, asg)
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app = web.Application(client_max_size=cfg.max_body_bytes)
     app.on_startup.append(r.on_startup)
     app.on_cleanup.append(r.on_cleanup)
     app.router.add_get("/v1/models", r.models)
@@ -466,6 +495,7 @@ def main():
     import boto3  # only needed in production
 
     cfg = Config.from_env()
+    cfg.check()
     ecs = boto3.client("ecs", region_name=cfg.region)
     asg = boto3.client("autoscaling", region_name=cfg.region) if cfg.asg_name else None
     web.run_app(make_app(cfg, ecs, asg=asg), host="0.0.0.0", port=cfg.listen_port, access_log=None)

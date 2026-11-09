@@ -140,6 +140,9 @@ static void gbnf_tests() {
     rejects([] { grammar::ParseGbnf("root ::= missing"); });
     rejects([] { grammar::ParseGbnf("start ::= \"a\""); });
     rejects([] { grammar::ParseGbnf("root ::= \"a\"{1,99999}"); });
+    // nesting is bounded before the parser recurses (50k groups used to overflow the stack)
+    rejects([] { grammar::ParseGbnf("root ::= " + std::string(50000, '(') + "\"a\"" + std::string(50000, ')')); });
+    CHECK(matches("root ::= " + std::string(200, '(') + "\"a\"" + std::string(200, ')'), "a"));
     rejects([] { GrammarCache::check("root ::= [a-"); });
     GrammarCache::check("root ::= \"ok\"");
 }

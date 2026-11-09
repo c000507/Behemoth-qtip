@@ -38,8 +38,9 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 
 # ------------------------------------------------------------------ trn host (ECS container instance)
 resource "aws_iam_role" "instance" {
-  name               = "${var.name}-ecs-instance"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+  name                 = "${var.name}-ecs-instance"
+  assume_role_policy   = data.aws_iam_policy_document.ec2_assume.json
+  permissions_boundary = var.role_permissions_boundary_arn != "" ? var.role_permissions_boundary_arn : null
 }
 
 resource "aws_iam_role_policy_attachment" "instance_ecs" {
@@ -59,8 +60,9 @@ resource "aws_iam_instance_profile" "instance" {
 
 # ------------------------------------------------------------------ task execution role (image pull, logs, secrets)
 resource "aws_iam_role" "execution" {
-  name               = "${var.name}-ecs-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  name                 = "${var.name}-ecs-execution"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+  permissions_boundary = var.role_permissions_boundary_arn != "" ? var.role_permissions_boundary_arn : null
 }
 
 resource "aws_iam_role_policy_attachment" "execution" {
@@ -103,8 +105,9 @@ resource "aws_iam_role_policy" "execution_secrets" {
 
 # ------------------------------------------------------------------ backend task role: read-only on the model bucket
 resource "aws_iam_role" "backend_task" {
-  name               = "${var.name}-backend-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  name                 = "${var.name}-backend-task"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+  permissions_boundary = var.role_permissions_boundary_arn != "" ? var.role_permissions_boundary_arn : null
 }
 
 data "aws_iam_policy_document" "backend_task" {
@@ -148,8 +151,9 @@ resource "aws_iam_role_policy" "backend_task" {
 
 # ------------------------------------------------------------------ router task role: control the backend service only
 resource "aws_iam_role" "router_task" {
-  name               = "${var.name}-router-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  name                 = "${var.name}-router-task"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+  permissions_boundary = var.role_permissions_boundary_arn != "" ? var.role_permissions_boundary_arn : null
 }
 
 data "aws_iam_policy_document" "router_task" {

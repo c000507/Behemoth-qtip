@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <span>
+#include <stdexcept>
 #include <string>
 
 namespace behemoth {
@@ -52,11 +53,17 @@ struct ScheduledBatch {
 //  - prefill_interval: with decodes running, only every N-th step carries prefill tokens, the
 //    others are decode-only (1: every step).
 // Without decodes, prefill uses the full token budget in prefill_chunk pieces. Queued prompts
-// prefill in arrival order. max_requests bounds the requests (and sampled rows) per step.
+// prefill in arrival order. max_requests bounds the requests (and sampled rows) per step;
+// max_queued bounds the requests held at all (running, waiting and finished-unread), so
+// submit() past it throws CapacityError (the server answers 503) instead of growing without limit.
 struct SchedulerPolicy {
     size_t mixed_prefill_tokens = 0;
     size_t prefill_interval = 1;
     size_t max_requests = 256;
+    size_t max_queued = 1024;
+};
+struct CapacityError : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 class Scheduler {
     PagePool pool_;

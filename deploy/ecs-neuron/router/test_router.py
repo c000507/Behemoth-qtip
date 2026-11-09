@@ -128,7 +128,8 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         await self.backend.close()
 
     async def start(self, ecs, asg=None, **kw):
-        kw.setdefault("cold_nonstream_mode", "wait")  # most tests check scaling state right after the response
+        kw.setdefault("cold_nonstream_mode", "wait")
+        kw.setdefault("allow_anonymous", True)  # most tests check scaling state right after the response
         cfg = Config(backend_port=self.backend.port, poll_interval_s=0.02, keepalive_interval_s=0.02,
                      max_wait_s=kw.pop("max_wait_s", 5), idle_timeout_s=kw.pop("idle_timeout_s", 60),
                      health_ttl_s=kw.pop("health_ttl_s", 10), **kw)
@@ -341,11 +342,39 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         r = await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer k"})
         self.assertEqual(r.status, 200)
 
+    async def test_no_key_fails_closed(self):
+        c = await self.start(FakeECS(), allow_anonymous=False)
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(r.status, 401)
+        self.assertEqual(self.ecs.updates, [])
+        with self.assertRaises(SystemExit):
+            Config().check()
+        Config(api_key="k").check()
+        Config(allow_anonymous=True).check()
+
+    async def test_invalid_requests_do_not_wake(self):
+        c = await self.start(FakeECS(), cold_nonstream_mode="reject", max_body_bytes=1024)
+        for body, status in [(b"not-json", 400), (b"[1]", 400), (b'{"model": "other"}', 404),
+                             (b'{"model": 5}', 404), (b'{"stream": "yes"}', 400),
+                             (b'{"messages": "' + b"x" * 2048 + b'"}', 413)]:
+            r = await c.post("/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+            self.assertEqual(r.status, status, body[:40])
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.ecs.updates, [])
+
+    async def test_inflight_limit(self):
+        c = await self.start(FakeECS(), max_inflight=0)
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(r.status, 429)
+        self.assertEqual(self.ecs.updates, [])
+
     def test_config_from_env(self):
         c = Config.from_env({"MODEL_IDS": "a, b", "IDLE_TIMEOUT_S": "60", "PROXY_PATHS": "/v1/chat/completions,/v1/completions"})
         self.assertEqual(c.model_ids, ["a", "b"])
         self.assertEqual(c.idle_timeout_s, 60)
         self.assertEqual(c.proxy_paths, ["/v1/chat/completions", "/v1/completions"])
+        self.assertFalse(c.allow_anonymous)
+        self.assertTrue(Config.from_env({"ALLOW_ANONYMOUS": "true"}).allow_anonymous)
 
 
 if __name__ == "__main__":

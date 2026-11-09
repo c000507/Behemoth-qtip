@@ -12,6 +12,8 @@ locals {
     TF_IN_AUTOMATION   = "1"
     TF_INPUT           = "0"
     CHECKPOINT_DISABLE = "1"
+    # the apply role may only create / edit stack roles that carry this boundary
+    TF_VAR_role_permissions_boundary_arn = aws_iam_policy.workload_boundary.arn
   }
 
   # project-level (static) environment; per-run values (commit, tags) are passed by the pipeline actions
@@ -25,7 +27,7 @@ locals {
       NEURON_RUNTIME_VERSION     = var.neuron_runtime_version
       NEURON_COLLECTIVES_VERSION = var.neuron_collectives_version
     }
-    plan  = local.terraform_env
+    plan  = merge(local.terraform_env, { BACKEND_REPO = var.backend_ecr_repository_name, ROUTER_REPO = local.router_repo })
     apply = local.terraform_env
   }
 

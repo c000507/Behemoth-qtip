@@ -57,18 +57,38 @@ int sample(const Vec &logits, float temperature, int topk, double topp, std::mt1
     }
     return order[keep - 1];
 }
+// Requests are served one connection at a time, so every socket operation runs against a deadline: a client
+// that stops sending (or stops reading) is dropped instead of stalling everyone behind it, health checks included.
+constexpr auto io_deadline = std::chrono::seconds(30);
+template <class Start> void bounded(tcp::socket &socket, Start start) {
+    auto &io = static_cast<asio::io_context &>(socket.get_executor().context());
+    boost::system::error_code result = asio::error::would_block;
+    start([&](boost::system::error_code ec, size_t) { result = ec; });
+    io.restart();
+    io.run_for(io_deadline);
+    if (result == asio::error::would_block) {
+        socket.close();
+        io.restart();
+        io.run();
+        throw std::runtime_error("client timed out");
+    }
+    if (result)
+        throw boost::system::system_error(result);
+}
+void send(tcp::socket &socket, const std::string &wire) {
+    bounded(socket, [&](auto done) { asio::async_write(socket, asio::buffer(wire), done); });
+}
 void reply(tcp::socket &socket, http::status status, const json &body) {
     http::response<http::string_body> response(status, 11);
     response.set(http::field::content_type, "application/json");
     response.body() = body.dump();
     response.prepare_payload();
-    http::write(socket, response);
+    bounded(socket, [&](auto done) { http::async_write(socket, response, done); });
 }
 void event(tcp::socket &socket, const std::string &body) {
     std::ostringstream length;
     length << std::hex << body.size();
-    auto wire = length.str() + "\r\n" + body + "\r\n";
-    asio::write(socket, asio::buffer(wire));
+    send(socket, length.str() + "\r\n" + body + "\r\n");
 }
 } // namespace
 int main(int argc, char **argv) {
@@ -138,7 +158,7 @@ int main(int argc, char **argv) {
                 http::request_parser<http::string_body> parser;
                 parser.body_limit(4 * 1024 * 1024);
                 boost::beast::flat_buffer buffer;
-                http::read(socket, buffer, parser);
+                bounded(socket, [&](auto done) { http::async_read(socket, buffer, parser, done); });
                 const auto &request = parser.get();
                 if (request.method() == http::verb::get && request.target() == "/health") {
                     reply(socket, http::status::ok, {{"healthy", true}});
@@ -207,7 +227,7 @@ int main(int argc, char **argv) {
                     h.set(http::field::content_type, "text/event-stream");
                     h.chunked(true);
                     http::response_serializer<http::empty_body> s(h);
-                    http::write_header(socket, s);
+                    bounded(socket, [&](auto done) { http::async_write_header(socket, s, done); });
                     headers = true;
                     event(socket, "data: " + chunk({{"role", "assistant"}}).dump() + "\n\n");
                 }
@@ -274,7 +294,7 @@ int main(int argc, char **argv) {
                                               .dump() +
                                           "\n\n");
                     event(socket, "data: [DONE]\n\n");
-                    asio::write(socket, asio::buffer(std::string("0\r\n\r\n")));
+                    send(socket, "0\r\n\r\n");
                 } else
                     reply(socket, http::status::ok,
                           {{"id", id},
@@ -294,7 +314,7 @@ int main(int argc, char **argv) {
                     else {
                         event(socket, "data: " + json({{"error", {{"message", e.what()}}}}).dump() + "\n\n");
                         event(socket, "data: [DONE]\n\n");
-                        asio::write(socket, asio::buffer(std::string("0\r\n\r\n")));
+                        send(socket, "0\r\n\r\n");
                     }
                 } catch (...) {
                 }

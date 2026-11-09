@@ -244,6 +244,21 @@ static void scheduler_policy_tests() {
         return n;
     };
     {
+        // Admission: submit() past max_queued throws CapacityError; an erased request frees its slot.
+        SchedulerPolicy p;
+        p.max_queued = 3;
+        Scheduler s(1024, 512, 512, p);
+        auto a = s.submit(std::vector<int>(3, 1), 10);
+        s.submit(std::vector<int>(3, 1), 10);
+        s.submit(std::vector<int>(3, 1), 10);
+        bool full = false;
+        try { s.submit(std::vector<int>(3, 1), 10); } catch (const CapacityError &) { full = true; }
+        CHECK(full);
+        s.cancel(a);
+        s.erase(a);
+        s.submit(std::vector<int>(3, 1), 10);
+    }
+    {
         // Cap: 2 decodes + a 1000-token prompt with budget 512 / chunk 512 / mixed cap 64.
         SchedulerPolicy p;
         p.mixed_prefill_tokens = 64;

@@ -21,7 +21,13 @@ SafeTensorsReader::SafeTensorsReader(const std::string& model_dir) : dir_(model_
     std::ifstream f(idx);
     json j = json::parse(f);
     std::map<std::string, int> files;
-    for (auto& kv : j["weight_map"].items()) files[kv.value().get<std::string>()] = 1;
+    for (auto& kv : j.at("weight_map").items()) {
+      const std::string file = kv.value().get<std::string>();
+      // shards live in the model directory itself: no absolute paths, no "..", no subdirectories
+      QCHECK(!file.empty() && fs::path(file).filename() == file && file != "." && file != "..",
+             "unsafe shard path in weight_map: " + file);
+      files[file] = 1;
+    }
     for (auto& kv : files) parse_file(kv.first);
   } else {
     parse_file("model.safetensors");
@@ -31,21 +37,50 @@ SafeTensorsReader::~SafeTensorsReader() {
   for (auto& kv : fds_) ::close(kv.second);
 }
 
+// Element width of a safetensors dtype, 0 when unknown (its byte count is then only bounds-checked).
+static uint64_t dtype_width(const std::string& d) {
+  if (d == "F64" || d == "I64" || d == "U64") return 8;
+  if (d == "F32" || d == "I32" || d == "U32") return 4;
+  if (d == "F16" || d == "BF16" || d == "I16" || d == "U16") return 2;
+  if (d == "F8_E4M3" || d == "F8_E5M2" || d == "F8_E8M0" || d == "I8" || d == "U8" || d == "BOOL") return 1;
+  return 0;
+}
+
+// Every offset, length and shape in the header is checked against the file before it is used: a corrupt or
+// hostile checkpoint fails here with an error instead of driving allocations or reads out of bounds.
 void SafeTensorsReader::parse_file(const std::string& file) {
   std::string path = (fs::path(dir_) / file).string();
   std::ifstream f(path, std::ios::binary);
   QCHECK(f, "cannot open " + path);
+  std::error_code ec;
+  const uint64_t size = fs::file_size(path, ec);
+  QCHECK(!ec && size >= 8, "invalid safetensors file " + path);
   uint64_t hlen = 0;
   f.read(reinterpret_cast<char*>(&hlen), 8);
+  QCHECK(f && hlen <= 100000000 && hlen <= size - 8, "invalid safetensors header length in " + path);
   std::string hdr(hlen, '\0');
   f.read(hdr.data(), std::streamsize(hlen));
+  QCHECK(f, "truncated safetensors header in " + path);
   json j = json::parse(hdr);
+  QCHECK(j.is_object(), "safetensors header is not an object in " + path);
+  const uint64_t data = size - 8 - hlen;
   for (auto& kv : j.items()) {
     if (kv.key() == "__metadata__") continue;
     TensorInfo t;
-    t.dtype = kv.value()["dtype"].get<std::string>();
-    t.shape = kv.value()["shape"].get<std::vector<int64_t>>();
-    auto offs = kv.value()["data_offsets"].get<std::vector<uint64_t>>();
+    t.dtype = kv.value().at("dtype").get<std::string>();
+    t.shape = kv.value().at("shape").get<std::vector<int64_t>>();
+    auto offs = kv.value().at("data_offsets").get<std::vector<uint64_t>>();
+    QCHECK(offs.size() == 2 && offs[0] <= offs[1] && offs[1] <= data,
+           "tensor offsets out of bounds: " + kv.key() + " in " + path);
+    if (const uint64_t width = dtype_width(t.dtype)) {
+      uint64_t count = 1;
+      for (int64_t s : t.shape) {
+        QCHECK(s >= 0 && (s == 0 || count <= UINT64_MAX / uint64_t(s)), "invalid shape: " + kv.key());
+        count *= uint64_t(s);
+      }
+      QCHECK(count <= UINT64_MAX / width && count * width == offs[1] - offs[0],
+             "tensor byte count does not match its shape: " + kv.key() + " in " + path);
+    }
     t.begin = 8 + hlen + offs[0];
     t.end = 8 + hlen + offs[1];
     t.file = file;

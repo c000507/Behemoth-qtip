@@ -145,6 +145,28 @@ variable "router_image_tag" {
   default     = "latest"
 }
 
+# Tags are mutable: the pipeline's plan resolves each tag to its digest and the task definitions name the image by
+# digest, so the approved plan runs exactly the image that was planned, whatever is later pushed under the tag.
+variable "backend_image_digest" {
+  description = "sha256:... digest of backend_image_tag; set, the task definition pins it. Empty = the tag alone."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.backend_image_digest == "" || can(regex("^sha256:[0-9a-f]{64}$", var.backend_image_digest))
+    error_message = "backend_image_digest must be sha256:<64 hex>."
+  }
+}
+
+variable "router_image_digest" {
+  description = "sha256:... digest of router_image_tag; set, the task definition pins it. Empty = the tag alone."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.router_image_digest == "" || can(regex("^sha256:[0-9a-f]{64}$", var.router_image_digest))
+    error_message = "router_image_digest must be sha256:<64 hex>."
+  }
+}
+
 variable "cloudflared_image" {
   description = "cloudflared sidecar image (pin a version)."
   type        = string
@@ -338,9 +360,21 @@ variable "secrets_kms_key_arn" {
 }
 
 variable "router_api_key_secret_arn" {
-  description = "Optional Secrets Manager / SSM ARN of a bearer key the router requires (useful with the ALB). Empty = no auth at the router."
+  description = "Secrets Manager / SSM ARN of a bearer key the router requires. Empty needs router_allow_anonymous = true."
   type        = string
   default     = ""
+}
+
+variable "role_permissions_boundary_arn" {
+  description = "Permissions boundary set on every role the stack creates. The pipeline passes its workload boundary (TF_VAR_role_permissions_boundary_arn), which its scoped apply role requires; empty = none (local applies with admin credentials)."
+  type        = string
+  default     = ""
+}
+
+variable "router_allow_anonymous" {
+  description = "Serve without a router bearer key. Only for deployments whose ingress authenticates callers itself (Cloudflare Access, an authenticating gateway); a tunnel token authenticates the connector, not callers."
+  type        = bool
+  default     = false
 }
 
 variable "enable_alb" {
@@ -350,7 +384,7 @@ variable "enable_alb" {
 }
 
 variable "alb_certificate_arn" {
-  description = "ACM certificate for an HTTPS listener. Empty = HTTP listener on port 80 only."
+  description = "ACM certificate for the ALB's HTTPS listener; required with enable_alb (port 80 only redirects)."
   type        = string
   default     = ""
 }

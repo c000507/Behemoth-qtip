@@ -184,6 +184,9 @@ class GlmModel final : public Backend {
             throw std::runtime_error("mmap embed.bin");
         if (e.at("dtype") != "bf16" || e.at("shape").at(0) != vocab_ || e.at("shape").at(1) != hidden)
             throw std::runtime_error("embed.bin is not bf16 [vocab][hidden]");
+        const size_t offset = e.at("offset"), need = size_t(vocab_) * size_t(hidden) * 2;
+        if (offset > embed_map_bytes || need > embed_map_bytes - offset)
+            throw std::runtime_error("embed.bin is smaller than its layout entry");
         embed = reinterpret_cast<const uint16_t *>(static_cast<const char *>(embed_map) + size_t(e.at("offset")));
     }
 
@@ -362,6 +365,8 @@ class GlmModel final : public Backend {
                     for (const auto &e : files.at(file)) {
                         const std::string name = prefix + e.at("name").get<std::string>();
                         const size_t bytes = e.at("bytes"), offset = e.at("offset");
+                        if (offset > data.size() || bytes > data.size() - offset)
+                            throw std::runtime_error(file + ": " + name + " lies outside the file");
                         Dev d = alloc(r, bytes, name);
                         put(d, data.data() + offset, bytes);
                         ranks[size_t(r)].t[name] = d;
