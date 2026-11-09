@@ -112,3 +112,9 @@ ROCm/HIP kernels (runtime/src/*.hip) → better Neuron kernels/graphs → direct
 - SDPA (attention.hip core math) LIFTED: emit_sdpa_gen(h,M,S,d,scale) single graph softmax(q@k^T*scale)@v. Device: a1 65.3us, a8-MHA 78.6us, b8(32q,256kv) 77.1us, all PASS 8.5e-06..1.2e-06. fp8 KV / paged KV / online-softmax split-K from attention.hip = NOT lifted (perf engineering layer).
 - oracle-gen compile time on box ~40-90s/shape incl transfer. gen key = /tmp/oracle_gen_<key> on box, /tmp/opencode/oracle_<key>/sg00 local.
 - NEXT: fuse chains (matmul+rms+matmul = ffn layer single graph via gen), multi-head large-S attention perf vs flash-style HIP, GC of gen path (chunk protocol stable), consider NKI-style tiling control = decode compiler's multi-tile lowering for big-M matmul.
+26. FULL TRANSFORMER BLOCK IN ONE NEFF + FUSION PERF (2026-11-09):
+- emit_block_gen(M,K,H,h,d,eps): rms*g1 -> fused qkv proj -> h-head sdpa (scale 1/sqrt d) -> o proj -> residual -> rms*g2 -> tanh-gelu MLP. ONE graph, 7 inputs. trn1 vs numpy M128 K128 H256 h2 d64: PASS 5.57e-06, 77.3us 200-iter avg.
+- FUSION PERF: same 7 ops as separate containers (all gen'd at exact sizes, device-timed) = 449.9us sum vs 77.3us fused = 5.8x. Launch floor ~62-70us/op dominates at these sizes; single-graph fusion kills it. THE project perf thesis validated end-to-end.
+- gen_oracle_custom gotchas: (1) cold jax-plugin compile can exceed SSM timeout -> empty stdout, now 3-attempt retry; (2) gc.py needs nenv.sh sourced for neuronx-cc on PATH during plugin eager lower; (3) big graphs compile fine (o.neff 72KB block).
+- NOTE jax.nn.gelu default = tanh approx - numpy mirror must match or maxdiff ~1e-1.
+- NEXT: (a) multi-layer chain (2 blocks seq in one graph) + attention.hip perf items (fp8 KV etc) if needed; (b) original todos: GPSIMD/Xtensa eval, cc_streams collectives, LLVM/MLIR decision, header tail fields - findings into AGENTS.md; (c) host-side graph builder on top of gen primitive for arbitrary DAGs.
