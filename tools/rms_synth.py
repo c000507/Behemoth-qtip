@@ -41,6 +41,7 @@ def synth_dve(M: int, K: int) -> bytes:
     P = M // 128
     d = bytearray(_DVE)
     _p(d, 210, 1 if M <= 128 else K)
+    _p(d, 216, K)
     _p(d, 218, P)
     _p(d, 236, 0x4000 + 4 * M + 8)
     _p(d, 248, P)
@@ -113,3 +114,7 @@ PROLOGUE = bytes.fromhex("".join([
     "0000000000000000000000000000000000000000000000000000000000000000",
     "cc10000000000000000000000000000000000000000000000000000000000000",
     "0000000000000000000000000000000000000000000000000000000000000000"]))
+
+# Domains with device-verified numerics (stream bytes = oracle-equal at these
+# points; see AGENTS.md item 29 for the M384/K256 probe evidence).
+VALIDATED = {(128, 128), (256, 128)}

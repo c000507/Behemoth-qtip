@@ -754,8 +754,10 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
     elementwise graph). Weighted rms = compose with emit_elementwise.
     """
     import rms_synth
-    if M % 128 != 0:
-        raise ValueError(f"rms synth supports M multiple of 128 (got {M})")
+    if (M, K) not in rms_synth.VALIDATED:
+        raise ValueError("rms synth validated only for "
+                         f"{rms_synth.VALIDATED}; got ({M},{K}) - y-block "
+                         "geometry beyond M,K=128 buckets is unproven")
     out = Path(outdir)
     sg = out / "sg00"
     shutil.rmtree(out, ignore_errors=True)
