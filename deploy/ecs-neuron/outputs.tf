@@ -44,3 +44,8 @@ output "alb_dns_name" {
   description = "ALB hostname (when enable_alb)."
   value       = var.enable_alb ? aws_lb.router[0].dns_name : null
 }
+
+output "api_keys_table" {
+  description = "DynamoDB table of approved router API keys (router/api_keys.py --table)"
+  value       = aws_dynamodb_table.api_keys.name
+}

@@ -119,6 +119,21 @@ To get the bucket name for step 2 before anything else exists, apply the bucket 
 `-target=aws_s3_bucket.models`, or set `s3_bucket_name`. The backend service is created with `desiredCount=0`, and
 Terraform ignores later changes to it.
 
+## API keys
+
+Callers send `Authorization: Bearer <key>`. Approved keys live in the `<name>-api-keys` DynamoDB table, one item per
+key holding only the key's SHA-256 (`key_hash`) with the owner's `email`, `name` and an `enabled` flag. The router
+looks a key up on first use and caches the answer for `KEY_CACHE_S` (60 s), so a revocation takes effect within a
+minute. Each proxied request is logged with its key's owner. Without any key source the router refuses to start
+(`router_allow_anonymous = true` opts out, only for an ingress that authenticates callers itself).
+
+```sh
+cd router   # needs boto3 + aiohttp and credentials that can write the table
+python api_keys.py add --email ada@example.com --name "Ada Lovelace"   # prints the key once
+python api_keys.py list
+python api_keys.py revoke --email ada@example.com                      # or --hash <prefix from list>
+```
+
 ## How scale-up and idle-down work
 
 * **Wake.** A POST to a proxied path calls `Backend.ensure()`. With no cached healthy address it starts one startup

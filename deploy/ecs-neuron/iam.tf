@@ -195,6 +195,11 @@ data "aws_iam_policy_document" "router_task" {
     resources = ["arn:${local.partition}:ecs:${var.region}:${local.account_id}:container-instance/${aws_ecs_cluster.this.name}/*"]
   }
   statement {
+    sid       = "ReadApiKeys"
+    actions   = ["dynamodb:GetItem"]
+    resources = [aws_dynamodb_table.api_keys.arn]
+  }
+  statement {
     sid       = "DescribeBackendTasks"
     actions   = ["ecs:DescribeTasks"]
     resources = ["arn:${local.partition}:ecs:${var.region}:${local.account_id}:task/${aws_ecs_cluster.this.name}/*"]

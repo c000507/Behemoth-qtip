@@ -360,7 +360,7 @@ variable "secrets_kms_key_arn" {
 }
 
 variable "router_api_key_secret_arn" {
-  description = "Secrets Manager / SSM ARN of a bearer key the router requires. Empty needs router_allow_anonymous = true."
+  description = "Optional Secrets Manager / SSM ARN of one extra bearer key the router accepts besides the approved keys in the <name>-api-keys DynamoDB table."
   type        = string
   default     = ""
 }
@@ -372,7 +372,7 @@ variable "role_permissions_boundary_arn" {
 }
 
 variable "router_allow_anonymous" {
-  description = "Serve without a router bearer key. Only for deployments whose ingress authenticates callers itself (Cloudflare Access, an authenticating gateway); a tunnel token authenticates the connector, not callers."
+  description = "Accept requests without any key (the api-keys table is ignored). Only for deployments whose ingress authenticates callers itself (Cloudflare Access, an authenticating gateway); a tunnel token authenticates the connector, not callers."
   type        = bool
   default     = false
 }

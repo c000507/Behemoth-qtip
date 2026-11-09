@@ -20,6 +20,7 @@ locals {
     MAX_WAIT_S          = tostring(var.max_wait_seconds)
     COLD_NONSTREAM_MODE = var.cold_nonstream_mode
     ALLOW_ANONYMOUS     = tostring(var.router_allow_anonymous)
+    API_KEYS_TABLE      = aws_dynamodb_table.api_keys.name
   }
 
   log_options = {
@@ -98,12 +99,6 @@ resource "aws_ecs_service" "router" {
     assign_public_ip = var.router_assign_public_ip
   }
 
-  lifecycle {
-    precondition {
-      condition     = var.router_api_key_secret_arn != "" || var.router_allow_anonymous
-      error_message = "Set router_api_key_secret_arn, or router_allow_anonymous = true when an outer gate (Cloudflare Access, a gateway) authenticates callers: the router refuses to start without either."
-    }
-  }
 
   # single router: its in-memory state (in-flight count, idle timer) must not be split across replicas
   deployment_minimum_healthy_percent = 0

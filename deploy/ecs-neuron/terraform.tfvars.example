@@ -32,9 +32,10 @@ enable_cloudflared                 = true
 cloudflare_tunnel_token_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/cloudflared-token-XXXXXX"
 # or an SSM SecureString: "arn:aws:ssm:us-east-1:912935854432:parameter/behemoth/cloudflared-token"
 
-# Caller authentication (one is required; the router refuses to start without either). A bearer key the router checks:
-router_api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/router-key-XXXXXX"
-# or, only when the ingress authenticates callers itself (Cloudflare Access, an authenticating gateway):
+# Caller authentication: approved keys live in the <name>-api-keys DynamoDB table (router/api_keys.py add / list /
+# revoke). Optionally one extra key from a secret:
+# router_api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/router-key-XXXXXX"
+# Only when the ingress authenticates callers itself (Cloudflare Access, an authenticating gateway), no key at all:
 # router_allow_anonymous = true
 
 enable_alb = false # with the ALB, alb_certificate_arn is required: inference is served over HTTPS only

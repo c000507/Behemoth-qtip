@@ -367,6 +367,14 @@ data "aws_iam_policy_document" "apply_scoped" {
     resources = ["arn:${local.partition}:ecr:${var.region}:${local.acct}:repository/${local.router_repo}"]
   }
   statement {
+    sid = "ApiKeysTable"
+    actions = [
+      "dynamodb:CreateTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable", "dynamodb:UpdateContinuousBackups",
+      "dynamodb:TagResource", "dynamodb:UntagResource", "dynamodb:UpdateTimeToLive",
+    ]
+    resources = ["arn:${local.partition}:dynamodb:${var.region}:${local.acct}:table/${local.p}-*"]
+  }
+  statement {
     sid = "StackLogGroups"
     actions = [
       "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
@@ -419,6 +427,11 @@ data "aws_iam_policy_document" "workload_boundary" {
       "autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection",
     ]
     resources = ["*"]
+  }
+  statement {
+    sid       = "ApiKeys" # the router reads approved keys
+    actions   = ["dynamodb:GetItem"]
+    resources = ["arn:${local.partition}:dynamodb:${var.region}:${local.acct}:table/${local.p}-*"]
   }
   statement {
     sid       = "ModelBucket"
