@@ -418,9 +418,11 @@ def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
     best = min(tpls, key=lambda k: score(*map(int, k.split("_"))))
     t = tpls[best]
     if key in tpls:
-        # exact-shape oracle ACT: carries the shape-dependent activation
-        # event counts the y-out drain waits on (sem4) - wrong act = zeros
-        t = dict(t, act_hex=tpls[key]["act_hex"])
+        # exact-shape oracle exists: byte-copy its full stream set. The
+        # compiler SB allocation varies per compile (fresh K384/N384 put w
+        # at 0x18000) and the oracle variant is device-proven; synth() is
+        # the path for shapes outside the oracle set.
+        return emit_matmul(M, K, N, outdir, name)
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
     sg = out / "sg00"

@@ -101,8 +101,10 @@ def a_base(M, K, N):
         if NT == 1:
             return 0x800
         if M == 32:
-            return 0x1000 if NT >= 4 else 0x800
-        return 0x1000  # M64 NT2 observed 0x1000; M96/128 NT>=2 unobserved
+            return 0x1000 if NT >= 3 else 0x800
+        return 0x800 if NT >= 3 else 0x1000  # M64: NT2=0x1000, NT3=0x800
+    if K >= 1024:
+        return 0x1000
     if NT >= 2 and M <= 64:
         return 0x0
     if M == 32 and K >= 512:
@@ -118,6 +120,8 @@ def final_scheme(M, K, N):
             dn = N if (M >= 96 or M == 32) else 128
             tiles = (N + dn - 1) // dn
             return "col", [PSUM | (4 * M * i) for i in range(tiles)], [dn] * tiles
+        if M == 64:
+            return "direct", [PSUM | 0], [N]
         return "col", [PSUM | (4 * M * i) for i in range(NT)], [M] * NT
     if M >= 96:
         return "direct", [PSUM | 0], [N]
@@ -187,6 +191,7 @@ def synth(M, K, N):
         out.extend(o2)
 
     kind, fdst, fdn = final_scheme(M, K, N)
+    d1a = desc1_addr(M, K, N)
     U6B = U6W if wring or (kind == "col" and N > 256) else U6F
     temps = b_temps(M, K, N)
 
@@ -205,7 +210,7 @@ def synth(M, K, N):
     out += bytes([0] * 32)
     if kind == "col":
         lw_num = M if (N <= 128 or (M == 32 and N <= 256)) else 128
-        anum = M if (M == 64 and N >= 256 and N <= 256) else None
+        anum = None
         ntiles = len(fdst)
         gpt = 2
         for t in range(ntiles):
@@ -216,7 +221,7 @@ def synth(M, K, N):
                 wait = (4, 1) if gp == 0 else None
                 scr_t = scr_col(M, K, N, t)
                 lw_t = (0x4000 + 4 * M * (t + 1) - 4 if ntiles == 1
-                        else x_bottom - 512 * (ntiles - 1 - t) - 4)
+                        else d1a + 512 * (t + 1) - 4)
                 dn_t = M if (M == 64 and N == 256) else fdn[t]
                 pair(lw_t, lw_num, wait, gp, scr_t, fdst[t], dn_t, 3,
                      1 if g == 0 else (2 if g == gpt - 1 else 0),
@@ -242,18 +247,30 @@ def synth(M, K, N):
                          (2 if (s == AS - 1 and p == 1) else 0),
                          upd, U6B, U6B, M)
     else:
-        # direct row-mode: LW = window, scr = SB w tiles below x ring
-        Ws = 4 * N
-        for s in range(AS):
-            for p in range(2):
-                gp = 2 * s + p
-                wait = (4, 1) if gp == 0 else None
-                upd = 0x5130000 if (s == AS - 1 and p == 1) else 0
-                pair(0x4000 + 4 * M * (s + 1) - 4, M, wait, gp,
-                     x_bottom - Ws * (AS - s), fdst[0], fdn[0], 3,
-                     1 if (s == 0 and p == 0) else
-                     (2 if (s == AS - 1 and p == 1) else 0),
-                     upd, U6B, U6B, fdn[0])
+        if M == 64 and K >= 1024:
+            # swapped: scr = window, LW = w ring (wring staging, direct dst)
+            for s in range(AS):
+                for p in range(2):
+                    gp = 2 * s + p
+                    wait = (4, 1) if gp == 0 else None
+                    upd = 0x5130000 if (s == AS - 1 and p == 1) else 0
+                    pair(x_bottom - 512 * (AS - 1 - s) - 4, M, wait, gp,
+                         0x4000 + 4 * M * s, fdst[0], fdn[0], 3,
+                         1 if (s == 0 and p == 0) else
+                         (2 if (s == AS - 1 and p == 1) else 0),
+                         upd, U6B, U6B, fdn[0])
+        else:
+            # direct row-mode: LW = window, scr = w chunks below x ring
+            for s in range(AS):
+                for p in range(2):
+                    gp = 2 * s + p
+                    wait = (4, 1) if gp == 0 else None
+                    upd = 0x5130000 if (s == AS - 1 and p == 1) else 0
+                    pair(0x4000 + 4 * M * (s + 1) - 4, M, wait, gp,
+                         x_bottom - 4 * N * (AS - s), fdst[0], fdn[0], 3,
+                         1 if (s == 0 and p == 0) else
+                         (2 if (s == AS - 1 and p == 1) else 0),
+                         upd, U6B, U6B, fdn[0])
 
     # ---- PV phase --------------------------------------------------------
     if kind == "pv" or (kind == "col" and len(fdst) > 1):
@@ -332,14 +349,6 @@ D1_CHUNKS = {
 # order: @24,@26,@28,@32,@34,@48,@50,@52,@54,@56,@58, addr40
 D1_FIELDS = {
 # fresh oracles
-    (64, 384, 128): (0, 1, 512, 3, 128, 512, 0, 0, 4, 3, 128, 98304),
-    (32, 384, 128): (0, 1, 512, 3, 128, 512, 0, 0, 4, 3, 128, 98304),
-    (32, 128, 384): (1536, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 98304),
-    (64, 128, 384): (1536, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 98304),
-    (32, 384, 256): (0, 2, 1024, 3, 128, 1024, 0, 0, 4, 3, 128, 98304),
-    (64, 512, 384): (0, 3, 1536, 2, 128, 1536, 0, 0, 4, 2, 128, 98304),
-    (32, 640, 128): (0, 1, 512, 5, 128, 512, 0, 0, 4, 5, 128, 98304),
-    (64, 1024, 128): (0, 1, 512, 8, 128, 512, 0, 0, 4, 8, 128, 98304),
     (128, 128, 128): (512, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 195072),
     (32, 1024, 128): (0, 1, 512, 8, 128, 512, 0, 0, 4, 8, 128, 187904),
     (32, 128, 128): (512, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 195456),
@@ -443,6 +452,14 @@ D2_DRAIN = {
 }
 
 
+def desc1_addr(M, K, N):
+    """w-region base: pool writes w chunk s at addr + 4N*s; PE scr/LW derive."""
+    f = D1_FIELDS.get((M, K, N))
+    if f is not None:
+        return f[11]
+    return d1_fields(M, K, N)[11]
+
+
 def synth_pool(M, K, N):
     """Generate Pool0.bin bytes (3 DMA descs + final event)."""
     AS, NT = K // 128, (N + 127) // 128
@@ -466,6 +483,7 @@ def synth_pool(M, K, N):
     else:
         drain = 0x4000 + 4 * M * AS
     f = D1_FIELDS.get((M, K, N)) or d1_fields(M, K, N)
+    addr40 = desc1_addr(M, K, N)
     d1 = bytearray(64)
     d1[0] = 212
     d1[1] = 16
@@ -476,7 +494,7 @@ def synth_pool(M, K, N):
     for i, val in zip((24, 26, 28, 32, 34, 48, 50, 52, 54, 56, 58), f[:11]):
         _u16(d1, i, val)
     struct.pack_into("<I", d1, 36, 4 * N)
-    struct.pack_into("<I", d1, 40, f[11])
+    struct.pack_into("<I", d1, 40, addr40)
     _u16(d1, 46, 4096)
     _u16(d1, 60, 4 * N)
     _u16(d1, 62, 0x0A0A)
@@ -485,7 +503,7 @@ def synth_pool(M, K, N):
     val = 2
     if kind == "pv":
         val = 2 + NT
-    elif pv:
+    elif pv or (M == 64 and K >= 1024):
         val = 3
     d2 = bytearray(64)
     d2[0] = 212
