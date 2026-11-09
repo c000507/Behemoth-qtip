@@ -14,6 +14,7 @@ DGE/shape side). Probes decouple P from n at fixed n=4096.
 
 Usage: bv_pscale.py OUTDIR P R [--rel48 V]
 """
+import json
 import shutil
 import struct
 import subprocess
@@ -70,7 +71,7 @@ def patch_pool_P(pool: bytes, P: int, rel48_override=None) -> bytes:
     return bytes(p)
 
 
-def build(outdir: Path, P: int, R: int, rel48_override=None):
+def build(outdir: Path, P: int, R: int, rel48_override=None, n: int = 4096):
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
     (out / "sg00").mkdir(parents=True)
@@ -80,6 +81,11 @@ def build(outdir: Path, P: int, R: int, rel48_override=None):
     for f in (ORACLE / "sg00").iterdir():
         shutil.copy(f, out / "sg00" / f.name)
     sg = out / "sg00"
+    if n != 4096:
+        nj = json.loads((out / "neff.json").read_text())
+        nj["attrs"]["shape"] = ["list_shape", [[n], [n]]]
+        nj["metadata"]["signatures"]["default"]["inputs"]["input0"]["shape"] = [n]
+        (out / "neff.json").write_text(json.dumps(nj))
 
     dve = open(sg / "DVE0.bin", "rb").read()
     assert len(dve) == 192 and dve[128] == 83 and dve[160] == 8
@@ -88,6 +94,7 @@ def build(outdir: Path, P: int, R: int, rel48_override=None):
     for _ in range(R):
         chain.append(("shr", 0, 1, 0x4000))
         chain.append(("shl", 0x4000, 1, 0x4000))
+    _ = n  # shapes patched above; streams are n-independent (4P fields only)
     ops = bytearray()
     for i, (op, src, imm, dst) in enumerate(chain):
         ops += ts_bitvec(op, src, imm, dst, P)
@@ -109,5 +116,15 @@ if __name__ == "__main__":
     outdir = Path(sys.argv[1])
     P = int(sys.argv[2])
     R = int(sys.argv[3])
-    rel48 = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[4] == "--rel48" else None
-    print(build(outdir, P, R, rel48))
+    rel48 = None
+    n = 4096
+    rest = sys.argv[4:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--rel48":
+            rel48 = int(rest[i + 1]); i += 2
+        elif rest[i] == "--n":
+            n = int(rest[i + 1]); i += 2
+        else:
+            i += 1
+    print(build(outdir, P, R, rel48, n))

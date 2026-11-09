@@ -316,16 +316,38 @@ baseline = 55 G values/s.
 - ACT LUT pass (measured): ~121 G/s marginal — above fp32 parity
   (55 G/s), below fp8 (220) and NVFP4 (440) needs. As a PIPELINE stage
   after DVE unpack the min rate still binds at DVE 57-70.
-- OPEN rate-law question that could still move the DVE number: the
-  n-sweep at decoupled small P (n = 16384 x P in {32,64,128}) — if
-  per-op time is latency-dominated (54 ns + 0.61 P) at LARGE n, the DVE
-  ceiling rises to ~220-280 Gop/s and fp8-via-DVE reaches parity; if
-  time = (n/P) x 0.5625 ns + const, P-scaling is dead permanently.
-- PE-native packed dtypes remain the only measured-free GO candidate:
-  in_dtype FP8_EXP4 = 14 exists; 16-bit staging geometry decode is the
-  gating item (dedicated probe session).
-- Revised verdicts: **NVFP4-via-DVE/ACT decode = NO-GO (measured)**;
-  fp8 = GO only via PE in_dtype (pending); QTIP = NO-GO via DVE/ACT
-  (per-value ~2 DVE + 1 ACT ops -> ~28 G values/s, DVE-bound) — both
-  flip only if the open rate-law test lands in the latency-dominated
-  regime, or via the PE-native path.
+- OPEN rate-law question RESOLVED (same session, R-amplified sweep,
+  tools/bv_pscale.py --n): per-op time is **INDEPENDENT of n** and
+  linear in P: **t_op ~= 60 ns + 0.75 ns x P** (P = channels),
+  validated n = 4096 -> 1048576 (at P = 32: 64-70 ns/op at EVERY n;
+  P = 1024 -> ~1.0 us/op; P = 8192 -> ~10.3 us/op, slight
+  superlinearity ~1.26 ns/ch at the top). n-independence means the DVE
+  streams all n elements inside one op (coverage is pattern/DGE-side,
+  not P-side; confirmed by P = 8 still processing all 4096 elems).
+
+### Final decode arithmetic (measured law)
+
+Sustained DVE rate at natural P = n/128: asymptote = 128/0.75 ns =
+**~171 G elem-ops/s**; measured 102 G/s at n = 1M (P = 8192), 128 G/s
+at n = 131k (P = 1024). Per-pass cost over a whole tensor = one op.
+
+- NVFP4: unpack = 2 DVE passes (AND 15 | SHR 4) + scale-mul = 1 more
+  DVE pass; ACT LUT (121 G/s) runs in parallel. DVE-bound:
+  171/3 ~= **57 G values/s** vs 440 needed = **13% of plateau. NO-GO.**
+- fp8 E4M3: values need no unpack; ACT LUT (256-entry) = 121 G/s < 220
+  G values/s needed = 55%; DVE scale-mul pass 171 G/s = 78%. Both
+  engines short alone; pipelined DVE+ACT still <= ~121-171 Gv/s.
+  **NO-GO via DVE/ACT; GO only via PE in_dtype = FP8_EXP4 (14), which
+  skips decode entirely — gated on the 16-bit staging geometry
+  decode.**
+- QTIP: ~1 DVE op/value (window extract) + 0.5 ACT lookup/value +
+  Hadamard epilogue adds (~2 DVE/value) -> DVE ~3 ops/value = ~57
+  G values/s vs ~390 G values/s demanded at 4.5 bits/weight.
+  **NO-GO.** (The earlier ACT-rate fear is retired — 121 G/s measured —
+  but the DVE op-per-value wall decides it.)
+- Bottom line: no software dequant path on DVE/ACT can keep up with
+  the DMA plateau at 4/8-bit densities. The only measured-free GO
+  candidates are (a) PE-native packed dtypes (fp8 in_dtype; 16-bit
+  LW/desc staging decode = the gating probe session), (b) GPSIMD
+  Xtensa glue (deferred), or (c) staying in fp32/bf16 with the 40%
+  compiler headroom already measured.
