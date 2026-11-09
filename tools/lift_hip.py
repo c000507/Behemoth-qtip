@@ -244,11 +244,12 @@ def _generate_oracle_on_box(M, K, N, key):
                    check=True, capture_output=True)
     inner = (
         "source /home/ubuntu/work/nenv.sh 2>/dev/null\n"
-        "export PATH=/usr/local/bin:$PATH\n"
+        "export PATH=/opt/aws_neuronx_venv_jax_0_9/bin:/usr/local/bin:$PATH\n"
+        "cd /tmp\n"
         "aws s3 cp s3://912935854432-neuron-build/tools/gen_cur.py.b64 /tmp/gen_cur.b64 1>/dev/null\n"
         "python3 -c \"import base64; open('/tmp/gen_cur.py','wb').write(base64.b64decode(open('/tmp/gen_cur.b64').read()))\"\n"
-        f"/home/ubuntu/codex-neuron-test/venv/bin/python3 /tmp/gen_cur.py\n"
-        f"cd /tmp/oracle_gen_{key} && neuronx-cc compile graph.mlirbc --framework XLA --target trn1 --output o.neff 2>&1 | tail -1\n"
+        f"/opt/aws_neuronx_venv_jax_0_9/bin/python /tmp/gen_cur.py\n"
+        f"cd /tmp/oracle_gen_{key} && neuronx-cc compile graph.mlirbc --framework XLA --target trn1 --output o.neff 2>&1 | tail -3\n"
         "python3 -c \"\n"
         "import gzip, tarfile, io, base64, json\n"
         "d = open('/tmp/oracle_gen_" + key + "/o.neff','rb').read()\n"
@@ -405,6 +406,7 @@ def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
     Literal tables (d0/d1 descs) fall back to interpolated formulas.
     """
     import mm_synth as _ms
+    key = f"{M}_{K}_{N}"
     tpls = _json.loads(_SHAPE_TPL.read_text())
     NT = (N + 127) // 128
     kc = 0 if K <= 128 else (1 if K <= 512 else 2)
@@ -415,6 +417,10 @@ def emit_matmul_synth(outdir: Path, M: int, K: int, N: int,
         return (abs(bnt - NT), abs(bkc - kc), abs(bm - M))
     best = min(tpls, key=lambda k: score(*map(int, k.split("_"))))
     t = tpls[best]
+    if key in tpls:
+        # exact-shape oracle ACT: carries the shape-dependent activation
+        # event counts the y-out drain waits on (sem4) - wrong act = zeros
+        t = dict(t, act_hex=tpls[key]["act_hex"])
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
     sg = out / "sg00"

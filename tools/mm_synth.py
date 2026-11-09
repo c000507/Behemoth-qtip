@@ -278,6 +278,15 @@ def synth(M, K, N):
 
 # desc rearm/chunk literals (per bucket, compiler choices)
 D0_REARM = {
+# fresh K384/N384/K640/K1024 oracles
+    (64, 384, 128): 1792,
+    (32, 384, 128): 1664,
+    (32, 128, 384): 1024,
+    (64, 128, 384): 768,
+    (32, 384, 256): 2048,
+    (64, 512, 384): 2304,
+    (32, 640, 128): 3072,
+    (64, 1024, 128): 4608,
     (32, 128, 128): 640,
     (32, 128, 256): 640,
     (32, 128, 512): 1024,
@@ -322,6 +331,15 @@ D1_CHUNKS = {
 # desc1 w-in: per-bucket u16 fields @24..@58 + u32 addr @40 (compiler literals)
 # order: @24,@26,@28,@32,@34,@48,@50,@52,@54,@56,@58, addr40
 D1_FIELDS = {
+# fresh oracles
+    (64, 384, 128): (0, 1, 512, 3, 128, 512, 0, 0, 4, 3, 128, 98304),
+    (32, 384, 128): (0, 1, 512, 3, 128, 512, 0, 0, 4, 3, 128, 98304),
+    (32, 128, 384): (1536, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 98304),
+    (64, 128, 384): (1536, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 98304),
+    (32, 384, 256): (0, 2, 1024, 3, 128, 1024, 0, 0, 4, 3, 128, 98304),
+    (64, 512, 384): (0, 3, 1536, 2, 128, 1536, 0, 0, 4, 2, 128, 98304),
+    (32, 640, 128): (0, 1, 512, 5, 128, 512, 0, 0, 4, 5, 128, 98304),
+    (64, 1024, 128): (0, 1, 512, 8, 128, 512, 0, 0, 4, 8, 128, 98304),
     (128, 128, 128): (512, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 195072),
     (32, 1024, 128): (0, 1, 512, 8, 128, 512, 0, 0, 4, 8, 128, 187904),
     (32, 128, 128): (512, 0, 1, 128, 1, 0, 4, 1, 0, 128, 1, 195456),
@@ -376,19 +394,17 @@ def d0_rearm(M, K, N):
 
 
 def d1_fields(M, K, N):
-    """desc1 fields for shapes outside the oracle set (interpolated)."""
+    """desc1 fields for shapes outside the oracle set (interpolated).
+
+    addr40 = pool chunk0 start: pool writes w chunk s at addr40 + 4N*s,
+    so it MUST equal synth()'s B-phase scr(s) / w-ring chunk0 start."""
     AS, NT = K // 128, (N + 127) // 128
     tof = to_off(M, K, N)
     x_bottom = tof - 512 * AS
-    if K <= 128:
-        kcls = 0
-    elif K <= 512:
-        kcls = 1
-    else:
-        kcls = 2
+    kcls = 0 if K <= 128 else (1 if K <= 512 else 2)
     f = [0] * 11
-    f[0] = 4 * K if kcls == 0 else 0          # @24
-    f[1] = 0 if AS == 1 else (NT if kcls >= 1 else 1)   # @26 chunks
+    f[0] = 4 * N if kcls == 0 else 0          # @24 (K128: 4N, else 0)
+    f[1] = 0 if AS == 1 else NT               # @26
     f[2] = 1 if kcls == 0 else 4 * N          # @28
     f[3] = 128 if kcls == 0 else AS           # @32
     f[4] = 1 if kcls == 0 else 128            # @34
@@ -398,14 +414,33 @@ def d1_fields(M, K, N):
     f[8] = 0 if kcls == 0 else 4              # @54
     f[9] = 128 if kcls == 0 else AS           # @56
     f[10] = 1 if kcls == 0 else 128           # @58
+    wring = ((M == 32 and K >= 512 and N <= 128)
+             or (N >= 256 and K >= 256 and M <= 64) or (N >= 256 and M == 64))
+    kind, _, _ = final_scheme(M, K, N)
+    Ws = max(512, 4 * N)
+    extra = 512 if Ws > 512 else 0
     if kcls == 0:
         addr = x_bottom - 4 * N
-    elif kcls == 1:
-        addr = x_bottom - AS * 4 * N - 4 * M
+    elif wring:
+        # chunk0 start: pool writes chunk s at addr+4N*s; PE reads halves
+        addr = x_bottom - extra - Ws * (AS - 1) - 512
+    elif kind == "col":
+        addr = x_bottom - 4 * N
     else:
         addr = x_bottom - AS * 4 * N
     f.append(addr)
     return f
+
+
+D2_DRAIN = {
+    (64, 384, 128): 17152,
+    (32, 384, 128): 16768,
+    (32, 128, 384): 16896,
+    (64, 128, 384): 16640,
+    (32, 384, 256): 17024,
+    (32, 640, 128): 17152,
+    (64, 1024, 128): 18688,
+}
 
 
 def synth_pool(M, K, N):
@@ -423,7 +458,9 @@ def synth_pool(M, K, N):
     d0r = d0_rearm(M, K, N)
     out += _desc(8, 4 * K, 4 * K, (0, M, d0r, M), 0)
     # desc1: w in, sem 9
-    if pv:
+    if (M, K, N) in D2_DRAIN:
+        drain = D2_DRAIN[(M, K, N)]
+    elif pv:
         pv0 = 0x4000 + (K if M == 32 else 2 * K) + 4 * M
         drain = pv0 + 4 * M * (NT - 1)
     else:
