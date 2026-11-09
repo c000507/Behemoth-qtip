@@ -745,24 +745,84 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
                  name: str = "rmsnorm") -> Path:
     """Emit y = x * rsqrt(mean(x^2, axis=-1) + eps) for x [M, K] f32.
 
-    Compiler-lowering oracle byte-copy (no PE: DVE MEMSET(73) +
-    TENSOR_REDUCE_ARITH_OP(66) into PSUM bank0 via DVE marker 8, then a
-    3-pass ACTIVATE(33) chain for sqrt/div/y-mul). eps = f32 @360 in
-    Activation0.bin (verified: 1e-6 vs 1e-3 differ only there).
-    Weighted rms (x * w * rs) = compose with emit_elementwise on the host.
+    OWN SYNTHESIS (tools/rms_synth.py): no PE engine. DVE MEMSET(73) +
+    TENSOR_REDUCE_ARITH_OP(66) into PSUM (marker 8) over P = M/128 channel
+    passes, then ACTIVATE(33) chain = setup (op122: 1.0 + K*K), sqrt/div
+    (op170, 1/K + eps f32), y-mul passes per channel block. Streams byte-
+    exact vs the rms128/rms256 oracles; M/K/eps parameterized. Engine
+    tables = frozen DATA from ref_tables (same exp/act LUT family as the
+    elementwise graph). Weighted rms = compose with emit_elementwise.
     """
-    import struct as _s
-    if (M, K) not in RMS_ORACLE_DIRS:
-        raise ValueError(f"no rms oracle for ({M},{K}); buckets: {list(RMS_ORACLE_DIRS)}")
-    sg_src = Path(RMS_ORACLE_DIRS[(M, K)])
+    import rms_synth
+    if M % 128 != 0:
+        raise ValueError(f"rms synth supports M multiple of 128 (got {M})")
     out = Path(outdir)
+    sg = out / "sg00"
     shutil.rmtree(out, ignore_errors=True)
-    (out / "sg00").mkdir(parents=True)
-    for f in sg_src.iterdir():
-        shutil.copy(f, out / "sg00" / f.name)
-    act = bytearray((out / "sg00" / "Activation0.bin").read_bytes())
-    _s.pack_into("<f", act, 360, eps)
-    (out / "sg00" / "Activation0.bin").write_bytes(bytes(act))
+    sg.mkdir(parents=True)
+    streams = rms_synth.synth_streams(M, K, eps)
+    (sg / "DVE0.bin").write_bytes(streams["DVE0.bin"])
+    (sg / "Activation0.bin").write_bytes(streams["Activation0.bin"])
+    (sg / "Pool0.bin").write_bytes(streams["Pool0.bin"])
+    (sg / "PE0.bin").write_bytes(rms_synth.PROLOGUE)
+    (sg / "SP0.bin").write_bytes(rms_synth.PROLOGUE)
+    # frozen engine tables + activation LUT family (DATA)
+    for f in ("act_info.json", "exp_and_others.json", "exp_and_others_bkt.bin",
+              "exp_and_others_ctrl.bin"):
+        shutil.copy(Path(__file__).parent / "ref_tables" / "elementwise" / f, sg)
+    for f in ("default_opcode_table.bin", "default_control_table.bin",
+              "default_datapath_table.bin"):
+        shutil.copy(Path(__file__).parent / "ref_tables" / f, sg)
+    # engine jsons (own, schema = reference)
+    (sg / "PE0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "PE0.bin", "name": "PE0.json"}))
+    (sg / "SP0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "SP0.bin", "name": "SP0.json"}))
+    (sg / "Pool0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "Pool0.bin", "name": "Pool0.json"}))
+    (sg / "DVE0.json").write_text(_json.dumps(
+        {"dma": [], "dve_tables": [{"control_table": "default_control_table.bin",
+                                     "datapath_table": "default_datapath_table.bin",
+                                     "opcode_table": "default_opcode_table.bin"}],
+         "engine_id": 0, "instr": "DVE0.bin", "name": "DVE0.json"}))
+    (sg / "Activation0.json").write_text(_json.dumps(
+        {"act_info": "act_info.json", "act_semaphore": 12,
+         "activation_function_sets": ["exp_and_others"], "dma": [],
+         "engine_id": 0, "instr": "Activation0.bin", "name": "Activation0.json"}))
+    dbg = {"pe": ["debug_info_asm_PE.dbg"], "dve": ["debug_info_asm_DVE.dbg"],
+           "pool": ["debug_info_asm_Pool.dbg"], "act": ["debug_info_asm_Activation.dbg"],
+           "dma": ["debug_info_backend_DMA.dbg"]}
+    nbytes = M * K * 4
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": dbg["act"],
+        "act_dbg": [], "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {},
+        "dma_dbg": dbg["dma"],
+        "dma_queue": {"qPoolDynamic": {
+            "dynamic_dma": {"SB_scratch_partition_offset": 0,
+                             "SB_scratch_partition_size": 16384},
+            "fabric_path": "main", "num_queues": 16, "owner": "pool",
+            "semaphore_set": list(range(8, 24)), "type": "dynamic"}},
+        "dve": "DVE0.json", "dve_asm_dbg": dbg["dve"], "dve_dbg": [],
+        "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": dbg["pe"], "pe_dbg": [],
+        "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": dbg["pool"], "pool_dbg": [],
+        "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json", "sp_asm_dbg": [], "sp_dbg": [], "sp_instr": "SP0.bin",
+        "var": {"DGETable0": {"list": [1, 2], "type": "dge-table", "var_id": 3},
+                "SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": nbytes, "type": "input", "var_id": 1},
+                "output0": {"ops": [], "size": nbytes, "type": "output", "var_id": 2}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
@@ -782,6 +842,10 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
         {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
          "version": "0.5", "target": "sunda", "revision": ""}))
     (out / "metrics.json").write_text("[]")
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
