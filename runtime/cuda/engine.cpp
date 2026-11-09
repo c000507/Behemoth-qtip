@@ -374,11 +374,17 @@ Model::Model(const fs::path &p, int device, int context, int tp, int max_batch) 
     auto raw = read(p / "config.json");
     auto kind = raw.value("model_type", "");
     if (kind == "glm5_next" || kind == "glm5_next_text") {
-        check(tp == 1, "GLM tensor parallel inference is not implemented yet");
+        // GLM runs its layers split over `tp` consecutive GPUs (a layer pipeline, not tensor
+        // parallelism) with resident weights up to the per-device budget; see glm53/README.md.
+        check(tp >= 1, "GLM needs at least one GPU");
         glm53::Config c(raw);
         check(context > 0 && context <= c.max_context, "Invalid GLM context limit");
         config = {c.vocab, context, c.eos};
-        backend_ = glm53::gpu_backend(p, device);
+        glm53::GpuOptions options;
+        options.device = device;
+        options.devices = tp;
+        options.context = context;
+        backend_ = glm53::gpu_backend(p, options);
     } else {
         // Llama/Mistral-layout QTIP checkpoint: geometry and stop tokens come from config.json
         // (behemoth::ModelConfig::read also validates the quip_params QTIP format).

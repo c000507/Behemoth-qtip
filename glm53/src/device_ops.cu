@@ -74,13 +74,33 @@ __device__ float weight(Matrix w, size_t i) {
     // W16A16 semantics without BF16/FP8 tensor-core requirements (sm_75).
     return f32(b16(v));
 }
-__global__ void gemv_kernel(Matrix w, const B16 *x, void *out, bool full) {
+__device__ float low(unsigned u) { return __uint_as_float(u << 16); }
+__device__ float high(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
+__global__ void gemv_kernel(Matrix w, const B16 *x, void *out, bool full, bool vector) {
     int row = int(blockIdx.x) * 4 + threadIdx.x / 32;
     int lane = threadIdx.x & 31;
     float sum = 0;
-    if (row < w.rows)
-        for (int c = lane; c < w.cols; c += 32)
-            sum = fmaf(weight(w, size_t(row) * w.cols + c), f32(x[c]), sum);
+    if (row < w.rows) {
+        if (vector) {
+            // BF16 rows with 16-byte loads: eight weights and eight activations per lane and step. The
+            // products are the same bf16-exact values as the scalar path; only the summation order differs.
+            const uint4 *wr = reinterpret_cast<const uint4 *>(static_cast<const B16 *>(w.data) + size_t(row) * w.cols);
+            const uint4 *xv = reinterpret_cast<const uint4 *>(x);
+            for (int c = lane; c < w.cols / 8; c += 32) {
+                uint4 a = wr[c], b = xv[c];
+                sum = fmaf(low(a.x), low(b.x), sum);
+                sum = fmaf(high(a.x), high(b.x), sum);
+                sum = fmaf(low(a.y), low(b.y), sum);
+                sum = fmaf(high(a.y), high(b.y), sum);
+                sum = fmaf(low(a.z), low(b.z), sum);
+                sum = fmaf(high(a.z), high(b.z), sum);
+                sum = fmaf(low(a.w), low(b.w), sum);
+                sum = fmaf(high(a.w), high(b.w), sum);
+            }
+        } else
+            for (int c = lane; c < w.cols; c += 32)
+                sum = fmaf(weight(w, size_t(row) * w.cols + c), f32(x[c]), sum);
+    }
     sum = warp_sum(sum);
     if (!lane && row < w.rows) {
         if (full)
@@ -510,7 +530,9 @@ __global__ void route_kernel(float *scores, const float *bias, int *ids, float *
 void launched() { checked(last_error(), "GPU kernel launch"); }
 } // namespace
 void gemv(Matrix w, const B16 *x, void *y, bool f, Stream s) {
-    gemv_kernel<<<(w.rows + 3) / 4, 128, 0, s>>>(w, x, y, f);
+    bool vector = w.format == 4 && w.cols % 8 == 0 && (reinterpret_cast<uintptr_t>(w.data) & 15) == 0 &&
+                  (reinterpret_cast<uintptr_t>(x) & 15) == 0;
+    gemv_kernel<<<(w.rows + 3) / 4, 128, 0, s>>>(w, x, y, f, vector);
     launched();
 }
 void decode_matrix(Matrix w, B16 *out, Stream s) {

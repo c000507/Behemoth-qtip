@@ -34,6 +34,15 @@ inline auto d2d(void *d, const void *a, size_t n, Stream s) {
     return cudaMemcpyAsync(d, a, n, cudaMemcpyDeviceToDevice, s);
 }
 inline auto last_error() { return cudaGetLastError(); }
+using Event = cudaEvent_t;
+inline auto event_create(Event *e) { return cudaEventCreateWithFlags(e, cudaEventDisableTiming); }
+inline auto event_destroy(Event e) { return cudaEventDestroy(e); }
+inline auto event_record(Event e, Stream s) { return cudaEventRecord(e, s); }
+inline auto stream_wait(Stream s, Event e) { return cudaStreamWaitEvent(s, e, 0); }
+inline auto copy_peer(void *d, int dd, const void *a, int ad, size_t n, Stream s) {
+    return cudaMemcpyPeerAsync(d, dd, a, ad, n, s);
+}
+inline auto memory_info(size_t *free, size_t *total) { return cudaMemGetInfo(free, total); }
 } // namespace glm53::gpu
 #else
 #include <hip/hip_runtime.h>
@@ -64,6 +73,15 @@ inline auto d2d(void *d, const void *a, size_t n, Stream s) {
     return hipMemcpyAsync(d, a, n, hipMemcpyDeviceToDevice, s);
 }
 inline auto last_error() { return hipGetLastError(); }
+using Event = hipEvent_t;
+inline auto event_create(Event *e) { return hipEventCreateWithFlags(e, hipEventDisableTiming); }
+inline auto event_destroy(Event e) { return hipEventDestroy(e); }
+inline auto event_record(Event e, Stream s) { return hipEventRecord(e, s); }
+inline auto stream_wait(Stream s, Event e) { return hipStreamWaitEvent(s, e, 0); }
+inline auto copy_peer(void *d, int dd, const void *a, int ad, size_t n, Stream s) {
+    return hipMemcpyPeerAsync(d, dd, a, ad, n, s);
+}
+inline auto memory_info(size_t *free, size_t *total) { return hipMemGetInfo(free, total); }
 } // namespace glm53::gpu
 #endif
 namespace glm53::gpu {

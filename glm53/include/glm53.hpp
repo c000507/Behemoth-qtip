@@ -132,4 +132,14 @@ class Model {
 };
 std::function<Vec(const Weights &, const std::string &, const Vec &)> gpu_projector(int device);
 std::shared_ptr<InferenceBackend> gpu_backend(const fs::path &, int device);
+// GPU execution options. Layers are split into contiguous ranges over `devices` consecutive GPUs
+// starting at `device` (activations cross between GPUs, weights do not). Linear weights stay resident
+// on their GPU up to `resident_bytes` per device (<0: automatic from free memory at load, leaving room
+// for the attention caches at `context` tokens; 0: stream every projection as before). The
+// GLM53_RESIDENT_GIB environment variable overrides the automatic budget.
+struct GpuOptions {
+    int device = 0, devices = 1, context = 0;
+    long long resident_bytes = -1;
+};
+std::shared_ptr<InferenceBackend> gpu_backend(const fs::path &, const GpuOptions &);
 } // namespace glm53
