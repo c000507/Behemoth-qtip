@@ -373,8 +373,13 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     "if nout > 1:" refs: none.
     """
     import ew_synth
-    if n <= 0 or (n + 127) // 128 > 16383:
-        raise ValueError(f"n={n} out of supported range (1..2098176)")
+    # Numerics cap (roofline finding): DVE pass semaphore counter = P*16
+    # increments, u16 wraps above 65535 -> wrong results at P >= 4096
+    # (observed at n=1048576; correct at n<=262144). Guard until per-pass
+    # re-arm is decoded.
+    if n <= 0 or (n + 127) // 128 > 4095:
+        raise ValueError(f"n={n} out of supported numerics range "
+                         f"(1..~524160; P*16 must fit u16)")
     P = (n + 127) // 128
     out = Path(outdir)
     shutil.rmtree(out, ignore_errors=True)
