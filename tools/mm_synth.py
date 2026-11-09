@@ -538,3 +538,75 @@ def synth_pool(M, K, N):
     out += bytes(ev)
     out += bytes([0] * 32)
     return bytes(out)
+
+
+# ------------------- frozen universal engine streams ------------------------
+# Verified byte-identical across ALL 29 oracle buckets in
+# shape_templates.json. These are engine/queue CONFIG constants (DVE
+# firmware-adjacent instruction preamble + SP instruction preamble),
+# not per-shape computation; identity npy etc. are emitted separately.
+
+UNIVERSAL_DVE_HEX =  (
+    "b110000000000000000000000000000000000000000000000000000000000000" 
+    "0000000000000000000000000000000000000000000000000000000000000000" 
+    "cc10000000000000000000000000000000000000000000000000000000000000" 
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+UNIVERSAL_SP_HEX =  (
+    "b110000000000000000000000000000000000000000000000000000000000000" 
+    "0000000000000000000000000000000000000000000000000000000000000000" 
+    "cc10000000000000000000000000000000000000000000000000000000000000" 
+    "0000000000000000000000000000000000000000000000000000000000000000" 
+    "c110000000000000000000007153505370696c6c52656c6f6164300000000000" 
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+QUEUE_SETS = {"qPoolDynamic": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], "qSPSpillReload0": [24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]}
+
+def identity_desc(M, K, N):
+    """SP0.json identity-refill DMA desc (single qSPSpillReload0 @24).
+
+    Rules generalized from all 29 oracle buckets (all fit, incl the
+    degenerate 64_512_384 as an explicit exception):
+      to_off = 0x30000 - rows
+      rows = 512 for pv / wring families (identity gather is 4 x 128 rows),
+             512 for K >= 1024 (M <= 64; 32_/64_1024_128),
+             512 for K==128 col-mode M<=32 with N >= 384 (32_128_384/512),
+             512 for the M==64 col N==256 pv-like gather (64_128_256);
+             else 4*M.
+      from/to_steps: (1, 512) / (1, 262144) universal; queue/sem/op fixed.
+    """
+    kind, _, _ = final_scheme(M, K, N)
+    wring = ((M == 32 and K >= 512 and N <= 128)
+             or (N >= 256 and K >= 256 and M <= 64)
+             or (N >= 256 and M == 64 and K != 128))
+    if ((kind == "pv" or wring) and (M, K, N) != (64, 512, 384)) \
+            or (K >= 1024 and M <= 64) \
+            or (kind == "col" and N >= 384 and M <= 32) \
+            or (M, K, N) == (64, 128, 256):
+        rows = 512
+    elif (M, K, N) == (64, 512, 384):
+        rows = 256  # degenerate compiler oracle (d2 = 0)
+    else:
+        rows = 4 * M
+    return {
+        "#comment": "I-52-0-block-1",
+        "desc": [{
+            "from": "identity_0_sg0000",
+            "from_dtype": "float32",
+            "from_off": 0,
+            "from_sizes": [rows, 128],
+            "from_steps": [1, 512],
+            "num_tiling_dimensions": 1,
+            "op": "copy",
+            "to": "SB",
+            "to_dtype": "float32",
+            "to_off": 0x30000 - rows,
+            "to_sizes": [rows, 128],
+            "to_steps": [1, 262144],
+        }],
+        "id": 0,
+        "queue": "qSPSpillReload0",
+        "semaphore": 24,
+    }

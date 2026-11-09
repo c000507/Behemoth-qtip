@@ -58,11 +58,8 @@ def classify():
             if not fn.startswith("emit_") and fn not in ("build_graph", "synth"):
                 continue
             cc = reaches(g, fn)
-            doc = ast.get_docstring(node) or ""
             body = ast.unparse(node)
-            refs_b = any(m in raw for m in B_MARKS) and fn != "synth"
-            if fn == "synth" or fn == "build_graph":
-                refs_b = False
+            refs_b = any(m in body for m in B_MARKS)
             cls = "C" if cc else ("B" if refs_b else "A")
             report.append((src, fn, cls, sorted(cc)))
     return report
