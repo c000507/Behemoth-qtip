@@ -123,3 +123,28 @@ ROCm/HIP kernels (runtime/src/*.hip) → better Neuron kernels/graphs → direct
 - GPSIMD/Xtensa EVAL (/tmp/opencode/gpsimd, 0.25.12): 8x Xtensa Q7 cores (ncore2gp) per device, xt-clang++ C++14 libc++ toolchain BUNDLED (license file local). API (custom_op.h): neuron_hbm_allocate/deallocate, neuron_dataram_allocate (+max_free_space), neuron_memcpy HBM<->dataram (DMA default), neuron_translate soc->nx windows. Build: build_custom_op.py -> ulib_to_ucode (1.25.36) -> ulib_to_isa (1.0.2520) = nrtucode integration, 8 per-CPU lsp variants. VERDICT: viable but defer - DVE covers bulk elementwise at 128-ch vector width; Q7 = scalar-ish cores = for glue (moe routing, top-k, complex dequant addressing, control flow) not bulk math. Cost = ucode build+load path integration. Revisit if a kernel needs real scalar control flow on-device.
 - COLLECTIVES (cc_streams): ISA side ALREADY EXTRACTED in isa-fields.json: common/v2/v3.NEURON_ISA_TPB_PSEUDO_TRIGGER_COLLECTIVE{,2,_EXT}_STRUCT (v1 = tensor-id based {ctype,dtype,group_id,input/output_tensor_id,src/dst_offset_elems,num_elements,events}; v2/v3 = SB-buffer based {stream_id,channel_id,cc_buf_start_addr/size_per_partition/num_partitions,src1_bitmap,cross_sb_output_transfer,permute_chain,max_block_size,dma_configs,prepare_op_id,instr_chaining}). SB2SB_COLLECTIVE opcode exists (S3D3 layout, ndbg asserts has_valid_nc_sb2sb_collective). CCE consts: DMA_CCE_MAX_DTYPE_ELEM_COUNT=1024, MAX_BIT_ACCURATE_ELEM_SIZE=4096. Runtime: libnrt parse_cc_streams (mla_resources json), aws_hal_xt_cc_init/cc_queue_init/cc_top_start, add_dma_packet_cce, aws_hal_get_sdma_*_cce_user_offset. def.json cc_streams{num_streams:0} = the hookup point; multi-rank TP = future work (needs 2+ NCs, box has /dev/neuron0 only... NEURON_LOGICAL_NC_CONFIG can split = revisit with TP experiments).
 - HEADER TAIL: resolved-enough: nrt_get_header_from_buffer validates ONLY size>0x3ff + u64@8>=size; my emitter (digest A only, digest B + tail zeroed) loads+executes on trn1 = digest B optional in this path. Digest B source still unknown (md5 of tar/name/header-zeros tried, no match) - likely set by packager for toolchain-internal verification. NOT a blocker for emission; revisit only if AWS tooling rejects our containers.
+28. COURSE CORRECTION (2026-11-09): THE GEN PATH IS NOT A DELIVERABLE. Project goal = bypass neuronx-cc entirely. jax/neuronx-cc/StableHLO = OFFLINE reference oracle only (decode formats, byte-diff + numeric validation of OUR output). NEVER in the emit path. This REVERSES memory 27's "no custom frontend" decision. Multi-output wrapper fix + real-dim Behemoth block (RoPE/GQA/SwiGLU/eps 1e-5/theta 1e6, M=1 KV-cache graph) = left UNFINISHED (runtime multi-output tensor-set issue: nrt lists only output0; raw compiler neff lists 3; byte-level neff.json/tar layout diffs exhausted - NEEDED LATER for our own block, note the open puzzle).
+
+AUDIT TABLE (tools/no_cc_check.py = the enforcement + progress metric; --strict exits 1 if any C):
+| emitter               | class | why |
+|-----------------------|-------|-----|
+| tile_ir.emit_pe_stream  | A | own synthesis |
+| tile_ir.emit_sp_stream  | A | own synthesis |
+| lift_hip.emit_graph     | B | tile IR + frozen DVE tables from reference |
+| lift_hip.emit_elementwise | B | ew_templates A/B frozen + param patch |
+| lift_hip.emit_softmax   | B | rms/softmax oracle sg00 byte-copy |
+| lift_hip.emit_dequant   | B | oracle sg00 byte-copy |
+| lift_hip.emit_rmsnorm   | B | rms_oracles byte-copy |
+| lift_hip.emit_matmul    | C | shape_templates copy BUT falls back to on-box oracle gen when template missing |
+| lift_hip.emit_matmul_synth | C | synth PE/pool BUT act stream = oracle copy when template present; must become full synth |
+| lift_hip.emit_rmsnorm_gen | C | emit-time jax+neuronx-cc on box |
+| lift_hip.emit_softmax_gen | C | emit-time |
+| lift_hip.emit_dequant_gen | C | emit-time |
+| lift_hip.emit_rmsnorm_fused | C | emit-time |
+| lift_hip.emit_matmul_gen  | C | emit-time |
+| lift_hip.emit_sdpa_gen    | C | emit-time |
+| lift_hip.emit_block_gen   | C | emit-time |
+
+GOAL: C -> 0, B -> A (synthesis with oracles as byte-diff ground truth only).
+ORDER (from brief): (1) extend mm_synth to arbitrary M/K/N (act stream synth + literal-table generalization; byte-diff vs tools/shape_templates oracles locally); (2) DVE elementwise+reduce (op65/66/67) own synthesis; (3) ACT passes (exp LUT, rsqrt, silu/gelu) own synthesis; (4) rms/softmax/sdpa/block composed from those with OUR scheduler/allocator (tile IR); (5) FRONTEND: read runtime/src/projection.hip -> tile_ir (nothing in tools/ opens .hip today), then ops.hip norms, attention.hip. Demo = HIP -> tile IR -> NEFF -> trn1 vs numpy, no cc/jax anywhere.
+BOX: presigned PUT trick for big transfers (venv boto3 generate_presigned_url put_object on bucket 912935854432-neuron-build, box: curl -T file URL; md5-check). Old chunked-stdout fetch = dead (24K cap + drops; 8-way parallel = throttles).
