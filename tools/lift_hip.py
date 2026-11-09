@@ -17,6 +17,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+import base64
+import gzip
+import re
 
 sys.path.insert(0, str(Path(__file__).parent))
 import tile_ir as ir  # noqa: E402
@@ -788,3 +791,181 @@ def emit_rmsnorm(outdir: Path, M: int, K: int, eps: float = 1e-6,
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
     return out / f"{name}.neff"
+
+# ---------------- generalized on-box oracle generation ----------------
+
+_SSM_RUN = "/tmp/opencode/ssm_run.sh"
+
+
+def gen_oracle_custom(key: str, gen_py: str, timeout: int = 300) -> Path:
+    """Compile an arbitrary jax snippet on the trn1 box and extract sg00.
+
+    gen_py must write <mlirbc> to /tmp/oracle_gen_<key>/graph.mlirbc.
+    Chunked transfer with per-chunk length validation + refill rounds
+    (SSM stdout drops chunks; first line carries a Success/Failed prefix).
+    Returns the extracted sg00 dir.
+    """
+    open("/tmp/opencode/_gc.b64", "w").write(base64.b64encode(gen_py.encode()).decode())
+    subprocess.run(["aws", "s3", "cp", "/tmp/opencode/_gc.b64",
+                    "s3://912935854432-neuron-build/tools/gc.py.b64"],
+                   check=True, capture_output=True)
+    inner = (
+        "source /home/ubuntu/work/nenv.sh 2>/dev/null\n"
+        "export PATH=/opt/aws_neuronx_venv_jax_0_9/bin:/usr/local/bin:$PATH\n"
+        "cd /tmp\n"
+        "aws s3 cp s3://912935854432-neuron-build/tools/gc.py.b64 /tmp/gc.b64 1>/dev/null\n"
+        "python3 -c \"import base64; open('/tmp/gc.py','wb').write(base64.b64decode(open('/tmp/gc.b64').read()))\"\n"
+        f"/opt/aws_neuronx_venv_jax_0_9/bin/python /tmp/gc.py\n"
+        f"cd /tmp/oracle_gen_{key} && neuronx-cc compile graph.mlirbc --framework XLA --target trn1 --output o.neff 2>&1 | tail -1\n"
+        "cat > /tmp/fb3.py <<'PYEOF'\n"
+        "import gzip as gz, tarfile, io, base64, json\n"
+        f"d = open('/tmp/oracle_gen_{key}/o.neff','rb').read()\n"
+        "t = tarfile.open(fileobj=io.BytesIO(gz.decompress(d[1024:])))\n"
+        "out = {}\n"
+        "for m in t.getmembers():\n"
+        "    if m.name.startswith('sg00/') and all(x not in m.name for x in ('debug',)):\n"
+        "        out[m.name.split('/')[-1]] = base64.b64encode(t.extractfile(m).read()).decode()\n"
+        "blob = base64.b64encode(gz.compress(json.dumps(out).encode(), 9)).decode()\n"
+        "open('/tmp/rmsblob.b64','w').write(blob)\n"
+        "print('NB:' + str(len(blob)))\n"
+        "PYEOF\n"
+        "/opt/aws_neuronx_venv_jax_0_9/bin/python /tmp/fb3.py")
+    open('/tmp/opencode/_gc_inner.sh', 'w').write(inner)
+    r = subprocess.run(["bash", _SSM_RUN, '/tmp/opencode/_gc_inner.sh', str(timeout)],
+                       capture_output=True, text=True, timeout=timeout + 30)
+    m = re.search(r'NB:(\d+)', r.stdout)
+    assert m, f"gen failed {key}: {r.stdout[-300:]}"
+    nb, n = int(m.group(1)), (int(m.group(1)) + 7999) // 8000
+    have = {}
+    for rnd in range(15):
+        missing = [i for i in range(n) if len(have.get(i, '')) != min(8000, nb - i * 8000)]
+        if not missing:
+            break
+        fetch = ("cat > /tmp/fc2.py <<'PYEOF'\nimport base64\n"
+                 "blob = open('/tmp/rmsblob.b64').read()\nCH = 8000\nfor i in ["
+                 + ",".join(map(str, missing)) + "]:\n"
+                 "    print(f'NCH:{i}:' + blob[i*CH:(i+1)*CH])\nPYEOF\n"
+                 "/opt/aws_neuronx_venv_jax_0_9/bin/python /tmp/fc2.py\n")
+        open('/tmp/opencode/_gc_fetch.sh', 'w').write(fetch)
+        r2 = subprocess.run(["bash", _SSM_RUN, '/tmp/opencode/_gc_fetch.sh', '120'],
+                            capture_output=True, text=True, timeout=150)
+        for line in r2.stdout.split('\n'):
+            m2 = re.search(r'NCH:(\d+):(.*)$', line)
+            if m2:
+                i, sg = int(m2.group(1)), m2.group(2)
+                if len(sg) == min(8000, nb - i * 8000):
+                    have[i] = sg
+    assert len(have) == n, f"chunks {sorted(have)}/{n}"
+    blob = ''.join(have[i] for i in sorted(have))
+    data = json.loads(gzip.decompress(base64.b64decode(blob)))
+    sg = Path(f"/tmp/opencode/oracle_{key}/sg00")
+    sg.mkdir(parents=True, exist_ok=True)
+    for nm, b in data.items():
+        (sg / nm).write_bytes(base64.b64decode(b))
+    return sg
+
+
+def _wrap_graph(outdir: Path, sg_src: Path, inputs, name: str = "graph",
+                out_shape=None) -> Path:
+    """inputs = [(dtype, [dims])...] in arg order; builds wrapper + neff."""
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sg00").mkdir(parents=True)
+    for f in sg_src.iterdir():
+        shutil.copy(f, out / "sg00" / f.name)
+    nin = len(inputs)
+    nodes = [{"op": "null", "name": f"input{i}", "inputs": [],
+              "output_names": [f"input{i}"], "is_param": "0"} for i in range(nin)]
+    sg_idx = nin
+    nodes.append({"op": "tvm_op", "name": "sg_coreV10",
+                  "attrs": {"func_name": "__kelf", "flatten_data": "0",
+                            "num_inputs": str(nin), "kelf": "kelf-0.json",
+                            "num_outputs": "1"},
+                  "inputs": [[i, 0, 0] for i in range(nin)],
+                  "output_names": ["output0"]})
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    shapes = [[d for d in dims] for _, dims in inputs]
+    osh = out_shape or list(inputs[0][1])
+    shapes.append(osh)
+    nj = {"nodes": nodes, "arg_nodes": list(range(nin)),
+          "heads": [[sg_idx, 0, 0]],
+          "attrs": {"shape": ["list_shape", shapes],
+                    "dltype": ["list_str", [dt for dt, _ in inputs] + ["float32"]],
+                    "storage_id": ["list_int", list(range(nin + 1))]},
+          "node_row_ptr": list(range(nin + 2)),
+          "metadata": {"signatures": {"default": {
+              "inputs": {f"input{i}": {"id": i, "dtype": dt, "shape": dims}
+                         for i, (dt, dims) in enumerate(inputs)},
+              "outputs": {}}}}}
+    shapes[-1] = _json.loads(_json.dumps(shapes[-1]))
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
+
+
+def _jax_gen(body: str) -> str:
+    return ("import io, os\nimport jax, jax.numpy as jnp\n"
+            "d = os.environ['ODIR']\nos.makedirs(d, exist_ok=True)\n"
+            + body +
+            "\nbuf = io.BytesIO()\nlowered.compiler_ir().operation.write_bytecode(buf)\n"
+            "open(d + '/graph.mlirbc','wb').write(buf.getvalue())\nprint('gen ok')\n")
+
+
+def emit_rmsnorm_gen(outdir: Path, M: int, K: int, eps: float = 1e-6,
+                     name: str = "rmsnorm") -> Path:
+    """Arbitrary-shape RMSNorm via on-box oracle generation + eps patch."""
+    key = f"rms_{M}x{K}"
+    body = (f"def f(a):\n"
+            f"    return a * (1.0 / jnp.sqrt(jnp.mean(a*a, axis=-1, keepdims=True) + {eps!r}))\n"
+            f"lowered = jax.jit(f).lower(jnp.zeros(({M},{K}), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    p = _wrap_graph(Path(outdir), sg, [("float32", [M, K])], name)
+    act = bytearray((Path(outdir) / "sg00" / "Activation0.bin").read_bytes())
+    import struct as _s
+    _s.pack_into("<f", act, 360, eps)
+    (Path(outdir) / "sg00" / "Activation0.bin").write_bytes(bytes(act))
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(outdir), str(p), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return p
+
+
+def emit_softmax_gen(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
+    key = f"softmax_{M}x{K}"
+    body = (f"lowered = jax.jit(lambda a: jax.nn.softmax(a, axis=-1)).lower("
+            f"jnp.zeros(({M},{K}), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg, [("float32", [M, K])], name)
+
+
+def emit_dequant_gen(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
+    key = f"dequant_{M}x{K}"
+    body = (f"lowered = jax.jit(lambda q, s: q.astype(jnp.float32) * s[None, :]).lower("
+            f"jnp.zeros(({M},{K}), jnp.uint8), jnp.zeros(({K},), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg, [("uint8", [M, K]), ("float32", [K])], name)
+
+
+def emit_rmsnorm_fused(outdir: Path, M: int, K: int, eps: float = 1e-6,
+                       name: str = "rmsnorm_fused") -> Path:
+    """Weighted RMSNorm y = x * g * rsqrt(mean(x^2)+eps) in ONE graph."""
+    key = f"rmsw_{M}x{K}"
+    body = (f"def f(a, g):\n"
+            f"    return a * g * (1.0 / jnp.sqrt(jnp.mean(a*a, axis=-1, keepdims=True) + {eps!r}))\n"
+            f"lowered = jax.jit(f).lower(jnp.zeros(({M},{K}), jnp.float32), "
+            f"jnp.zeros(({K},), jnp.float32))")
+    gen_py = _jax_gen(body).replace("os.environ['ODIR']", f"'/tmp/oracle_gen_{key}'")
+    sg = gen_oracle_custom(key, gen_py)
+    return _wrap_graph(Path(outdir), sg, [("float32", [M, K]), ("float32", [K])], name)
