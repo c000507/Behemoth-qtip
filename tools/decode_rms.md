@@ -53,3 +53,24 @@ DGETable0 vid 3. dma_queue = qPoolDynamic only.
 4. Emit path: RMSNorm emitter = DVE0(384B template w/ patched sizes) +
    ACT(448B template) + Pool(3 descs, sem8 in / sem9 out) + wrapper.
    M/N generalization = same u16-field discipline as matmul/elementwise.
+
+## 2026-11-09 (later): oracle container wrapper status
+- rms128 oracle re-extracted with FULL sg00 (19 files incl act_info,
+  exp_and_others tables, PE0.json etc) via chunked transfer with
+  per-chunk length validation (SSM stdout drops/prefixes lines:
+  ALWAYS re.search not match; validate chunk len == 8000 or tail).
+  Blob persisted on box at /tmp/rmsblob.b64 (38576B), fetcher = /tmp/fc2.py.
+- Wrapper built (neff.json 1-input rms graph + def.json from oracle).
+- DEVICE: nrt_load = "Invalid NEFF buffer" - root cause NOT yet found:
+  the tgz transfer was flaky (stale object / partial extraction), so the
+  loaded neff may have been truncated. NEXT SESSION: re-upload with
+  checksum, verify on box (md5), then re-test load. If load still fails,
+  compare def.json/neff.json against a KNOWN-GOOD matmul wrapper
+  (emit_matmul output) field by field - rms def.json is the compiler's own.
+- sp_dma identity facts (fresh oracles): 32_128_384 rows [512,128]
+  to_off tof-N(=0x2fe00); 64_128_384 rows [256,128] to_off tof(0x2ff00);
+  64_1024_128 rows [512,128] to_off tof-4M(0x2fe00); 32_640_128
+  rows [512,128] to_off 0x2fe00 (= tof-384, NOT tof!); 32_384_256
+  rows [512,128] to_off 0x2fe00 (= tof, big layout). to_off rule =
+  shape literal, table-driven for now.
+- Perf harness (timing.cpp) still at /home/ubuntu/work/nrtd on box.
