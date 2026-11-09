@@ -11,6 +11,18 @@ import struct
 
 PSUM = 0x02000000
 
+# Fresh-compile family (neuronx-cc later builds): w region lives at fixed
+# SB base 0x18000 (pool desc1 addr40 = 0x18000 exactly), x ring / scr may
+# be relocated per shape (X shifts measured from oracles). Old (18-bucket)
+# compiles pack w below the x ring.
+W0 = 0x18000
+FRESH_SHAPES = {(32, 384, 128), (32, 384, 256), (32, 640, 128),
+                (32, 128, 384), (64, 128, 384), (48, 256, 128),
+                (48, 384, 128), (64, 1024, 128), (64, 384, 128)}
+# Structural anomalies: 32_640_256 = extra B chunk + interleaved B dsts +
+# 3-stage PV; 64_512_384 = degenerate compiler oracle (d2 = 0).
+UNSUPPORTED_SHAPES = {(32, 640, 256), (64, 512, 384)}
+
 
 def _u16(buf, off, val):
     struct.pack_into("<H", buf, off, val & 0xFFFF)
@@ -126,7 +138,7 @@ def final_scheme(M, K, N):
     if M >= 96:
         return "direct", [PSUM | 0], [N]
     pv = (M == 32 and (K >= 512 or (N >= 256 and K >= 256))) or \
-         (M == 64 and N >= 256)
+         (M == 64 and (N >= 256 or K >= 1024))
     if pv:
         base = 0x800 if NT == 1 else (0x1800 if NT == 2 else 0x800)
         return "pv", [PSUM | (base + 0x200 * t) for t in range(NT)], [128] * NT
@@ -171,12 +183,28 @@ def synth(M, K, N):
     out += _ev(0x1805)
     out += bytes([0] * 32)
     x_bottom = tof - 512 * AS
+    fresh = (M, K, N) in FRESH_SHAPES
+    if (M, K, N) in UNSUPPORTED_SHAPES:
+        raise ValueError(f"({M},{K},{N}) has no decoded synthesis "
+                         "(structural anomaly) - use oracle template")
+
+    # x-side relocation for fresh col/K1024 compiles (oracle-measured):
+    # LW shift for all three; scr/tof shift only for the col-N384 family
+    xsh = 0
+    if (M, K, N) == (32, 128, 384):
+        xsh = -N
+    elif (M, K, N) == (64, 128, 384):
+        xsh = 4 * M
+    elif (M, K, N) == (64, 1024, 128):
+        xsh = -4 * M
+    xsh_ascr = xsh                      # A-phase scr shift (all fresh-shift shapes)
+    xsh_pvscr = xsh                     # PV-phase scr shift (col + K1024 shapes)
 
     def x_lw(s):
-        return tof - 512 * (AS - 1 - s) - 4
+        return tof - 512 * (AS - 1 - s) - 4 + xsh
 
     U6A = 0x8000 + M          # A-phase op10 const
-    U6F = 0x80 + 0x2000 * (M // 32)  # B/PV const, non-wring families
+    U6F = 0x80 + 0x1000 * (M // 16)  # B/PV const, non-wring families
     U6W = 0x8080              # B const, wring families and col N>256
     wring = ((M == 32 and K >= 512 and N <= 128)
              or (N >= 256 and K >= 256 and M <= 64) or (N >= 256 and M == 64))
@@ -192,7 +220,10 @@ def synth(M, K, N):
 
     kind, fdst, fdn = final_scheme(M, K, N)
     d1a = desc1_addr(M, K, N)
-    U6B = U6W if wring or (kind == "col" and N > 256) else U6F
+    u6w_ok = (wring and not (M == 64 and K == 128 and N > 256)) \
+        or (M == 64 and K >= 1024)
+    U6B = U6W if (u6w_ok or (kind == "col" and N > 256 and not
+                             (M == 64 and K == 128 and N > 256))) else U6F
     temps = b_temps(M, K, N)
 
     # ---- A phase: AS slots x 2 pairs
@@ -202,7 +233,8 @@ def synth(M, K, N):
             gp = 2 * s + p
             upd = 0x5130000 if gp == 2 * AS - 1 else 0
             wait = (8, 16) if gp == 0 else None
-            pair(x_lw(s), 128, wait, gp, tof, PSUM | (ab + 4 * M * s), M, 2,
+            pair(x_lw(s), 128, wait, gp, tof + xsh_ascr,
+                 PSUM | (ab + 4 * M * s), M, 2,
                  1 if p == 0 else 2, upd, U6A, U6A, M)
 
     # ---- B phase --------------------------------------------------------
@@ -219,7 +251,8 @@ def synth(M, K, N):
                 upd = (0x5130000 if (gpt > 1 and t == ntiles - 1
                                      and g == gpt - 1) else 0)
                 wait = (4, 1) if gp == 0 else None
-                scr_t = scr_col(M, K, N, t)
+                scr_t = (0x4000 if fresh and M <= 32
+                         else scr_col(M, K, N, t))
                 lw_t = (0x4000 + 4 * M * (t + 1) - 4 if ntiles == 1
                         else d1a + 512 * (t + 1) - 4)
                 dn_t = M if (M == 64 and N == 256) else fdn[t]
@@ -227,12 +260,20 @@ def synth(M, K, N):
                      1 if g == 0 else (2 if g == gpt - 1 else 0),
                      upd, U6B, U6B, anum if anum is not None else dn_t)
     elif kind == "pv":
-        # wring families: LW = w ring (last tile +Ws/2), scr = window
+        # wring families: LW = w ring, scr = window.
+        # old compiles: w ring packed below x ring (descending from top);
+        # fresh compiles: w region at W0 = 0x18000, ascending chunks.
         Ws = max(512, 4 * N)
         extra = 0 if Ws == 512 else 512
 
         def lwbase(s):
-            return x_bottom - extra - Ws * (AS - 1 - s) - 4
+            if fresh or Ws > 512:
+                # w ring LW end = addr40 + 512 + Ws*s - 4 (+512 for the
+                # non-last tile group) - holds for fresh (all N) and old
+                # N256 compiles (old addr40 = x_bottom-family literal)
+                return d1a + 512 + Ws * s - 4
+            # old N128-wring: w chunks adjacent under the x ring
+            return x_bottom - Ws * (AS - 1 - s) - 4
 
         for ti, t in enumerate(range(NT - 1, -1, -1)):
             off = 0 if t == NT - 1 else 512
@@ -247,27 +288,17 @@ def synth(M, K, N):
                          (2 if (s == AS - 1 and p == 1) else 0),
                          upd, U6B, U6B, M)
     else:
-        if M == 64 and K >= 1024:
-            # swapped: scr = window, LW = w ring (wring staging, direct dst)
+            # direct row-mode: LW = window, scr = w chunks (old: below x
+            # ring descending; fresh: W0 region ascending)
             for s in range(AS):
                 for p in range(2):
                     gp = 2 * s + p
                     wait = (4, 1) if gp == 0 else None
                     upd = 0x5130000 if (s == AS - 1 and p == 1) else 0
-                    pair(x_bottom - 512 * (AS - 1 - s) - 4, M, wait, gp,
-                         0x4000 + 4 * M * s, fdst[0], fdn[0], 3,
-                         1 if (s == 0 and p == 0) else
-                         (2 if (s == AS - 1 and p == 1) else 0),
-                         upd, U6B, U6B, fdn[0])
-        else:
-            # direct row-mode: LW = window, scr = w chunks below x ring
-            for s in range(AS):
-                for p in range(2):
-                    gp = 2 * s + p
-                    wait = (4, 1) if gp == 0 else None
-                    upd = 0x5130000 if (s == AS - 1 and p == 1) else 0
+                    scr_s = (W0 + 4 * N * s if fresh
+                             else x_bottom - 4 * N * (AS - s))
                     pair(0x4000 + 4 * M * (s + 1) - 4, M, wait, gp,
-                         x_bottom - 4 * N * (AS - s), fdst[0], fdn[0], 3,
+                         scr_s, fdst[0], fdn[0], 3,
                          1 if (s == 0 and p == 0) else
                          (2 if (s == AS - 1 and p == 1) else 0),
                          upd, U6B, U6B, fdn[0])
@@ -286,7 +317,8 @@ def synth(M, K, N):
                 elif p == 0 and t == 1 and NT == 2 and kind == "pv":
                     wait = (4, 3)
                 upd = 0x5130000 if (t == NT - 1 and p == 1) else 0
-                pair(pv0 + 4 * M * t - 4, M, wait, gp, tof, pvdst[t], 128, 2,
+                pair(pv0 + 4 * M * t - 4, M, wait, gp, tof + xsh_pvscr,
+                     pvdst[t], 128, 2,
                      1 if p == 0 else 2, upd, U6F, U6F, 128)
     return bytes(out)
 
@@ -454,6 +486,8 @@ D2_DRAIN = {
 
 def desc1_addr(M, K, N):
     """w-region base: pool writes w chunk s at addr + 4N*s; PE scr/LW derive."""
+    if (M, K, N) in FRESH_SHAPES or (M, K, N) in UNSUPPORTED_SHAPES:
+        return W0
     f = D1_FIELDS.get((M, K, N))
     if f is not None:
         return f[11]
