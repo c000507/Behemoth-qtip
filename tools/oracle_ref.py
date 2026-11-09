@@ -8,6 +8,7 @@ numerical validation of our own synthesis. Per project course correction
 lift_hip.py / tile_ir.py / mm_synth.py / act_synth.py must NEVER import
 from this module - tools/no_cc_check.py enforces the emit path.
 """
+import json
 import json as _json
 import shutil
 import struct

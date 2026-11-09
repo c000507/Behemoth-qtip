@@ -645,30 +645,95 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     return out / f"{name}.neff"
 
 
-SOFTMAX_ORACLE_DIRS = {  # (M, K) -> frozen oracle sg00 dir (tools/)
+SOFTMAX_ORACLE_DIRS = {  # frozen sg00 dirs (ground truth + tables)
     (128, 128): str(Path(__file__).parent / "oracle_sg00" / "softmax128"),
 }
 
 
 def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
-    """Emit y = exp(x - max) / sum(exp(x - max)) rowwise, f32 [M, K].
+    """Emit y = softmax(x, axis=-1) rowwise for x [M, K] f32 (OWN SYNTH).
 
-    Compiler-lowering oracle byte-copy (DVE TENSOR_REDUCE_ARITH_OP(66) for
-    max + sum, ACTIVATE(33) exp via LUT tables; exp_and_others_bkt +
-    act_info ship with the oracle)."""
+    DVE max/sum reduce + row-div (op66/op67/op72), ACT exp pair - fully
+    synthesized in tools/sf_synth.py (byte-exact vs softmax128 and
+    M96/K384 oracles). PE/SP = frozen prologue bytes, engine tables and
+    act LUTs = frozen DATA from the oracle sg00 dir.
+    """
     if (M, K) not in SOFTMAX_ORACLE_DIRS:
-        raise ValueError(f"no softmax oracle for ({M},{K})")
-    sg_src = Path(SOFTMAX_ORACLE_DIRS[(M, K)])
+        raise ValueError(f"no softmax table for ({M},{K})")
+    import sf_synth
+    sf_path = Path(SOFTMAX_ORACLE_DIRS[(M, K)])
     out = Path(outdir)
+    sg = out / "sg00"
     shutil.rmtree(out, ignore_errors=True)
-    (out / "sg00").mkdir(parents=True)
-    for f in sg_src.iterdir():
-        shutil.copy(f, out / "sg00" / f.name)
+    sg.mkdir(parents=True)
+    streams = sf_synth.synth_streams(M, K)
+    (sg / "DVE0.bin").write_bytes(streams["DVE0.bin"])
+    (sg / "Activation0.bin").write_bytes(streams["Activation0.bin"])
+    (sg / "Pool0.bin").write_bytes(streams["Pool0.bin"])
+    shutil.copy(sf_path / "PE0.bin", sg)
+    shutil.copy(sf_path / "SP0.bin", sg)
+    for f in ("act_info.json", "exp_and_others.json", "exp_and_others_bkt.bin",
+              "exp_and_others_ctrl.bin", "default_opcode_table.bin",
+              "default_control_table.bin", "default_datapath_table.bin"):
+        shutil.copy(sf_path / f, sg)
+    (sg / "PE0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "PE0.bin", "name": "PE0.json"}))
+    (sg / "SP0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "SP0.bin", "name": "SP0.json"}))
+    (sg / "Pool0.json").write_text(_json.dumps(
+        {"dma": [], "engine_id": 0, "instr": "Pool0.bin", "name": "Pool0.json"}))
+    (sg / "DVE0.json").write_text(_json.dumps(
+        {"dma": [], "dve_tables": [{"control_table": "default_control_table.bin",
+                                     "datapath_table": "default_datapath_table.bin",
+                                     "opcode_table": "default_opcode_table.bin"}],
+         "engine_id": 0, "instr": "DVE0.bin", "name": "DVE0.json"}))
+    (sg / "Activation0.json").write_text(_json.dumps(
+        {"act_info": "act_info.json", "act_semaphore": 12,
+         "activation_function_sets": ["exp_and_others"], "dma": [],
+         "engine_id": 0, "instr": "Activation0.bin", "name": "Activation0.json"}))
+    dbg = {"pe": ["debug_info_asm_PE.dbg", "debug_info_backend_PE.dbg"],
+           "dve": ["debug_info_asm_DVE.dbg", "debug_info_backend_DVE.dbg"],
+           "pool": ["debug_info_asm_Pool.dbg", "debug_info_backend_Pool.dbg"],
+           "sp": ["debug_info_asm_SP.dbg", "debug_info_backend_SP.dbg"],
+           "act": ["debug_info_asm_Activation.dbg", "debug_info_backend_Activation.dbg"],
+           "dma": ["debug_info_backend_DMA.dbg"]}
+    nbytes = M * K * 4
+    d = {
+        "#rank_world_size": 0,
+        "act": "Activation0.json", "act_asm_dbg": dbg["act"][:1],
+        "act_dbg": dbg["act"][1:], "act_instr": "Activation0.bin",
+        "cc_streams": {"num_streams": 0}, "debug_info": {},
+        "dma_dbg": dbg["dma"],
+        "dma_queue": {"qPoolDynamic": {
+            "dynamic_dma": {"SB_scratch_partition_offset": 0,
+                             "SB_scratch_partition_size": 16384},
+            "fabric_path": "main", "num_queues": 16, "owner": "pool",
+            "semaphore_set": list(range(8, 24)), "type": "dynamic"}},
+        "dve": "DVE0.json", "dve_asm_dbg": dbg["dve"][:1],
+        "dve_dbg": dbg["dve"][1:], "dve_instr": "DVE0.bin",
+        "fp8_conversion_config": {"emax_fp8_e4m3": 7, "emax_fp8_e5m2": 14,
+                                  "fp8_range_extension": True, "fp8_sis": False,
+                                  "fp8_sns": False, "ocp_sat": True},
+        "name": "definition", "neff_features": [],
+        "pe": "PE0.json", "pe_asm_dbg": dbg["pe"][:1],
+        "pe_dbg": dbg["pe"][1:], "pe_instr": "PE0.bin",
+        "pool": "Pool0.json", "pool_asm_dbg": dbg["pool"][:1],
+        "pool_dbg": dbg["pool"][1:], "pool_instr": "Pool0.bin",
+        "runtime_event_count": 12, "runtime_semaphore_count": 3,
+        "sp": "SP0.json", "sp_asm_dbg": dbg["sp"][:1],
+        "sp_dbg": dbg["sp"][1:], "sp_instr": "SP0.bin",
+        "var": {"DGETable0": {"list": [1, 2], "type": "dge-table", "var_id": 3},
+                "SB": {"type": "state-buffer", "var_id": 0},
+                "input0": {"ops": [], "size": nbytes, "type": "input", "var_id": 1},
+                "output0": {"ops": [], "size": nbytes, "type": "output", "var_id": 2}},
+        "version": "0.6",
+    }
+    (sg / "def.json").write_text(_json.dumps(d, indent=1))
     nj = {"nodes": [
         {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
         {"op": "tvm_op", "name": "sg_coreV10",
          "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "1",
-                   "kelf": "kelf-0.json", "num_outputs": "1"},
+                    "kelf": "kelf-0.json", "num_outputs": "1"},
          "inputs": [[0, 0, 0]], "output_names": ["output0"]}],
         "arg_nodes": [0], "heads": [[1, 0, 0]],
         "attrs": {"shape": ["list_shape", [[M, K], [M, K]]],
@@ -683,6 +748,10 @@ def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
         {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
          "version": "0.5", "target": "sunda", "revision": ""}))
     (out / "metrics.json").write_text("[]")
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
     subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
                     str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
                    check=True, capture_output=True)
