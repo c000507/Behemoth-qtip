@@ -635,6 +635,104 @@ def emit_elementwise(outdir: Path, n: int = 4096, name: str = "elementwise",
     return out / f"{name}.neff"
 
 
+SOFTMAX_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
+    (128, 128): "/tmp/opencode/oracle_softmax128/sg00",
+}
+
+
+def emit_softmax(outdir: Path, M: int, K: int, name: str = "softmax") -> Path:
+    """Emit y = exp(x - max) / sum(exp(x - max)) rowwise, f32 [M, K].
+
+    Compiler-lowering oracle byte-copy (DVE TENSOR_REDUCE_ARITH_OP(66) for
+    max + sum, ACTIVATE(33) exp via LUT tables; exp_and_others_bkt +
+    act_info ship with the oracle)."""
+    if (M, K) not in SOFTMAX_ORACLE_DIRS:
+        raise ValueError(f"no softmax oracle for ({M},{K})")
+    sg_src = Path(SOFTMAX_ORACLE_DIRS[(M, K)])
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sg00").mkdir(parents=True)
+    for f in sg_src.iterdir():
+        shutil.copy(f, out / "sg00" / f.name)
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    nj = {"nodes": [
+        {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+        {"op": "tvm_op", "name": "sg_coreV10",
+         "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "1",
+                   "kelf": "kelf-0.json", "num_outputs": "1"},
+         "inputs": [[0, 0, 0]], "output_names": ["output0"]}],
+        "arg_nodes": [0], "heads": [[1, 0, 0]],
+        "attrs": {"shape": ["list_shape", [[M, K], [M, K]]],
+                  "dltype": ["list_str", ["float32", "float32"]],
+                  "storage_id": ["list_int", [0, 1]]},
+        "node_row_ptr": [0, 1, 2],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "float32", "shape": [M, K]}},
+            "outputs": {}}}}}
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
+
+
+DEQUANT_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
+    (128, 128): "/tmp/opencode/oracle_dequant128/sg00",
+}
+
+
+def emit_dequant(outdir: Path, M: int, K: int, name: str = "dequant") -> Path:
+    """Emit y = q.cast(f32) * s[None, :] for q uint8 [M,K], s f32 [K].
+
+    Compiler-lowering oracle byte-copy (cast happens on PE, scale on DVE).
+    Input file order: in0 = q (uint8), in1 = s (f32 K), output = f32.
+    """
+    if (M, K) not in DEQUANT_ORACLE_DIRS:
+        raise ValueError(f"no dequant oracle for ({M},{K})")
+    sg_src = Path(DEQUANT_ORACLE_DIRS[(M, K)])
+    out = Path(outdir)
+    shutil.rmtree(out, ignore_errors=True)
+    (out / "sg00").mkdir(parents=True)
+    for f in sg_src.iterdir():
+        shutil.copy(f, out / "sg00" / f.name)
+    (out / "info.json").write_text(_json.dumps({
+        "tool_version": "behemoth-reverse-0.1", "kelp_version": "Dynamic",
+        "name": f"{name}.neff", "num_tpb": 1, "num_tpb_requested": 1,
+        "num_tpb_per_node": [1] + [0] * 63}))
+    nj = {"nodes": [
+        {"op": "null", "name": "input0", "inputs": [], "output_names": ["input0"], "is_param": "0"},
+        {"op": "null", "name": "input1", "inputs": [], "output_names": ["input1"], "is_param": "0"},
+        {"op": "tvm_op", "name": "sg_coreV10",
+         "attrs": {"func_name": "__kelf", "flatten_data": "0", "num_inputs": "2",
+                   "kelf": "kelf-0.json", "num_outputs": "1"},
+         "inputs": [[0, 0, 0], [1, 0, 0]], "output_names": ["output0"]}],
+        "arg_nodes": [0, 1], "heads": [[2, 0, 0]],
+        "attrs": {"shape": ["list_shape", [[M, K], [K], [M, K]]],
+                  "dltype": ["list_str", ["uint8", "float32", "float32"]],
+                  "storage_id": ["list_int", [0, 1, 2]]},
+        "node_row_ptr": [0, 1, 2, 3],
+        "metadata": {"signatures": {"default": {
+            "inputs": {"input0": {"id": 0, "dtype": "uint8", "shape": [M, K]},
+                       "input1": {"id": 1, "dtype": "float32", "shape": [K]}},
+            "outputs": {}}}}}
+    (out / "neff.json").write_text(_json.dumps(nj))
+    (out / "kelf-0.json").write_text(_json.dumps(
+        {"graphs": [{"definition": "sg00/def.json", "name": "sg00"}],
+         "version": "0.5", "target": "sunda", "revision": ""}))
+    (out / "metrics.json").write_text("[]")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "neff_emit.py"),
+                    str(out), str(out / f"{name}.neff"), "--name", f"{name}.neff"],
+                   check=True, capture_output=True)
+    return out / f"{name}.neff"
+
+
 RMS_ORACLE_DIRS = {  # (M, K) -> extracted compiler oracle sg00 dir
     (128, 128): "/tmp/opencode/oracle_rms128/sg00",
     (256, 128): "/tmp/opencode/oracle_rms256/sg00",

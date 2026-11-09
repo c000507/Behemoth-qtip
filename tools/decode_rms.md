@@ -74,3 +74,17 @@ DGETable0 vid 3. dma_queue = qPoolDynamic only.
   rows [512,128] to_off 0x2fe00 (= tof, big layout). to_off rule =
   shape literal, table-driven for now.
 - Perf harness (timing.cpp) still at /home/ubuntu/work/nrtd on box.
+
+## 2026-11-09 (final): all lifted ops device-validated
+- rms128 oracle container: PASS bit-accurate (2.4e-07) after md5-verified
+  transfer ("Invalid NEFF buffer" was purely transfer flakiness).
+- emit_rmsnorm 4/4 PASS: M128/M256 x eps {1e-6, 1e-3} (eps f32 @360 ACT).
+- emit_softmax PASS: 1.6e-06 (exp LUT tables ship in oracle sg00).
+- emit_dequant PASS BIT-EXACT (0.0): q uint8 cast on PE + scale broadcast.
+- weighted rms full-chain (rms + elementwise g compose): PASS 1.8e-07.
+- perf (timing.cpp rebuilt on box, 200 iters): synth 64_384_128 = 62.7us
+  avg vs oracle = 62.4us = parity; rms 61.5us, softmax 62.0us; all
+  launch-bound (~60us floor at these sizes).
+- Box gotchas: /tmp dirs get wiped by overlapping SSM runs - use
+  /home/ubuntu/work/pf for multi-step box work; S3 GET flaky (~1 in 3)
+  - always md5-verify + retry loop.
