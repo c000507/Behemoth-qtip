@@ -327,17 +327,27 @@ struct NeuronModel::Impl {
                 m.argmax = j.value("argmax", false);
                 m.wt = j.value("wt", false);
                 accept(m);
-                if (!heads.empty() && heads.front().meta.argmax == m.argmax &&
-                    (heads.front().meta.fp8 != m.fp8 || heads.front().meta.wt != m.wt))
+                // lm_head is uploaded in ONE format and bound to every head bucket, so fp8/wt must agree
+                // across ALL heads regardless of the argmax flag (a mixed fp8-argmax/bf16-logits set binds
+                // wrong-size weights and fails at execute).
+                if (!heads.empty() && (heads.front().meta.fp8 != m.fp8 || heads.front().meta.wt != m.wt))
                     throw std::runtime_error("head NEFFs mix bf16 / fp8 or transposed / plain lm_head formats");
-                head_fp8 = m.fp8;
-                head_transposed = m.wt;
+                if (heads.empty()) { // one upload format: fixed by the first head enumerated
+                    head_fp8 = m.fp8;
+                    head_transposed = m.wt;
+                }
                 HeadBucket b;
                 b.meta = m;
                 b.argmax = m.argmax;
                 heads.push_back(std::move(b));
             }
         }
+        for (const auto &h : heads) // an argmax head without a same-shape logits head leaves non-greedy steps unservable
+            if (h.argmax && !std::any_of(heads.begin(), heads.end(), [&](const HeadBucket &g) {
+                    return !g.argmax && g.meta.T == h.meta.T;
+                }))
+                throw std::runtime_error("argmax head NEFF for T=" + std::to_string(h.meta.T) +
+                                         " has no logits-head fallback (non-greedy steps need one); stage both formats");
         if (!tp)
             throw std::runtime_error("no NEFF buckets (meta.json + graph.neff directories) in " + options.neff_dir.string());
         // Whole-model graphs of one (R, Q, P): body segments (residual out), optionally ending in one head segment (logits
@@ -1277,6 +1287,14 @@ struct NeuronModel::Impl {
                             dump_x(b, int(step) + 1, pr.x[(step + 1) % 2]);
                     }
                 }
+                // drain before stopping the layers clock: the executes are async (the runtime queues them),
+                // so reading a few bytes of the residual stream forces the wait for THIS rank's device work
+                // (the collectives inside the graphs sync both ranks).
+                {
+                    float drain[16];
+                    check(nrt_tensor_read(pr.x[0].t, drain, 0, sizeof(drain)), "read x drain");
+                    check(nrt_tensor_read(pr.x[1].t, drain, 0, sizeof(drain)), "read x drain");
+                }
                 const auto t_layers = Clock::now();
                 if (r == 0) {
                     phase_upload_ms += std::chrono::duration<double, std::milli>(t_uploaded - t_start).count();
@@ -1306,6 +1324,10 @@ struct NeuronModel::Impl {
         for (auto &j : jobs)
             j.get();
         if (head && head->argmax && L.want_argmax) {
+            // Merge the two ranks' (max, argmax-shard-index) candidates. vocab_shard = ceil(vocab/TP) with the
+            // padded tail on the last rank, so idx + r*vocab_shard can exceed vocab-1 only for ranks that own
+            // padded rows - harmless for vocab=131072/TP=2 (131072 is even, no padding) but not general; ties
+            // keep rank 0 (the lowest shard = the same convention as the host argmax).
             for (size_t i = 0; i < L.head_rows.size(); ++i) {
                 int best_r = 0;
                 float best = out[0][i];

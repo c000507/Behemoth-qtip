@@ -451,10 +451,10 @@ struct Engine::Impl {
                 // Device argmax fast path: every sampled row must be unconstrained greedy (the drafts are verified by
                 // greedy comparison, so they qualify); the head graph then returns per-row (max, argmax) and the host
                 // only merges the two ranks' candidates.
-                bool greedy_step = true;
+                bool greedy_step = false; // default OFF (docs); BEHEMOTH_NEURON_DEVICE_ARGMAX=1 enables
                 if (const char *da = std::getenv("BEHEMOTH_NEURON_DEVICE_ARGMAX"))
-                    if (da[0] != '1')
-                        greedy_step = false;
+                    if (da[0] == '1')
+                        greedy_step = true;
                 for (size_t i = 0; i < step.requests.size(); ++i) {
                     if (!step.requests[i].sample)
                         continue;
@@ -468,7 +468,6 @@ struct Engine::Impl {
                         break;
                     }
                 }
-                const auto t_sample0 = Clock::now();
                 const auto logits = model.forward(input, greedy_step);
                 const size_t vocab = size_t(model.vocab());
                 // sampled[i]: the tokens of request i's rows (scheduled token, then one per draft row), in row order
@@ -484,6 +483,7 @@ struct Engine::Impl {
                         sampling_steps.push_back(i);
                     }
                 // Each request is an independent pass over its rows of 128k logits with its own RNG: spread them over threads.
+                const auto t_sample0 = Clock::now(); // sample_ms = the sampling block only (excludes the forward)
                 std::exception_ptr sampling_error;
                 std::mutex error_mutex;
 #pragma omp parallel for schedule(dynamic, 1)

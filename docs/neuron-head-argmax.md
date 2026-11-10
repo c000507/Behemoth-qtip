@@ -87,3 +87,18 @@ or bucket names change for the current behaviour.
   shape.
 - Not validated / rejected: the device-argmax performance (negative), the
   fp8 head + argmax combination (execute status 2), any shipping change.
+
+## Post-review fixes (2026-11-10)
+
+- BEHEMOTH_NEURON_DEVICE_ARGMAX is now default-OFF (the brief-20 build had
+  it default-ON when argmax buckets were present).
+- The head fp8/wt consistency check now covers ALL head buckets regardless
+  of the argmax flag (lm_head is uploaded in one format). HYPOTHESIS (not
+  re-tested): the brief-20 "fp8 head + argmax = nrt status 2" was likely
+  the mixed-format binding (an fp8 argmax head next to bf16 logits heads
+  binds wrong-size lm_head weights), not a broken graph.
+- An argmax head with no same-shape logits head is now refused at load
+  (non-greedy steps would otherwise hit "no head NEFF").
+- sample_ms now measures the sampling block only (the brief-20 number
+  included the forward); layer_bench/token_loop stop their clocks after a
+  drain read (the earlier figures were submit-side).

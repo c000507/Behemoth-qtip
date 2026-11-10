@@ -7,8 +7,11 @@
 // layer, distinct fp8 weight buffers, TP=2 with collectives), KV pool
 // 91 MB x 40. Device chaining: layer i output tensor feeds layer i+1
 // input (same nrt_tensor_t added to both tensor sets); EHS argmax feeds
-// the next step's embed token input. Host per step = position + page
-// slot int64 writes only.
+// the next step's embed token input. NOTE (review 2026-11-10): this
+// harness writes NOTHING per step - the position/page-table inputs stay
+// constant, the KV never advances and the layer outputs are distinct
+// per-layer tensors (not in-place), so it times the execute chain only,
+// not the serving loop's host work.
 //
 // usage: token_loop dec1_128.neff ehs.neff embed.neff [tokens] [ranks]
 //   steps modes: TOKENLOOP_MODE=a|b|c|d  (a sync+host-head-ish baseline is
@@ -56,6 +59,10 @@ struct RankOut {
 // (the ehs graph compiled as: h8 = quant(x*a); logits = h8 @ w.T * a; argmax)
 
 int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s dec1_128.neff ehs.neff embed.neff [tokens] [ranks]\n", argc ? argv[0] : "token_loop");
+        return 2;
+    }
     const char* layer_path = argv[1];
     const char* ehs_path = argv[2];
     bool no_ehs = getenv("NO_EHS") != nullptr;
@@ -137,7 +144,11 @@ int main(int argc, char** argv) {
                 nrt_tensor_t* dev = nullptr;
                 size_t sz = ti.size;
                 std::string key = std::string(ti.name) + (ti.usage == NRT_TENSOR_USAGE_INPUT ? ":i" : ":o");
-                if (is_shared(ti.name) && shared.count(key)) {
+                if (ti.usage == NRT_TENSOR_USAGE_INPUT && l > 0 && std::strcmp(ti.name, "input0") == 0 && L[l - 1].x_out) {
+                    // device chaining: layer l-1's output0 IS layer l's input0 (bind once; no second
+                    // tensor-set add under the same name, no superseded tensor left behind)
+                    dev = L[l - 1].x_out;
+                } else if (is_shared(ti.name) && shared.count(key)) {
                     dev = shared[key];
                 } else {
                     check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, rank, sz, ti.name, &dev), "alloc", rank);
@@ -157,11 +168,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-        }
-        // chain: layer l output0 -> layer l+1 input0 (same device tensor)
-        for (int l = 0; l + 1 < 40; ++l) {
-            if (!L[l].x_out || !L[l+1].x_in) continue;
-            check(nrt_add_tensor_to_tensor_set(L[l+1].in, L[l+1].x_in_name.c_str(), L[l].x_out), "chain", rank);
+            nrt_free_model_tensor_info(info);
         }
         // the EHS hidden input = the layer-39 output0
         // the EHS input named by size match: the hidden = 20480 B f32 = the first matching EHS input
@@ -170,8 +177,9 @@ int main(int argc, char** argv) {
             if (ehs_sz[i] == 20480 && ehs_t[i]) { ehs_hidden = ehs_t[i]; break; }
         }
         if (ehs_hidden && L[39].x_out) {
-            // rebuild the ehs input set with the layer-39 output tensor bound to the hidden slot
-            // (simpler: the runtime binds by name; the same tensor = OK)
+            // bind the layer-39 output as the EHS hidden input. NOTE: this re-adds "in0" over the tensor
+            // already bound at EHS build time (the runtime keeps the last binding); the superseded tensor
+            // stays allocated until exit - acceptable for a harness, the runtime behavior is device-validated.
             check(nrt_add_tensor_to_tensor_set(ehs_in, "in0", L[39].x_out), "ehs chain", rank);
         }
 
@@ -202,11 +210,9 @@ int main(int argc, char** argv) {
             // host: read back the token (8 B) only every 8 steps (async-friendly);
             // write the position/slot (8 B) - both trivial
         }
-        sync.arrive_and_wait();
-        results[rank].wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tstart).count();
-        // read the final token
+        // drain: read the final token BEFORE stopping the clock so the wall time covers the device
+        // (the last executes are still in flight when the submit loop ends)
         std::vector<char> host(8);
-        // the token tensor = the last EHS output = find by name
         for (uint64_t i = 0; i < ehs_info->tensor_count; ++i) {
             const auto& ti = ehs_info->tensor_array[i];
             if (ti.usage != NRT_TENSOR_USAGE_INPUT && ehs_sz[i] <= 8) {
@@ -216,6 +222,9 @@ int main(int argc, char** argv) {
             }
         }
         std::memcpy(&results[rank].first_token, host.data(), sizeof(long));
+        nrt_free_model_tensor_info(ehs_info);
+        sync.arrive_and_wait();
+        results[rank].wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tstart).count();
     };
 
     std::vector<std::thread> th;
@@ -225,7 +234,7 @@ int main(int argc, char** argv) {
     double max_load = 0, max_wall = 0;
     for (auto& r : results) { max_load = std::max(max_load, r.load_s); max_wall = std::max(max_wall, r.wall_s); }
     double ms_per_token = max_wall * 1000.0 / tokens;
-    std::printf("{\"tokens\":%ld,\"ranks\":%d,\"load_s\":%.2f,\"wall_s\":%.3f,\"ms_per_token\":%.3f,\"t_per_s\":%.1f,\"last_token\":%ld}\n",
+    std::printf("{\"tokens\":%d,\"ranks\":%d,\"load_s\":%.2f,\"wall_s\":%.3f,\"ms_per_token\":%.3f,\"t_per_s\":%.1f,\"token0\":%ld}\n",
                 tokens, ranks, max_load, max_wall, ms_per_token, 1000.0 / ms_per_token, results[0].first_token);
     return 0;
 }

@@ -84,6 +84,25 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
     sync.arrive_and_wait();
     auto t1 = std::chrono::steady_clock::now();
     for (int i = 0; i < steps; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute", rank);
+    // drain: read one (small) output tensor so the clock stops when the DEVICE finished, not the host submit
+    {
+        size_t best = SIZE_MAX;
+        const nrt_tensor_t* dev = nullptr;
+        size_t best_idx = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const nrt_tensor_info_t& ti = info->tensor_array[i];
+            if (ti.usage != NRT_TENSOR_USAGE_INPUT && ti.size < best) {
+                best = ti.size;
+                dev = tensors[i];
+                best_idx = i;
+            }
+        }
+        if (dev) {
+            std::vector<uint8_t> sink(best ? best : 1);
+            check(nrt_tensor_read(const_cast<nrt_tensor_t*>(dev), sink.data(), 0, best ? best : 1), "drain read", rank);
+        }
+        (void)best_idx;
+    }
     sync.arrive_and_wait();
     result.sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 
