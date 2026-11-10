@@ -70,7 +70,11 @@ std::vector<float> nvfp4_forward(const behemoth::qtip::HostLinear &l, std::span<
 
 std::vector<float> project(const Checkpoint &cp, int layer, const std::string &name,
                            std::span<const float> x, bool round_z) {
-    auto l = behemoth::qtip::load_linear(cp, layer, name);
+    // all-FP8 layers (repacked FP8 checkpoints: weight + per-row weight_scale, no trellis) as well as QTIP / NVFP4 / FP8 K/V
+    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    auto l = cp.has_tensor(base + "weight") && !cp.has_tensor(base + "trellis")
+                 ? behemoth::qtip::load_fp8_linear(cp.tensor(base + "weight"), cp.tensor(base + "weight_scale"), layer, name)
+                 : behemoth::qtip::load_linear(cp, layer, name);
     if (l.is_nvfp4()) // no rotated intermediate: round_z does not apply (runner ignores it too)
         return nvfp4_forward(l, x);
     return behemoth::qtip::reference_forward(l, x, true, round_z);
@@ -112,13 +116,7 @@ int main(int argc, char **argv) {
               << " fp8_kv=" << fp8_kv << '\n';
     const int heads = c.q_heads, kvheads = c.kv_heads, dim = c.dim, group = heads / kvheads;
 
-    std::vector<float> freq(size_t(dim / 2));
-    if (c.rope_llama3) {
-        freq = behemoth::llama3_inv_freq(dim, c.theta, c.rope);
-    } else {
-        for (int d = 0; d < dim / 2; ++d)
-            freq[size_t(d)] = float(std::pow(double(c.theta), -2.0 * d / dim));
-    }
+    const std::vector<float> freq = behemoth::rope_inv_freq(c);
 
     const size_t embed_n = size_t(c.vocab) * size_t(c.hidden);
     auto embed = float_tensor(cp, "model.embed_tokens.weight", embed_n);
@@ -142,8 +140,8 @@ int main(int argc, char **argv) {
         std::vector<float> cos(size_t(dim / 2)), sin(size_t(dim / 2));
         for (int d = 0; d < dim / 2; ++d) {
             const double angle = double(freq[size_t(d)]) * token_index;
-            cos[size_t(d)] = float(std::cos(angle));
-            sin[size_t(d)] = float(std::sin(angle));
+            cos[size_t(d)] = float(c.rope_attention_factor * std::cos(angle));
+            sin[size_t(d)] = float(c.rope_attention_factor * std::sin(angle));
         }
         for (int layer = 0; layer < c.layers; ++layer) {
             const std::string p = "model.layers." + std::to_string(layer) + ".";

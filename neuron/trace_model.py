@@ -17,7 +17,8 @@ The KV tensors are aliased input -> output (updated in place on the device).
 Geometry (hidden, heads, kv heads, head dim, intermediate, vocab) comes from the checkpoint's config.json
 (MODEL=/path/to/checkpoint or CONFIG=/path/config.json; default: Llama 3.1 8B) and TP from the TP env (default 2);
 every meta.json records it and the runtime refuses a bucket directory traced for another geometry or TP.
-Sharding: q/k/v/gate/up column-parallel (heads and kv heads divided over the ranks, so kv_heads % TP == 0),
+Sharding: q/k/v/gate/up column-parallel (heads and kv heads divided over the ranks; with TP > kv_heads each kv head
+is replicated on TP / kv_heads consecutive ranks, which hold its query heads),
 o/down row-parallel with an all-reduce, lm_head by vocabulary rows padded to a multiple of TP.
 
 Inputs (order == ORDER), per rank:
@@ -57,8 +58,12 @@ class Geometry:
     def __init__(self, d, tp):
         self.H, self.HEADS, self.KVHEADS, self.D = d['hidden'], d['heads'], d['kv_heads'], d['head_dim']
         self.FF, self.VOCAB, self.LAYERS, self.TP = d['intermediate'], d['vocab'], d['layers'], tp
-        if self.HEADS % self.KVHEADS or self.HEADS % tp or self.KVHEADS % tp or self.FF % tp or self.D % 2:
-            raise ValueError(f'geometry {d} is not shardable over TP={tp} (heads, kv heads and intermediate must divide; kv_heads < TP would need K/V replication)')
+        # kv heads are divided over the ranks, or (TP > kv_heads) each one replicated on TP / kv_heads consecutive ranks, whose
+        # query heads must then all belong to it
+        kv_split = self.KVHEADS % tp == 0 or (tp % self.KVHEADS == 0 and (self.HEADS // self.KVHEADS) % max(1, self.HEADS // tp) == 0)
+        if self.HEADS % self.KVHEADS or self.HEADS % tp or not kv_split or self.FF % tp or self.D % 2:
+            raise ValueError(f'geometry {d} is not shardable over TP={tp} (heads and intermediate must divide; kv heads must divide TP or be divided by it)')
+        self.KVL = max(1, self.KVHEADS // tp)  # kv heads per rank
         self.VOCAB_PAD = (self.VOCAB + tp - 1) // tp * tp
 
     def meta(self):
@@ -116,12 +121,12 @@ HEAD_FP8_ORDER = ['x', 'rows', 'norm', 'wf', 'ws']
 
 def shapes(R, Q, P, pages):
     H, D, f8 = g.H, g.D, torch.float8_e4m3fn
-    T, q, kv, ff = R * Q, g.HEADS * D // g.TP, g.KVHEADS * D // g.TP, g.FF // g.TP
+    T, q, kv, ff = R * Q, g.HEADS * D // g.TP, g.KVL * D, g.FF // g.TP
     s = {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache': ((pages, 2, g.KVHEADS // g.TP, PAGE, D), torch.float8_e4m3fn if KV8 else torch.bfloat16),
-        'cscale': ((pages, 2, g.KVHEADS // g.TP, PAGE), torch.float32),
+        'cache': ((pages, 2, g.KVL, PAGE, D), torch.float8_e4m3fn if KV8 else torch.bfloat16),
+        'cscale': ((pages, 2, g.KVL, PAGE), torch.float32),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
@@ -316,7 +321,7 @@ def paged_layer(R, Q, P, *args):
     t = dict(zip(order, args))
     groups = [list(range(g.TP))]
     allreduce = lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=groups)
-    D, heads, kvh = g.D, g.HEADS // g.TP, g.KVHEADS // g.TP
+    D, heads, kvh = g.D, g.HEADS // g.TP, g.KVL
     rep, T, half = heads // kvh, R * Q, D // 2
     H, FF = g.H, g.FF
     w = lambda a, b: Fp8Weight(t[a], t[b], WT)
@@ -422,7 +427,7 @@ class FullModel(torch.nn.Module):
     def __init__(self, R, Q, P, L, S, pages, head=True):
         super().__init__()
         self.R, self.Q, self.P, self.L, self.S, self.head = R, Q, P, L, S, head
-        shape = (pages, 2, g.KVHEADS // g.TP, PAGE, g.D)
+        shape = (pages, 2, g.KVL, PAGE, g.D)
         for i in range(L):
             self.register_buffer(f'kv{i}', torch.zeros(shape, dtype=torch.bfloat16))
 

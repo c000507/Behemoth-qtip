@@ -228,7 +228,7 @@ struct NeuronModel::Impl {
         if (decode.empty() || prefill.empty() || ((needs_head(decode) || needs_head(prefill)) && heads.empty()))
             throw std::runtime_error("need decode and prefill NEFF buckets (and head NEFFs for per-layer buckets) in " + options.neff_dir.string());
         vocab_shard = (vocab_ + tp - 1) / tp;
-        kv_local = config.kv_heads / tp;
+        kv_local = std::max(1, config.kv_heads / tp); // tp > kv_heads: one replicated kv head per rank
         // Implicit async execution (launches return before the device finishes; the logits read synchronises): hides the per-layer
         // launch gap, 10 % on single-stream decode and more with wide batches. A value set by the caller wins.
         setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "8", 0);
@@ -241,13 +241,7 @@ struct NeuronModel::Impl {
         embed_file = std::make_unique<SafeTensorFile>(o.model / "model-embed.safetensors");
         embed = embed_file->floats("model.embed_tokens.weight");
         final_norm = embed_file->floats("model.norm.weight");
-        if (config.rope_llama3)
-            inv_freq = llama3_inv_freq(dim, config.theta, config.rope);
-        else {
-            inv_freq.resize(size_t(dim / 2));
-            for (int d = 0; d < dim / 2; ++d)
-                inv_freq[size_t(d)] = float(std::pow(double(config.theta), -2.0 * d / dim));
-        }
+        inv_freq = rope_inv_freq(config);
         load_buckets();
         load_weights();
     }
@@ -630,7 +624,7 @@ struct NeuronModel::Impl {
         uint32_t n = 0;
         f.read(magic, 8);
         f.read(reinterpret_cast<char *>(&n), 4);
-        if (!f || std::string(magic, 8) != "BSHD0001" || n > 64)
+        if (!f || std::string(magic, 8) != "BSHD0001" || n > 16 * 64) // 16 entries per rank, up to 64 ranks
             throw std::runtime_error("bad prepared shard file " + path.string());
         std::vector<PreparedEntry> entries(n);
         f.read(reinterpret_cast<char *>(entries.data()), std::streamsize(n * sizeof(PreparedEntry)));
@@ -798,7 +792,7 @@ struct NeuronModel::Impl {
             const double budget = (options.hbm_gib - options.hbm_reserve_gib) * double(1 << 30);
             double used = double(vocab_shard) * double(hidden) * (head_fp8 ? 1.0 : 2.0) + double(vocab_shard) * 4;
             for (int layer = 0; layer < config.layers; ++layer) {
-                used += double(kv_bytes()) + 2.0 * hidden * 4 + 2.0 * (size_t(config.kv_heads / tp) * size_t(dim) * size_t(hidden) + size_t(config.kv_heads / tp) * size_t(dim) * 4);
+                used += double(kv_bytes()) + 2.0 * hidden * 4 + 2.0 * (size_t(kv_local) * size_t(dim) * size_t(hidden) + size_t(kv_local) * size_t(dim) * 4);
                 used += compressible[size_t(layer)] ? double(packed_bytes[size_t(layer)]) : double(expanded_bytes[size_t(layer)]);
             }
             for (int layer = 0; layer < config.layers; ++layer) {
@@ -1124,11 +1118,12 @@ struct NeuronModel::Impl {
             in.read(reinterpret_cast<char *>(out), std::streamsize(size_t(hidden) * 4));
         }
     }
-    void rope_row(int position, float *out) const { // [cos x dim/2, sin x dim/2] from fp64 angles, any position
+    void rope_row(int position, float *out) const { // [cos x dim/2, sin x dim/2] from fp64 angles, any position (YaRN: x mscale)
+        const double m = config.rope_attention_factor;
         for (int d = 0; d < dim / 2; ++d) {
             const double angle = double(position) * double(inv_freq[size_t(d)]);
-            out[d] = float(std::cos(angle));
-            out[dim / 2 + d] = float(std::sin(angle));
+            out[d] = float(m * std::cos(angle));
+            out[dim / 2 + d] = float(m * std::sin(angle));
         }
     }
 
