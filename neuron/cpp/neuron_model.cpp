@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -241,6 +242,11 @@ struct NeuronModel::Impl {
     ModelConfig config;
     std::unique_ptr<SafeTensorFile> embed_file;
     FloatTensorView embed, final_norm;
+    // BEHEMOTH_NEURON_EMBED_RESIDENT=1: the embedding table copied into anonymous memory at load (bf16 codes, 1.3 GB for a 131k x 5120
+    // vocabulary). Default off: embed_row reads the mmap'd safetensors file, and every first touch of a 4 KB page of it is a disk read
+    // (~50-150 ms per 256-token prefill chunk of fresh tokens on the test box; docs/neuron-nki-fusion.md section 3).
+    std::vector<uint16_t> embed_resident_bf16;
+    std::vector<float> embed_resident_f32;
     std::vector<float> inv_freq;
     int tp = 0, hidden = 0, dim = 0;                           // from the NEFF geometry (checked against config.json)
     int vocab_ = 0, vocab_shard = 0, pages_total = 0, kv_local = 0; // vocab_shard: lm_head rows per rank (vocab padded to TP)
@@ -288,6 +294,18 @@ struct NeuronModel::Impl {
         embed_file = std::make_unique<SafeTensorFile>(o.model / "model-embed.safetensors");
         embed = embed_file->floats("model.embed_tokens.weight");
         final_norm = embed_file->floats("model.norm.weight");
+        if (const char *res = std::getenv("BEHEMOTH_NEURON_EMBED_RESIDENT"); res && std::string(res) == "1") {
+            const auto t_e = Clock::now();
+            if (embed.format == FloatTensorView::Format::bf16) {
+                embed_resident_bf16.resize(embed.size());
+                std::memcpy(embed_resident_bf16.data(), embed.data.data(), embed.size() * 2);
+            } else {
+                embed_resident_f32.resize(embed.size());
+                for (size_t i = 0; i < embed.size(); ++i) embed_resident_f32[i] = embed[i];
+            }
+            std::cerr << "embedding table resident in host memory (" << embed.size() * (embed_resident_bf16.empty() ? 4 : 2) / 1e9 << " GB, "
+                      << ms_since(t_e) / 1e3 << " s)\n";
+        }
         inv_freq = rope_inv_freq(config);
         load_buckets();
         load_weights();
@@ -1185,8 +1203,17 @@ struct NeuronModel::Impl {
     void embed_row(int token, float *out) const {
         if (token < 0 || token >= vocab_)
             throw std::runtime_error("token outside the vocabulary");
-        for (size_t i = 0; i < size_t(hidden); ++i)
-            out[i] = embed[size_t(token) * size_t(hidden) + i];
+        const size_t base = size_t(token) * size_t(hidden);
+        if (!embed_resident_bf16.empty()) {
+            const uint16_t *row = embed_resident_bf16.data() + base;
+            for (size_t i = 0; i < size_t(hidden); ++i)
+                out[i] = std::bit_cast<float>(uint32_t(row[i]) << 16);
+        } else if (!embed_resident_f32.empty()) {
+            std::memcpy(out, embed_resident_f32.data() + base, size_t(hidden) * 4);
+        } else {
+            for (size_t i = 0; i < size_t(hidden); ++i)
+                out[i] = embed[base + i];
+        }
         if (const char *file = std::getenv("NEURON_X_IN")) { // debugging: replace the embedding row by f32 [hidden] from this file
             std::ifstream in(file, std::ios::binary);
             in.read(reinterpret_cast<char *>(out), std::streamsize(size_t(hidden) * 4));
