@@ -89,13 +89,14 @@ int main(int argc, char** argv) {
     std::string mailbox = "s3://912935854432-neuron-build/mailbox";
     std::string graph, outdir = ".";
     std::vector<std::string> inputs;
-    long iters = 100;
+    long iters = 100, timeout = 240;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--iters" && i + 1 < argc) iters = std::strtol(argv[++i], nullptr, 10);
         else if (a == "--out" && i + 1 < argc) outdir = argv[++i];
         else if (a == "--mailbox" && i + 1 < argc) mailbox = argv[++i];
+        else if (a == "--timeout" && i + 1 < argc) timeout = std::strtol(argv[++i], nullptr, 10);
         else pos.push_back(a);
     }
     if (pos.size() < 1 || pos[0] != "run" || pos.size() < 2) {
@@ -139,7 +140,7 @@ int main(int argc, char** argv) {
     fs::remove(req);
 
     fs::path resp = fs::path("/tmp/neuronctl") / (ids + ".resp");
-    for (int poll = 0; poll < 600; ++poll) {   // up to 10 min
+    for (int poll = 0; poll < timeout; ++poll) {   // fail fast
         if (sh("/snap/bin/aws s3 cp \"" + mailbox + "/done/" + ids + ".resp\" \"" + resp.string() + "\" >/dev/null 2>&1") == 0) {
             break;
         }
