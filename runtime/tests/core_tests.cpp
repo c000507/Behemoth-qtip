@@ -244,6 +244,21 @@ static void scheduler_policy_tests() {
         return n;
     };
     {
+        // Admission: submit() past max_queued throws CapacityError; an erased request frees its slot.
+        SchedulerPolicy p;
+        p.max_queued = 3;
+        Scheduler s(1024, 512, 512, p);
+        auto a = s.submit(std::vector<int>(3, 1), 10);
+        s.submit(std::vector<int>(3, 1), 10);
+        s.submit(std::vector<int>(3, 1), 10);
+        bool full = false;
+        try { s.submit(std::vector<int>(3, 1), 10); } catch (const CapacityError &) { full = true; }
+        CHECK(full);
+        s.cancel(a);
+        s.erase(a);
+        s.submit(std::vector<int>(3, 1), 10);
+    }
+    {
         // Cap: 2 decodes + a 1000-token prompt with budget 512 / chunk 512 / mixed cap 64.
         SchedulerPolicy p;
         p.mixed_prefill_tokens = 64;
@@ -970,6 +985,58 @@ static void fp8_checkpoint_tests() {
     tensor("weights.safetensors", base + "weight", "F8_E4M3", {1024, 12288}, raw.data(), raw.size());
     rejects([&] { Checkpoint checkpoint(root); (void)qtip::load_linear(checkpoint, 0, "self_attn.k_proj"); });
 }
+static void yarn_tests() {
+    // Devstral 2 123B (ministral3) rope_parameters, as the repack writes them into config.json rope_scaling; the
+    // reference is transformers 5.17 ROPE_INIT_FUNCTIONS["yarn"] on that model's config (float32 inv_freq).
+    namespace fs = std::filesystem;
+    using json = nlohmann::json;
+    static const double hf[64] = {
+        1, 0.805842221, 0.649381638, 0.523299158, 0.421696514, 0.339820832, 0.273841977, 0.220673397, 0.177827939,
+        0.143301263, 0.115478203, 0.0930572003, 0.0749894157, 0.0604296438, 0.0486967526, 0.0392418988, 0.0316227786,
+        0.0254829675, 0.0205352511, 0.0165481716, 0.0133352149, 0.0107460786, 0.00865964312, 0.00697830599,
+        0.00493146945, 0.00341638923, 0.00230373535, 0.00149435364, 0.000912423129, 0.000500132213, 0.000213544496,
+        1.9389654e-05, 1.56250007e-05, 1.25912848e-05, 1.01465885e-05, 8.17654836e-06, 6.58900763e-06,
+        5.30970055e-06, 4.27878058e-06, 3.4480222e-06, 2.77856157e-06, 2.23908228e-06, 1.80434677e-06,
+        1.45401884e-06, 1.17170975e-06, 9.4421307e-07, 7.60886792e-07, 6.13154668e-07, 4.94105848e-07,
+        3.98171352e-07, 3.20863279e-07, 2.58565166e-07, 2.08362721e-07, 1.67907473e-07, 1.35306934e-07,
+        1.09036037e-07, 8.78658355e-08, 7.08059957e-08, 5.70584575e-08, 4.59801122e-08, 3.70527147e-08, 2.985864e-08,
+        2.4061352e-08, 1.93896526e-08};
+    const auto root = fs::temp_directory_path() / ("behemoth-yarn-" + std::to_string(getpid()));
+    fs::create_directory(root);
+    struct Cleanup { fs::path path; ~Cleanup() { fs::remove_all(path); } } cleanup{root};
+    json config = {{"hidden_size", 12288}, {"intermediate_size", 28672}, {"num_hidden_layers", 88},
+        {"num_attention_heads", 96}, {"num_key_value_heads", 8}, {"head_dim", 128}, {"vocab_size", 131072},
+        {"model_type", "llama"}, {"hidden_act", "silu"}, {"tie_word_embeddings", false},
+        {"max_position_embeddings", 262144}, {"rms_norm_eps", 1e-5f}, {"rope_theta", 1000000.f},
+        {"rope_scaling", {{"beta_fast", 4.0}, {"beta_slow", 1.0}, {"factor", 64.0}, {"mscale", 1.0}, {"mscale_all_dim", 0.0},
+                          {"original_max_position_embeddings", 4096}, {"llama_4_scaling_beta", 0.0}, {"rope_type", "yarn"}}},
+        {"quip_params", {{"codebook", "bitshift"}, {"L", 16}, {"K", 2}, {"V", 2}, {"tlut_bits", 9},
+                         {"decode_mode", "quantlut_sym"}, {"td_x", 16}, {"td_y", 16}}},
+        {"qtip_quant", {{"kv_format", "fp8"}, {"layer_formats", json(std::vector<std::string>(88, "fp8"))}}}};
+    auto read = [&] {
+        std::ofstream(root / "config.json") << config;
+        return ModelConfig::read(root / "config.json");
+    };
+    const ModelConfig c = read();
+    CHECK(c.rope_yarn && !c.rope_llama3);
+    CHECK(std::abs(c.rope_attention_factor - (0.1 * std::log(64.0) + 1)) < 1e-12);
+    const auto inv = rope_inv_freq(c);
+    CHECK(inv.size() == 64);
+    for (size_t d = 0; d < 64; ++d)
+        CHECK(std::abs(double(inv[d]) - hf[d]) <= 2e-7 * hf[d]);
+    // mscale and mscale_all_dim both set: their ratio (DeepSeek form)
+    config["rope_scaling"]["mscale_all_dim"] = 0.5;
+    CHECK(std::abs(read().rope_attention_factor - (0.1 * std::log(64.0) + 1) / (0.05 * std::log(64.0) + 1)) < 1e-12);
+    config["rope_scaling"]["mscale_all_dim"] = 0.0;
+    config.erase("rope_scaling");
+    const ModelConfig plain = read();
+    CHECK(!plain.rope_yarn && plain.rope_attention_factor == 1);
+    CHECK(std::abs(double(rope_inv_freq(plain)[1]) - std::pow(1e6, -2.0 / 128)) < 1e-7);
+    config["rope_scaling"] = {{"rope_type", "yarn"}, {"factor", 64.0}, {"llama_4_scaling_beta", 0.1}};
+    rejects([&] { (void)read(); });
+    config["rope_scaling"] = {{"rope_type", "dynamic"}, {"factor", 2.0}};
+    rejects([&] { (void)read(); });
+}
 int main() {
     try {
         // The exact-draw comparison against the reference sampler needs the sorted path; the
@@ -999,7 +1066,8 @@ int main() {
                   {"sampler_equivalence", sampler_equivalence_tests},
                   {"tuning", tuning_tests},
                  {"checkpoint", checkpoint_tests},
-                 {"fp8_checkpoint", fp8_checkpoint_tests}}) {
+                 {"fp8_checkpoint", fp8_checkpoint_tests},
+                 {"yarn", yarn_tests}}) {
             fn();
             std::cout << "PASS " << name << '\n';
         }

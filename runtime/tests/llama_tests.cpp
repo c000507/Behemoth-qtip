@@ -617,7 +617,7 @@ void rejection_test(const fs::path &root) {
         throw std::runtime_error(std::string("config must be rejected: ") + what);
     };
     (void)ModelConfig::read(root / "config.json");
-    rejected("yarn rope", [](json &c) { c["rope_scaling"] = {{"rope_type", "yarn"}, {"factor", 4.0}}; });
+    rejected("dynamic rope", [](json &c) { c["rope_scaling"] = {{"rope_type", "dynamic"}, {"factor", 4.0}}; });
     rejected("hidden 8200 (no Hadamard factor)", [](json &c) { c["hidden_size"] = 8200; });
     rejected("hidden not multiple of 32", [](json &c) { c["hidden_size"] = 100; });
     rejected("pow2 part > 8192", [](json &c) { c["intermediate_size"] = 28 * 16384; });

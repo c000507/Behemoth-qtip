@@ -6,7 +6,7 @@ Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy pol
     : pool_(pages), token_budget_(budget), chunk_(chunk), policy_(policy), vocab_(vocab) {
     if (!budget || !chunk || chunk > budget)
         throw std::invalid_argument("Invalid scheduler token budget/chunk");
-    if (!policy_.prefill_interval || !policy_.max_requests)
+    if (!policy_.prefill_interval || !policy_.max_requests || !policy_.max_queued)
         throw std::invalid_argument("Invalid scheduler policy");
 }
 uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, SamplingOptions sampling) {
@@ -16,6 +16,8 @@ uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, Sampling
     for (int t : prompt)
         if (t < 0 || t >= vocab_)
             throw std::invalid_argument("Token outside vocabulary");
+    if (requests_.size() >= policy_.max_queued)
+        throw CapacityError("Server at capacity (" + std::to_string(policy_.max_queued) + " requests); retry later");
     Request r;
     r.id = next_id_++;
     r.history.assign(prompt.begin(), prompt.end());

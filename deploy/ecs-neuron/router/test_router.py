@@ -8,7 +8,23 @@ import unittest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from router import Config, make_app
+from router import Config, key_hash, make_app
+
+
+class FakeDynamo:
+    """The router's one DynamoDB call: get_item on the key table."""
+
+    def __init__(self, keys: dict[str, tuple[str, str, bool]] | None = None, fail=False):
+        self.items = {key_hash(k): {"key_hash": {"S": key_hash(k)}, "email": {"S": e}, "name": {"S": n},
+                                    "enabled": {"BOOL": on}} for k, (e, n, on) in (keys or {}).items()}
+        self.gets, self.fail = 0, fail
+
+    def get_item(self, TableName, Key, ConsistentRead=False):
+        self.gets += 1
+        if self.fail:
+            raise RuntimeError("dynamodb down")
+        item = self.items.get(Key["key_hash"]["S"])
+        return {"Item": item} if item else {}
 
 
 class FakeECS:
@@ -128,12 +144,13 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         await self.backend.close()
 
     async def start(self, ecs, asg=None, **kw):
-        kw.setdefault("cold_nonstream_mode", "wait")  # most tests check scaling state right after the response
+        kw.setdefault("cold_nonstream_mode", "wait")
+        kw.setdefault("allow_anonymous", True)  # most tests check scaling state right after the response
         cfg = Config(backend_port=self.backend.port, poll_interval_s=0.02, keepalive_interval_s=0.02,
                      max_wait_s=kw.pop("max_wait_s", 5), idle_timeout_s=kw.pop("idle_timeout_s", 60),
                      health_ttl_s=kw.pop("health_ttl_s", 10), **kw)
         self.ecs = ecs
-        self.client = TestClient(TestServer(make_app(cfg, ecs, asg=asg)))
+        self.client = TestClient(TestServer(make_app(cfg, ecs, asg=asg, dynamodb=getattr(self, "dynamo", None))))
         await self.client.start_server()
         return self.client
 
@@ -341,11 +358,84 @@ class RouterTest(unittest.IsolatedAsyncioTestCase):
         r = await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer k"})
         self.assertEqual(r.status, 200)
 
+    async def test_dynamo_keys(self):
+        self.dynamo = FakeDynamo({"good": ("ada@example.com", "Ada", True), "old": ("bob@example.com", "Bob", False)})
+        c = await self.start(FakeECS(), allow_anonymous=False, api_keys_table="keys")
+        with self.assertLogs("router", "INFO") as logs:
+            r = await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer good"})
+        self.assertEqual(r.status, 200)
+        self.assertTrue(any("Ada <ada@example.com>" in m for m in logs.output))
+        for auth in ["Bearer old", "Bearer nope", "Basic good", ""]:
+            r = await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": auth})
+            self.assertEqual(r.status, 401, auth)
+        self.assertEqual(self.ecs.updates, [1])  # only the approved request woke the backend
+        gets = self.dynamo.gets
+        for _ in range(3):  # cached: no further lookups for known keys, approved or not
+            await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer good"})
+            await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer nope"})
+        self.assertEqual(self.dynamo.gets, gets)
+
+    async def test_dynamo_down_fails_closed(self):
+        self.dynamo = FakeDynamo(fail=True)
+        c = await self.start(FakeECS(), allow_anonymous=False, api_keys_table="keys")
+        r = await c.post("/v1/chat/completions", json={"messages": []}, headers={"Authorization": "Bearer x"})
+        self.assertEqual(r.status, 401)
+        self.assertEqual(self.ecs.updates, [])
+
+    async def test_key_cache_expiry_revokes(self):
+        self.dynamo = FakeDynamo({"k": ("a@example.com", "A", True)})
+        c = await self.start(FakeECS(), allow_anonymous=False, api_keys_table="keys", key_cache_s=0.05)
+        h = {"Authorization": "Bearer k"}
+        self.assertEqual((await c.post("/v1/chat/completions", json={"messages": []}, headers=h)).status, 200)
+        self.dynamo.items[key_hash("k")]["enabled"] = {"BOOL": False}
+        await asyncio.sleep(0.1)
+        self.assertEqual((await c.post("/v1/chat/completions", json={"messages": []}, headers=h)).status, 401)
+
+    async def test_models_need_key(self):
+        self.dynamo = FakeDynamo({"good": ("ada@example.com", "Ada", True)})
+        c = await self.start(FakeECS(), allow_anonymous=False, api_keys_table="keys")
+        self.assertEqual((await c.get("/v1/models")).status, 401)
+        self.assertEqual((await c.get("/v1/models", headers={"Authorization": "Bearer bad"})).status, 401)
+        r = await c.get("/v1/models", headers={"Authorization": "Bearer good"})
+        self.assertEqual(r.status, 200)
+        self.assertEqual([m["id"] for m in (await r.json())["data"]], ["cydonia-24b"])
+        self.assertEqual((await c.get("/health")).status, 200)  # the ECS health check stays open
+        self.assertEqual(self.ecs.calls, [])
+
+    async def test_no_key_fails_closed(self):
+        c = await self.start(FakeECS(), allow_anonymous=False)
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(r.status, 401)
+        self.assertEqual(self.ecs.updates, [])
+        with self.assertRaises(SystemExit):
+            Config().check()
+        Config(api_key="k").check()
+        Config(allow_anonymous=True).check()
+        Config(api_keys_table="t").check()
+
+    async def test_invalid_requests_do_not_wake(self):
+        c = await self.start(FakeECS(), cold_nonstream_mode="reject", max_body_bytes=1024)
+        for body, status in [(b"not-json", 400), (b"[1]", 400), (b'{"model": "other"}', 404),
+                             (b'{"model": 5}', 404), (b'{"stream": "yes"}', 400),
+                             (b'{"messages": "' + b"x" * 2048 + b'"}', 413)]:
+            r = await c.post("/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+            self.assertEqual(r.status, status, body[:40])
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.ecs.updates, [])
+
+    async def test_inflight_limit(self):
+        c = await self.start(FakeECS(), max_inflight=0)
+        r = await c.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(r.status, 429)
+        self.assertEqual(self.ecs.updates, [])
+
     def test_config_from_env(self):
         c = Config.from_env({"MODEL_IDS": "a, b", "IDLE_TIMEOUT_S": "60", "PROXY_PATHS": "/v1/chat/completions,/v1/completions"})
         self.assertEqual(c.model_ids, ["a", "b"])
         self.assertEqual(c.idle_timeout_s, 60)
         self.assertEqual(c.proxy_paths, ["/v1/chat/completions", "/v1/completions"])
+        self.assertFalse(c.allow_anonymous)
+        self.assertTrue(Config.from_env({"ALLOW_ANONYMOUS": "true"}).allow_anonymous)
 
 
 if __name__ == "__main__":

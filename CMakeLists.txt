@@ -75,6 +75,8 @@ target_compile_options(qtip_reference_logits PRIVATE -O3 -march=${QTIP_CPU_ARCH}
 
 add_executable(qtip_tests_cpu tests/test_cpu.cpp)
 target_link_libraries(qtip_tests_cpu PRIVATE qtip_core)
+add_executable(qtip_safetensors_tests tests/test_safetensors.cpp)
+target_link_libraries(qtip_safetensors_tests PRIVATE qtip_core)
 add_executable(qtip_fp8kv_tests tests/test_fp8kv.cpp)
 target_link_libraries(qtip_fp8kv_tests PRIVATE qtip_core)
 add_executable(qtip_tests_gpu tests/test_gpu.cpp)

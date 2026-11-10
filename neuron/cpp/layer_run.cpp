@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
     char filename[64];
     std::snprintf(filename, sizeof filename, "model-layer-%05d.safetensors", layer);
     SafeTensorFile file(root / filename);
-    const int hidden = config.hidden, dim = config.dim, kvheads = config.kv_heads / TP;
+    const int hidden = config.hidden, dim = config.dim, kvheads = std::max(1, config.kv_heads / TP);
 
     auto t0 = std::chrono::steady_clock::now();
     struct P { const char *key, *name; bool col; };
@@ -80,14 +80,13 @@ int main(int argc, char **argv) {
     for (int i = 0; i < hidden; ++i) { xb[size_t(i)] = BFloat16(.5f * std::sin(float(i) * .071f)); x[size_t(i)] = float(xb[size_t(i)]); }
 
     const int half = dim / 2;
-    std::vector<float> inv(static_cast<size_t>(half));
-    if (config.rope_llama3) inv = llama3_inv_freq(dim, config.theta, config.rope);
-    else for (int d = 0; d < half; ++d) inv[size_t(d)] = float(std::pow(double(config.theta), -2.0 * d / dim));
+    const std::vector<float> inv = rope_inv_freq(config);
+    const float m = float(config.rope_attention_factor);
     std::vector<float> cos_sin(static_cast<size_t>(CONTEXT) * 2 * size_t(half));
     for (int p = 0; p < CONTEXT; ++p)
         for (int d = 0; d < half; ++d) {
-            cos_sin[(size_t(p) * 2 + 0) * size_t(half) + size_t(d)] = std::cos(float(p) * inv[size_t(d)]);
-            cos_sin[(size_t(p) * 2 + 1) * size_t(half) + size_t(d)] = std::sin(float(p) * inv[size_t(d)]);
+            cos_sin[(size_t(p) * 2 + 0) * size_t(half) + size_t(d)] = m * std::cos(float(p) * inv[size_t(d)]);
+            cos_sin[(size_t(p) * 2 + 1) * size_t(half) + size_t(d)] = m * std::sin(float(p) * inv[size_t(d)]);
         }
     std::vector<float> mask(static_cast<size_t>(CONTEXT), -1e9f);
     mask[0] = 0;

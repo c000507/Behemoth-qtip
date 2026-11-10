@@ -32,10 +32,15 @@ enable_cloudflared                 = true
 cloudflare_tunnel_token_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/cloudflared-token-XXXXXX"
 # or an SSM SecureString: "arn:aws:ssm:us-east-1:912935854432:parameter/behemoth/cloudflared-token"
 
-enable_alb = false
+# Caller authentication: approved keys live in the <name>-api-keys DynamoDB table (router/api_keys.py add / list /
+# revoke). Optionally one extra key from a secret:
+# router_api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:912935854432:secret:behemoth/router-key-XXXXXX"
+# Only when the ingress authenticates callers itself (Cloudflare Access, an authenticating gateway), no key at all:
+# router_allow_anonymous = true
+
+enable_alb = false # with the ALB, alb_certificate_arn is required: inference is served over HTTPS only
 # alb_subnet_ids      = ["subnet-a", "subnet-b"]
 # alb_certificate_arn = "arn:aws:acm:us-east-1:912935854432:certificate/..."
-# router_api_key_secret_arn = "arn:aws:secretsmanager:...:secret:behemoth/router-key-XXXXXX"
 
 # Streamed load (entrypoint STREAM_LOAD=1, default): layer files download while the server loads. Optional RAM staging:
 # backend_shm_size_mib = 6144

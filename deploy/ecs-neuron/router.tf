@@ -4,7 +4,7 @@ resource "aws_cloudwatch_log_group" "router" {
 }
 
 locals {
-  router_image = "${aws_ecr_repository.router.repository_url}:${var.router_image_tag}"
+  router_image = "${aws_ecr_repository.router.repository_url}:${var.router_image_tag}${var.router_image_digest != "" ? "@${var.router_image_digest}" : ""}"
 
   router_env = {
     AWS_REGION          = var.region
@@ -19,6 +19,8 @@ locals {
     IDLE_TIMEOUT_S      = tostring(var.idle_timeout_seconds)
     MAX_WAIT_S          = tostring(var.max_wait_seconds)
     COLD_NONSTREAM_MODE = var.cold_nonstream_mode
+    ALLOW_ANONYMOUS     = tostring(var.router_allow_anonymous)
+    API_KEYS_TABLE      = aws_dynamodb_table.api_keys.name
   }
 
   log_options = {
@@ -97,6 +99,7 @@ resource "aws_ecs_service" "router" {
     assign_public_ip = var.router_assign_public_ip
   }
 
+
   # single router: its in-memory state (in-flight count, idle timer) must not be split across replicas
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
@@ -159,6 +162,10 @@ resource "aws_lb" "router" {
       condition     = length(var.alb_subnet_ids) >= 2
       error_message = "enable_alb requires alb_subnet_ids in at least two AZs."
     }
+    precondition {
+      condition     = var.alb_certificate_arn != ""
+      error_message = "enable_alb requires alb_certificate_arn: inference (prompts, bearer keys) is served over HTTPS only."
+    }
   }
 }
 
@@ -183,28 +190,19 @@ resource "aws_lb_listener" "router_http" {
   port              = 80
   protocol          = "HTTP"
 
-  dynamic "default_action" {
-    for_each = var.alb_certificate_arn == "" ? [1] : []
-    content {
-      type             = "forward"
-      target_group_arn = aws_lb_target_group.router[0].arn
-    }
-  }
-  dynamic "default_action" {
-    for_each = var.alb_certificate_arn != "" ? [1] : []
-    content {
-      type = "redirect"
-      redirect {
-        port        = "443"
-        protocol    = "HTTPS"
-        status_code = "HTTP_301"
-      }
+  # never forwards: plain HTTP only redirects (a key already sent over it should be treated as exposed)
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
     }
   }
 }
 
 resource "aws_lb_listener" "router_https" {
-  count             = var.enable_alb && var.alb_certificate_arn != "" ? 1 : 0
+  count             = var.enable_alb ? 1 : 0
   load_balancer_arn = aws_lb.router[0].arn
   port              = 443
   protocol          = "HTTPS"

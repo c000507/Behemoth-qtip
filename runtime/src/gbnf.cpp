@@ -58,6 +58,9 @@ struct Parser {
     // state is per rule, so unbounded counts are a memory DoS (`"x"{1,5e7}`).
     static constexpr int kMaxRepeat = 4096;
     static constexpr size_t kMaxRules = 1 << 17;
+    // Parsing a "( ... )" group recurses, so nesting is bounded before the
+    // descent: 50k '(' in a 100 KB grammar would overflow the stack.
+    static constexpr int kMaxGroupDepth = 256;
 
     const std::string& src;
     size_t pos = 0;
@@ -267,6 +270,8 @@ void Parser::ParseSequence(const std::string& rule_name, std::vector<Elem>& out)
         } else if (c == '(') {
             ++pos;
             SkipSpace(true);
+            if (group_depth >= kMaxGroupDepth)
+                Fail("groups nested deeper than " + std::to_string(kMaxGroupDepth));
             uint32_t id = GenSymbolId(rule_name);
             ++group_depth;
             ParseAlternates(rule_name, id);

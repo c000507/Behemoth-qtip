@@ -11,6 +11,10 @@ locals {
     "arn:${local.partition}:ecr:${var.region}:${local.acct}:repository/${local.router_repo}",
   ]
 
+  # the stack's own roles (deploy/ecs-neuron/iam.tf): the only roles the apply build may pass, all under the boundary
+  stack_role_arns = [for r in ["ecs-instance", "ecs-execution", "backend-task", "router-task"] :
+  "arn:${local.partition}:iam::${local.acct}:role/${local.p}-${r}"]
+
   state_bucket_arn    = aws_s3_bucket.this["state"].arn
   artifact_bucket_arn = aws_s3_bucket.this["artifacts"].arn
 
@@ -258,14 +262,44 @@ data "aws_iam_policy_document" "apply_scoped" {
       values   = [var.region]
     }
   }
+  # Roles the apply build creates or edits always carry the workload boundary (below), so no inline policy it writes
+  # can grant more than the boundary does: the build cannot mint an administrator role and run a workload as it.
+  statement {
+    sid = "IamStackRolesBounded"
+    actions = [
+      "iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:DetachRolePolicy",
+      "iam:PutRolePermissionsBoundary",
+    ]
+    resources = ["arn:${local.partition}:iam::${local.acct}:role/${local.p}-*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.workload_boundary.arn]
+    }
+  }
   statement {
     sid = "IamStackRoles"
     actions = [
-      "iam:CreateRole", "iam:DeleteRole", "iam:UpdateRole", "iam:UpdateRoleDescription", "iam:UpdateAssumeRolePolicy",
-      "iam:TagRole", "iam:UntagRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:DetachRolePolicy",
-      "iam:PassRole", # task/execution roles to ECS, the instance role to EC2 / its instance profile
+      "iam:DeleteRole", "iam:UpdateRole", "iam:UpdateRoleDescription", "iam:UpdateAssumeRolePolicy",
+      "iam:TagRole", "iam:UntagRole",
     ]
     resources = ["arn:${local.partition}:iam::${local.acct}:role/${local.p}-*"]
+  }
+  statement {
+    sid       = "PassStackRoles" # task/execution roles to ECS, the instance role to EC2 / its instance profile
+    actions   = ["iam:PassRole"]
+    resources = local.stack_role_arns
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com", "ec2.amazonaws.com"]
+    }
+  }
+  statement {
+    sid       = "KeepBoundaries"
+    effect    = "Deny"
+    actions   = ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"]
+    resources = ["*"]
   }
   # the pipeline's own roles also match <name>-*: never let the apply build edit them (or itself)
   statement {
@@ -278,6 +312,11 @@ data "aws_iam_policy_document" "apply_scoped" {
     sid       = "IamAttachKnownManagedPolicies"
     actions   = ["iam:AttachRolePolicy"]
     resources = ["arn:${local.partition}:iam::${local.acct}:role/${local.p}-*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.workload_boundary.arn]
+    }
     condition {
       test     = "ArnEquals"
       variable = "iam:PolicyARN"
@@ -328,6 +367,14 @@ data "aws_iam_policy_document" "apply_scoped" {
     resources = ["arn:${local.partition}:ecr:${var.region}:${local.acct}:repository/${local.router_repo}"]
   }
   statement {
+    sid = "ApiKeysTable"
+    actions = [
+      "dynamodb:CreateTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable", "dynamodb:UpdateContinuousBackups",
+      "dynamodb:TagResource", "dynamodb:UntagResource", "dynamodb:UpdateTimeToLive",
+    ]
+    resources = ["arn:${local.partition}:dynamodb:${var.region}:${local.acct}:table/${local.p}-*"]
+  }
+  statement {
     sid = "StackLogGroups"
     actions = [
       "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
@@ -338,6 +385,83 @@ data "aws_iam_policy_document" "apply_scoped" {
       "arn:${local.partition}:logs:${var.region}:${local.acct}:log-group:/ecs/${local.p}/*:*",
     ]
   }
+}
+
+# ------------------------------------------------------------------ workload boundary for the stack's roles
+# The most any role the stack manages may do: what the trn host (ECS agent, SSM), the task execution role (image pull,
+# logs, secrets) and the backend / router tasks need. No IAM, no STS, no instance launches, reads only from the model
+# bucket and the stack's secrets.
+data "aws_iam_policy_document" "workload_boundary" {
+  statement {
+    sid       = "Ecs"
+    actions   = ["ecs:*"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+  statement {
+    sid = "ImagesAndLogs"
+    actions = [
+      "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+      "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    sid = "HostAgents" # AmazonEC2ContainerServiceforEC2Role / AmazonSSMManagedInstanceCore
+    actions = [
+      "ec2:DescribeTags", "ec2:DescribeInstances", "ec2messages:*", "ssmmessages:*",
+      "ssm:DescribeAssociation", "ssm:GetDeployablePatchSnapshotForInstance", "ssm:GetDocument", "ssm:DescribeDocument",
+      "ssm:GetManifest", "ssm:ListAssociations", "ssm:ListInstanceAssociations", "ssm:PutInventory",
+      "ssm:PutComplianceItems", "ssm:PutConfigurePackageResult", "ssm:UpdateAssociationStatus",
+      "ssm:UpdateInstanceAssociationStatus", "ssm:UpdateInstanceInformation",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    sid = "BackendAsg" # the router scales the backend ASG directly
+    actions = [
+      "autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    sid       = "ApiKeys" # the router reads approved keys
+    actions   = ["dynamodb:GetItem"]
+    resources = ["arn:${local.partition}:dynamodb:${var.region}:${local.acct}:table/${local.p}-*"]
+  }
+  statement {
+    sid       = "ModelBucket"
+    actions   = ["s3:ListBucket", "s3:GetObject"]
+    resources = ["arn:${local.partition}:s3:::${local.models_bucket}", "arn:${local.partition}:s3:::${local.models_bucket}/*"]
+  }
+  statement {
+    sid     = "StackSecrets" # the tunnel token / router key, named <name>/... or <name>-...
+    actions = ["secretsmanager:GetSecretValue", "ssm:GetParameters", "ssm:GetParameter"]
+    resources = [
+      "arn:${local.partition}:secretsmanager:${var.region}:${local.acct}:secret:${local.p}/*",
+      "arn:${local.partition}:secretsmanager:${var.region}:${local.acct}:secret:${local.p}-*",
+      "arn:${local.partition}:ssm:${var.region}:${local.acct}:parameter/${local.p}/*",
+    ]
+  }
+  statement {
+    sid       = "DecryptViaServices"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.${var.region}.amazonaws.com", "ssm.${var.region}.amazonaws.com", "s3.${var.region}.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "workload_boundary" {
+  name   = "${var.name}-workload-boundary"
+  policy = data.aws_iam_policy_document.workload_boundary.json
 }
 
 resource "aws_iam_role_policy" "apply_scoped" {

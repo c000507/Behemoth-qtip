@@ -90,6 +90,38 @@ std::vector<float> llama3_inv_freq(int dim, double theta, const RopeScalingLlama
     }
     return out;
 }
+std::vector<float> yarn_inv_freq(int dim, double theta, const RopeScalingYarn &r) {
+    // HF transformers _compute_yarn_parameters: dims rotating fewer than beta_slow times over the original context are
+    // interpolated (freq / factor), more than beta_fast times extrapolated (freq), with a linear ramp in between.
+    const double original = double(r.original_max_position_embeddings);
+    auto correction_dim = [&](double rotations) { return dim * std::log(original / (rotations * 2 * M_PI)) / (2 * std::log(theta)); };
+    double low = correction_dim(r.beta_fast), high = correction_dim(r.beta_slow);
+    if (r.truncate) {
+        low = std::floor(low);
+        high = std::ceil(high);
+    }
+    low = std::max(low, 0.0);
+    high = std::min(high, double(dim - 1));
+    if (low == high)
+        high += 0.001;
+    std::vector<float> out(size_t(dim / 2));
+    for (int d = 0; d < dim / 2; ++d) {
+        const double freq = std::pow(theta, -2.0 * d / dim);
+        const double extrapolate = 1.0 - std::clamp((d - low) / (high - low), 0.0, 1.0);
+        out[size_t(d)] = float(freq / r.factor * (1.0 - extrapolate) + freq * extrapolate);
+    }
+    return out;
+}
+std::vector<float> rope_inv_freq(const ModelConfig &c) {
+    if (c.rope_llama3)
+        return llama3_inv_freq(c.dim, c.theta, c.rope);
+    if (c.rope_yarn)
+        return yarn_inv_freq(c.dim, c.theta, c.yarn);
+    std::vector<float> out(size_t(c.dim / 2));
+    for (int d = 0; d < c.dim / 2; ++d)
+        out[size_t(d)] = float(std::pow(double(c.theta), -2.0 * d / c.dim));
+    return out;
+}
 static int hadamard_pow2_part(int n) {
     // p with n = hadK * 2^p for the QTIP factorisation (hadK in {1, 12, 28}); 0 when unsupported
     auto pow2 = [](long v) { return v > 0 && (v & (v - 1)) == 0; };
@@ -171,8 +203,34 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
         if (j.contains("rope_scaling") && !j.at("rope_scaling").is_null()) {
             const auto &rs = j.at("rope_scaling");
             std::string type = rs.value("rope_type", rs.value("type", std::string()));
+            if (type == "yarn") {
+                auto &y = c.yarn;
+                y.factor = rs.at("factor").get<double>();
+                y.original_max_position_embeddings = rs.value("original_max_position_embeddings", long(c.max_context));
+                y.beta_fast = rs.value("beta_fast", 32.0);
+                y.beta_slow = rs.value("beta_slow", 1.0);
+                y.mscale = rs.value("mscale", 0.0);
+                y.mscale_all_dim = rs.value("mscale_all_dim", 0.0);
+                y.truncate = rs.value("truncate", true);
+                if (!(y.factor > 0) || y.original_max_position_embeddings <= 0 || !(y.beta_fast > 0) || !(y.beta_slow > 0) ||
+                    !std::isfinite(y.mscale) || !std::isfinite(y.mscale_all_dim))
+                    throw std::invalid_argument("Invalid yarn rope_scaling factors");
+                if (rs.value("llama_4_scaling_beta", 0.0) != 0.0)
+                    throw std::invalid_argument("rope_scaling llama_4_scaling_beta (position-dependent q scale) is not supported");
+                auto get_mscale = [](double scale, double m) { return scale <= 1 ? 1.0 : 0.1 * m * std::log(scale) + 1.0; };
+                if (rs.contains("attention_factor") && !rs.at("attention_factor").is_null())
+                    y.attention_factor = rs.at("attention_factor").get<double>();
+                else if (y.mscale != 0 && y.mscale_all_dim != 0)
+                    y.attention_factor = get_mscale(y.factor, y.mscale) / get_mscale(y.factor, y.mscale_all_dim);
+                else
+                    y.attention_factor = get_mscale(y.factor, 1.0);
+                if (!(y.attention_factor > 0) || !std::isfinite(y.attention_factor))
+                    throw std::invalid_argument("Invalid yarn attention factor");
+                c.rope_attention_factor = y.attention_factor;
+                c.rope_yarn = true;
+            } else {
             if (type != "llama3")
-                throw std::invalid_argument("Unsupported rope_scaling type '" + type + "' (only llama3)");
+                throw std::invalid_argument("Unsupported rope_scaling type '" + type + "' (llama3 or yarn)");
             c.rope.factor = rs.at("factor").get<double>();
             c.rope.low_freq_factor = rs.at("low_freq_factor").get<double>();
             c.rope.high_freq_factor = rs.at("high_freq_factor").get<double>();
@@ -183,6 +241,7 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
                 c.rope.original_max_position_embeddings <= 0)
                 throw std::invalid_argument("Invalid llama3 rope_scaling factors");
             c.rope_llama3 = true;
+            }
         }
         // stop tokens: generation_config.json eos list (e.g. Llama 3.3 <|end_of_text|>/<|eot_id|>),
         // else the config.json eos_token_id; defaults keep the original Behemoth {2}.

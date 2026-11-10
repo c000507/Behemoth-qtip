@@ -33,7 +33,7 @@ Fp8Shard quantize_rows(const float *w, int rows, int cols);
 
 // Any projection of a layer file (QTIP trellis, FP8 weight + scale, or NVFP4 packed) as tp FP8 shards,
 // ready to bind to the tensor-parallel FP8 layer graph. FP8 and NVFP4 tensors are dequantized and
-// re-encoded with a per-row scale (max 224).
+// re-encoded with a per-row scale (max 224). k / v with tp > kv_heads: one kv head per rank, replicated.
 std::vector<Fp8Shard> load_projection_shards(const behemoth::SafeTensorFile &file, int layer, const std::string &name,
                                              const behemoth::ModelConfig &config, int tp, bool column_parallel);
 

@@ -4,7 +4,7 @@ resource "aws_cloudwatch_log_group" "backend" {
 }
 
 locals {
-  backend_image = "${data.aws_ecr_repository.backend.repository_url}:${var.backend_image_tag}"
+  backend_image = "${data.aws_ecr_repository.backend.repository_url}:${var.backend_image_tag}${var.backend_image_digest != "" ? "@${var.backend_image_digest}" : ""}"
 
   # IAM needs some prefix even when prepared shards are off; a name nothing is ever written under
   prepared_prefix = var.prepared_s3_prefix != "" ? var.prepared_s3_prefix : "prepared/unused"

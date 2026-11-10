@@ -8,7 +8,8 @@
 // Tool calling (tools.hpp), for GLM tokenizers (<tool_call> / <arg_key> / <arg_value> control tokens, templates that
 // render tools: the conversation and tools go through the checkpoint's own template) and for Mistral tokenizers (Tekken: [AVAILABLE_TOOLS], [TOOL_CALLS] and [ARGS] control
 // tokens; Cydonia / Mistral Small 3.2): their chat templates take no tools, so conversations with tools or tool
-// messages are rendered in Mistral's v11 form (render_mistral_tools) behind the template's own system prompt.
+// messages are rendered in Mistral's v11 form (render_mistral_tools) behind the template's own system prompt, or the
+// v13 form when the model directory ships a tekken.json of version v13 or later (Devstral 2507).
 // BEHEMOTH_TOOLS=0 turns tool calling off. Constrained answers start with an optional <think> block only for templates
 // that know <think> (ChatBackend::think). Message content may be text blocks (joined); other parts are rejected.
 #include "behemoth/protocol.hpp"
@@ -60,6 +61,13 @@ struct Tokenizer::Impl {
         if (args < 0)
             return;
         tools = {"[TOOL_CALLS]", bpe.decode({args}, true), calls, args};
+        // Mistral's own tokenizer file, when shipped, says which prompt version the checkpoint was trained on
+        std::ifstream tekken(root / "tekken.json");
+        const auto version = nlohmann::json::parse(tekken, nullptr, false);
+        if (!version.is_discarded() && version.contains("config")) {
+            const std::string v = version["config"].value("version", "");
+            tools.tools_first = v.size() > 1 && v[0] == 'v' && std::atoi(v.c_str() + 1) >= 13;
+        }
     }
     // Id of the control token spelled `text`, else -1.
     int control(const std::string &text) const {
@@ -121,8 +129,8 @@ Tokenizer::Tokenizer(const std::filesystem::path &root)
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
             return render_mistral_tools(messages, tools, impl->tools, impl->bos, impl->eos, impl->default_system());
         };
-        std::cerr << "Tool calling: Mistral v11 format ([TOOL_CALLS] " << impl->tools.calls_token << ", [ARGS] "
-                  << impl->tools.args_token << " '" << impl->tools.args << "')\n";
+        std::cerr << "Tool calling: Mistral " << (impl->tools.tools_first ? "v13" : "v11") << " format ([TOOL_CALLS] "
+                  << impl->tools.calls_token << ", [ARGS] " << impl->tools.args_token << " '" << impl->tools.args << "')\n";
     }
     set_chat_backend(std::move(backend));
 }

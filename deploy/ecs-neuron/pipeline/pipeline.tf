@@ -89,7 +89,7 @@ resource "aws_codepipeline" "this" {
       owner            = "AWS"
       provider         = "CodeBuild"
       version          = "1"
-      namespace        = "PlanVariables" # PLAN_SUMMARY, PLAN_LOG_URL
+      namespace        = "PlanVariables" # PLAN_SUMMARY, PLAN_LOG_URL, BACKEND_DIGEST, ROUTER_DIGEST
       input_artifacts  = ["SourceOutput"]
       output_artifacts = ["PlanOutput"]
       configuration = {
@@ -112,7 +112,7 @@ resource "aws_codepipeline" "this" {
       provider = "Manual"
       version  = "1"
       configuration = merge({
-        CustomData         = "Commit #{SourceVariables.CommitId}: backend=#{BuildVariables.BACKEND_TAG} router=#{BuildVariables.ROUTER_TAG}. #{PlanVariables.PLAN_SUMMARY} Full plan: the Plan build log (link) or plan.txt in the PlanOutput artifact."
+        CustomData         = "Commit #{SourceVariables.CommitId}: backend=#{BuildVariables.BACKEND_TAG}@#{PlanVariables.BACKEND_DIGEST} router=#{BuildVariables.ROUTER_TAG}@#{PlanVariables.ROUTER_DIGEST}. #{PlanVariables.PLAN_SUMMARY} Full plan: the Plan build log (link) or plan.txt in the PlanOutput artifact."
         ExternalEntityLink = "#{PlanVariables.PLAN_LOG_URL}"
       }, var.approval_sns_topic_arn != "" ? { NotificationArn = var.approval_sns_topic_arn } : {})
     }

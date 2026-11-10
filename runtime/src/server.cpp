@@ -421,6 +421,10 @@ class Session : public std::enable_shared_from_this<Session> {
                 enqueue("data: " + chunk({{"role", "assistant"}}).dump() + "\n\n");
                 heartbeat();
             }
+        } catch (const CapacityError &e) {
+            respond(http::status::service_unavailable,
+                    {{"error", {{"message", e.what()}, {"type", "server_overloaded"}, {"param", nullptr},
+                                {"code", nullptr}}}});
         } catch (const RequestError &e) {
             respond(http::status::bad_request,
                     {{"error", {{"message", e.what()}, {"type", "invalid_request_error"}, {"param", e.param},
@@ -522,6 +526,8 @@ int main(int argc, char **argv) {
                 options.scheduler.prefill_interval = std::stoul(value);
             else if (key == "--max-batch-requests")
                 options.scheduler.max_requests = std::stoul(value);
+            else if (key == "--max-queued-requests")
+                options.scheduler.max_queued = std::stoul(value);
             else if (key == "--zero-copy-rows")
                 options.zero_copy_rows = std::stoul(value);
             else if (key == "--qtip-dense-rows")

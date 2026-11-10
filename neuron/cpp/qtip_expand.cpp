@@ -89,6 +89,16 @@ Fp8Shard expand_qtip_to_fp8(const qtip::HostLinear &l, int tp, int rank, bool co
 
 std::vector<Fp8Shard> load_projection_shards(const SafeTensorFile &file, int layer, const std::string &name,
                                              const ModelConfig &config, int tp, bool column_parallel) {
+    // TP > kv_heads: each kv head is replicated on tp / kv_heads consecutive ranks (the ranks holding its query heads)
+    if ((name == "self_attn.k_proj" || name == "self_attn.v_proj") && column_parallel && tp > config.kv_heads) {
+        if (config.kv_heads < 1 || tp % config.kv_heads)
+            throw std::invalid_argument("tensor-parallel degree must be a multiple of the kv head count");
+        auto heads = load_projection_shards(file, layer, name, config, config.kv_heads, true);
+        std::vector<Fp8Shard> shards;
+        for (int rank = 0; rank < tp; ++rank)
+            shards.push_back(heads[size_t(rank / (tp / config.kv_heads))]);
+        return shards;
+    }
     const std::string base = "model.layers." + std::to_string(layer + layer_offset()) + "." + name + ".";
     if (file.contains(base + "trellis"))
         return expand_qtip_all(qtip::load_linear(file, layer, name, &config), tp, column_parallel);

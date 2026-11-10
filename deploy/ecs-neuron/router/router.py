@@ -1,10 +1,15 @@
 """Scale-to-zero router for the Neuron LLM backend on ECS.
 
-* GET  /v1/models            answered locally from MODEL_IDS (never wakes the backend)
-* GET  /health               router liveness + backend state (never wakes the backend)
+* GET  /v1/models            answered locally from MODEL_IDS (needs a key; never wakes the backend)
+* GET  /health               router liveness + backend state (no key: the ECS health check; never wakes the backend)
 * POST <PROXY_PATHS>         wake the backend ECS service if needed (single-flight), wait until the task is RUNNING
                              and its /health is OK, then proxy (SSE streaming passes through chunk by chunk)
 * idle reaper                desiredCount=0 after IDLE_TIMEOUT_S without requests and none in flight
+
+Callers need `Authorization: Bearer <key>`: a key approved in the API_KEYS_TABLE DynamoDB table (item per key: its
+SHA-256 as key_hash, the owner's email and name, enabled; see api_keys.py), or the single ROUTER_API_KEY. With neither
+configured the router refuses to start unless ALLOW_ANONYMOUS opts in. Each request is logged with its key's owner. Unauthorized, malformed (not a JSON object, unknown model, non-boolean stream), oversized (MAX_BODY_BYTES)
+and excess (MAX_INFLIGHT) requests are answered before anything can wake the backend.
 
 Backend address: ECS DescribeTasks -> awsvpc ENI attachment -> privateIPv4Address.
 """
@@ -12,6 +17,8 @@ Backend address: ECS DescribeTasks -> awsvpc ENI attachment -> privateIPv4Addres
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -52,6 +59,11 @@ class Config:
     request_timeout_s: float = 1800.0
     health_ttl_s: float = 10.0
     api_key: str | None = None
+    api_keys_table: str | None = None  # DynamoDB table of approved keys (key_hash -> email, name, enabled)
+    key_cache_s: float = 60.0  # how long a key lookup (approved or not) is trusted; revocation takes effect within this
+    allow_anonymous: bool = False  # no ROUTER_API_KEY: refuse to start (and answer 401) unless this opts in
+    max_body_bytes: int = 4 * 1024 * 1024  # the backend's own body limit: larger bodies get 413 before any wake-up
+    max_inflight: int = 256  # requests proxied or waiting for the backend at once; more get 429
 
     @classmethod
     def from_env(cls, env=os.environ) -> "Config":
@@ -79,7 +91,63 @@ class Config:
         c.retry_after_s = int(env.get("RETRY_AFTER_S", c.retry_after_s))
         c.request_timeout_s = float(env.get("REQUEST_TIMEOUT_S", c.request_timeout_s))
         c.api_key = env.get("ROUTER_API_KEY") or None
+        c.api_keys_table = env.get("API_KEYS_TABLE") or None
+        c.key_cache_s = float(env.get("KEY_CACHE_S", c.key_cache_s))
+        c.allow_anonymous = env.get("ALLOW_ANONYMOUS", "false").lower() in ("1", "true", "yes")
+        c.max_body_bytes = int(env.get("MAX_BODY_BYTES", c.max_body_bytes))
+        c.max_inflight = int(env.get("MAX_INFLIGHT", c.max_inflight))
         return c
+
+    def check(self):
+        if not self.api_key and not self.api_keys_table and not self.allow_anonymous:
+            raise SystemExit("no API_KEYS_TABLE or ROUTER_API_KEY: set one, or ALLOW_ANONYMOUS=true to serve without "
+                             "authentication")
+
+
+def key_hash(key: str) -> str:
+    """How a key is stored: only its SHA-256, so the table never holds a usable key."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+@dataclass
+class Caller:
+    email: str
+    name: str
+
+
+class KeyStore:
+    """Approved keys from DynamoDB, each lookup (hit or miss) cached for key_cache_s; one lookup in flight per key."""
+
+    MAX_CACHED = 10000  # unknown keys are cached too (a flood of guesses costs one lookup each, then nothing)
+
+    def __init__(self, cfg: Config, dynamodb):
+        self.cfg, self.db = cfg, dynamodb
+        self._cache: dict[str, tuple[float, Caller | None]] = {}
+        self._pending: dict[str, asyncio.Future] = {}
+
+    async def lookup(self, key: str) -> Caller | None:
+        h = key_hash(key)
+        now = time.monotonic()
+        hit = self._cache.get(h)
+        if hit and now - hit[0] < self.cfg.key_cache_s:
+            return hit[1]
+        if h not in self._pending:
+            self._pending[h] = asyncio.ensure_future(self._fetch(h))
+        try:
+            caller = await asyncio.shield(self._pending[h])
+        finally:
+            self._pending.pop(h, None)
+        if len(self._cache) >= self.MAX_CACHED:
+            self._cache.clear()
+        self._cache[h] = (time.monotonic(), caller)
+        return caller
+
+    async def _fetch(self, h: str) -> Caller | None:
+        item = (await asyncio.to_thread(self.db.get_item, TableName=self.cfg.api_keys_table,
+                                        Key={"key_hash": {"S": h}}, ConsistentRead=True)).get("Item")
+        if not item or not item.get("enabled", {}).get("BOOL", False):
+            return None
+        return Caller(email=item.get("email", {}).get("S", ""), name=item.get("name", {}).get("S", ""))
 
 
 class StartupError(Exception):
@@ -262,10 +330,10 @@ class Backend:
         return True
 
 
-def _error(status: int, msg: str, retry_after: int | None = None) -> web.Response:
+def _error(status: int, msg: str, retry_after: int | None = None, kind: str | None = None) -> web.Response:
     headers = {"Retry-After": str(retry_after)} if retry_after else None
-    return web.json_response({"error": {"message": msg, "type": "backend_unavailable"}}, status=status,
-                             headers=headers)
+    kind = kind or ("backend_unavailable" if status >= 500 else "rate_limited" if status == 429 else "invalid_request_error")
+    return web.json_response({"error": {"message": msg, "type": kind}}, status=status, headers=headers)
 
 
 def _held_error(msg: str, stream: bool) -> bytes:
@@ -298,8 +366,9 @@ async def _keepalive_until(resp: web.StreamResponse, fut: asyncio.Future, interv
 
 
 class Router:
-    def __init__(self, cfg: Config, ecs, http: ClientSession | None = None, asg=None):
+    def __init__(self, cfg: Config, ecs, http: ClientSession | None = None, asg=None, dynamodb=None):
         self.cfg, self.ecs, self._http, self.asg = cfg, ecs, http, asg
+        self.keys = KeyStore(cfg, dynamodb) if cfg.api_keys_table else None
         self.backend: Backend | None = None
         self._reaper: asyncio.Task | None = None
 
@@ -325,12 +394,26 @@ class Router:
             except Exception as e:
                 log.warning("idle check failed: %s", e)
 
-    def _authorized(self, request: web.Request) -> bool:
-        if not self.cfg.api_key:
-            return True
-        return request.headers.get("Authorization", "") == f"Bearer {self.cfg.api_key}"
+    async def _caller(self, request: web.Request) -> Caller | None:
+        """Who the request's bearer key belongs to; None = not authorized."""
+        if not self.cfg.api_key and not self.keys:
+            return Caller("", "anonymous") if self.cfg.allow_anonymous else None
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer ") or len(auth) > 512:
+            return None
+        key = auth[7:].strip()
+        if self.cfg.api_key and hmac.compare_digest(key.encode(), self.cfg.api_key.encode()):
+            return Caller("", "router key")
+        if self.keys:
+            try:
+                return await self.keys.lookup(key)
+            except Exception as e:  # DynamoDB unreachable: fail closed
+                log.warning("API key lookup failed: %s", e)
+        return None
 
     async def models(self, request):
+        if await self._caller(request) is None:
+            return web.json_response({"error": {"message": "unauthorized", "type": "invalid_api_key"}}, status=401)
         now = int(time.time())
         return web.json_response({"object": "list", "data": [
             {"id": m, "object": "model", "created": now, "owned_by": self.cfg.owned_by} for m in self.cfg.model_ids]})
@@ -341,15 +424,31 @@ class Router:
                                   "idle_s": round(time.monotonic() - b.last_activity, 1)})
 
     async def proxy(self, request: web.Request):
-        if not self._authorized(request):
-            return web.json_response({"error": {"message": "unauthorized"}}, status=401)
+        caller = await self._caller(request)
+        if caller is None:
+            return web.json_response({"error": {"message": "unauthorized", "type": "invalid_api_key"}}, status=401)
         b = self.backend
-        body = await request.read()
+        if b.inflight >= self.cfg.max_inflight:
+            return _error(429, "too many requests in flight, retry later", 5)
+        # everything that can be rejected is rejected here, before a request can wake (and pay for) the backend
         try:
-            req = json.loads(body or b"{}")
-            stream, model = bool(req.get("stream")), str(req.get("model") or self.cfg.model_ids[0])
-        except (ValueError, AttributeError):
-            stream, model = False, self.cfg.model_ids[0]
+            body = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return _error(413, f"request body exceeds {self.cfg.max_body_bytes} bytes")
+        try:
+            req = json.loads(body)
+        except ValueError:
+            return _error(400, "request body is not valid JSON")
+        if not isinstance(req, dict):
+            return _error(400, "request body must be a JSON object")
+        model = req.get("model", self.cfg.model_ids[0])
+        if not isinstance(model, str) or model not in self.cfg.model_ids:
+            return _error(404, f"model {model!r} is not served here", kind="model_not_found")
+        stream = req.get("stream", False)
+        if not isinstance(stream, bool):
+            return _error(400, "'stream' must be a boolean")
+        log.info("request %s from %s <%s> model=%s stream=%s bytes=%d", request.path, caller.name, caller.email,
+                 model, stream, len(body))
         b.inflight += 1
         b.last_activity = time.monotonic()
         try:
@@ -448,9 +547,9 @@ class _BackendGone(Exception):
         self.started = started
 
 
-def make_app(cfg: Config, ecs, http: ClientSession | None = None, asg=None) -> web.Application:
-    r = Router(cfg, ecs, http, asg)
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+def make_app(cfg: Config, ecs, http: ClientSession | None = None, asg=None, dynamodb=None) -> web.Application:
+    r = Router(cfg, ecs, http, asg, dynamodb)
+    app = web.Application(client_max_size=cfg.max_body_bytes)
     app.on_startup.append(r.on_startup)
     app.on_cleanup.append(r.on_cleanup)
     app.router.add_get("/v1/models", r.models)
@@ -466,9 +565,11 @@ def main():
     import boto3  # only needed in production
 
     cfg = Config.from_env()
+    cfg.check()
     ecs = boto3.client("ecs", region_name=cfg.region)
     asg = boto3.client("autoscaling", region_name=cfg.region) if cfg.asg_name else None
-    web.run_app(make_app(cfg, ecs, asg=asg), host="0.0.0.0", port=cfg.listen_port, access_log=None)
+    dynamodb = boto3.client("dynamodb", region_name=cfg.region) if cfg.api_keys_table else None
+    web.run_app(make_app(cfg, ecs, asg=asg, dynamodb=dynamodb), host="0.0.0.0", port=cfg.listen_port, access_log=None)
 
 
 if __name__ == "__main__":
