@@ -54,6 +54,7 @@ class NeuronModel {
     int vocab() const;
     int max_decode_rows() const;          // largest R of the decode buckets (rows a step can verify at once)
     int decode_bucket_pages(int pages) const; // table pages of the smallest decode bucket covering `pages` (0: none)
+    bool has_shared_verify() const;           // the graph set has shared-table verify buckets (dec8s_*)
     const std::vector<int> &eos() const;
     int max_context() const;
     // Recurrent state per sequence (GLM's KDA layers): the engine then neither drafts (rejected draft rows would advance

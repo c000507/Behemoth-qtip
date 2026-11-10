@@ -1545,6 +1545,14 @@ int NeuronModel::decode_bucket_pages(int pages) const {
         if (b.meta.P >= pages && (!best || b.meta.P < best)) best = b.meta.P;
     return best;
 }
+bool NeuronModel::has_shared_verify() const {
+    if (backend_)
+        return false;
+    for (const auto &b : impl_->decode)
+        if (b.meta.shared_table)
+            return true;
+    return false;
+}
 const std::vector<int> &NeuronModel::eos() const { return backend_ ? backend_->eos() : impl_->config.eos; }
 int NeuronModel::max_context() const {
     if (backend_)

@@ -227,3 +227,11 @@ apply, so a deployment that changes the default must ship the buckets (0.002 wit
 5. Rollback: delete the `dec8s_*` bucket directories from the graphs prefix (the engine then never picks the shared path; the new binary
    is otherwise identical) or set `BEHEMOTH_NEURON_SPEC_PAGE_COST=0.01`; no data-format change (KV layout, prepared shards, heads untouched).
 
+
+## Deployment guard (added when shipping)
+
+The engine default for `BEHEMOTH_NEURON_SPEC_PAGE_COST` is now chosen at load: 0.002 only when the graph set contains shared-table verify buckets
+(`NeuronModel::has_shared_verify()`, any decode bucket with `shared_table`), otherwise 0.01 as before. Reason: with per-row dec8 verify (+47 ms per
+verify step at 512 pages) a 0.002 gate drafts at a loss, so a new image deployed BEFORE the dec8s_* buckets reach the graphs prefix must keep the old
+gate. An explicit `BEHEMOTH_NEURON_SPEC_PAGE_COST` still overrides either default. Compile-checked locally (g++ -fsyntax-only on neuron_model.cpp and
+neuron_engine.cpp); not run on the box.

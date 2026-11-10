@@ -57,6 +57,7 @@ int NeuronModel::cache_pages() const { return impl_->pages; }
 int NeuronModel::vocab() const { return impl_->vocab; }
 int NeuronModel::max_decode_rows() const { return impl_->rows; }
 int NeuronModel::decode_bucket_pages(int pages) const { return pages; }
+bool NeuronModel::has_shared_verify() const { return false; }
 const std::vector<int> &NeuronModel::eos() const { return impl_->eos; }
 int NeuronModel::max_context() const { return impl_->context; }
 nlohmann::json NeuronModel::last_profile() const { return {{"fake_steps", impl_->steps}}; }

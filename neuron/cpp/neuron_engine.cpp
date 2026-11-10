@@ -120,11 +120,12 @@ struct Engine::Impl {
     // paged K/V gather, measured 0.006-0.013 on the 8B with the per-row kernel), on top of a plain step (plain_step_ms, running
     // mean). A request drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats
     // twice that overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers (~10 steps).
-    // Default 0.002 (was 0.01) for graph sets with shared-table verify buckets (dec8s_*, docs/neuron-verify-kernel.md section 7:
+    // Default 0.01 for graph sets WITHOUT shared-table verify buckets; 0.002 when the graph set has dec8s_* buckets (see the constructor;
+    // docs/neuron-verify-kernel.md section 7:
     // measured +10.9 / +12.7 ms per verify step at 128 / 512 pages on Devstral, nearly flat in pages): 128 pages always try, 512 pages
     // draft while alpha >= 0.24, 1024 pages while alpha >= 0.47. Set BEHEMOTH_NEURON_SPEC_PAGE_COST=0.01 for a graph set WITHOUT dec8s
     // buckets (the per-row dec8 verify costs +47 ms per step at 512 pages and would then draft at a loss).
-    double spec_page_cost = 0.002, plain_step_ms = 40;
+    double spec_page_cost = 0.01, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
     // structured outputs: constraints of the constrained requests; per-token cost of the constraint calls
@@ -172,6 +173,9 @@ struct Engine::Impl {
         spec_requests = env_int("BEHEMOTH_NEURON_SPEC_REQUESTS", 4);
         spec_rows = std::min(env_int("BEHEMOTH_NEURON_SPEC_ROWS", 8), max_rows);
         spec_ngram = std::max(1, env_int("BEHEMOTH_NEURON_SPEC_NGRAM", 3));
+        // the shared-table verify buckets make a verify step nearly flat in pages: only then is the lower default right (per-row dec8
+        // verify at 0.002 would draft at a loss on long contexts)
+        spec_page_cost = model.has_shared_verify() ? 0.002 : 0.01;
         if (const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_PAGE_COST"))
             spec_page_cost = std::atof(v);
         if (o.prefix_cache.slots && model.recurrent())
