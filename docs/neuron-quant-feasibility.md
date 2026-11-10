@@ -283,7 +283,8 @@ Fit: ACT exp ~= 2 us fixed + 8.3 ns/elem -> **~121 G exp/s marginal**
 (917504 extra elems / 7.6 us extra). Supersedes the 17 G/s softmax-based
 guess — the ACT LUT pipeline is ~7x faster than feared. Pool/DMA
 marginal in the compiler mul containers = 7.34 MB / 18.6 us = ~395 GB/s
-(our synth-desc plateau = 220 GB/s; compiler desc granularity is better).
+counted read+write (CORRECTION 2026-11-10: an HBM->HBM copy = 198 GB/s
+payload per direction; our synth-desc plateau = 220 GB/s one-direction).
 
 **op123 TENSOR_DEQUANTIZE: NO** (does not execute on trn1 in any tested
 placement). 64B instr built per v3.NEURON_ISA_TPB_S3D3_TENS_DEQUANT

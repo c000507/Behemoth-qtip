@@ -1,5 +1,10 @@
 # neff-opt: NEFF DMA post-processor — geometry study + tool
 
+STATUS (2026-11-10, review): PROTOTYPE / NON-DELIVERABLE — the tool is
+compiler-version-dependent BY DESIGN (it rewrites descriptors that a
+neuronx-cc release emitted) and is paused; the geometry study below is
+the durable part.
+
 Purpose: rewrite the DMA descriptor geometry of neuronx-cc-compiled
 NEFFs so weight streaming approaches the pure-DMA ceiling. neuronx-cc
 stays in the loop (it compiles the input graphs); this tool only
@@ -9,7 +14,7 @@ rewrites descriptors in place. C++20, tools/neff_opt/.
 
 | graph | geometry | GB/s (marginal) |
 |---|---|---|
-| compiler elementwise mul (x*1.0, n=1M) | ONE desc, all engines idle | **395** |
+| compiler elementwise mul (x*1.0, n=1M) | ONE desc, all engines idle | **395** (CORRECTION 2026-11-10: read+write of an HBM->HBM copy = 198 GB/s payload) |
 | compiler GEMV M1 K=N=12288 bf16 | 66-desc circular ring | 232 |
 | compiler GEMV M1/4/8 K=N=4096/12288 (bf16) | 66-desc circular ring | 152-243 |
 | our serial 2-desc DMA-only probe | in->out chained | 224-266 |
@@ -48,7 +53,10 @@ gemv_m1_k4096_n4096_bf16 (w = 33.5 MB bf16 streamed per execute):
   loops ~8x per execute with the hardware auto-advancing the HBM
   offset. The first descs carry no wait; later groups are gated by
   op160 event instrs (2 descs per gate).
-- Rate = 222-244 GB/s marginal = **~60-65% of the pure-DMA ceiling**.
+- Rate = 222-244 GB/s marginal = **~60-65% of the pure-DMA ceiling**
+  (the "ceiling" here = the 395 copy figure = 198 GB/s payload per
+  direction, CORRECTION 2026-11-10 — compare against the one-direction
+  read ceiling 210-228 / multi-stream 260-265 instead).
 
 ## Conclusion of the diff (what the post-processor can and cannot do)
 

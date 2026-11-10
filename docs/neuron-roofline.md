@@ -95,6 +95,10 @@ Serial chain (HBM->SB then SB->HBM, 200-iter avg):
   2-desc serial chain — the pseudo-desc internals (packet splitting at
   DMA_MAX_DESC_COUNT_PER_PACKET=64 x 64 KiB) are opaque; treat
   250-400 GB/s as the desc-geometry-dependent envelope.
+  CORRECTION (2026-11-10, review): the 395 GB/s = read+WRITE of an
+  HBM->HBM copy (3.67 MB each way / 18.6 us = 198 GB/s payload) — it is
+  not a read-path envelope; the read envelopes = 210-228 one-direction,
+  260-265 multi-stream.
 - **Queue sweep = IMPOSSIBLE via def.json num_queues**: q1/q4 = exec
   timeout (5) at a shape that passes with the default 16 — the
   semaphore wiring is tied to the 16-sem set (descs reference sems
