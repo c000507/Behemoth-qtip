@@ -286,3 +286,43 @@ matmul, and neither is controllable from the trace. Practical ceiling:
 the layer at ~83% of the achievable bus = the remaining upside ~1.05-
 1.15x (17-19 t/s), consistent with briefs 10-12. Implied t/s for the
 realistic improvements: tail polish only.
+
+## 11. Brief 14: KV-copy hypothesis KILLED; final accounting
+
+Bucket-scaling test (repo layer_bench, 2 ranks, 100 steps):
+
+| bucket | cache capacity (pages x 32 KB) | ms/step |
+|---|---|---|
+| dec1_32  | 22.8 MB  | **1.299** |
+| dec1_128 | 91.1 MB  | **1.319** |
+| dec1_512 | 364.4 MB | **1.433** |
+
+- dec1_32 -> dec1_128 costs only **20 us** for a 4x cache. A full
+  91 MB cache read+write copy per layer would cost ~0.4-0.55 ms at the
+  measured rates: **there is no full-cache copy.** The KV write-back
+  touches only the current page(s) (the NKI kernel writes the new K/V
+  rows); output1 is capacity-sized and only partly written.
+- dec1_512's +114 us = the attention gather/kernel group-loop scaling
+  with the gather span (~0.16 us/page = ~32 KB/page at the DMA rate),
+  not a copy.
+- Corrected accounting (HLO-verified): weights per rank = **91.1 MB
+  fused attention weight [44488,2048] + 3 x 83.9 MB MLP shards =
+  343 MB**; total inputs = 372.1 MB per rank per layer read from HBM
+  (weights + tables + scales + touched pages). Input21 = the KV cache
+  (5561 x 8 x 16 x 128 fp8 = 91,111,424 B) staged once at load; the
+  566 pool descriptors = the per-execute HBM reads of all inputs
+  (~372 MB), NOT a cache copy.
+- Implied per-execute read rate = 372 MB / 1.32 ms = **282 GB/s** =
+  at/above the single-NC multi-stream read ceiling (260-265): the
+  layer is at the practical memory-system ceiling with both ranks
+  running.
+- Brief14 task 3 (no-copy variant) = MOOT: no copy exists to remove.
+  The remaining per-layer lever = the attention gather span (use the
+  bucket that matches the actual context; already done by the user's
+  bucketing) and the ~10% launch/tail polish. t/s ceiling ~17-19.
+
+Note: input21 = the KV cache; the 91.1 MB fused attention WEIGHT lives
+in the HLO as p1.497 [44488, 2048] = a separate input among the 23
+(the 10.5/2.6 MB tensors include q/o shards and kernel tables). The
+brief-13 "input21 = attention weight" relabel was wrong; the supervisor's
+original accounting was right.
