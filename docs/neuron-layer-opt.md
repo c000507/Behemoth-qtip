@@ -206,3 +206,40 @@ layer's tiling already hides about as well as anything measured.
 Remaining levers: batch amortization (68 us/row), or not streaming all
 weights per token. Single-stream t/s upside from graph work: ~1.1x
 at most (17 -> ~19 t/s).
+
+## 9. Brief 12: the real layer is ALREADY native fp8 x fp8 — dequant claim corrected
+
+FACT-FIND (local, dec1_128 unpacked NEFF): the PE stream = 5850 LW +
+6026 MM 64B instructions; in_dtype histogram (byte @+32):
+**LW: 5578 x FP8_EXP4(14)**, 240 x f32(10), 24 x bf16(6), 8 x u8(3);
+**MM: 5754 x FP8_EXP4(14)**, 240 x f32, 24 x bf16, 8 x u8.
+The seven big projections run as **native fp8 x fp8 PE matmuls**
+(the repo fp8_linear form: the activation row-scaled into E4M3,
+fp8 x fp8 dot with f32 accumulate, output x act_scale x weight_scale).
+The brief-11 "dequant f32 in SB" inference for the REAL layer was
+WRONG — it applies only to the isolated cast-form matvec. The real
+layer never casts the weights.
+
+Isolated native-fp8 matvec (same retarget pipeline, 100 iters, w = 168 MB fp8):
+
+| form | 32768x5120 | 5120x32768 | split S=1/4/8 |
+|---|---|---|---|
+| native fp8 x fp8 | 1430/1429/1533 us = 122 GB/s | 1239/1240/1237 us = 142 GB/s | flat, no effect |
+| cast form (brief 11) | 1341 us = 131 GB/s | - | flat |
+
+- The native form is SLOWER than the cast form at this isolated shape
+  (1430 vs 1341) — the 8B-layer table (native 1.84 vs cast 3.96) does
+  not transfer to a single isolated matvec; the real layer's win comes
+  from its deep tiling/pipelining, which the isolated matvec lacks.
+- The isolated matvecs (122-142 GB/s effective) are ALL below the real
+  layer's 210 GB/s effective. The layer pipelines better than anything
+  we can build standalone from single matmuls.
+- Splitting (S=1..8) = flat in every form: brief 11 step 3 answered
+  definitively NO.
+
+Revised bound picture: the PE consumes fp8 directly (no dequant); the
+layer's 210 GB/s effective fp8-byte rate sits between the 179 GB/s
+one-element-per-cycle operand rate and the ~358 GB/s packed rate, and
+80-92% of the one-direction read ceiling (228-264). The remaining
+lever = the non-overlapped tail (~0.1-0.2 ms) = the layer ~1.15-1.2 ms
+-> ~17-19 t/s. No packing, splitting, or dtype-form change moves it.
