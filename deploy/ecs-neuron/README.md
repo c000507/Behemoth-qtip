@@ -135,6 +135,17 @@ python api_keys.py list
 python api_keys.py revoke --email ada@example.com                      # or --hash <prefix from list>
 ```
 
+## Hosts in other regions
+
+For a Trainium host run by hand outside `region` (e.g. a `trn1.32xlarge` Capacity Block in Sydney or Mumbai),
+`remote_regions` (default `ap-southeast-2`, `ap-south-1`) creates a no-ingress security group in each region's default
+VPC and one `<name>-remote-neuron` instance profile: SSM Session Manager, read of the model bucket, ECR pulls and
+logs. The host reads weights and graphs across regions from the bucket in `region`. Launch with the
+`remote_instance_profile` and `remote_security_groups` outputs, e.g.
+`--iam-instance-profile Name=behemoth-remote-neuron --security-group-ids <id>`. The pipeline's apply role may manage
+security groups in `pipeline/` `remote_regions` (keep the two lists in step; adding a region also needs a provider alias
+in `remote_regions.tf`).
+
 ## How scale-up and idle-down work
 
 * **Wake.** A POST to a proxied path calls `Backend.ensure()`. With no cached healthy address it starts one startup

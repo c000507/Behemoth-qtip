@@ -14,6 +14,12 @@ variable "region" {
   default     = "us-east-1"
 }
 
+variable "remote_regions" {
+  description = "Regions where the stack's remote_regions.tf may manage security groups (keep in step with the stack's remote_regions)."
+  type        = list(string)
+  default     = ["ap-southeast-2", "ap-south-1"]
+}
+
 variable "name" {
   description = "Name prefix of the MAIN stack (its var.name): used to scope the apply role to the stack's resources."
   type        = string
