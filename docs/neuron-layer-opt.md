@@ -40,24 +40,36 @@ NEURON_RT_ROOT_COMM_ID), 100-step steady state.
   pass. The tiled layer does better than the isolated matvec
   (210 vs 150 GB/s) because its MLP tiling overlaps the pipeline.
 
-## 3. Ceiling arithmetic for "faster layer graphs"
+## 3. THE DECISIVE EXPERIMENT: read-only DMA rate (2026-11-10)
 
-- If the weight stream ran at the compiler's elementwise-mul geometry
-  (~395 GB/s aggregate, ONE continuous multi-packet desc — decoded in
-  docs/neff-opt.md): 278 MB / 395 = 0.70 ms; add the measured
-  non-overlapped tail (~0.2-0.35 ms: KV page gather + scales + all-
-  reduce + attention glue) -> **0.9-1.05 ms/layer** -> 40 layers =
-  36-42 ms + head 2 ms + host ~3 ms = **41-47 ms/token = 21-24 t/s**
-  IF the dequant stays hidden inside the stream.
-- At the measured parallel-DMA ceiling only (240-265 GB/s): 278/250 =
-  1.11 ms + the same tail = ~1.3-1.45 ms = little gain. **The upside
-  is entirely in whether the mul-geometry (continuous desc, no
-  per-slice semaphore round-trips) can carry the tiled MLP weight
-  streams while the consumer paces them.**
-- Hard ceiling (any geometry): the HBM read of 278 MB at the observed
-  ~395 GB/s envelope = 0.70 ms/layer = 28 ms/40 layers = ~25-26 t/s
-  with a zero-cost head. Beyond that = not streaming every weight per
-  token (rejected for now) or a faster consumer dtype path.
+The 395 GB/s mul number = read+write. Read-only probes:
+
+| probe | traffic | marginal rate |
+|---|---|---|
+| jnp.sum(x) n=262144->1048576 (4 MB read + 4 B write per execute) | 3 MB delta / 14.3 us | **210 GB/s** |
+| GEMV M=1 12288^2 bf16 (302 MB weight read + 4 KB output) | 302 MB / 1322 us | **228 GB/s** |
+| mul x*1.0 (4 MB read + 4 MB write, HBM->HBM direct copy) | 7.34 MB / 18.6 us | 395 total |
+
+Conclusion: the 395 GB/s geometry = the **HBM->HBM direct copy**
+(DIRECT2D: ~198 read + ~198 write concurrent, saturating the bus). A
+pure one-direction read — which is what a weight stream is — tops out
+at **210-230 GB/s regardless of descriptor geometry**. The compiler's
+GEMV ring (66 auto-advancing descs) is ALREADY at that ceiling; the
+real dec1_128 layer at 210 GB/s effective = **92-100% of the
+read ceiling**.
+
+**Verdict on brief9 questions:**
+1. Faster per-layer graphs: the weight read = at the per-direction DMA
+   ceiling; the remaining lever = the non- overlapped tail only
+   (~8-15%: perfect-overlap floor ~1.15-1.20 ms/layer -> 17-19 t/s).
+   The 21-24 t/s estimate in the previous revision is RETRACTED — it
+   assumed the 395 geometry transfers to reads; it does not.
+2. Packing the weights differently: no. The read rate is
+   geometry-independent at the ceiling; the scale-fold test = no-op;
+   interleaving cannot exceed the one-direction bus rate. fp8 already
+   minimizes bytes. The only real levers left: batch (68 us marginal
+   per row), not streaming every weight per token (rejected), or a
+   different hardware path (rejected for now).
 
 ## 4. Packing tests done so far (matvec level, isolated)
 
@@ -94,3 +106,20 @@ lever is the DMA chunk geometry, not the scale placement.
 - dec1 vs dec4/dec8: batching amortizes the stream almost perfectly;
   for single-stream latency the graph variants above are the only
   lever.
+
+## 6. Read-only measurement details (2026-11-10, decisive experiment)
+
+- sumread probes: compiled via the oracle pipeline (jax sum lowers to
+  a reduce over a staged 4 MB f32 tensor; output = 4 B). Marginal
+  between n=262144 (65.2 us) and n=1048576 (79.5 us): 3 MB / 14.3 us
+  = 210 GB/s. Caveat: the reduce adds ~8-9 us at 1M elements, so the
+  TRUE pure-read rate sits between 210 (reduce-mixed) and the GEMV's
+  228 (a matvec output is 4 KB = effectively read-only, no reduce).
+- The mul-geometry decode (docs/neff-opt.md): ONE op212 desc,
+  continuous, 64 KiB packets, packet-count field = bytes/64KiB; both
+  src and dst = HBM vars (DIRECT2D) — hence the 2-direction 395.
+- Weight streams = src HBM -> dst SB: one-direction by definition.
+  The observed per-direction DMA ceiling across every probe:
+  210 (sum, reduce-mixed), 224-266 (serial desc chain, r then w),
+  228 (GEMV ring, pure read), 240-265 (2 concurrent reads + write).
+  A single-direction stream never exceeded ~266; reads top at ~228.
