@@ -243,3 +243,46 @@ one-element-per-cycle operand rate and the ~358 GB/s packed rate, and
 80-92% of the one-direction read ceiling (228-264). The remaining
 lever = the non-overlapped tail (~0.1-0.2 ms) = the layer ~1.15-1.2 ms
 -> ~17-19 t/s. No packing, splitting, or dtype-form change moves it.
+
+## 10. Brief 13: WHY standalone matvecs are slower than the layer (differential, measured)
+
+Structure diff (PE stream, per 64B LW/MM pair):
+
+| graph | weight bytes | LW pairs | bytes/LW pair | descs | KB/desc |
+|---|---|---|---|---|---|
+| isolated native matvec (any shape) | 168 MB | 20482 | **8.2 KB** | 323-355 | ~520 |
+| isolated MLP chain (3x84MB, real deps) | 252 MB | 30982 | **8.1 KB** | - | - |
+| real dec1_128 layer | 343 MB | 5850 | **58.6 KB** | 566 | ~560 |
+
+- The compiler picks **8.1-8.2 KB PE tiles for ANY standalone matmul**
+  (every shape tested: [5120,32768], [40960,4096], [20480,4096]; every
+  form: native, cast, split, 8-separate-inputs) and **58.6 KB tiles
+  only inside the full-layer compile**. Tile choice is layer-context-
+  dependent and not controllable from the trace.
+- At M=1 the matmul is PE pair-latency-bound at 8 KB tiles: measured
+  62.6 ns per LW+MM pair (168 MB / 20482 pairs / 1.28 ms) -> the PE
+  chain caps the standalone graph at **~130-142 GB/s** and the DMA
+  waits for it. Splitting (S=1..8), separate input tensors (8x), shape
+  changes, and the real MLP chain all land at the same ~130-142.
+- HLO decode corrections: the real layer = 2 computations (SPMD ranks);
+  the attention = ONE fused [44488, 2048] fp8 weight (91.1 MB) inside an
+  AwsNeuronCustomNativeKernel; the MLP = 3 x [20480, 4096] fp8 + [1,
+  16384] scales. **Weights per rank = 91.1 + 3 x 83.9 = 343 MB** (not
+  278 — the 91.1 MB tensor had been mislabeled as the KV cache; it is
+  the fused attention weight). The KV cache = the small page tensors +
+  a 91.1 MB output written back each layer.
+- REAL layer traffic per execute = 343 MB read + 91.1 MB KV write-back
+  (+ touched-page reads) = ~434 MB in 1.320 ms = **329 GB/s bus
+  aggregate** (reads at the ~260 multi-stream ceiling + the writes
+  concurrent), ~83% of the ~2 x 395-class chip-bus envelope with both
+  ranks running. The layer is BUS-bound, not PE-bound and not
+  descriptor-bound.
+
+Verdict: the 122-142 vs 210 gap = the compiler's PE tile size (8 KB
+standalone vs 58.6 KB in-layer), which amortizes the M=1 LW+MM pair
+latency; and the layer additionally overlaps its KV write-back with
+the weight reads. Neither is reproducible in a standalone compiled
+matmul, and neither is controllable from the trace. Practical ceiling:
+the layer at ~83% of the achievable bus = the remaining upside ~1.05-
+1.15x (17-19 t/s), consistent with briefs 10-12. Implied t/s for the
+realistic improvements: tail polish only.
