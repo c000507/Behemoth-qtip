@@ -98,6 +98,10 @@ ATTN_DEC_ROWS = int(os.environ.get('ATTN_DEC_ROWS', 8))
 # per 128-page group for all rows (nki_decode.decode_attention_fp8_2p_shared); meta.json "shared_table": true, the runtime picks such a
 # bucket only for single-request verify steps (docs/neuron-verify-kernel.md)
 ATTN_DEC_SHARED = os.environ.get('ATTN_DEC_SHARED', '0') == '1'
+# ATTN_QKV=nki: decode graphs (T <= QKV_ROWS rows, WT=1) run RMSNorm + fp8 quant + q/k/v + RoPE as one NKI kernel (nki_qkv.py); the graph's inputs,
+# outputs and meta are unchanged, so the runtime needs no change (docs/neuron-nki-fusion.md)
+ATTN_QKV = os.environ.get('ATTN_QKV', 'xla')
+QKV_ROWS = int(os.environ.get('QKV_ROWS', 32))
 ATTN_DEC_MIN_PAGES = int(os.environ.get('ATTN_DEC_MIN_PAGES', 128))  # below this the kernel (padded to 64 pages) is no faster than the torch-op loop
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
@@ -380,6 +384,21 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     return acc / l.unsqueeze(-1)
 
 
+# LAYER_STAGE=<name> (profiling only, docs/neuron-nki-fusion.md): the layer graph stops after the named stage and returns that stage's
+# tensor (+ cache / cscale), every unused input kept alive through a dead scalar so the input ORDER (layer_bench binding) is unchanged.
+# Consecutive stages timed with layer_bench give the per-piece cost of the attention half. Stages, in graph order:
+#   norm1 | qkv | rope | kvwrite | kvgather (prefill: the gathered + dequantised pages) | attn | oproj (no all-reduce) | oproj_ar | norm2 | mlpin (fp8 act quant)
+LAYER_STAGE = os.environ.get('LAYER_STAGE', '')
+STAGES = ['norm1', 'qkv', 'rope', 'kvwrite', 'kvgather', 'attn', 'oproj', 'oproj_ar', 'norm2', 'mlpin']
+
+
+def _stage_return(t, keep, *outs):
+    """outs[0] + 0 * (one element of every unused input), cache, cscale: the graph of one profiling stage."""
+    dead = sum(t[k].float().reshape(-1)[0] for k in layer_order() if k not in keep and k not in ('cache', 'cscale'))
+    first = outs[0].float() + 0.0 * dead
+    return (first, t['cache'], t['cscale']) if KV8 else (first, t['cache'])
+
+
 def paged_layer(R, Q, P, *args):
     import torch_xla.core.xla_model as xm
     order = layer_order()
@@ -392,22 +411,42 @@ def paged_layer(R, Q, P, *args):
     w = lambda a, b: Fp8Weight(t[a], t[b], WT)
     qtip = WEIGHTS == 'qtip'
     x = t['x']
-    h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm1']).to(torch.bfloat16)
-    if qtip:
+    qkv_keep = ('x', 'norm1', 'qf', 'qs', 'kf', 'ks', 'vf', 'vs')
+    fused_qkv = ATTN_QKV == 'nki' and not qtip and WT and T <= QKV_ROWS
+    if fused_qkv:
+        # one NKI kernel for RMSNorm + fp8 quant + q / k / v + RoPE (nki_qkv.py): same semantics as the XLA chain below, graph interface unchanged
+        import nki_qkv
+        NQ, NKV = heads * D, kvh * D
+        o = nki_qkv.qkv_fused(x, t['norm1'], t['qf'], t['qs'].reshape(1, -1), t['kf'], t['ks'].reshape(1, -1), t['vf'], t['vs'].reshape(1, -1), t['cos_sin'])
+        q, k, v = o[:, :NQ].reshape(T, heads, D), o[:, NQ:NQ + NKV].reshape(T, kvh, D), o[:, NQ + NKV:].reshape(T, kvh, D)
+        if LAYER_STAGE in ('norm1', 'qkv', 'rope'):
+            return _stage_return(t, qkv_keep + ('cos_sin',), o)
+    h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm1']).to(torch.bfloat16) if not fused_qkv else None
+    if LAYER_STAGE == 'norm1':
+        return _stage_return(t, ('x', 'norm1'), h)
+    if fused_qkv:
+        pass
+    elif qtip:
         # q column-parallel: rotate the replicated input, multiply this rank's rows of W~, all-gather z, finish on the
         # full vector and keep this rank's heads
         z = qtip_graph.gather_tp(qtip_graph.kernel_matmul(qtip_graph.rotate_in(h, t['qsu'], H), t['qw'], t['ql']), t['sel_h'], H, allreduce, g.TP)
         q = torch.index_select(qtip_graph.finish(z, t['qsv'], H), -1, t['sel_h']).reshape(T, heads, D)
     else:
         q = lin_fp8(h, w('qf', 'qs')).float().reshape(T, heads, D)
-    k = lin_fp8(h, w('kf', 'ks')).float().reshape(T, kvh, D)
-    v = lin_fp8(h, w('vf', 'vs')).float().reshape(T, kvh, D)
+    if not fused_qkv:
+        k = lin_fp8(h, w('kf', 'ks')).float().reshape(T, kvh, D)
+        v = lin_fp8(h, w('vf', 'vs')).float().reshape(T, kvh, D)
+    if LAYER_STAGE == 'qkv':
+        return _stage_return(t, qkv_keep, torch.cat((q.reshape(T, -1), k.reshape(T, -1), v.reshape(T, -1)), dim=-1))
     cos, sin = t['cos_sin'][:, 0].reshape(T, 1, half), t['cos_sin'][:, 1].reshape(T, 1, half)
 
     def rope(z):
         a, b = z[..., :half], z[..., half:]
         return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1)
-    q, k = rope(q), rope(k)
+    if not fused_qkv:
+        q, k = rope(q), rope(k)
+    if LAYER_STAGE == 'rope':
+        return _stage_return(t, qkv_keep + ('cos_sin',), torch.cat((q.reshape(T, -1), k.reshape(T, -1), v.reshape(T, -1)), dim=-1))
     page = torch.bitwise_right_shift(t['wslot'], 4)
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
     at = (page[:, None, None], torch.arange(2, dtype=torch.int64, device=x.device)[None, :, None],
@@ -427,8 +466,20 @@ def paged_layer(R, Q, P, *args):
             cscale = t['cscale'].index_put(at, sc)
     else:
         cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
+    if LAYER_STAGE in ('kvwrite', 'kvgather'):
+        t2 = dict(t, cache=cache, cscale=cscale)
+        if LAYER_STAGE == 'kvwrite':
+            return _stage_return(t2, qkv_keep + ('cos_sin', 'wslot'), q.reshape(T, -1))
+        kv = cache[t['table'][0]]                                              # the prefill kernel's gather + dequant + permute (flash_paged_nki)
+        if cscale is not None:
+            kv = (kv.float() * cscale[t['table'][0]].unsqueeze(-1)).to(torch.bfloat16)
+        kk = kv[:, 0].permute(1, 3, 0, 2).reshape(kvh, D, P * PAGE)
+        vv = kv[:, 1].permute(1, 0, 2, 3).reshape(kvh, P * PAGE, D)
+        return _stage_return(t2, qkv_keep + ('cos_sin', 'wslot', 'table'), torch.cat((kk.reshape(1, -1), vv.reshape(1, -1), q.reshape(1, -1)), dim=-1))
     attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, cscale, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
+    if LAYER_STAGE == 'attn':
+        return _stage_return(dict(t, cache=cache, cscale=cscale), qkv_keep + ('cos_sin', 'wslot', 'table', 'pos'), attn)
     # ATTN_PROFILE='attn': stop after the attention kernel (the attention half); 'noattn': skip the attention
     # kernel (attn = 0) and run the MLP tail. Unused weights stay in the graph through a dead scalar so the
     # input ORDER (and thus layer_bench binding) is unchanged.
@@ -448,8 +499,19 @@ def paged_layer(R, Q, P, *args):
         u = torch.index_select(qtip_graph.rotate_in(attn_full, t['osu'], H), -1, t['sel_h'])
         x = x + qtip_graph.finish(allreduce(qtip_graph.kernel_matmul(u, t['ow'], t['ol'])), t['osv'], H)
     else:
+        attn_keep = qkv_keep + ('cos_sin', 'wslot', 'table', 'pos', 'of', 'os')
+        if LAYER_STAGE == 'oproj':
+            return _stage_return(dict(t, cache=cache, cscale=cscale), attn_keep, x + lin_fp8(attn, w('of', 'os'), OUT_F32).float())
         x = x + allreduce(lin_fp8(attn, w('of', 'os'), OUT_F32).float())
+        if LAYER_STAGE == 'oproj_ar':
+            return _stage_return(dict(t, cache=cache, cscale=cscale), attn_keep, x)
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * t['norm2']).to(torch.bfloat16)
+    if LAYER_STAGE == 'norm2':
+        return _stage_return(dict(t, cache=cache, cscale=cscale), attn_keep + ('norm2',), torch.cat((x, h.float()), dim=-1))
+    if LAYER_STAGE == 'mlpin':
+        ha = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        h8T = (h.float() / ha).to(torch.float8_e4m3fn).T.contiguous()
+        return _stage_return(dict(t, cache=cache, cscale=cscale), attn_keep + ('norm2',), torch.cat((x, h8T.T.float() + ha), dim=-1))
     if qtip:
         # gate | up column-parallel with one all-gather; their full outputs are replicated, so down (row-parallel)
         # needs no all-gather of its input
@@ -560,7 +622,7 @@ def example_inputs(R, Q, P, pages):
 
 
 # Trace-time env flags recorded in meta.json "build" (provenance only; the runtime reads none of them)
-BUILD_ENV_FLAGS = ['MODEL', 'CONFIG', 'TP', 'PAGES', 'WEIGHTS', 'KV', 'KVATT', 'ATTN_DEC', 'ATTN_DEC_SHARED', 'ATTN_DEC_MIN_PAGES', 'ATTN_PROFILE',
+BUILD_ENV_FLAGS = ['MODEL', 'CONFIG', 'TP', 'PAGES', 'WEIGHTS', 'KV', 'KVATT', 'ATTN_DEC', 'ATTN_DEC_SHARED', 'ATTN_DEC_MIN_PAGES', 'ATTN_PROFILE', 'LAYER_STAGE', 'ATTN_QKV', 'ATTN_DEC_ROWS',
                    'WT', 'MLP', 'DOWN_BF16', 'OUT_F32', 'HEAD_ROWS', 'HEAD_FP8', 'HEAD_ARGMAX', 'UNSAFE_FP8FNCAST', 'NCC_FLAGS', 'NEURON_PLATFORM_TARGET_OVERRIDE']
 
 
