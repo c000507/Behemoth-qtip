@@ -100,6 +100,8 @@ struct Meta {
     bool kv8 = false;                             // kind "layer": FP8 KV cache (E4M3 bytes + f32 scale per K|V, token, head), trace_model.py KV=fp8
     bool wt = false;                              // kind "layer": FP8 projections stored transposed [in][out] (trace_model.py WT=1)
     bool mlp_tiled = false;                       // kind "layer": gate / up / down in nki_mlp.tile_weight's layout (trace_model.py MLP=nki)
+    bool shared_table = false;                    // kind "layer": every row attends over table row 0 (trace_model.py ATTN_DEC_SHARED=1): only for
+                                                  // launches whose rows all belong to ONE request (a verify step); never picked otherwise
     std::string weights = "fp8";                  // kind "layer": "fp8" (seven E4M3 shards) or "qtip" (q/o/gate/up/down trellis resident)
     std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
     Geometry geometry;
@@ -291,6 +293,7 @@ struct NeuronModel::Impl {
                 kv8 = m.kv8;
                 kv8_seen = true;
                 m.mlp_tiled = j.value("mlp", std::string("plain")) == "tiled";
+                m.shared_table = j.value("shared_table", false);
                 if (m.weights == "fp8") {
                     if (mlp_seen && mlp_tiled != m.mlp_tiled)
                         throw std::runtime_error("FP8 layer NEFFs in " + options.neff_dir.string() + " mix tiled (MLP=nki) and plain MLP weights");
@@ -309,7 +312,7 @@ struct NeuronModel::Impl {
                 auto &set = m.Q == 1 ? decode : prefill;
                 LayerBucket *same = nullptr;
                 for (auto &b : set)
-                    if (!b.full() && b.meta.R == m.R && b.meta.Q == m.Q && b.meta.P == m.P) same = &b;
+                    if (!b.full() && b.meta.R == m.R && b.meta.Q == m.Q && b.meta.P == m.P && b.meta.shared_table == m.shared_table) same = &b;
                 if (same) {
                     if (same->variants.count(m.weights))
                         throw std::runtime_error("two " + m.weights + " layer NEFFs for the same bucket R=" + std::to_string(m.R) + " Q=" +
@@ -1408,10 +1411,12 @@ struct NeuronModel::Impl {
         // Bucket choice: the cheapest (rows x table pages, or queries x table pages) NEFF that covers the work; a
         // whole-model bucket wins a tie with the per-layer one.
         auto cost = [](const LayerBucket &b) { return double(b.tokens()) * double(b.meta.P) + (b.full() ? 0. : .5); };
-        auto pick = [&](std::vector<LayerBucket> &set, int need_rows, int need_queries, int pages) -> LayerBucket * {
+        // shared: true picks among the shared-table buckets only (every row reads table row 0, so the launch must hold the rows of
+        // ONE request); false (the default) never picks one, so a graph set without such buckets behaves as before.
+        auto pick = [&](std::vector<LayerBucket> &set, int need_rows, int need_queries, int pages, bool shared = false) -> LayerBucket * {
             LayerBucket *best = nullptr;
             for (auto &b : set)
-                if (b.meta.R >= need_rows && b.meta.Q >= need_queries && b.meta.P >= pages && (!best || cost(b) < cost(*best)))
+                if (b.meta.shared_table == shared && b.meta.R >= need_rows && b.meta.Q >= need_queries && b.meta.P >= pages && (!best || cost(b) < cost(*best)))
                     best = &b;
             return best;
         };
@@ -1442,7 +1447,13 @@ struct NeuronModel::Impl {
                 for (size_t i = 0; i < count; ++i) pages = std::max(pages, pages_needed(rows[at + i].req));
                 return pages;
             };
-            LayerBucket *bucket = pick(decode, int(n), 1, pages_of(n));
+            LayerBucket *bucket = nullptr;
+            // a multi-row launch whose rows all belong to one request (a verify step: the scheduled token + its drafts) may use a
+            // shared-table bucket (one page gather for all rows); any other mix uses the per-row buckets as before
+            if (n > 1 && std::all_of(rows.begin() + std::ptrdiff_t(at), rows.begin() + std::ptrdiff_t(at + n), [&](const Row &r) { return r.req == rows[at].req; }))
+                bucket = pick(decode, int(n), 1, pages_of(n), true);
+            if (!bucket)
+                bucket = pick(decode, int(n), 1, pages_of(n));
             while (!bucket && n > 1) {
                 n = std::min(n - 1, size_t(max_rows));
                 bucket = pick(decode, int(n), 1, pages_of(n));

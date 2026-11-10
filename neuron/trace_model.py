@@ -94,6 +94,10 @@ KEY_BLOCK_PAGES = int(os.environ.get('KEY_BLOCK_PAGES', 128))  # G: pages per fl
 ATTN = os.environ.get('ATTN', 'nki')  # 'nki': prefill chunks (R = 1, Q a multiple of 128) run NKI's flash_fwd over the gathered pages; 'xla': torch-op flash loop
 ATTN_DEC = os.environ.get('ATTN_DEC', 'xla')  # 'nki': decode (Q = 1, bf16 cache, up to ATTN_DEC_ROWS rows) runs nki_decode.decode_attention
 ATTN_DEC_ROWS = int(os.environ.get('ATTN_DEC_ROWS', 8))
+# ATTN_DEC_SHARED=1 (FP8 KV, ATTN_DEC=nki): every decode row attends over ROW 0's page table (the verify rows of ONE request): one gather
+# per 128-page group for all rows (nki_decode.decode_attention_fp8_2p_shared); meta.json "shared_table": true, the runtime picks such a
+# bucket only for single-request verify steps (docs/neuron-verify-kernel.md)
+ATTN_DEC_SHARED = os.environ.get('ATTN_DEC_SHARED', '0') == '1'
 ATTN_DEC_MIN_PAGES = int(os.environ.get('ATTN_DEC_MIN_PAGES', 128))  # below this the kernel (padded to 64 pages) is no faster than the torch-op loop
 DECODE_BLOCK_PAGES = int(os.environ.get('DECODE_BLOCK_PAGES', 256))  # decode (Q = 1): few big blocks, the score row is tiny; 32-page blocks were ~50 us of serial small ops each
 ORDER = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2',
@@ -236,6 +240,36 @@ def flash_decode_nki_fp8(q, cache, cscale, table, pos, R, P, kvh, rep):
     return o.reshape(R, 1, kvh, rep, D)
 
 
+def flash_decode_nki_fp8_shared(q, cache, cscale, table, pos, R, P, kvh, rep):
+    """flash_decode_nki_fp8 for R rows that share ONE page table (table[0]; the other table rows are ignored) through
+    nki_decode.decode_attention_fp8_2p_shared: every 128-page group is gathered once for all R x 16 query rows (<= 128 partitions);
+    the causal / length mask is per row (its own position), the K / V scales are repeated over the rows. Any P (padded to whole groups)."""
+    import numpy as np
+    import nki_decode as nd
+    D, dev, GP = g.D, q.device, nd.GROUP8_PAGES
+    G = -(-P // GP)
+    NP = R * nd.ROWS
+    assert NP <= 128, f'ATTN_DEC_SHARED: {R} rows x {nd.ROWS} query rows exceed 128 partitions'
+    pages = table[:1]                                                          # [1, P]: the shared table
+    if P < G * GP:
+        pages = torch.cat((pages, torch.full((1, G * GP - P), cache.shape[0] - 1, dtype=pages.dtype, device=dev)), dim=1)
+    pg = pages.reshape(G, GP)
+    heads = torch.arange(kvh, dtype=torch.int64, device=dev).reshape(kvh, 1, 1)
+    def rows(kv):                                                              # [kvh, 128, G] cache row of page j of group g, head h
+        return ((pg.reshape(1, G, GP) * 2 + kv) * kvh + heads).permute(0, 2, 1).to(torch.int32)
+    kpos = torch.tensor(nd.native_key_positions8(G), dtype=torch.int64, device=dev)                       # [G, 2048]
+    bias = torch.where(kpos.reshape(G, 1, 2048) > pos.reshape(1, R, 1), -30000.0, 0.0).to(torch.float32)   # [G, R, 2048]
+    bias = bias.reshape(G, R, 1, 2048).expand(G, R, nd.ROWS, 2048).reshape(G, NP, 2048).contiguous()
+    sc = cscale[pages[0]].reshape(G, GP, 2, kvh, PAGE)                                                    # [G, j, K|V, h, t]
+    def native(kv):                                                            # [G, NP, 2048]: row 16 r + 4 h + i, column t * 128 + j
+        s = sc[:, :, kv].permute(0, 2, 3, 1).reshape(G, kvh, 1, PAGE * GP).expand(G, kvh, rep, PAGE * GP)
+        return s.reshape(G, 1, nd.ROWS, PAGE * GP).expand(G, R, nd.ROWS, PAGE * GP).reshape(G, NP, PAGE * GP).contiguous()
+    mask = torch.tensor(np.tile(np.kron(np.eye(kvh, dtype=np.float32), np.ones((rep, 1), np.float32)), (R, 1)), device=dev)   # [NP, kvh]
+    qt = (q.reshape(R, kvh, rep, D).float() * (D ** -0.5)).to(torch.bfloat16).permute(0, 1, 3, 2).contiguous()
+    o = nd.decode_attention_fp8_2p_shared(qt, cache.reshape(-1, PAGE * D), rows(0), rows(1), bias, mask, native(0), native(1))
+    return o.reshape(R, 1, kvh, rep, D)
+
+
 def flash_decode_nki_fp8_paired(q, cache, cscale, table, pos, R, P, kvh, rep):
     """flash_decode_nki_fp8 over the PAIRED cache [pages, kvh, 2, PAGE, D]: row r = p * kvh + h holds K|V in one
     4 KB row, so pass 1 gathers K and V together and pass 2 reuses the resident tile (nki_decode.decode_attention_fp8_2p_paired)."""
@@ -307,6 +341,8 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """q [R,Q,kvh,rep,D] bf16 (rope applied) -> [R,Q,kvh,rep,D] f32. Online softmax over blocks of G pages."""
     if ATTN == 'nki' and R == 1 and Q % 128 == 0:
         return flash_paged_nki(q, cache, cscale, table, pos, Q, P, kvh, rep)
+    if ATTN_DEC == 'nki' and ATTN_DEC_SHARED and Q == 1 and cscale is not None and R <= ATTN_DEC_ROWS:
+        return flash_decode_nki_fp8_shared(q, cache, cscale, table, pos, R, P, kvh, rep)
     if ATTN_DEC == 'nki' and Q == 1 and cscale is None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
         return flash_decode_nki(q, cache, table, pos, R, P, kvh, rep)
     if ATTN_DEC == 'nki' and Q == 1 and cscale is not None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
@@ -560,6 +596,8 @@ def main():
         if WEIGHTS not in ('fp8', 'qtip'):
             raise SystemExit(f'WEIGHTS={WEIGHTS}: expected fp8 or qtip')
         meta = {'kind': 'layer', 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'order': layer_order(), 'weights': WEIGHTS, 'wt': WT, 'kv': 'fp8' if KV8 else 'bf16', 'mlp': 'tiled' if MLP == 'nki' else 'plain'}
+        if ATTN_DEC == 'nki' and ATTN_DEC_SHARED and KV8 and Q == 1:
+            meta['shared_table'] = True  # every row attends over table[0]: the runtime uses this bucket for single-request verify steps only
     elif kind == 'model':
         if WEIGHTS != 'fp8' or KV8:
             raise SystemExit('whole-model graphs are only generated for WEIGHTS=fp8 with a bf16 KV cache')
