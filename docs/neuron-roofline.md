@@ -54,6 +54,61 @@ granularity + per-chunk semaphore traffic.)
 P = ceil(n/128) ≤ ~4095 (P·16 ≤ 65535, u16 semaphore wrap). Fix =
 per-pass semaphore re-arm or 32-bit counters (decode needed).
 
+## 2b. DMA-only sweep (no compute in the path, 2026-11-10)
+
+Containers: the validated shr shape with the DVE work stripped — pool
+desc0 = HBM->SB (x-in, sem 8) chained to desc1 = SB->HBM (y-out, wait
+sem 8 GE 16); desc events: wait = u16@4, upd = u16@6; an assigned sem
+(u32@12 = sem<<8) is auto-incremented +16 by the transfer completion.
+The 4P desc fields = BYTES PER CHANNEL = n*4/128 — they MUST scale
+with n (desc1 GE value = 16 = one desc completion). Run through the
+fault-isolated neurond (tools/neurond/neurond.cpp, per-request child
+process, 240 s kill). traffic = in + out bytes per execute.
+
+Serial chain (HBM->SB then SB->HBM, 200-iter avg):
+
+| n (elem) | bytes/dir | total | avg us | marginal GB/s (avg-56) |
+|---|---|---|---|---|
+| 128      | 512 B  | 1 KB    | 59.0  | ~0 (floor) |
+| 512      | 2 KB   | 4 KB    | 58.9  | ~1 |
+| 2048     | 8 KB   | 16 KB   | 59.2  | ~5 |
+| 8192     | 32 KB  | 64 KB   | 59.4  | 19  |
+| 16384    | 64 KB  | 128 KB  | 59.9  | 33  |
+| 32768    | 128 KB | 256 KB  | 63.5  | 34  |
+| 65536    | 256 KB | 512 KB  | 60.9  | 105 |
+| 131072   | 512 KB | 1 MB    | 64.1  | 123 |
+| 262144   | 1 MB   | 2 MB    | 66.9  | 183 |
+| 524288   | 2 MB   | 4 MB    | 74.3  | 219 |
+| 1048576  | 4 MB   | 8 MB    | 91.7  | 224 |
+
+- Ceiling (serial) = **~220-225 GB/s aggregate** at >= 2 MB/dir;
+  transfers < 128 KB/dir run at 1-100 GB/s (fixed per-transfer cost
+  ~3-5 us + small-chunk inefficiency).
+- PARALLEL variant (compiler 2-input and-oracle, 3 descs: 2x in
+  concurrent + y-out; numerics a&b verified): n=131072: 67.3 us
+  (1.5 MB, 133-163 GB/s); n=524288: 82.7 us (6 MB, 225-248); n=
+  1048576: 105.4 us (12 MB, marginal 259-264 GB/s). **Aggregate DMA
+  ceiling ~240-265 GB/s**; the 220 GB/s proxy number = right order,
+  mildly conservative.
+- The compiler mul marginal (395 GB/s, quant-feasibility doc) exceeds
+  the DMA-only probes: its desc geometry pipelines better than our
+  2-desc serial chain — the pseudo-desc internals (packet splitting at
+  DMA_MAX_DESC_COUNT_PER_PACKET=64 x 64 KiB) are opaque; treat
+  250-400 GB/s as the desc-geometry-dependent envelope.
+- **Queue sweep = IMPOSSIBLE via def.json num_queues**: q1/q4 = exec
+  timeout (5) at a shape that passes with the default 16 — the
+  semaphore wiring is tied to the 16-sem set (descs reference sems
+  8/9/10 of qPoolDynamic's set); shrinking the queue count breaks it.
+  Parallelism must come from MORE DESCRIPTORS (more streams), not
+  fewer queues.
+- **Size cap = 4 MB/dir per pseudo-desc**: n*4/128 bytes-per-channel
+  overflows u16 at n > 2M elem AND DMA_MAX_DESC_COUNT_PER_PACKET(64) x
+  64 KiB = 4 MB; the 8 MB probe hard-faulted the exec unit (101).
+  Bigger transfers need a real multi-desc chain (undecoded).
+- "Both cores" = not exercised: single-graph containers bind 1 NC;
+  2-core aggregate needs either 2 concurrent processes (device has 2
+  NCs) or cc_streams collectives (deferred).
+
 ## 3. Weight streaming (decode-shaped matmuls, fp32, compiler)
 
 w[K,N] streams from HBM through the SB w-region in 512B row-chunks; the
@@ -68,9 +123,12 @@ multi-round path (compiler only, decode pending).
 | 32×4096×128 (oracle)      | 2.1 MB | 71.8 | 68.7 | 139 |
 | 512×2048×512 (oracle)     | 4.2 MB | 136.0 | 129.6 | – |
 
-- Marginal w-streaming rate at K4096 ≈ **139 GB/s** = ~60% of the
-  elementwise DMA plateau (220 GB/s): the 512B chunk granularity costs
-  ~40% at decode shapes.
+- Marginal w-streaming rate at K4096/N128 ≈ **133-139 GB/s** = ~60% of
+  the DMA-only plateau (see the DMA sweep below). NOT an arithmetic
+  bug: the w rows = N x elem = 512 B at N=128 = the SMALL-CHUNK DMA
+  regime (chunk size = row width, set by N). The GEMV sweep (K=N=4096,
+  16 KB rows) reaches 165-243 GB/s. Consistent picture: the DMA is
+  chunk-size-bound, not fixed at 220.
 - 512×2048×512 = 1.07 GFLOP in 136 µs = **7.9 TFLOP/s fp32** (incl. all
   overheads) — the only shape where compute is visible above the floor.
 - Our synth containers = byte-exact vs compiler streams at the covered
@@ -98,11 +156,13 @@ untested; expected effect = 2-4× lower w-stream bytes for the same GB/s.
    graph. Multi-op fusion in one graph (0.27 µs/op marginal) removes it.
    This is already proven (5.8× block fusion, memory 26) and is the main
    lever our emitter stack exploits.
-2. **Decode-shape weight streaming runs at ~60% of the DMA plateau**
-   (139 vs 220 GB/s): bigger staging chunks (or multi-round pipelining
-   with fewer, larger descs) could buy ~1.7× on bandwidth-bound GEMV.
-   The compiler does not do this; ours can (chunk size is our choice in
-   the pool descs).
+2. **Chunk-size-bound streaming**: the DMA plateau is ~220-265 GB/s
+   aggregate for >= 512 KB transfers but collapses to 1-140 GB/s below
+   ~256 KB/dir (and for 512 B-row layouts like N=128 weights: 133-139
+   GB/s). Chunk size is largely set by the tensor row geometry; the
+   lever = re-packing weights/layouts so the DMA sees big contiguous
+   runs, IF the PE consumption pattern allows it (open question — the
+   LW pattern reads N-row-shaped tiles).
 3. **Low-bit weights** multiply the same lever: NVFP4 = 4× fewer w bytes
    than fp32 on top of headroom 2 — quant study next
    (docs/neuron-quant-feasibility.md).
