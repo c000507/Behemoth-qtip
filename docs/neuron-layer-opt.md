@@ -326,3 +326,49 @@ in the HLO as p1.497 [44488, 2048] = a separate input among the 23
 (the 10.5/2.6 MB tensors include q/o shards and kernel tables). The
 brief-13 "input21 = attention weight" relabel was wrong; the supervisor's
 original accounting was right.
+
+## 12. Brief 15: per-token breakdown — where the non-layer time goes
+
+Residency (settled): input21 [5561,2,4,16,128] = the FULL-context KV
+pool (identical in dec1_32 and dec1_128 def.json = bucket-independent).
+Weights 278 MB x 40 layers = 11.1 GB + KV 91 MB x 40 = 3.6 GB =
+**14.7 GB < 16 GB per core = weights are RESIDENT on device.** The
+serving stack's STAGE_DIR=/dev/shm + STREAM_AHEAD=8 = load-time host
+staging only (each layer's NEFF+weights uploaded once at model load,
+<=8 ahead); per-token there is NO weight upload. The 1.32 ms/layer =
+the HBM re-read of the resident weights per execute (the DMA geometry
+already covered).
+
+Measured (real graphs, 2 ranks, layer_bench):
+
+| measurement | result |
+|---|---|
+| head1 (lm_head, bf16, 671 MB/rank) | **3.371 ms/token** |
+| dec1_128 sync, 40 steps | 1.327 ms/layer |
+| dec1_128 ASYNC inflight=8, 40 steps | **1.133 ms/layer** |
+| dec1_128 ASYNC, 200 steps | 1.215 ms/layer |
+
+- **The launch gap = 0.11-0.19 ms/layer and it is hideable** with
+  NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=8: 40 x 0.19 = up to
+  **7.8 ms/token**. The repo already sets this in cpp/neuron_model.cpp
+  (setenv) — whether the user's Devstral serving path inherits it must
+  be checked in their stack (image behemoth-neuron-server).
+- Head = 3.37 ms bf16 (671 MB read/rank); the repo's HEAD_FP8=1
+  (quantized lm_head rows, max 224) = measured 2.1 ms in PERF_NOTES =
+  **-1.3 ms/token** on the shelf.
+- Token arithmetic (measured device floor): layers 40 x 1.15-1.21 =
+  46-48.5 ms + head 3.37 = **49-52 ms device**. The user's 15 t/s =
+  66.7 ms/token -> **host-side = ~15-17 ms/token (23-25%)**: embedding,
+  RoPE rows, page-table updates, logits read-back (131072 x f32 =
+  524 KB = trivial), sampling over a 131k vocab, per-step host sync.
+  This is now the LARGEST single chunk and it is outside libnrt.
+- Concrete fixes, largest first:
+  1. Verify/set NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=8 in the
+     serving env (or the repo's neuron_engine.cpp path) = -5..-8 ms.
+  2. HEAD_FP8=1 head buckets = -1.3 ms.
+  3. Host: overlap sampling/readback with the next step's first layer
+     (async execute of layer 0 while sampling); batch the host ops.
+  Expected: 15 -> 17-19 t/s with 1+2 and ~19-21 with 1-3, if the host
+  is really ~15 ms; measuring the true host split needs the real
+  engine run (BEHEMOTH_NEURON_STEP_LOG=1) which needs the full prepared
+  model set — flagged as the remaining unverified item.
