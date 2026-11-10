@@ -452,18 +452,24 @@ SHARED = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'rows', 'head_norm', 'head_w'
 BODY_SHARED = SHARED[:5]  # a body segment (no head) takes only these and returns the residual stream
 
 
-def head_graph(S, x, rows, norm, w, ws=None, transposed=False):
+def head_graph(S, x, rows, norm, w, ws=None, transposed=False, argmax=False):
     """Final RMSNorm and this rank's vocab slice of lm_head for S selected rows -> logits [S, VOCAB_PAD/TP] f32.
     bf16 lm_head (w [V/TP, H]) or, with ws, an E4M3 lm_head with a per-row scale: the activation is scaled per row into
     E4M3 like the layer projections, the matmul runs fp8 x fp8 and the f32 result is rescaled (not rounded to bf16).
-    transposed: w is [H, V/TP] (contraction axis first, like WT layer weights)."""
+    transposed: w is [H, V/TP] (contraction axis first, like WT layer weights).
+    argmax: return (per-row max, per-row argmax int32) over the vocab shard instead of the logits (greedy fast path)."""
     x = torch.index_select(x, 0, rows)
     h = (x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-5) * norm).to(torch.bfloat16)
     if ws is None:
-        return (h @ (w if transposed else w.T)).float()
-    a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
-    h8 = (h.float() / a).to(torch.float8_e4m3fn)
-    return torch.matmul(h8, w if transposed else w.T).float() * a * ws.reshape(1, -1)
+        logits = (h @ (w if transposed else w.T)).float()
+    else:
+        a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        h8 = (h.float() / a).to(torch.float8_e4m3fn)
+        logits = torch.matmul(h8, w if transposed else w.T).float() * a * ws.reshape(1, -1)
+    if argmax:
+        mx, am = torch.max(logits, dim=-1)
+        return mx, am.to(torch.int32)
+    return logits
 
 
 class FullModel(torch.nn.Module):
@@ -568,16 +574,17 @@ def main():
         S = int(sys.argv[3])
         T = int(os.environ.get('HEAD_ROWS', '256'))
         fp8 = os.environ.get('HEAD_FP8', '0') == '1'
+        argmax = os.environ.get('HEAD_ARGMAX', '0') == '1'
         rows = g.VOCAB_PAD // g.TP
         inputs = [torch.zeros(T, g.H), torch.zeros(S, dtype=torch.int64), torch.ones(1, g.H)]
         kwargs = {}
         if fp8:
             inputs += [torch.zeros(*((g.H, rows) if WT else (rows, g.H))).to(torch.float8_e4m3fn), torch.ones(rows)]
-            fn = lambda x, rows_, norm, wf, ws: head_graph(S, x, rows_, norm, wf, ws, WT)
+            fn = lambda x, rows_, norm, wf, ws: head_graph(S, x, rows_, norm, wf, ws, WT, argmax)
         else:
             inputs += [torch.zeros(*((g.H, rows) if WT else (rows, g.H)), dtype=torch.bfloat16)]
-            fn = lambda x, rows_, norm, w: head_graph(S, x, rows_, norm, w, None, WT)
-        meta = {'kind': 'head', 'S': S, 'T': T, 'fp8': fp8, 'wt': WT, 'order': HEAD_FP8_ORDER if fp8 else HEAD_ORDER}
+            fn = lambda x, rows_, norm, w: head_graph(S, x, rows_, norm, w, None, WT, argmax)
+        meta = {'kind': 'head', 'S': S, 'T': T, 'fp8': fp8, 'argmax': argmax, 'wt': WT, 'order': HEAD_FP8_ORDER if fp8 else HEAD_ORDER}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

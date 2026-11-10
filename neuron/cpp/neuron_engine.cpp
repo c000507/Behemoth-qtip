@@ -448,7 +448,28 @@ struct Engine::Impl {
             }
             try {
                 const auto start = Clock::now();
-                const auto logits = model.forward(input);
+                // Device argmax fast path: every sampled row must be unconstrained greedy (the drafts are verified by
+                // greedy comparison, so they qualify); the head graph then returns per-row (max, argmax) and the host
+                // only merges the two ranks' candidates.
+                bool greedy_step = true;
+                if (const char *da = std::getenv("BEHEMOTH_NEURON_DEVICE_ARGMAX"))
+                    if (da[0] != '1')
+                        greedy_step = false;
+                for (size_t i = 0; i < step.requests.size(); ++i) {
+                    if (!step.requests[i].sample)
+                        continue;
+                    if (step_constraints[i]) {
+                        greedy_step = false;
+                        break;
+                    }
+                    const auto &req0 = scheduler.request(step.requests[i].id);
+                    if (has_logit_processing(req0.sampling) || req0.sampling.temperature != 0.f) {
+                        greedy_step = false;
+                        break;
+                    }
+                }
+                const auto t_sample0 = Clock::now();
+                const auto logits = model.forward(input, greedy_step);
                 const size_t vocab = size_t(model.vocab());
                 // sampled[i]: the tokens of request i's rows (scheduled token, then one per draft row), in row order
                 std::vector<std::vector<int>> sampled(step.requests.size());
@@ -475,6 +496,13 @@ struct Engine::Impl {
                         auto d = drafts.find(step.requests[i].id);
                         TokenConstraint *constraint = step_constraints[i];
                         for (size_t j = 0; j < sampled[i].size(); ++j) {
+                            if (greedy_step) {
+                                const int dt = model.device_token(logits_row[i] + j);
+                                if (dt >= 0) {
+                                    sampled[i][j] = dt;
+                                    continue;
+                                }
+                            }
                             auto row = logits.subspan((logits_row[i] + j) * vocab, vocab);
                             if (process) { // penalties see the tokens before this row: history, then drafts 0 .. j - 1
                                 processed.assign(row.begin(), row.end());
@@ -504,6 +532,7 @@ struct Engine::Impl {
                 std::lock_guard lock(mutex);
                 model_seconds += std::chrono::duration<double>(Clock::now() - start).count();
                 last_profile = model.last_profile();
+                last_profile["sample_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - t_sample0).count();
                 ++steps;
                 size_t step_tokens = 0, step_drafts = 0;
                 for (size_t i = 0; i < step.requests.size(); ++i) {

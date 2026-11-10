@@ -96,6 +96,7 @@ struct Meta {
     int R = 0, Q = 0, P = 0, S = 0, T = 0, L = 0; // kind "model": L layers in this graph (a bucket's total after discover())
     bool head = true;                             // kind "model": ends with the final norm + lm_head (else outputs the residual)
     bool fp8 = false;                             // kind "head": E4M3 lm_head with per-row scale (5 inputs) instead of bf16 (4)
+    bool argmax = false;                          // kind "head": outputs (per-row max, argmax int32) instead of logits (device greedy)
     bool kv8 = false;                             // kind "layer": FP8 KV cache (E4M3 bytes + f32 scale per K|V, token, head), trace_model.py KV=fp8
     bool wt = false;                              // kind "layer": FP8 projections stored transposed [in][out] (trace_model.py WT=1)
     bool mlp_tiled = false;                       // kind "layer": gate / up / down in nki_mlp.tile_weight's layout (trace_model.py MLP=nki)
@@ -171,9 +172,10 @@ struct LayerBucket {
 };
 struct HeadBucket {
     Meta meta;
+    bool argmax = false;
     std::vector<nrt_model_t *> model;
     struct PerRank {
-        Dev rows, logits;
+        Dev rows, logits, amx;
         // by the layer bucket whose residual buffer feeds the head, then by parity of the buffer holding the final x
         std::map<const LayerBucket *, std::array<nrt_tensor_set_t *, 2>> in;
         std::array<nrt_tensor_set_t *, 2> out{};
@@ -210,6 +212,9 @@ struct NeuronModel::Impl {
     std::vector<std::unique_ptr<RankWorker>> workers;
     nlohmann::json profile = nlohmann::json::object();
     double phase_upload_ms = 0, phase_layers_ms = 0, phase_head_ms = 0; // rank 0, summed over the launches of a forward
+    double phase_head_submit_ms = 0, phase_head_read_ms = 0, phase_gather_ms = 0;
+    std::vector<int> device_tokens;             // destination row -> token (device argmax path; -1: not produced)
+    bool used_device_argmax = false;
     size_t weight_bytes_rank = 0, kv_bytes_rank = 0;                   // resident per NeuronCore, for the load report
     bool kv8 = false, kv8_seen = false;                                // FP8 KV cache: cache bytes + a scale tensor per layer (meta.kv)
     bool weights_transposed = false, wt_seen = false;
@@ -319,14 +324,17 @@ struct NeuronModel::Impl {
             } else {
                 m.S = j.at("S"); m.T = j.at("T");
                 m.fp8 = j.value("fp8", false);
+                m.argmax = j.value("argmax", false);
                 m.wt = j.value("wt", false);
                 accept(m);
-                if (!heads.empty() && (heads.front().meta.fp8 != m.fp8 || heads.front().meta.wt != m.wt))
+                if (!heads.empty() && heads.front().meta.argmax == m.argmax &&
+                    (heads.front().meta.fp8 != m.fp8 || heads.front().meta.wt != m.wt))
                     throw std::runtime_error("head NEFFs mix bf16 / fp8 or transposed / plain lm_head formats");
                 head_fp8 = m.fp8;
                 head_transposed = m.wt;
                 HeadBucket b;
                 b.meta = m;
+                b.argmax = m.argmax;
                 heads.push_back(std::move(b));
             }
         }
@@ -524,7 +532,9 @@ struct NeuronModel::Impl {
             for (int r = 0; r < tp; ++r) {
                 check(nrt_load(neff.data(), neff.size(), r, 1, &h.model[size_t(r)]), "nrt_load head");
                 h.rank[size_t(r)].rows = alloc(r, size_t(h.meta.S) * 8, "rows");
-                h.rank[size_t(r)].logits = alloc(r, size_t(h.meta.S) * size_t(vocab_shard) * 4, "logits");
+                h.rank[size_t(r)].logits = alloc(r, size_t(h.meta.S) * (h.argmax ? 1 : size_t(vocab_shard)) * 4, "logits");
+                if (h.argmax)
+                    h.rank[size_t(r)].amx = alloc(r, size_t(h.meta.S) * 4, "amx");
             }
         }
         if (!pages_total)
@@ -1080,6 +1090,8 @@ struct NeuronModel::Impl {
                 for (int p = 0; p < 2; ++p) {
                     check(nrt_allocate_tensor_set(&hr.out[size_t(p)]), "set");
                     check(nrt_add_tensor_to_tensor_set(hr.out[size_t(p)], "output0", hr.logits.t), "head out");
+                    if (h.argmax)
+                        check(nrt_add_tensor_to_tensor_set(hr.out[size_t(p)], "output1", hr.amx.t), "head amx out");
                 }
                 for (const auto *group : {&decode, &prefill})
                     for (const auto &b : *group) {
@@ -1106,6 +1118,7 @@ struct NeuronModel::Impl {
         std::vector<int64_t> pos, wslot, table;
         std::vector<int> head_rows;   // rows of x to produce logits for
         std::vector<int> destination; // output row (in `logits`) of each head row
+        bool want_argmax = false;     // device argmax head for this launch (falls back to the logits head when unavailable)
     };
 
     void embed_row(int token, float *out) const {
@@ -1186,16 +1199,27 @@ struct NeuronModel::Impl {
                 }));
             for (auto &j : jobs)
                 j.get();
+            const auto t_g = Clock::now();
             gather_logits(L, out, dest);
+            phase_gather_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_g).count();
             return;
         }
         const HeadBucket *head = nullptr;
-        if (!L.head_rows.empty())
+        if (!L.head_rows.empty()) {
             for (const auto &h : heads)
-                if (h.meta.T == b.tokens() && h.meta.S >= int(L.head_rows.size())) {
+                if (h.meta.T == b.tokens() && h.meta.S >= int(L.head_rows.size()) && h.argmax == L.want_argmax) {
                     head = &h;
                     break;
                 }
+            if (!head && L.want_argmax) { // no argmax head for this shape: fall back to the logits head
+                for (const auto &h : heads)
+                    if (h.meta.T == b.tokens() && h.meta.S >= int(L.head_rows.size()) && !h.argmax) {
+                        head = &h;
+                        L.want_argmax = false;
+                        break;
+                    }
+            }
+        }
         if (!L.head_rows.empty() && !head)
             throw std::runtime_error("no head NEFF for " + std::to_string(L.head_rows.size()) + " rows of " + std::to_string(b.tokens()));
         int layers = config.layers;
@@ -1213,6 +1237,7 @@ struct NeuronModel::Impl {
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
         std::vector<std::vector<float>> out(static_cast<size_t>(tp));
+        std::vector<std::vector<int32_t>> amx(static_cast<size_t>(tp));
         std::vector<std::future<void>> jobs;
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
@@ -1261,16 +1286,42 @@ struct NeuronModel::Impl {
                     auto &hr = const_cast<HeadBucket *>(head)->rank[size_t(r)];
                     put(hr.rows, rows.data(), rows.size() * 8);
                     check(nrt_execute(head->model[size_t(r)], hr.in.at(&b)[size_t(final_parity)], hr.out[size_t(final_parity)]), "head execute");
-                    out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_shard));
-                    check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
-                    if (r == 0)
+                    const auto t_head_submit = Clock::now();
+                    if (head->argmax && L.want_argmax) {
+                        out[size_t(r)].resize(size_t(L.head_rows.size()));
+                        check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read head max");
+                        amx[size_t(r)].resize(size_t(L.head_rows.size()));
+                        check(nrt_tensor_read(hr.amx.t, amx[size_t(r)].data(), 0, amx[size_t(r)].size() * 4), "read head argmax");
+                    } else {
+                        out[size_t(r)].resize(size_t(head->meta.S) * size_t(vocab_shard));
+                        check(nrt_tensor_read(hr.logits.t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                    }
+                    if (r == 0) {
+                        phase_head_submit_ms += std::chrono::duration<double, std::milli>(t_head_submit - t_layers).count();
+                        phase_head_read_ms += ms_since(t_head_submit);
                         phase_head_ms += ms_since(t_layers);
+                    }
                 }
             }));
         for (auto &j : jobs)
             j.get();
-        if (head)
+        if (head && head->argmax && L.want_argmax) {
+            for (size_t i = 0; i < L.head_rows.size(); ++i) {
+                int best_r = 0;
+                float best = out[0][i];
+                for (int r = 1; r < tp; ++r)
+                    if (out[size_t(r)][i] > best) {
+                        best = out[size_t(r)][i];
+                        best_r = r;
+                    }
+                if (L.destination[i] >= 0 && size_t(L.destination[i]) < device_tokens.size())
+                    device_tokens[size_t(L.destination[i])] = int(amx[size_t(best_r)][i]) + best_r * vocab_shard;
+            }
+        } else if (head) {
+            const auto t_g = Clock::now();
             gather_logits(L, out, dest);
+            phase_gather_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_g).count();
+        }
     }
 
     // Debugging: NEURON_DUMP_X=prefix writes rank 0's residual stream (f32 [tokens][hidden]) after layers 16 and 32 (when the
@@ -1295,9 +1346,15 @@ struct NeuronModel::Impl {
         std::ofstream(std::string(prefix) + ".x" + std::to_string(layers_done), std::ios::binary).write(reinterpret_cast<const char *>(v.data()), std::streamsize(v.size() * 4));
     }
 
-    std::span<const float> forward(const InferenceBatch &batch) {
+    bool device_argmax_used() const { return used_device_argmax; }
+    int device_token(size_t row) const { return row < device_tokens.size() ? device_tokens[row] : -1; }
+
+    std::span<const float> forward(const InferenceBatch &batch, bool want_argmax = false) {
         const auto t0 = Clock::now();
         phase_upload_ms = phase_layers_ms = phase_head_ms = 0;
+        phase_head_submit_ms = phase_head_read_ms = phase_gather_ms = 0;
+        device_tokens.assign(batch.sample_rows.size(), -1);
+        used_device_argmax = false;
         const auto &lay = batch.layout;
         const int scratch = pages_total - 1;
         logits.resize(batch.sample_rows.size() * size_t(vocab_)); // every sampled row is overwritten by execute()
@@ -1382,6 +1439,7 @@ struct NeuronModel::Impl {
                     L.destination.push_back(sample_of[size_t(token_index)]);
                 }
             }
+            L.want_argmax = want_argmax;
             execute(L, logits.data());
             ++launches;
             at += n;
@@ -1406,6 +1464,7 @@ struct NeuronModel::Impl {
                     L.head_rows.push_back(take - 1);
                     L.destination.push_back(sample_of[size_t(first + done + take - 1)]);
                 }
+                L.want_argmax = want_argmax;
                 execute(L, logits.data());
                 ++launches;
                 done += take;
@@ -1418,7 +1477,10 @@ struct NeuronModel::Impl {
             for (auto id : batch.sample_ids)
                 ids << id << '\n';
         }
-        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms}, {"head_ms", phase_head_ms}, {"tokens", batch.tokens.size()}};
+        used_device_argmax = want_argmax && std::any_of(device_tokens.begin(), device_tokens.end(), [](int t) { return t >= 0; });
+        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms},
+                   {"head_ms", phase_head_ms}, {"head_submit_ms", phase_head_submit_ms}, {"head_read_ms", phase_head_read_ms},
+                   {"gather_ms", phase_gather_ms}, {"tokens", batch.tokens.size()}};
         return logits;
     }
 };
@@ -1456,7 +1518,13 @@ int NeuronModel::max_context() const {
     for (const auto &b : impl_->decode) p = std::max(p, b.meta.P);
     return std::min(p * PAGE, impl_->config.max_context);
 }
-std::span<const float> NeuronModel::forward(const InferenceBatch &b) { return backend_ ? backend_->forward(b) : impl_->forward(b); }
+std::span<const float> NeuronModel::forward(const InferenceBatch &b, bool want_argmax) {
+    if (backend_)
+        return backend_->forward(b);
+    return impl_->forward(b, want_argmax);
+}
+bool NeuronModel::device_argmax_used() const { return !backend_ && impl_->device_argmax_used(); }
+int NeuronModel::device_token(size_t logits_row) const { return backend_ ? -1 : impl_->device_token(logits_row); }
 nlohmann::json NeuronModel::last_profile() const { return backend_ ? backend_->last_profile() : impl_->profile; }
 // Prefix-cache copies exist only for the Llama graphs (the engine disables the cache for recurrent models).
 size_t NeuronModel::kv_page_bytes() const { return backend_ ? 0 : impl_->kv_page_rank_bytes() * size_t(impl_->tp); }

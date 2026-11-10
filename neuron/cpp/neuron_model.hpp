@@ -60,7 +60,11 @@ class NeuronModel {
     // the state) nor uses the prefix cache (restored K/V pages carry no recurrent state).
     bool recurrent() const;
     // Logits of batch.sample_rows in order: [n_sample][vocab] (valid until the next call).
-    std::span<const float> forward(const behemoth::InferenceBatch &);
+    // want_argmax: greedy rows may be sampled on the device when an argmax head bucket covers the launch
+    // (device_token(row) >= 0 then; -1 rows still come from the returned logits).
+    std::span<const float> forward(const behemoth::InferenceBatch &, bool want_argmax = false);
+    bool device_argmax_used() const;
+    int device_token(size_t logits_row) const;
     nlohmann::json last_profile() const;
     // Prefix cache: host bytes of one 16-token page (K/V and FP8 scales of every layer and rank), and synchronous copies
     // between pool pages and host pages of `arena` (host page h at arena + h * kv_page_bytes()). Call between forward()s.
