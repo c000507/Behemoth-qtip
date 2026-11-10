@@ -14,6 +14,15 @@
 > 14.3 ms was retracted by brief 20: it is mostly the layer drain, not the
 > head matmul. (4) "NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS removed in
 > 2.33" is wrong: the env is ignored because depth-8 async is the default.
+>
+> DRAINED RE-MEASUREMENT (2026-11-10, clocks now stop after a drain
+> nrt_tensor_read): layer_bench dec1_128 = 1.321-1.326 ms/step (unchanged
+> vs 1.331 — the 200-step back-to-back loop is already device-saturated,
+> so the bench figure was never submit-side); token_loop variant S =
+> 58.74 ms/token = 17.0 t/s (was 59.46). Honest device floor: ~1.2-1.3
+> ms/layer (the depth-8 re-derivation ~1.19-1.20 pure device; the bench
+> 1.32 includes the inter-execute gaps) = ~48-52 ms/40 layers + ~3.4 ms
+> head + ~4 ms host = the measured 56-58 ms/token, 17-19 t/s.
 
 Harness: neuron/cpp/token_loop.cpp. Faithful decode loop on both ranks
 (TP=2, collectives, real Devstral dims, dec1_128 bucket, 100-200 iters

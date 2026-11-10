@@ -23,7 +23,9 @@ submits hide~~ CORRECTION (2026-11-10, review): the engine's step-log
 32 of 40 free, 8 blocked at the device rate), so 0.95/0.98/1.06/1.17 are
 submit-rate artifacts; the per-layer device time = ~1.2-1.3 ms in both the
 bench and the engine. The bench/engine column gap is partly the missing-drain
-signature, not a constant overhead.
+signature, not a constant overhead. Drained re-measurement (2026-11-10):
+layer_bench with a drain read = 1.321-1.326 ms/step on dec1_128 (unchanged);
+the bench column = the device time including the inter-execute gaps.
 
 | ctx (P) | bench full | engine layers/step | attn half (bench) | MLP tail = F−A |
 |---|---|---|---|---|

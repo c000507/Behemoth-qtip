@@ -340,6 +340,10 @@ Bucket-scaling test (repo layer_bench, 2 ranks, 100 steps):
   The remaining per-layer lever = the attention gather span (use the
   bucket that matches the actual context; already done by the user's
   bucketing) and the ~10% launch/tail polish. t/s ceiling ~17-19.
+  DRAINED RE-MEASUREMENT (2026-11-10): layer_bench with a drain read =
+  1.321-1.326 ms/step on dec1_128 (unchanged; the back-to-back bench is
+  already device-saturated) and the token_loop variant S = 58.74
+  ms/token (was 59.46); the per-layer device floor = ~1.2-1.3 ms.
 
 Note: input21 = the KV cache (5561 x 8 x 16 x 128 fp8 = 91,111,424 B;
 the HLO p1.497 [44488, 2048] = the same bytes in the kernel's view, one
