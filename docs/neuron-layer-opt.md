@@ -407,3 +407,44 @@ SERVING.md documents the sweep (neuronx-cc 2.26, torch-neuronx 2.9):
      image (-7.8 ms/token if missing), 2) HEAD_FP8=1 (-1.3 ms),
   3) host-side: overlap sampling/readback with the next step's first
      layer execute (-5..-10 ms if the host is really 15-17 ms).
+
+## 14. Brief 17: the faithful token loop (neuron/cpp/token_loop.cpp)
+
+Harness: dec1_128 loaded 40x (one model per layer, distinct fp8 weight
+buffers, TP=2 collectives), non-weight tensors (KV pool, tables,
+scales) SHARED across layers by name, the layer-i output tensor feeds
+layer i+1 (the same nrt_tensor_t in both sets), the EHS head at the
+end, the host per step = position/slot writes only. Both ranks, 64+
+tokens. Memory: ~12 GB/rank (the sharing = required: with distinct KV
+pools = OOM at 40 layers).
+
+| run | ms/token | t/s |
+|---|---|---|
+| full loop (40 layers + ehs), 64 tok | **67.96** | 14.7 |
+| full loop, 128 tok | 68.99 | 14.5 |
+| no-ehs (40 layers only) | 71.63 (noise-band) | 14.0 |
+
+- **The loop calibrates to the user's serving: 68 vs 66.7 ms/token
+  (1.5%).** The user's 15 t/s is now EXPLAINED end to end.
+- Decomposition: 41 executes x ~1.33 ms (layer_bench per-layer) =
+  54.5 ms; the measured 68 = **~330 us per execute of model-rotation
+  overhead** (40-model rotation; layer_bench has zero model switches).
+  The ehs head = noise-level inside the loop.
+- **ASYNC CORRECTION (retracts brief 15's 1.133 finding)**: libnrt
+  2.33 explicitly logs "NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS is
+  no longer supported and will be ignored" — the implicit async mode
+  was REMOVED. The brief-15 1.133 vs 1.327 difference = run-to-run
+  variance. The real async = the explicit nrta_execute_schedule API
+  (nrt_async.h) = the genuine remaining lever: it schedules executes
+  without the per-execute host round trip and may also hide the
+  330 us model-switch cost. Not yet wired (moderate engineering).
+- Context/batch (from the earlier layer_bench sweeps, both ranks):
+  dec1_32/128/512 = 1.299/1.319/1.433 ms (the gather span grows
+  ~0.16 us/page); dec4/dec8_128 = 1.642/1.797 ms = the batch
+  amortization (68 us/row marginal).
+- Floor estimate: the layer device work = 372 MB read/execute at the
+  one-direction read ceiling (~230-260 GB/s/core) + the KV write-back
+  riding concurrently = 1.32-1.43 ms/layer = the device floor
+  53-57 ms/token = **17.5-19 t/s with ZERO overhead**. The rotation
+  overhead (13 ms) and the host are the only remaining chunks, both
+  addressable via the explicit async API + the on-device head (built).
