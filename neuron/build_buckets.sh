@@ -29,6 +29,13 @@ if [ "${SHARED_VERIFY:-0}" = 1 ]; then
     set -- $spec; n=$1; shift; ATTN_DEC_SHARED=1 build "$n" layer "$@"
   done
 fi
+# WIDE_NKI=1: the 16- and 32-row decode buckets at 128 pages through the NKI decode kernel (ATTN_DEC_ROWS=32) instead of the torch-op loop:
+# 4.2 -> 2.1 and 7.0 -> 2.9 ms/layer (docs/neuron-nki-fusion.md). Replaces dec16_128 / dec32_128 (same bucket names; the 32-page ones stay loops).
+if [ "${WIDE_NKI:-0}" = 1 ]; then
+  for spec in "dec16_128 16 1 128" "dec32_128 32 1 128"; do
+    set -- $spec; n=$1; shift; rm -rf "$OUT/$n"; ATTN_DEC_ROWS=32 build "$n" layer "$@"
+  done
+fi
 for spec in "head1 1 1" "head4 4 4" "head8 8 8" "head16 16 16" "head32 32 32" "head64 64 1" "head256 256 1"; do
   set -- $spec; n=$1; t=$2; s=$3; HEAD_ROWS=$t build "$n" head "$s"
 done
