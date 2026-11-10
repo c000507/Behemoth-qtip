@@ -1,0 +1,306 @@
+{
+  "audit_date": "2026-11-09",
+  "revision": "a74e679a15532e193172f0ab427daece4b0fb29e",
+  "branch": "rocm-to-neff",
+  "production_source_modified": false,
+  "severity_counts": {
+    "high": 6,
+    "medium": 4
+  },
+  "native_probes": {
+    "grammar_control": {
+      "returncode": 0,
+      "stdout": "accepted 101 rules\n"
+    },
+    "grammar_deep": {
+      "returncode": -11,
+      "stdout": ""
+    },
+    "bad_offsets": {
+      "returncode": -6,
+      "stdout": "",
+      "diagnostic": "UBSan: reference binding/load through null pointer; ASan SEGV at src/safetensors.cpp:49"
+    },
+    "shard_traversal": {
+      "returncode": 0,
+      "stdout": "read 4 bytes\n"
+    },
+    "queue_admission": {
+      "returncode": 0,
+      "stdout": "batch_cap=1 pending=1000\n"
+    }
+  },
+  "router_probes": {
+    "unauthenticated_malformed": {
+      "status": 503,
+      "fake_aws_desired_updates": [
+        1
+      ]
+    },
+    "configured_key_control": {
+      "status": 401,
+      "fake_aws_desired_updates": []
+    },
+    "backend_oversized": {
+      "request_bytes": 5242911,
+      "status": 413,
+      "fake_aws_desired_updates": [
+        1
+      ],
+      "meaning": "Oversized body admitted by router; backend rejected it after scale-out"
+    }
+  },
+  "existing_tests": {
+    "router": {
+      "passed": 21
+    },
+    "native_asan_ubsan": {
+      "core_correctness": "passed",
+      "structured_outputs": "passed",
+      "total_seconds": 179.47,
+      "leak_detection": false
+    }
+  },
+  "secrets_current_tree": {
+    "tracked_files": 626,
+    "findings": [],
+    "scope": "working-tree tracked files; recognizable credential prefixes only"
+  },
+  "secrets_history": {
+    "scope": "added lines in all locally available branch histories",
+    "diff_lines_scanned": 1387994,
+    "matches": [],
+    "git_exit": 0
+  },
+  "bandit": {
+    "python_lines": 8277,
+    "medium_high_reported": 12,
+    "triage": "No additional confirmed application vulnerability; see report for exclusions."
+  },
+  "python_dependency_audit": {
+    "dependencies": [
+      {
+        "name": "aiohttp",
+        "version": "3.14.3",
+        "vulns": [
+          {
+            "id": "CVE-2026-111064",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-5wr8-gcqf-gqf3"
+            ],
+            "description": "### Summary  The keepalive timeout was not used during the initial portion of a request.  ### Impact  An attacker could keep an idle connection open indefinitely before sending any data.  ### Workaround  Use a reverse proxy (as recommended for all production deployments) with sensible keepalive limits."
+          },
+          {
+            "id": "GHSA-2g87-pp6c-29x5",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [],
+            "description": "### Summary  Multiple cases were found where aiohttp could use excessive or unbounded memory, or excessive CPU consumption on attacker controlled requests.  ### Impact  An attacker could cause resource exhaustion through specially crafted requests."
+          },
+          {
+            "id": "CVE-2026-111063",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-494j-54xm-rwp3"
+            ],
+            "description": "### Summary  The Secure attribute was not being enforced for the shared cookie.  ### Impact  It may be possible to send a shared cookie marked Secure through an unencrypted request."
+          },
+          {
+            "id": "CVE-2026-111750",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-pqxq-w44r-73xw"
+            ],
+            "description": "### Summary  The pure Python parser is vulnerable to an HTTP request smuggling attack.  ### Impact  If users are using the Python parser (`AIOHTTP_NO_EXTENSIONS`, or not a standard wheel installed), then an application may be vulnerable to a request smuggling attack.  ### Workaround  Switch to the default C parser."
+          },
+          {
+            "id": "CVE-2026-111066",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-9xw5-w5jj-pvcg"
+            ],
+            "description": "### Summary  An attacker can exhaust file descriptors with specially crafted multipart requests.  ### Impact  If a handler uses `Request.post()`, it may be possible for an attacker to use an unlimited number of file descriptors, potentially resulting in resource exhaustion."
+          },
+          {
+            "id": "CVE-2026-111749",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-gx76-c99x-2c96"
+            ],
+            "description": "### Summary  A subdomain can remove the Host-Only flag from an existing cookie to a parent domain.  ### Impact  A user accessing untrusted subdomains could see their Host-Only protections stripped from cookies. Given most usecases won't reflect these cookies to a browser, the impact is limited."
+          },
+          {
+            "id": "CVE-2026-111065",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-6cjc-53gc-5rqm"
+            ],
+            "description": "### Summary  An overflow in Max-Age processing can skip closing a connection.  ### Impact  An attacker may be able to exhaust the connection pool temporarily, until garbage collection resolves the connections."
+          },
+          {
+            "id": "CVE-2026-111748",
+            "fix_versions": [
+              "3.14.4"
+            ],
+            "aliases": [
+              "GHSA-f9xw-jh8m-3mwq"
+            ],
+            "description": "### Summary  An attacker sending an absolute-form request can spoof the scheme used.  ### Impact  If user code depends on the `Request.scheme` attribute for anything security related, an attacker may be able to circumvent this logic, tricking the application into thinking a connection is encrypted when it is not, or vice versa.  ### Workaround  A WAF rule to reject absolute-form requests (legitimate requests should only use this form for proxies)."
+          }
+        ]
+      },
+      {
+        "name": "boto3",
+        "version": "1.35.99",
+        "vulns": []
+      },
+      {
+        "name": "botocore",
+        "version": "1.35.99",
+        "vulns": []
+      },
+      {
+        "name": "jmespath",
+        "version": "1.1.0",
+        "vulns": []
+      },
+      {
+        "name": "multidict",
+        "version": "6.9.1",
+        "vulns": []
+      },
+      {
+        "name": "python-dateutil",
+        "version": "2.9.0.post0",
+        "vulns": []
+      },
+      {
+        "name": "s3transfer",
+        "version": "0.10.4",
+        "vulns": []
+      },
+      {
+        "name": "urllib3",
+        "version": "2.8.0",
+        "vulns": []
+      },
+      {
+        "name": "yarl",
+        "version": "1.25.1",
+        "vulns": []
+      },
+      {
+        "name": "aiohappyeyeballs",
+        "version": "2.7.1",
+        "vulns": []
+      },
+      {
+        "name": "aiosignal",
+        "version": "1.4.0",
+        "vulns": []
+      },
+      {
+        "name": "attrs",
+        "version": "26.1.0",
+        "vulns": []
+      },
+      {
+        "name": "frozenlist",
+        "version": "1.8.0",
+        "vulns": []
+      },
+      {
+        "name": "idna",
+        "version": "3.20",
+        "vulns": []
+      },
+      {
+        "name": "propcache",
+        "version": "0.5.4",
+        "vulns": []
+      },
+      {
+        "name": "six",
+        "version": "1.17.0",
+        "vulns": []
+      },
+      {
+        "name": "typing-extensions",
+        "version": "4.16.0",
+        "vulns": []
+      }
+    ],
+    "fixes": []
+  },
+  "osv_advisories": [
+    {
+      "id": "GHSA-2g87-pp6c-29x5",
+      "summary": "aiohttp: Multiple instances of excessive or unbounded memory/CPU use",
+      "severity": "HIGH",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-494j-54xm-rwp3",
+      "summary": "AIOHTTP: Secure attribute not enforced for shared cookie",
+      "severity": "MODERATE",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-5wr8-gcqf-gqf3",
+      "summary": "aiohttp server lacks an initial request/header timeout",
+      "severity": "HIGH",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-6cjc-53gc-5rqm",
+      "summary": "AIOHTTP: Connector pool exhaustion via Max-Age overflow",
+      "severity": "MODERATE",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-9xw5-w5jj-pvcg",
+      "summary": "AIOHTTP: File descriptor exhaustion in multipart requests",
+      "severity": "HIGH",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-f9xw-jh8m-3mwq",
+      "summary": "AIOHTTP: Absolute-form request targets can spoof Request.scheme",
+      "severity": "MODERATE",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-gx76-c99x-2c96",
+      "summary": "AIOHTTP: Cookie from subdomain can remove Host-Only Scope from existing cookies",
+      "severity": "LOW",
+      "fixed": "3.14.4"
+    },
+    {
+      "id": "GHSA-pqxq-w44r-73xw",
+      "summary": "AIOHTTP: Pure-Python parser request smuggling",
+      "severity": "MODERATE",
+      "fixed": "3.14.4"
+    }
+  ],
+  "not_exercised": [
+    "live AWS/IAM",
+    "public endpoints",
+    "Cloudflare Access",
+    "GPU/Neuron device malformed inputs",
+    "container image CVE/SBOM scan"
+  ]
+}
