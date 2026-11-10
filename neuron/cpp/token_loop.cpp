@@ -76,19 +76,18 @@ int main(int argc, char** argv) {
     check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init", 0);
     auto run_rank = [&](int rank) {
         // load the EHS model (rank-local; 1-NC graph but must land on this rank's core)
-        nrt_model_t* ehs_model = nullptr;
-        check(nrt_load_collectives(ehs_neff.data(), ehs_neff.size(), rank, -1,
-                                   uint32_t(rank), uint32_t(ranks), &ehs_model), "load ehs", rank);
-
-        // 40 layer models
-        std::vector<nrt_model_t*> layers(40);
+        // Variant S: ONE loaded model (the NEFF is generic - weights are inputs),
+        // 40 prebuilt tensor sets with distinct weight buffers per layer.
+        nrt_model_t* layer_model = nullptr;
         auto t0 = std::chrono::steady_clock::now();
-        for (int l = 0; l < 40; ++l) {
-            check(nrt_load_collectives(layer_neff.data(), layer_neff.size(), rank, -1,
-                                       uint32_t(rank), uint32_t(ranks), &layers[l]),
-                  "load layer", rank);
-        }
+        check(nrt_load_collectives(layer_neff.data(), layer_neff.size(), rank, -1,
+                                   uint32_t(rank), uint32_t(ranks), &layer_model),
+              "load layer model", rank);
         results[rank].load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<nrt_model_t*> layers(40, layer_model);
+        // the ehs graph = single-NC: load AFTER the layer models (the same core)
+        nrt_model_t* ehs_model = nullptr;
+        check(nrt_load(ehs_neff.data(), ehs_neff.size(), rank, 1, &ehs_model), "load ehs", rank);
 
         // allocate the EHS tensors
         nrt_tensor_info_array_t* ehs_info = nullptr;
