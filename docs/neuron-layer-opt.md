@@ -372,3 +372,38 @@ Measured (real graphs, 2 ranks, layer_bench):
   is really ~15 ms; measuring the true host split needs the real
   engine run (BEHEMOTH_NEURON_STEP_LOG=1) which needs the full prepared
   model set — flagged as the remaining unverified item.
+
+## 13. Brief 16: fused one-call-per-token kernel — DEAD ON EXISTING DATA
+
+The repo already built and measured this: trace_model.py "model R Q P L S"
+compiles L layers (+ the optional head segment) into ONE graph, and
+SERVING.md documents the sweep (neuronx-cc 2.26, torch-neuronx 2.9):
+
+| path | 30 layers, 8 rows, 128 pages | per-layer |
+|---|---|---|
+| one fused graph (1 launch) | 48.2 ms | 1.61 ms |
+| 30 separate executes (SYNC) | 51.7 ms | 1.72 ms |
+| dec1_128 async inflight=8 (my brief-15 measurement, Devstral) | - | **1.133 ms** |
+
+- The fused graph's entire benefit = removing the launch gap = **7%
+  over SYNC**. The async-inflight execute queue removes the SAME gap
+  (measured 1.327 -> 1.133 = 15% on the Devstral dec1 bucket) WITHOUT
+  the fused graph's costs: the sweep showed the fused per-layer device
+  time is never better than the per-layer path (numerics match to fp8
+  noise; a layer-31 binding bug exists in the fused mode).
+- The Devstral scale-up (N=2..40 fused compiles, new tiling, ~900
+  input tensors bound per execute, cc_stream count limits) would cost
+  hours of compile per point to chase a benefit the async path already
+  delivers. NOT BUILT — killed by existing data.
+- What remains for one-call-per-token = the HOST-side 15-17 ms/token
+  (embedding, RoPE rows, page tables, sampling over 131k vocab,
+  readback): moving those on-device (embedding gather + argmax are
+  cheap graph ops; sampling via passed-in Gumbel noise) is the real
+  lever, worth ~15-17 ms IF the host really costs that much — needs
+  the real engine step-log (BEHEMOTH_NEURON_STEP_LOG=1) to split host
+  vs device before building anything.
+- Practical order of wins for 15 -> ~19 t/s without new graphs:
+  1) verify NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=8 in the serving
+     image (-7.8 ms/token if missing), 2) HEAD_FP8=1 (-1.3 ms),
+  3) host-side: overlap sampling/readback with the next step's first
+     layer execute (-5..-10 ms if the host is really 15-17 ms).
