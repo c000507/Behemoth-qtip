@@ -170,3 +170,39 @@ contiguous runs should lift the per-core read from ~210-228 to
 t/s = 1000/(40*1.10+5) ~= 20-21. Unverified: whether the layer's
 consumer pacing (NKI attention, tiled MLP) tolerates the deeper
 concurrency, and cross-core DMA behavior beyond the 2-rank layer bench.
+
+## 8. Brief 11: split-stream fp8 matvec at the real MLP shape — KILLED
+
+32768x5120 fp8 + per-row scales, single NC, 100 iters, weight split
+along the output rows into S independent batched matvecs (contiguous
+32 KB rows, disjoint outputs, concatenated):
+
+| S | avg us | eff GB/s (w bytes / (t-56)) | maxdiff |
+|---|---|---|---|
+| 1  | 1340.8 | 131 | 0.0056 |
+| 2  | 1337.8 | 131 | 0.0056 |
+| 4  | 1337.0 | 131 | 0.0056 |
+| 8  | 1338.8 | 131 | 0.0056 |
+| 16 | 1454.7 | 120 | 0.0056 |
+
+- All variants bit-identical to each other and to the plain matvec
+  (1361 us, earlier matrix). **No split helps; S=16 is 8% worse.**
+- Effective rate = 131 GB/s vs the read ceiling 184-264: the fp8
+  matvec is NOT DMA-bound at this shape — it is **dequant-bound**: the
+  in-graph cast materializes fp8 x4 as f32 through SB (168 MB fp8 ->
+  672 MB f32 write + re-read), and that SB-side traffic + the cast
+  pipeline, not the HBM read, sets the time.
+- fp8 vs bf16 at the same shape: 1341 vs 1808 us = 1.35x — the fp8
+  byte savings are almost entirely consumed by the dequant.
+- Therefore brief 11 step 2 (applying the split to the real layer via
+  the Devstral-dim trace) is MOOT: there is no single-NC win to carry.
+  The layer's 210 GB/s effective already exceeds the isolated matvec's
+  131 because its tiling hides the dequant better.
+
+Net verdict across briefs 9-11: the Devstral decode layer is bounded
+by (a) the one-direction HBM read ceiling (~210-230 GB/s per core,
+geometry-independent) and (b) the fp8 dequant SB traffic, which the
+layer's tiling already hides about as well as anything measured.
+Remaining levers: batch amortization (68 us/row), or not streaming all
+weights per token. Single-stream t/s upside from graph work: ~1.1x
+at most (17 -> ~19 t/s).
