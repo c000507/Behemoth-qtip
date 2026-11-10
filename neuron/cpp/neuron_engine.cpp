@@ -117,10 +117,14 @@ struct Engine::Impl {
     // verify step may grow to), matching the last BEHEMOTH_NEURON_SPEC_NGRAM tokens
     int spec_tokens = 0, spec_requests = 4, spec_rows = 8, spec_ngram = 3, max_rows = 1;
     // Adaptive: a verify step costs about spec_page_cost ms per draft row and table page of the bucket it lands in (the
-    // paged K/V gather, measured 0.006-0.013 on the 8B), on top of a plain step (plain_step_ms, running mean). A request
-    // drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats twice that
-    // overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers (~10 steps).
-    double spec_page_cost = 0.01, plain_step_ms = 40;
+    // paged K/V gather, measured 0.006-0.013 on the 8B with the per-row kernel), on top of a plain step (plain_step_ms, running
+    // mean). A request drafts only while its running acceptance (accepted drafts per verify step, EMA, optimistic start) beats
+    // twice that overhead measured in plain steps, and a request that stopped drafting retries as its estimate recovers (~10 steps).
+    // Default 0.002 (was 0.01) for graph sets with shared-table verify buckets (dec8s_*, docs/neuron-verify-kernel.md section 7:
+    // measured +10.9 / +12.7 ms per verify step at 128 / 512 pages on Devstral, nearly flat in pages): 128 pages always try, 512 pages
+    // draft while alpha >= 0.24, 1024 pages while alpha >= 0.47. Set BEHEMOTH_NEURON_SPEC_PAGE_COST=0.01 for a graph set WITHOUT dec8s
+    // buckets (the per-row dec8 verify costs +47 ms per step at 512 pages and would then draft at a loss).
+    double spec_page_cost = 0.002, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
     // structured outputs: constraints of the constrained requests; per-token cost of the constraint calls
