@@ -68,3 +68,70 @@ partially overlappable). The context sweep (dec1_32/128/512 =
    host off the critical path.
 3. No fusing (docs/neuron-fused.md: the fused graphs = 2.6-3.4x worse
    per layer). No async env (removed in 2.33).
+
+## Real Devstral Small 2507 end-to-end on the box (brief 18)
+
+Setup: real prepared weights (40 x 556 MB shards = 20.7 GiB), real
+graphs (all buckets), real config/tokenizer, repo engine
+(neuron_engine_cli built from the repo with the Dockerfile flags).
+16-token prompt ("The capital of France is Paris. The largest planet
+in the solar system is"), greedy, 32 new tokens.
+
+| mode | wall | ms/token | t/s |
+|---|---|---|---|
+| greedy, spec decoding ON (the default; 63 drafted / 11 accepted) | 1.42 s | 44.5 | 22.5 |
+| greedy, BEHEMOTH_NEURON_SPEC_TOKENS=0 (plain) | 1.86 s | **58.2** | **17.2** |
+
+Step log (spec off): layers_ms = 38.07 (**0.95 ms/layer**), head_ms =
+14.26, forward_ms = 54.96, launches 1. The output text = coherent
+greedy continuation (Paris -> Jupiter -> Pacific Ocean -> Asia ->
+Russia...).
+
+## THE FINDING: the repo engine ALREADY IS variant S
+
+SERVING.md: "One NEFF per bucket serves every layer; the layers differ
+only in the weight and KV tensors bound to it at run time
+(cpp/neuron_model.cpp)". The engine loads ONE dec1_128 model handle per
+rank and binds 40 per-layer weight/KV tensor sets — exactly the
+variant-S scheme I built in token_loop.cpp. My token_loop variant-A
+(40 separate model handles, 68 ms/token) = an artificial pattern the
+real engine never had; there is NOTHING TO PATCH. The ask "patch the
+engine to variant S" = the shipped design.
+
+Cross-validation: the real engine's 38.1 ms / 40 layers = 0.95 ms/layer
+is BETTER than my synthetic loops (layer_bench 1.32, token_loop variant
+S 59.5 ms/token) — the engine's RankWorker pipelines uploads against
+executes across the layer sequence, which none of my synthetic loops
+do. The loop numbers were conservative, not optimistic.
+
+## What actually bounds the real engine now
+
+| chunk | ms | share |
+|---|---|---|
+| 40 layers | 38.1 | 69% |
+| head (bf16, head1 bucket, 671 MB/rank) | **14.3** | 26% |
+| upload + other | 2.6 | 5% |
+
+- The layers at 0.95 ms = BELOW my 1.32 synthetic estimate: the engine
+  overlaps uploads with execution across layers. The read-ceiling floor
+  (0.9-1.05 ms/layer-equivalent) = CONFIRMED REACHED.
+- **The head = 14.3 ms = the largest remaining chunk** (26%): the bf16
+  head1 bucket reads 671 MB/rank at only ~47 GB/s effective — far
+  below the 210-260 the matmuls get. Levers: HEAD_FP8 (the repo has
+  HEAD_FP8=1 = E4M3 lm_head rows, half the bytes), the head8/head16
+  multi-row buckets, or the ehs-style one-call head. Getting the head
+  to even 130 GB/s = -6 ms/token = 58.2 -> ~52 = ~19 t/s.
+- The spec decoding (the default ON) = 44.5 ms/token = 22.5 t/s
+  measured — the prompt-lookup drafts amortize the weight stream; the
+  acceptance depends on the workload's repetition.
+
+## Verdict for the user
+
+- The engine = already the one-load + per-layer-tensor-set design;
+  no patch is needed or possible (it is the shipped architecture).
+- The measured real-model greedy decode = **17.2 t/s plain, 22.5 t/s
+  with the default spec decoding** on this box (the user's 15 t/s =
+  the serving-stack overheads: the longer contexts, the HTTP stack,
+  the batch scheduling, possibly an older runtime).
+- The next lever = the head (14.3 ms, bf16): HEAD_FP8=1 buckets or the
+  ehs-style fused head = up to -6..-12 ms/token.
