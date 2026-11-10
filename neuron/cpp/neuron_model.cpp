@@ -1421,6 +1421,7 @@ struct NeuronModel::Impl {
             return best;
         };
         int launches = 0, max_rows = 0, max_queries = 0;
+        std::string decode_bucket; // step log: the last decode launch's bucket, "dec<R>_<P>" (+ "s" for a shared-table bucket)
         for (const auto &b : decode) max_rows = std::max(max_rows, b.meta.R);
         for (const auto &b : prefill) max_queries = std::max(max_queries, b.meta.Q);
         // Rows of the decode launches: one-token requests, and short continuations (a decode token followed by draft
@@ -1461,6 +1462,7 @@ struct NeuronModel::Impl {
             if (!bucket)
                 throw std::runtime_error("no decode NEFF bucket large enough for " + std::to_string(pages_of(n)) + " pages");
             auto L = fresh(*bucket);
+            decode_bucket = "dec" + std::to_string(bucket->meta.R) + "_" + std::to_string(bucket->meta.P) + (bucket->meta.shared_table ? "s" : "");
             for (size_t i = 0; i < n; ++i) {
                 const int req = rows[at + i].req, token_index = rows[at + i].token_index;
                 const int position = lay.positions[size_t(token_index)];
@@ -1513,7 +1515,7 @@ struct NeuronModel::Impl {
         used_device_argmax = want_argmax && std::any_of(device_tokens.begin(), device_tokens.end(), [](int t) { return t >= 0; });
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"upload_ms", phase_upload_ms}, {"layers_ms", phase_layers_ms},
                    {"head_ms", phase_head_ms}, {"head_submit_ms", phase_head_submit_ms}, {"head_read_ms", phase_head_read_ms},
-                   {"gather_ms", phase_gather_ms}, {"tokens", batch.tokens.size()}};
+                   {"gather_ms", phase_gather_ms}, {"tokens", batch.tokens.size()}, {"decode_bucket", decode_bucket}};
         return logits;
     }
 };

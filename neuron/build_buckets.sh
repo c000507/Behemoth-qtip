@@ -22,6 +22,13 @@ for spec in "dec1_32 1 1 32" "dec1_128 1 1 128" "dec1_512 1 1 512" "dec1_1024 1 
             "pre256_32 1 256 32" "pre256_128 1 256 128" "pre256_256 1 256 256" "pre256_512 1 256 512" "pre256_768 1 256 768" "pre256_1024 1 256 1024"; do
   set -- $spec; n=$1; shift; build "$n" layer "$@"
 done
+# SHARED_VERIFY=1: shared-page-table verify buckets dec8s_P (trace_model.py ATTN_DEC_SHARED=1, meta "shared_table"): the runtime uses them only for
+# single-request verify steps (the scheduled token + its drafts); docs/neuron-verify-kernel.md. Off by default: the graph set is unchanged without it.
+if [ "${SHARED_VERIFY:-0}" = 1 ]; then
+  for spec in "dec8s_32 8 1 32" "dec8s_128 8 1 128" "dec8s_512 8 1 512" "dec8s_1024 8 1 1024"; do
+    set -- $spec; n=$1; shift; ATTN_DEC_SHARED=1 build "$n" layer "$@"
+  done
+fi
 for spec in "head1 1 1" "head4 4 4" "head8 8 8" "head16 16 16" "head32 32 32" "head64 64 1" "head256 256 1"; do
   set -- $spec; n=$1; t=$2; s=$3; HEAD_ROWS=$t build "$n" head "$s"
 done
