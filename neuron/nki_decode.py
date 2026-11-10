@@ -309,3 +309,101 @@ def decode_attention_fp8_2p(qt, cache, idxk, idxv, bias, mask, ksc, vsc):
         nl.store(out[nl.ds(r * ROWS, ROWS), :], nl.divide(acc, l))
     return out
 
+
+
+# ---- FP8 two-pass, paired K/V rows -------------------------------------------------------------------------------------------------------------
+# Cache layout [pages, kvh, 2, 16, D] (the K and V blocks of one (page, head) are adjacent), viewed as [pages * kvh, 4096]:
+# row r = p * kvh + h holds K in columns 0..2048 and V in 2048..4096. One DMA of 4 KB per (page, head) fetches both;
+# pass 2 reuses the pass-1 tile instead of gathering V again: half the descriptors and bytes of decode_attention_fp8_2p.
+GROUPP_PAGES = 128
+
+
+def native_key_positionsp(groups):
+    return native_key_positions8(groups)
+
+
+def row_indices_p(table_pages, kvh, groups):
+    """int32 [kvh, 128, groups]: paired row of page j of group g for head h (table_pages [groups * 128])."""
+    p = np.asarray(table_pages).reshape(groups, GROUPP_PAGES)
+    out = np.zeros((kvh, 128, groups), np.int32)
+    for h in range(kvh):
+        out[h] = ((p * kvh + h).T).astype(np.int32)
+    return out
+
+
+@nki.jit
+def decode_attention_fp8_2p_paired(qt, cache, idxk, idxv, bias, mask, ksc, vsc):
+    """Same contract as decode_attention_fp8_2p; cache = [pages, kvh, 2, 16, D] E4M3 viewed as [pages*kvh, 4096] pairs
+    (idxk = the paired row index, idxv unused), ksc/vsc as before. Groups are processed in 2-group chunks: one paired
+    4 KB gather per (page, head) feeds both passes (K in pass 1, V resident in SBUF for pass 2), halving the gather
+    descriptors and bytes versus decode_attention_fp8_2p."""
+    R = qt.shape[0]
+    G = idxk.shape[3]
+    kvh = qt.shape[1]
+    GP2 = (G + 1) // 2 * 2                                                      # even group count
+    out = nl.ndarray((R * ROWS, D), dtype=nl.float32, buffer=nl.shared_hbm)
+    i1, _ = nl.mgrid[:128, :1]
+    _, jfp = nl.mgrid[:128, :4096]
+    rowmask = nl.load(mask)
+    for r in nl.affine_range(R):
+        qp = nl.zeros((128, KVH * ROWS), dtype=nl.bfloat16, buffer=nl.sbuf)
+        tabk = nl.ndarray((128, KVH * G), dtype=nl.int32, buffer=nl.sbuf)
+        for h in nl.affine_range(kvh):
+            qp[:, nl.ds(h * ROWS + h * REP, REP)] = nl.load(qt[r, h])
+            tabk[:, nl.ds(h * G, G)] = nl.load(idxk[r, h])
+        s_all = nl.ndarray((ROWS, GP2 * 2048), dtype=nl.float32, buffer=nl.sbuf)
+        mx_all = nl.ndarray((ROWS, GP2), dtype=nl.float32, buffer=nl.sbuf)
+        kva = nl.ndarray((128, kvh * 4096), dtype=cache.dtype, buffer=nl.sbuf)
+        kvb = nl.ndarray((128, kvh * 4096), dtype=cache.dtype, buffer=nl.sbuf)
+        k8a = kva.view(nl.float8_e4m3) if cache.dtype == nl.uint8 else kva
+        k8b = kvb.view(nl.float8_e4m3) if cache.dtype == nl.uint8 else kvb
+        for c in nl.static_range(GP2 // 2):
+            for i in nl.static_range(2):
+                g = c * 2 + i
+                kv8, kvs = (k8a, kva) if i == 0 else (k8b, kvb)
+                for h in nl.affine_range(kvh):                                   # one paired gather for K and V
+                    nisa.dma_copy(src=cache[tabk[i1, h * G + g], jfp], dst=kvs[:, nl.ds(h * 4096, 4096)])
+                ksc_t = nl.load(ksc[r, g])
+                bias_t = nl.load(bias[r, g])
+                for quarter in nl.affine_range(4):
+                    s_ps = nl.zeros((ROWS, 512), dtype=nl.float32, buffer=nl.psum)
+                    for h in nl.affine_range(kvh):
+                        kt_ps = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
+                        for tt in nl.affine_range(4):
+                            kt_ps[:, nl.ds(tt * 128, 128)] = nisa.nc_transpose(kv8[:, nl.ds(h * 4096 + (quarter * 4 + tt) * 128, 128)])
+                        kt_sb = nl.copy(kt_ps, dtype=nl.bfloat16)
+                        s_ps += nl.matmul(qp[:, nl.ds(h * ROWS, ROWS)], kt_sb, transpose_x=True)
+                    s_all[:, nl.ds(g * 2048 + quarter * 512, 512)] = nl.add(nl.multiply(s_ps, ksc_t[:, nl.ds(quarter * 512, 512)]),
+                                                                             bias_t[:, nl.ds(quarter * 512, 512)])
+                mx_all[:, nl.ds(g, 1)] = nisa.tensor_reduce(np.max, s_all[:, nl.ds(g * 2048, 2048)], axis=(1,), dtype=nl.float32, negate=False)
+        negm = nl.multiply(nisa.tensor_reduce(np.max, mx_all, axis=(1,), dtype=nl.float32, negate=False), -1.0)
+        l_all = nl.ndarray((ROWS, GP2 * 4), dtype=nl.float32, buffer=nl.sbuf)
+        acc_all = nl.ndarray((ROWS, GP2 * D), dtype=nl.float32, buffer=nl.sbuf)
+        for c in nl.static_range(GP2 // 2):
+            for i in nl.static_range(2):
+                g = c * 2 + i
+                kv8 = k8a if i == 0 else k8b
+                vsc_t = nl.load(vsc[r, g])
+                p = nl.ndarray((ROWS, 2048), dtype=nl.float32, buffer=nl.sbuf)
+                for quarter in nl.affine_range(4):
+                    p[:, nl.ds(quarter * 512, 512)] = nisa.activation_reduce(np.exp, s_all[:, nl.ds(g * 2048 + quarter * 512, 512)], bias=negm, scale=1.0,
+                                                                                reduce_op=nl.add, reduce_res=l_all[:, nl.ds(g * 4 + quarter, 1)], dtype=nl.float32)
+                pw = nl.multiply(p, vsc_t)
+                ps = nl.maximum(nl.multiply(nisa.tensor_reduce(np.max, pw, axis=(1,), dtype=nl.float32, negate=False), 1.0 / 224.0), 1e-30)
+                p8 = nl.copy(nl.divide(pw, ps), dtype=nl.float8_e4m3)
+                pt8 = nl.ndarray((128, 16 * ROWS), dtype=nl.float8_e4m3, buffer=nl.sbuf)
+                for cc in nl.affine_range(16):
+                    pt8[:, nl.ds(cc * ROWS, ROWS)] = nl.copy(nisa.nc_transpose(p8[:, nl.ds(cc * 128, 128)]), dtype=nl.float8_e4m3)
+                ag = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.sbuf)
+                for h in nl.sequential_range(kvh):
+                    pv_ps = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.psum)
+                    for t in nl.affine_range(16):
+                        pv_ps += nl.matmul(pt8[:, nl.ds(t * ROWS, ROWS)], kv8[:, nl.ds(h * 4096 + 2048 + t * 128, 128)], transpose_x=True)
+                    ag[...] = nl.add(ag, nl.multiply(pv_ps, nl.multiply(rowmask[:, nl.ds(h, 1)], ps)))
+                acc_all[:, nl.ds(g * D, D)] = nl.multiply(ag, ps)
+        acc = nl.zeros((ROWS, D), dtype=nl.float32, buffer=nl.sbuf)
+        for g in nl.sequential_range(GP2):
+            acc[...] = nl.add(acc, acc_all[:, nl.ds(g * D, D)])
+        l = nl.sum(l_all, axis=1, keepdims=True)
+        nl.store(out[nl.ds(r * ROWS, ROWS), :], nl.divide(acc, l))
+    return out

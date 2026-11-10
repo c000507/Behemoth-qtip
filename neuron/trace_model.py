@@ -104,6 +104,7 @@ ORDER_QTIP = ['x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'norm1', 'norm2'
               'gw', 'gl', 'gsu', 'gsv', 'uw', 'ul', 'usu', 'usv', 'dw', 'dl', 'dsu', 'dsv']
 WEIGHTS = os.environ.get('WEIGHTS', 'fp8')
 KV8 = os.environ.get('KV', 'bf16') == 'fp8'
+KVPAIR = os.environ.get('KVPAIR', '0') == '1'  # paired K/V cache rows [pages, kvh, 2, 16, D]: one 4KB gather per (page, head), pass 2 reuses the tile
 KVATT = os.environ.get('KVATT', 'deq')  # KV=fp8 attention: 'deq' (dequantise the gathered pages, bf16 loop; validated) or 'fp8' (fp8 x fp8 batched matmuls, GPU semantics: gives non-finite logits on trn1, see PERF_NOTES)  # KV cache as E4M3 bytes + one f32 scale per (K|V, token, kv head), like the GPU runtime's FP8 K/V
 if KV8:
     ORDER.insert(ORDER.index('cache') + 1, 'cscale')
@@ -125,8 +126,8 @@ def shapes(R, Q, P, pages):
     s = {
         'x': ((T, H), torch.float32), 'cos_sin': ((T, 2, D // 2), torch.float32), 'pos': ((T,), torch.int64),
         'wslot': ((T,), torch.int64), 'table': ((R, P), torch.int64),
-        'cache': ((pages, 2, g.KVL, PAGE, D), torch.float8_e4m3fn if KV8 else torch.bfloat16),
-        'cscale': ((pages, 2, g.KVL, PAGE), torch.float32),
+        'cache': ((pages, g.KVL, 2, PAGE, D) if KVPAIR else (pages, 2, g.KVL, PAGE, D), torch.float8_e4m3fn if KV8 else torch.bfloat16),
+        'cscale': ((pages, g.KVL, 2, PAGE) if KVPAIR else (pages, 2, g.KVL, PAGE), torch.float32),
         'norm1': ((1, H), torch.float32), 'norm2': ((1, H), torch.float32),
         'qf': ((q, H), f8), 'qs': ((q,), torch.float32), 'of': ((H, q), f8), 'os': ((H,), torch.float32),
         'kf': ((kv, H), f8), 'ks': ((kv,), torch.float32), 'vf': ((kv, H), f8), 'vs': ((kv,), torch.float32),
@@ -235,6 +236,32 @@ def flash_decode_nki_fp8(q, cache, cscale, table, pos, R, P, kvh, rep):
     return o.reshape(R, 1, kvh, rep, D)
 
 
+def flash_decode_nki_fp8_paired(q, cache, cscale, table, pos, R, P, kvh, rep):
+    """flash_decode_nki_fp8 over the PAIRED cache [pages, kvh, 2, PAGE, D]: row r = p * kvh + h holds K|V in one
+    4 KB row, so pass 1 gathers K and V together and pass 2 reuses the resident tile (nki_decode.decode_attention_fp8_2p_paired)."""
+    import numpy as np
+    import nki_decode as nd
+    D, dev, GP = g.D, q.device, nd.GROUPP_PAGES
+    G = -(-P // GP)
+    pages = table
+    if P < G * GP:
+        pages = torch.cat((pages, torch.full((R, G * GP - P), cache.shape[0] - 1, dtype=pages.dtype, device=dev)), dim=1)
+    pg = pages.reshape(R, G, GP)
+    heads = torch.arange(kvh, dtype=torch.int64, device=dev).reshape(1, kvh, 1, 1)
+    rows = ((pg.reshape(R, 1, G, GP) * kvh + heads)).permute(0, 1, 3, 2).to(torch.int32)   # [R, kvh, 128, G]
+    kpos = torch.tensor(nd.native_key_positionsp(G), dtype=torch.int64, device=dev)
+    bias = torch.where(kpos.reshape(1, G, 2048) > pos.reshape(R, 1, 1), -30000.0, 0.0).to(torch.float32)
+    bias = bias.reshape(R, G, 1, 2048).expand(R, G, nd.ROWS, 2048).contiguous()
+    sc = cscale[pages].reshape(R, G, GP, kvh, 2, PAGE)                                                    # [R, G, j, h, K|V, t]
+    def native(kv):
+        s = sc[:, :, :, :, kv].permute(0, 1, 3, 4, 2).reshape(R, G, kvh, 1, PAGE * GP)
+        return s.expand(R, G, kvh, rep, PAGE * GP).reshape(R, G, kvh * rep, PAGE * GP).contiguous()
+    mask = torch.tensor(np.kron(np.eye(kvh, dtype=np.float32), np.ones((rep, 1), np.float32)), device=dev)
+    qt = (q.reshape(R, kvh, rep, D).float() * (D ** -0.5)).to(torch.bfloat16).permute(0, 1, 3, 2).contiguous()
+    o = nd.decode_attention_fp8_2p_paired(qt, cache.reshape(-1, PAGE * D * 2), rows, rows, bias, mask, native(0), native(1))
+    return o.reshape(R, 1, kvh, rep, D)
+
+
 def flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
     """Flash loop over an FP8 cache with the GPU runtime's attention semantics (runtime/src/attention.cpp): q is quantised per (query, head) row,
     scores = (q8 . k8) q_scale k_scale / sqrt(D), probabilities are weighted by the V scale of their token, quantised per row and block to E4M3
@@ -284,6 +311,8 @@ def flash_paged(q, cache, cscale, table, pos, R, Q, P, kvh, rep):
         return flash_decode_nki(q, cache, table, pos, R, P, kvh, rep)
     if ATTN_DEC == 'nki' and Q == 1 and cscale is not None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
         return flash_decode_nki_fp8(q, cache, cscale, table, pos, R, P, kvh, rep)
+    if ATTN_DEC == 'nkikv' and Q == 1 and cscale is not None and R <= ATTN_DEC_ROWS and P >= ATTN_DEC_MIN_PAGES:
+        return flash_decode_nki_fp8_paired(q, cache, cscale, table, pos, R, P, kvh, rep)
     if cscale is not None and KVATT == 'fp8':
         return flash_paged_fp8(q, cache, cscale, table, pos, R, Q, P, kvh, rep)
     G = min(KEY_BLOCK_PAGES if Q > 1 else DECODE_BLOCK_PAGES, P)
@@ -352,12 +381,30 @@ def paged_layer(R, Q, P, *args):
         kk = torch.stack((k, v), dim=1)                                                  # [T,2,kvh,D] f32
         sc = torch.amax(torch.abs(kk), dim=-1).clamp(min=1e-20) / 224.0                  # one scale per (token, K|V, kv head)
         k8 = (kk / sc.unsqueeze(-1)).to(torch.float8_e4m3fn)
-        cache = t['cache'].index_put(at, k8)
-        cscale = t['cscale'].index_put(at, sc)
+        if KVPAIR:
+            atp = (page[:, None, None], torch.arange(kvh, dtype=torch.int64, device=x.device)[None, :, None],
+                   torch.arange(2, dtype=torch.int64, device=x.device)[None, None, :], off[:, None, None])
+            cache = t['cache'].index_put(atp, k8.permute(0, 2, 1, 3))
+            cscale = t['cscale'].index_put(atp, sc.permute(0, 2, 1))
+        else:
+            cache = t['cache'].index_put(at, k8)
+            cscale = t['cscale'].index_put(at, sc)
     else:
         cache = t['cache'].index_put(at, torch.stack((k, v), dim=1).to(torch.bfloat16))  # [T,2,kvh,D] -> cache[page, kv, head, off]
     attn = flash_paged(q.to(torch.bfloat16).reshape(R, Q, kvh, rep, D), cache, cscale, t['table'], t['pos'], R, Q, P, kvh, rep)
     attn = attn.reshape(T, heads * D).to(torch.bfloat16)
+    # ATTN_PROFILE='attn': stop after the attention kernel (the attention half); 'noattn': skip the attention
+    # kernel (attn = 0) and run the MLP tail. Unused weights stay in the graph through a dead scalar so the
+    # input ORDER (and thus layer_bench binding) is unchanged.
+    prof = os.environ.get('ATTN_PROFILE', '')
+    if prof:
+        used = {'attn': ('x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'cscale', 'norm1', 'qf', 'qs', 'kf', 'ks', 'vf', 'vs'),
+                'noattn': ('x', 'cos_sin', 'pos', 'wslot', 'table', 'cache', 'cscale', 'norm1', 'qf', 'qs', 'kf', 'ks', 'vf', 'vs',
+                           'norm2', 'of', 'os', 'gf', 'gs', 'uf', 'us', 'df', 'ds')}[prof]
+        dead = sum(t[k].float().reshape(-1)[0] for k in ORDER if k not in used)
+        if prof == 'attn':
+            return (attn.float() + 0.0 * dead, cache, cscale) if KV8 else (attn.float() + 0.0 * dead, cache)
+        attn = q.reshape(T, heads * D).to(torch.bfloat16)
     if qtip:
         # o row-parallel: the rotation needs all heads (all-gather, rank order = head order), this rank multiplies its
         # columns of W~ by its slice of u, the partial z is all-reduced and finished on both ranks
