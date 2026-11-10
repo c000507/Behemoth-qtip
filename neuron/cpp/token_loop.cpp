@@ -1,11 +1,12 @@
 // token_loop: faithful Devstral decode token loop (brief 17).
 //
-// One "token" = EMBED execute -> 40 layer executes -> EHS (embed-table is
-// separate: embed graph gathers hidden row + cos/sin row for the step's
-// position; EHS graph = final-norm-scale + fp8 head + argmax) -> token id.
-// All weights resident: dec1_128 NEFF loaded 40x (one model handle per
-// layer, distinct fp8 weight buffers, TP=2 with collectives), KV pool
-// 91 MB x 40. Device chaining: layer i output tensor feeds layer i+1
+// One "token" = 40 layer executes -> EHS (embed-table is separate: the
+// embed graph gathers the hidden row + cos/sin row for the step's
+// position; the EHS graph = final-norm-scale + fp8 head + argmax) -> token
+// id. All weights resident: the dec1_128 NEFF is loaded ONCE (variant S:
+// the NEFF is generic, weights are inputs) and executed 40x with 40
+// prebuilt tensor sets with distinct fp8 weight buffers (TP=2,
+// collectives), KV pool 91 MB x 40. Device chaining: layer i output tensor feeds layer i+1
 // input (same nrt_tensor_t added to both tensor sets); EHS argmax feeds
 // the next step's embed token input. NOTE (review 2026-11-10): this
 // harness writes NOTHING per step - the position/page-table inputs stay
@@ -13,7 +14,7 @@
 // per-layer tensors (not in-place), so it times the execute chain only,
 // not the serving loop's host work.
 //
-// usage: token_loop dec1_128.neff ehs.neff embed.neff [tokens] [ranks]
+// usage: token_loop dec1_128.neff ehs.neff [tokens] [ranks]
 //   steps modes: TOKENLOOP_MODE=a|b|c|d  (a sync+host-head-ish baseline is
 //   approximated by b without the async env; d = async + minimal host)
 //
