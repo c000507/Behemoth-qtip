@@ -49,3 +49,16 @@ output "api_keys_table" {
   description = "DynamoDB table of approved router API keys (router/api_keys.py --table)"
   value       = aws_dynamodb_table.api_keys.name
 }
+
+output "remote_instance_profile" {
+  description = "Instance profile for hand-run Trainium hosts outside the stack region (empty without remote_regions)."
+  value       = one(aws_iam_instance_profile.remote_neuron[*].name)
+}
+
+output "remote_security_groups" {
+  description = "Per remote region: the no-ingress security group and the default VPC it is in."
+  value = merge(
+    { for m in module.remote_sg_ap_southeast_2 : "ap-southeast-2" => { security_group_id = m.security_group_id, vpc_id = m.vpc_id } },
+    { for m in module.remote_sg_ap_south_1 : "ap-south-1" => { security_group_id = m.security_group_id, vpc_id = m.vpc_id } },
+  )
+}

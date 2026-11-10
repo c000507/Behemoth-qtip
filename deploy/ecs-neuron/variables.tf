@@ -406,3 +406,13 @@ variable "container_insights" {
   type        = bool
   default     = false
 }
+
+variable "remote_regions" {
+  description = "Regions outside var.region that get a no-ingress security group (default VPC) for hand-run Trainium hosts, e.g. Capacity Blocks; with any, the stack also creates the <name>-remote-neuron instance profile. Supported: ap-southeast-2, ap-south-1."
+  type        = list(string)
+  default     = ["ap-southeast-2", "ap-south-1"]
+  validation {
+    condition     = alltrue([for r in var.remote_regions : contains(["ap-southeast-2", "ap-south-1"], r)])
+    error_message = "remote_regions supports ap-southeast-2 and ap-south-1 (each needs a provider alias in remote_regions.tf)."
+  }
+}

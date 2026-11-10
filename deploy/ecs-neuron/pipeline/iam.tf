@@ -12,7 +12,7 @@ locals {
   ]
 
   # the stack's own roles (deploy/ecs-neuron/iam.tf): the only roles the apply build may pass, all under the boundary
-  stack_role_arns = [for r in ["ecs-instance", "ecs-execution", "backend-task", "router-task"] :
+  stack_role_arns = [for r in ["ecs-instance", "ecs-execution", "backend-task", "router-task", "remote-neuron"] :
   "arn:${local.partition}:iam::${local.acct}:role/${local.p}-${r}"]
 
   state_bucket_arn    = aws_s3_bucket.this["state"].arn
@@ -232,6 +232,21 @@ data "aws_iam_policy_document" "apply_scoped" {
       test     = "StringEquals"
       variable = "aws:RequestedRegion"
       values   = [var.region]
+    }
+  }
+  statement {
+    sid = "RemoteSecurityGroups" # remote_regions.tf: the no-ingress groups for hand-run Trainium hosts in other regions
+    actions = [
+      "ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup",
+      "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupEgress", "ec2:RevokeSecurityGroupIngress",
+      "ec2:ModifySecurityGroupRules", "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+      "ec2:CreateTags", "ec2:DeleteTags",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.remote_regions
     }
   }
   statement {
