@@ -579,9 +579,13 @@ def build_info():
                 pass
     except Exception:  # noqa: BLE001  (provenance only)
         pass
-    run = lambda *cmd: subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
-    try:  # the compiler binary that `neuronx-cc compile` below resolves to (the venv pip version above may differ from PATH)
-        info['neuronx_cc_bin'] = run('neuronx-cc', '--version').splitlines()[0].split('version')[-1].strip()
+    def run(*cmd, stderr=False):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return (r.stdout + (r.stderr if stderr else '')).strip() if r.returncode == 0 else ''
+    try:  # the compiler binary that `neuronx-cc compile` below resolves to (the venv pip version above may differ from PATH);
+        # the banner "NeuronX Compiler version X" may go to stderr
+        line = next((l for l in run('neuronx-cc', '--version', stderr=True).splitlines() if 'version' in l), '')
+        info['neuronx_cc_bin'] = line.split('version')[-1].strip()
     except Exception:  # noqa: BLE001
         pass
     try:  # the runtime library installed where the buckets are compiled (the serving image may install another: the runtime logs both)
@@ -591,7 +595,8 @@ def build_info():
     try:
         here = Path(__file__).resolve().parent
         info['git_commit'] = run('git', '-C', str(here), 'rev-parse', 'HEAD')
-        info['git_dirty'] = bool(run('git', '-C', str(here), 'status', '--porcelain', '--', str(here)))
+        if info['git_commit']:  # a plain copy of the tree (no .git) records neither
+            info['git_dirty'] = bool(run('git', '-C', str(here), 'status', '--porcelain', '--', str(here)))
     except Exception:  # noqa: BLE001
         pass
     info['env'] = {k: os.environ[k] for k in BUILD_ENV_FLAGS if k in os.environ}

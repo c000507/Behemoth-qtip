@@ -175,11 +175,11 @@ Verified on the box (chain 2):
   "torch_xla": "2.9.0", "torch": "2.9.1", "nki": "0.5.0+28631259367.ga768afa6", "libneuronxla": "2.2.17544.0+fb9962bf", "libnrt":
   "2.33.10.0-3dcef56f0", "git_dirty": false, "env": {"MODEL": ..., "PAGES": "5561", "KV": "fp8", "ATTN_DEC": "nki", "WT": "1",
   "MLP": "nki", "HEAD_ROWS": "1", "HEAD_FP8": "1", "UNSAFE_FP8FNCAST": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn1"}}`.
-  `neuronx_cc_bin` and `git_commit` are absent there because the box copy is not a git checkout and `neuronx-cc --version` prints
-  "NeuronX Compiler version X" (parsed; it was on PATH - the field is missing because `run()` raised on the non-git dir first? No:
-  the two lookups are independent; `neuronx_cc_bin` was dropped by the `.split('version')[-1]` returning the version only when the
-  line contains the word, which it does - **this field needs a second look on a box; the venv `neuronx_cc` field is the one
-  `verify_graph_set.py` and the engine fall back to, so nothing downstream is affected**).
+  `neuronx_cc_bin` and `git_commit` are absent there: the box copy is a plain file copy (no `.git`, so `rev-parse` fails and
+  nothing is recorded - but `git_dirty: false` was still written, a bug), and `neuronx-cc --version` evidently prints its banner
+  on stderr (the first version read only stdout). Both fixed in the follow-up commit (banner read from stdout + stderr, `git_dirty`
+  only next to a found commit); NOT re-traced on the box (it was stopped by then), so the fixed fields are unverified there. The
+  venv `neuronx_cc` field, which `verify_graph_set.py` and the engine fall back to, was correct in the real trace.
 - `graphs_fp8v` = the fp8 graph set with `head1 -> v_head1`: the OLD engine (`sw/BUILD`, no provenance code) loaded it and ran
   tool15 plain at 52.6 ms/token = 19.00 t/s, the hardened engine (`sw/BUILD2`, commit b812972 sources, built with
   `ENGINE_BUILD2_EXIT 0`) 52.7 ms/token = 18.99 t/s with the same 53 tokens: unknown meta keys are ignored by both.
@@ -232,8 +232,8 @@ the 0.002 default is the safe choice and already wins; recommend revisiting with
   builds, ignores and logs the new meta key, and the old engine ignores it; `verify_graph_set.py` on two real graph dirs.
 - Not validated: the fp8 head on non-greedy sampling (temperature > 0 was not run; the logits KL suggests no visible effect);
   the 14k / 2048-page bucket (not built); a production-prompt eval of fp8-head quality (3 prompts + 1 text here); the WARNING
-  branches of the version log on a real mismatch (no second libnrt / compiler on the box; code-reviewed only); `build.neuronx_cc_bin`
-  (missing in the one real trace, see section 2); multi-request steps.
+  branches of the version log on a real mismatch (no second libnrt / compiler on the box; code-reviewed only); `build.neuronx_cc_bin` / `git_commit` after the
+  stderr / no-git fix (missing in the one real trace, see section 2); multi-request steps.
 - Failures / fixes: the HF `tokenizer.json` has `truncation.max_length = 4096`, which silently capped the 9.5k prompt at 5299
   tokens on the first attempt (`tok.no_truncation()`; the earlier docs' "long" 4398-token prompt was built through the same
   truncation, its token count is unaffected); the first engine process after the instance start took 213 s (cold page cache for
