@@ -2,8 +2,10 @@
 #include "qtip_expand.hpp"
 #include "behemoth/checkpoint.hpp"
 #include "behemoth/worker.hpp"
+#include <cstdint>
 #include <nrt/nrt.h>
 #include <nrt/nrt_experimental.h>
+#include <nrt/nrt_version.h> // nrt_get_version (BEHEMOTH_NEURON_LOG_VERSIONS=1 provenance log)
 
 #include <algorithm>
 #include <array>
@@ -106,7 +108,45 @@ struct Meta {
     std::vector<std::string> order;               // kind "layer": input names (trace_model.py ORDER / ORDER_QTIP), "cache" is aliased
     Geometry geometry;
     std::filesystem::path neff;
+    std::string build_compiler, build_libnrt;   // meta.json "build" (trace_model.py build_info): neuronx-cc / libnrt versions the bucket was
+                                                  // compiled with; provenance only, logged with BEHEMOTH_NEURON_LOG_VERSIONS=1, never enforced
 };
+
+// meta.json "build" is optional provenance; any other unknown key is ignored (nlohmann value()/at() on known keys only).
+void parse_build(const nlohmann::json &j, Meta &m) {
+    if (!j.contains("build") || !j.at("build").is_object())
+        return;
+    const auto &b = j.at("build");
+    m.build_compiler = b.value("neuronx_cc_bin", b.value("neuronx_cc", std::string()));
+    m.build_libnrt = b.value("libnrt", std::string());
+}
+
+// BEHEMOTH_NEURON_LOG_VERSIONS=1: log the libnrt version the engine loaded and the compiler / libnrt versions recorded in the buckets'
+// meta.json, with a WARNING (stderr, never an error) when the buckets mix compiler versions or were compiled against another libnrt.
+// Off by default: nothing is printed and nothing changes.
+void log_versions(const std::vector<Meta> &metas) {
+    if (!std::getenv("BEHEMOTH_NEURON_LOG_VERSIONS"))
+        return;
+    std::string loaded;
+    nrt_version_t v{};
+    if (nrt_get_version(&v, sizeof v) == NRT_SUCCESS)
+        loaded = std::to_string(v.rt_major) + "." + std::to_string(v.rt_minor) + "." + std::to_string(v.rt_patch) + "." + std::to_string(v.rt_maintenance);
+    std::cerr << "Neuron versions: libnrt loaded " << (loaded.empty() ? std::string("unknown (nrt_get_version failed)") : loaded) << "\n";
+    std::map<std::string, int> compilers, libnrts;
+    int without = 0;
+    for (const auto &m : metas) {
+        if (m.build_compiler.empty() && m.build_libnrt.empty()) { ++without; continue; }
+        ++compilers[m.build_compiler.empty() ? "unknown" : m.build_compiler];
+        ++libnrts[m.build_libnrt.empty() ? "unknown" : m.build_libnrt];
+    }
+    for (const auto &[c, n] : compilers) std::cerr << "Neuron versions: " << n << " bucket(s) compiled with neuronx-cc " << c << "\n";
+    if (without) std::cerr << "Neuron versions: " << without << " bucket(s) without build info in meta.json (older trace_model.py)\n";
+    if (compilers.size() > 1) std::cerr << "WARNING: the NEFF buckets mix neuronx-cc versions (see above); rebuild the set with one compiler\n";
+    for (const auto &[l, n] : libnrts) // the recorded version is the dpkg version string ("2.33.10.0-hash"), the loaded one is numeric
+        if (l != "unknown" && !loaded.empty() && l.rfind(loaded, 0) != 0)
+            std::cerr << "WARNING: " << n << " bucket(s) were compiled on a host with aws-neuronx-runtime-lib " << l << ", this process loaded libnrt "
+                      << loaded << " (ok when the compiler matches; see docs/neuron-build-pinning.md)\n";
+}
 
 // Layer NEFF inputs of the first generator version (no "order" in meta.json): the FP8 layer.
 const std::vector<std::string> kFp8Order = {"x", "cos_sin", "pos", "wslot", "table", "cache", "norm1", "norm2", "qf", "qs", "of", "os",
@@ -276,6 +316,7 @@ struct NeuronModel::Impl {
             m.neff = entry.path() / "graph.neff";
             if (j.contains("geometry"))
                 m.geometry = Geometry::parse(j.at("geometry"));
+            parse_build(j, m);
             if (m.kind == "model") {
                 if (std::getenv("NEURON_USE_LAYERS"))
                     continue;
@@ -353,6 +394,13 @@ struct NeuronModel::Impl {
                                          " has no logits-head fallback (non-greedy steps need one); stage both formats");
         if (!tp)
             throw std::runtime_error("no NEFF buckets (meta.json + graph.neff directories) in " + options.neff_dir.string());
+        if (std::getenv("BEHEMOTH_NEURON_LOG_VERSIONS")) { // provenance log (off by default), before any device work
+            std::vector<Meta> all(segments);
+            for (const auto &b : decode) for (const auto &[n, v] : b.variants) all.push_back(v.meta);
+            for (const auto &b : prefill) for (const auto &[n, v] : b.variants) all.push_back(v.meta);
+            for (const auto &h : heads) all.push_back(h.meta);
+            log_versions(all);
+        }
         // Whole-model graphs of one (R, Q, P): body segments (residual out), optionally ending in one head segment (logits
         // out), chained over the layers in order. Used when their layer counts add up to the checkpoint's; without a head
         // segment the separate head NEFF of the same token count produces the logits.

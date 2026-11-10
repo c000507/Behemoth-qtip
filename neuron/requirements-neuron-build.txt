@@ -1,0 +1,22 @@
+# Exact versions of the NEFF build host (trn1.2xlarge i-0adbefb8af607c610, venv /opt/aws_neuronx_venv_pytorch_2_9,
+# collected 2026-11-10 with `pip list` / `neuronx-cc --version` / `dpkg -l | grep neuron`), the stack that compiled the
+# production Devstral bucket set (b18 graphs + dec8s_* + the fp8 heads measured in docs/neuron-small-wins.md).
+# Install into a fresh venv: pip install --extra-index-url https://pip.repos.neuron.amazonaws.com -r neuron/requirements-neuron-build.txt
+# (python 3.12.3). docs/neuron-build-pinning.md explains how to rebuild a bucket set and check the serving image's libnrt.
+neuronx-cc==2.26.6360.0+6f180f47
+torch-neuronx==2.9.0.2.15.32035+de43f57c
+torch-xla==2.9.0
+torch==2.9.1
+torchvision==0.24.1
+libneuronxla==2.2.17544.0+fb9962bf
+nki==0.5.0+28631259367.ga768afa6
+neuronx-distributed==0.19.28492+435aae2b
+numpy==2.4.6
+protobuf==7.35.1
+# System packages (apt, not pip) of the same host; the serving image installs aws-neuronx-runtime-lib / -collectives
+# (deploy/ecs-neuron/backend/Dockerfile NEURON_RUNTIME_VERSION / NEURON_COLLECTIVES_VERSION build args; empty = latest):
+#   aws-neuronx-runtime-lib 2.33.10.0-3dcef56f0   (libnrt.so.2.33.10.0: the version meta.json "build.libnrt" records)
+#   aws-neuronx-collectives 2.33.10.0-068180c7a
+#   aws-neuronx-tools       2.31.13.0-a9e473f33   (neuron-profile)
+#   aws-neuronx-dkms        2.29.0.0
+#   kernel 6.17.0-1019-aws

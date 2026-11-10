@@ -559,6 +559,45 @@ def example_inputs(R, Q, P, pages):
     return out
 
 
+# Trace-time env flags recorded in meta.json "build" (provenance only; the runtime reads none of them)
+BUILD_ENV_FLAGS = ['MODEL', 'CONFIG', 'TP', 'PAGES', 'WEIGHTS', 'KV', 'KVATT', 'ATTN_DEC', 'ATTN_DEC_SHARED', 'ATTN_DEC_MIN_PAGES', 'ATTN_PROFILE',
+                   'WT', 'MLP', 'DOWN_BF16', 'OUT_F32', 'HEAD_ROWS', 'HEAD_FP8', 'HEAD_ARGMAX', 'UNSAFE_FP8FNCAST', 'NCC_FLAGS', 'NEURON_PLATFORM_TARGET_OVERRIDE']
+
+
+def build_info():
+    """Tool versions, repo commit, trace env and a timestamp for meta.json "build" (verify_graph_set.py reads it; the runtime only
+    logs it with BEHEMOTH_NEURON_LOG_VERSIONS=1). Every field is best effort: a missing tool leaves the key out, never fails the trace."""
+    import datetime
+    info = {'timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'python': sys.version.split()[0]}
+    try:
+        from importlib import metadata
+        for key, dist in [('neuronx_cc', 'neuronx-cc'), ('torch_neuronx', 'torch-neuronx'), ('torch_xla', 'torch-xla'), ('torch', 'torch'),
+                          ('nki', 'nki'), ('libneuronxla', 'libneuronxla')]:
+            try:
+                info[key] = metadata.version(dist)
+            except metadata.PackageNotFoundError:
+                pass
+    except Exception:  # noqa: BLE001  (provenance only)
+        pass
+    run = lambda *cmd: subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+    try:  # the compiler binary that `neuronx-cc compile` below resolves to (the venv pip version above may differ from PATH)
+        info['neuronx_cc_bin'] = run('neuronx-cc', '--version').splitlines()[0].split('version')[-1].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # the runtime library installed where the buckets are compiled (the serving image may install another: the runtime logs both)
+        info['libnrt'] = run('dpkg-query', '-W', '-f=${Version}', 'aws-neuronx-runtime-lib')
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        here = Path(__file__).resolve().parent
+        info['git_commit'] = run('git', '-C', str(here), 'rev-parse', 'HEAD')
+        info['git_dirty'] = bool(run('git', '-C', str(here), 'status', '--porcelain', '--', str(here)))
+    except Exception:  # noqa: BLE001
+        pass
+    info['env'] = {k: os.environ[k] for k in BUILD_ENV_FLAGS if k in os.environ}
+    return {k: v for k, v in info.items() if v not in ('', None)}
+
+
 def main():
     global g
     workdir, kind = sys.argv[1], sys.argv[2]
@@ -624,6 +663,7 @@ def main():
             fn = lambda x, rows_, norm, w: head_graph(S, x, rows_, norm, w, None, WT, argmax)
         meta = {'kind': 'head', 'S': S, 'T': T, 'fp8': fp8, 'argmax': argmax, 'wt': WT, 'order': HEAD_FP8_ORDER if fp8 else HEAD_ORDER}
     meta['geometry'] = g.meta()
+    meta['build'] = build_info()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
     except RuntimeError as error:

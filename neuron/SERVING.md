@@ -28,6 +28,11 @@ NEURON_RT_VISIBLE_CORES=0-1 NEURON_RT_ROOT_COMM_ID=127.0.0.1:62128 BEHEMOTH_NEUR
   BUILD/neuron_server --model /path/to/checkpoint --port 8080
 ```
 
+Reproducible builds: `neuron/requirements-neuron-build.txt` pins the compiler venv of the production bucket set, every `meta.json`
+records the tool versions / commit / trace flags it was built with (`"build"`), `neuron/verify_graph_set.py OUT` checks a set for
+mixed compiler versions, and `BEHEMOTH_NEURON_LOG_VERSIONS=1` makes the engine log the loaded libnrt version against the buckets'
+(warning only): docs/neuron-build-pinning.md.
+
 `neuron_server` is `runtime/src/server.cpp` linked against the Neuron `Engine` and a Llama-3 byte-level BPE
 `Tokenizer` (`neuron/cpp/llama_text.cpp`, the checkpoint's chat template through `set_chat_backend`). It speaks the
 same OpenAI chat API with streaming, stop strings, `/health`, `/metrics`. `neuron_engine_cli MODEL requests.json` drives the
