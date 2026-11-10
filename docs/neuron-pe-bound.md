@@ -32,7 +32,9 @@
 - Therefore an fp8 weight stream that is DEQUANTIZED BEFORE the PE is
   not limited by 179 GB/s of fp8 bytes; it is limited by
   (a) the DMA that moves the fp8 bytes (measured ceiling 224-266
-  serial / 240-265 parallel; compiler mul geometry reaches ~395), and
+  serial / 240-265 parallel; the compiler "mul geometry ~395" =
+  read+write of an HBM->HBM copy = 198 GB/s payload (CORRECTION
+  2026-11-10, review) — not a faster read path), and
   (b) the dequant pass that reads fp8 + scale and writes f32.
 - fp8 buys wall time only to the extent the DMA + dequant pipeline
   hides behind each other. Measured: 1.29-1.33x on an isolated matvec.
@@ -47,10 +49,11 @@
 - KV cache tensor = 91.1 MB fp8 (in + out): only the touched pages are
   gathered per execute at M=1; the full-tensor sizes are capacities.
 - Implied effective weight-stream rate = 278 MB / 1.32 ms =
-  **210 GB/s** — ABOVE the 179 GB/s PE-operand floor, consistent with
-  the dequant-into-SB picture: the layer pipelines DMA(fp8) ->
-  dequant(SB, f32) -> PE(f32 operands), so its bound is the DMA +
-  dequant overlap, not the PE operand rate.
+  **210 GB/s** — ABOVE the 179 GB/s PE-operand floor.
+  CORRECTION (2026-11-10, review/brief 12): the "dequant-into-SB,
+  f32 operands" picture is refuted for the REAL layer — the PE stream
+  is native fp8 x fp8 (in_dtype = 14 on 5578/5754 instructions); this
+  description only applies to the isolated cast-form matvec.
 - Token arithmetic at the measured 1.32 ms: 40 layers = 52.8 ms +
   head ~2 ms + host ~3 ms ≈ 58 ms/token ≈ 17 t/s ceiling for the
   dec1 bucket; the user's 15 t/s = the launch gaps + the older 1.46 ms
@@ -76,7 +79,9 @@ The fp8 decode is not at a hard PE wall; it is at a
 DMA-geometry + dequant-overlap wall. Isolated matvec evidence: fp8
 1.29-1.33x over bf16 with a naive per-row-scale dequant; the layer
 achieves 210 GB/s effective vs the 224-266 (ours) / ~395 (compiler
-elementwise geometry) DMA envelope. Closing that gap = descriptor
-geometry + dequant placement/packing (brief 9), worth up to ~1.2-1.6x
-per layer if the 395 GB/s geometry can be applied to the weight
-streams and the dequant stays hidden.
+elementwise geometry) DMA envelope. CORRECTION (2026-11-10, review):
+the ~395 figure = read+write of an HBM->HBM copy (198 GB/s payload) —
+it cannot be "applied to the weight streams"; the multi-stream read
+ceiling = 260-265 GB/s. Closing that gap = descriptor geometry +
+dequant placement/packing (brief 9), worth up to ~1.2-1.6x per layer;
+the upper end that assumed the 395 geometry is retracted.

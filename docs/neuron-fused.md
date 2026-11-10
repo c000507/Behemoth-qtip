@@ -18,14 +18,22 @@ structurally impossible).
 | dec1_128 sync (fp8-KV) | 23 | 372.1 | 1.327 | 1.327 |
 | dec1_128 async inflight=8 | 23 | 372.1 | **1.133-1.193** | 1.133-1.193 |
 
-Compile: 39 s (N=2) / 61 s (N=4) — cheap. Performance: **the fused
-per-layer time is 2.6-3.4x WORSE than async per-layer executes.** Even
-discounting the bf16-KV gather (2x KV bytes), the fused path loses
-badly: the compiler's cross-layer tiling degrades (the same finding as
-the repo's 8B one-graph sweep, where the fused path beat only the SYNC
-path by 7% — the async-inflight path removes the same launch gap
-without the tiling penalty). Layer fusion is DEAD on Devstral dims,
-now measured, not extrapolated.
+(CORRECTION 2026-11-10: the dec1 MB/rank 372.1 = the capacity sum
+(weights 278 + the resident KV pool 91.1 + cscale 2.85); the per-execute
+HBM read = 278.8 MB.)
+
+CORRECTION (2026-11-10, review): (1) the MB/rank figures include the
+671 MB bf16 lm_head that the fused graphs carry ONCE (SHARED includes
+head_w), so 1235.7 = 2 layer-weights + 671 and 1800.3 = 4 + 671 — the
+fused ms/execute includes that head matmul; subtracting the measured
+3.37 ms head: N=2 = (7.4-7.7)/2 ≈ 2.0-2.15 ms/layer, N=4 ≈ 2.1-2.2
+ms/layer = **~1.6x worse than the 1.327 ms sync layer**, not
+"2.6-3.4x". (2) the 1.133-1.193 baseline is retracted (the
+missing-drain signature of the 200-step bench window); the comparison
+baseline = 1.327 (or the ~1.2-1.3 ms device). (3) the fused graphs also
+run bf16 KV and a different attention path, so they are not
+apple-to-apple. Direction (fusion loses) holds; "measured, not
+extrapolated" is withdrawn.
 
 ## Embedding + final norm + fp8 head + argmax: ONE call works
 

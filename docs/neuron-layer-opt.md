@@ -34,6 +34,11 @@ NEURON_RT_ROOT_COMM_ID), 100-step steady state.
   cannot be PE-operand-bound: it pipelines HBM->SB (fp8) -> dequant to
   f32 in SB -> PE (f32 operands, 716 GB/s equivalent). The binding
   stages are the fp8 DMA and the dequant, which must overlap the PE.
+  CORRECTION (2026-11-10, review/brief 12): the "dequant to f32 in SB"
+  picture for the REAL layer is refuted — the real dec1_128 PE stream is
+  NATIVE fp8 x fp8 (in_dtype = 14 on 5578 LW + 5754 MM instructions);
+  the dequant-to-f32 description only matches the isolated cast-form
+  matvec.
 - Isolated M=1 matvec (docs/neuron-pe-bound.md): bf16 12288^2 =
   1378 us = 228 GB/s (DMA serial ceiling); fp8 = 1065 us (150 GB/s
   effective, 1.29x over bf16, NOT 2x): the gap = the in-graph dequant
@@ -46,7 +51,7 @@ The 395 GB/s mul number = read+write. Read-only probes:
 
 | probe | traffic | marginal rate |
 |---|---|---|
-| jnp.sum(x) n=262144->1048576 (4 MB read + 4 B write per execute) | 3 MB delta / 14.3 us | **210 GB/s** |
+| jnp.sum(x) n=262144->1048576 (4 MB read + 4 B write per execute) | 786,432 x 4 B = 3.15 MB / 14.3 us | **220 GB/s** (CORRECTION 2026-11-10: was "3 MB / 210") |
 | GEMV M=1 12288^2 bf16 (302 MB weight read + 4 KB output) | 302 MB / 1322 us | **228 GB/s** |
 | mul x*1.0 (4 MB read + 4 MB write, HBM->HBM direct copy) | 7.34 MB / 18.6 us | 395 total |
 
@@ -90,19 +95,25 @@ lever is the DMA chunk geometry, not the scale placement.
   INTERMEDIATE 14336; Devstral = 5120/32768). Candidate variants:
   fused QKV, fused gate/up, MLP tile shape, scale placement, KV gather
   placement. Each compile = tens of minutes; needs a dedicated session.
-- The 395-geometry test on a real weight stream: recompiling the MLP
-  tile with the elementwise-mul descriptor form and measuring both
-  ranks. This is the decisive experiment for the 21-24 t/s range.
+- ~~The 395-geometry test on a real weight stream... the decisive
+  experiment for the 21-24 t/s range.~~ SUPERSEDED (2026-11-10): the 395
+  figure = the read+write total of an HBM->HBM copy (3.67 MB each way /
+  18.6 us = 198 GB/s payload), not a read-geometry to transplant; see
+  the read-only section.
 - 2-rank numerics validation vs the C++ oracle (the runner fills
   deterministic inputs; numerics = checked separately).
 
 ## Verdict
 
 - The user is NOT at the PE floor; the layer is at 210 GB/s effective
-  vs a 250-400 GB/s DMA envelope. Realistic upside = 1.15-1.6x per
+  vs ~~a 250-400 GB/s DMA envelope~~ (CORRECTION 2026-11-10: the 395
+  GB/s "envelope" = read+write of an HBM->HBM copy = 198 GB/s payload;
+  the measured read rates = 210-228 one-direction, 260-265
+  multi-stream). Realistic upside = 1.15-1.6x per
   layer (15 -> 17-24 t/s), entirely from DMA geometry and dequant
   overlap, NOT from the vector engines (rejected) and NOT from scale
-  packing (measured no-op).
+  packing (measured no-op). The 21-24 t/s upper end rested on the 395
+  figure and is retracted (17-19 t/s stands).
 - dec1 vs dec4/dec8: batching amortizes the stream almost perfectly;
   for single-stream latency the graph variants above are the only
   lever.
@@ -111,8 +122,8 @@ lever is the DMA chunk geometry, not the scale placement.
 
 - sumread probes: compiled via the oracle pipeline (jax sum lowers to
   a reduce over a staged 4 MB f32 tensor; output = 4 B). Marginal
-  between n=262144 (65.2 us) and n=1048576 (79.5 us): 3 MB / 14.3 us
-  = 210 GB/s. Caveat: the reduce adds ~8-9 us at 1M elements, so the
+  between n=262144 (65.2 us) and n=1048576 (79.5 us): 3.15 MB / 14.3 us
+  = 220 GB/s. Caveat: the reduce adds ~8-9 us at 1M elements, so the
   TRUE pure-read rate sits between 210 (reduce-mixed) and the GEMV's
   228 (a matvec output is 4 KB = effectively read-only, no reduce).
 - The mul-geometry decode (docs/neff-opt.md): ONE op212 desc,
@@ -252,7 +263,7 @@ Structure diff (PE stream, per 64B LW/MM pair):
 |---|---|---|---|---|---|
 | isolated native matvec (any shape) | 168 MB | 20482 | **8.2 KB** | 323-355 | ~520 |
 | isolated MLP chain (3x84MB, real deps) | 252 MB | 30982 | **8.1 KB** | - | - |
-| real dec1_128 layer | 343 MB | 5850 | **58.6 KB** | 566 | ~560 |
+| real dec1_128 layer | 343 MB (CORRECTION 2026-11-10: 278 MB weights + the 91.1 MB input21 = the KV pool counted here; the per-execute read = 278.8 MB) | 5850 | **58.6 KB** | 566 | ~560 |
 
 - The compiler picks **8.1-8.2 KB PE tiles for ANY standalone matmul**
   (every shape tested: [5120,32768], [40960,4096], [20480,4096]; every
@@ -271,12 +282,20 @@ Structure diff (PE stream, per 64B LW/MM pair):
   278 — the 91.1 MB tensor had been mislabeled as the KV cache; it is
   the fused attention weight). The KV cache = the small page tensors +
   a 91.1 MB output written back each layer.
-- REAL layer traffic per execute = 343 MB read + 91.1 MB KV write-back
-  (+ touched-page reads) = ~434 MB in 1.320 ms = **329 GB/s bus
-  aggregate** (reads at the ~260 multi-stream ceiling + the writes
-  concurrent), ~83% of the ~2 x 395-class chip-bus envelope with both
-  ranks running. The layer is BUS-bound, not PE-bound and not
-  descriptor-bound.
+  CORRECTION (2026-11-10, review): the [44488,2048] tensor IS the KV
+  pool, not an attention weight: 5561 x 8 x 16 x 128 fp8 = 91,111,424 B
+  = input21. Weights per rank = 3 x 83,886,080 MLP + 10,485,760 q + 10,485,760
+  o + 2,621,440 k + 2,621,440 v = **277,872,640 B = 278 MB**. The pool is
+  staged once at load and only the touched pages are written per step (the
+  brief-14 bucket scaling below proves it); profile hbm_read = 278.8 MB
+  per execute. The 343/372 MB and the 282-329 GB/s figures below are
+  superseded: effective = 278 MB / 1.32 ms = 211 GB/s.
+- ~~REAL layer traffic per execute = 343 MB read + 91.1 MB KV
+  write-back = ~434 MB in 1.320 ms = 329 GB/s bus aggregate... The layer
+  is BUS-bound~~ CORRECTION (2026-11-10, review): input21 = the KV pool
+  (not an attention weight, not read per execute); per-execute read =
+  278.8 MB at 211 GB/s effective, below the 260-265 ceiling. "BUS-bound"
+  is withdrawn.
 
 Verdict: the 122-142 vs 210 gap = the compiler's PE tile size (8 KB
 standalone vs 58.6 KB in-layer), which amortizes the M=1 LW+MM pair
@@ -305,27 +324,29 @@ Bucket-scaling test (repo layer_bench, 2 ranks, 100 steps):
 - dec1_512's +114 us = the attention gather/kernel group-loop scaling
   with the gather span (~0.16 us/page = ~32 KB/page at the DMA rate),
   not a copy.
-- Corrected accounting (HLO-verified): weights per rank = **91.1 MB
-  fused attention weight [44488,2048] + 3 x 83.9 MB MLP shards =
-  343 MB**; total inputs = 372.1 MB per rank per layer read from HBM
-  (weights + tables + scales + touched pages). Input21 = the KV cache
-  (5561 x 8 x 16 x 128 fp8 = 91,111,424 B) staged once at load; the
-  566 pool descriptors = the per-execute HBM reads of all inputs
-  (~372 MB), NOT a cache copy.
-- Implied per-execute read rate = 372 MB / 1.32 ms = **282 GB/s** =
-  at/above the single-NC multi-stream read ceiling (260-265): the
-  layer is at the practical memory-system ceiling with both ranks
-  running.
+- Corrected accounting (HLO-verified): ~~weights per rank = 91.1 MB
+  fused attention weight + 3 x 83.9 MB MLP shards = 343 MB; total
+  inputs = 372.1 MB per rank per layer read from HBM~~ CORRECTION
+  (2026-11-10, review): input21 (5561 x 8 x 16 x 128 fp8 = 91,111,424 B)
+  IS the KV pool, staged once at load, only the touched pages written
+  per step; weights per rank = 278 MB and the per-execute HBM read =
+  278.8 MB (neuron-profile). The 566 pool descriptors = the weight
+  streams + the touched-page traffic, NOT a ~372 MB cache read.
+- Implied per-execute read rate = ~~372 MB / 1.32 ms = 282 GB/s~~
+  **278 MB / 1.32 ms = 211 GB/s** = below the 260-265 single-NC
+  multi-stream read ceiling; the layer is not at the memory-system
+  ceiling (the earlier claim rested on the 372 MB sum).
 - Brief14 task 3 (no-copy variant) = MOOT: no copy exists to remove.
   The remaining per-layer lever = the attention gather span (use the
   bucket that matches the actual context; already done by the user's
   bucketing) and the ~10% launch/tail polish. t/s ceiling ~17-19.
 
-Note: input21 = the KV cache; the 91.1 MB fused attention WEIGHT lives
-in the HLO as p1.497 [44488, 2048] = a separate input among the 23
-(the 10.5/2.6 MB tensors include q/o shards and kernel tables). The
-brief-13 "input21 = attention weight" relabel was wrong; the supervisor's
-original accounting was right.
+Note: input21 = the KV cache (5561 x 8 x 16 x 128 fp8 = 91,111,424 B;
+the HLO p1.497 [44488, 2048] = the same bytes in the kernel's view, one
+input among the 23). CORRECTION (2026-11-10, review): the "91.1 MB fused
+attention WEIGHT" reading and this note's earlier "p1.497 is a separate
+weight" framing are withdrawn — there is one 91.1 MB tensor, the KV
+pool.
 
 ## 12. Brief 15: per-token breakdown — where the non-layer time goes
 
@@ -424,16 +445,24 @@ pools = OOM at 40 layers).
 | full loop, 128 tok | 68.99 | 14.5 |
 | no-ehs (40 layers only) | 71.63 (noise-band) | 14.0 |
 
-- **The loop calibrates to the user's serving: 68 vs 66.7 ms/token
-  (1.5%).** The user's 15 t/s is now EXPLAINED end to end.
+- ~~The loop calibrates to the user's serving: 68 vs 66.7 ms/token
+  (1.5%). The user's 15 t/s is now EXPLAINED end to end.~~ CORRECTION
+  (2026-11-10, review): the engine loads ONE model per bucket and binds
+  per-layer tensor sets (neuron_model.cpp, SERVING.md), so variant A's
+  "40-model rotation" = an artificial pattern the serving never had;
+  the 1.5% match = a coincidence.
 - Decomposition: 41 executes x ~1.33 ms (layer_bench per-layer) =
   54.5 ms; the measured 68 = **~330 us per execute of model-rotation
   overhead** (40-model rotation; layer_bench has zero model switches).
   The ehs head = noise-level inside the loop.
 - **ASYNC CORRECTION (retracts brief 15's 1.133 finding)**: libnrt
   2.33 explicitly logs "NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS is
-  no longer supported and will be ignored" — the implicit async mode
-  was REMOVED. The brief-15 1.133 vs 1.327 difference = run-to-run
+  no longer supported and will be ignored"~~ — the implicit async mode
+  was REMOVED~~. CORRECTION (2026-11-10, review): the env is ignored
+  BECAUSE depth-8 async is the DEFAULT in 2.33 (PERF_NOTES "async depth
+  8 (now the default in the runtime)"); async was not removed. The
+  brief-15 1.133-vs-1.327 delta = the missing-drain signature (40 vs
+  200 steps timed 32/40 vs 192/200 of the device work), not run-to-run
   variance. The real async = the explicit nrta_execute_schedule API
   (nrt_async.h) = the genuine remaining lever: it schedules executes
   without the per-execute host round trip and may also hide the
