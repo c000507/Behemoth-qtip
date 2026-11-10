@@ -123,3 +123,50 @@ lever is the DMA chunk geometry, not the scale placement.
   210 (sum, reduce-mixed), 224-266 (serial desc chain, r then w),
   228 (GEMV ring, pure read), 240-265 (2 concurrent reads + write).
   A single-direction stream never exceeded ~266; reads top at ~228.
+
+## 7. Payload accounting + engine-concurrency sweep (brief 10, 2026-11-10)
+
+Payload accounting: the mul "395 GB/s" counts read+write bytes of the
+HBM->HBM copy: 3.67 MB read + 3.67 MB write in 18.6 us = **198 GB/s
+payload** — BELOW the 228 GB/s pure-read GEMV. The copy is not a faster
+path; it never was.
+
+Concurrency sweep (single NC, read-only, jnp.sum over N independent
+4 MB inputs; compile-time graphs, 100-200 iters):
+
+| streams | slice | total read | avg us | aggregate GB/s |
+|---|---|---|---|---|
+| 1  | 4 MB | 4.2 MB   | 78.7  | 184 |
+| 2  | 4 MB | 8.4 MB   | 94.9  | 216 |
+| 4  | 4 MB | 16.8 MB  | 127.6 | 234 |
+| 8  | 4 MB | 33.6 MB  | 190.3 | 250 |
+| 16 | 4 MB | 67.1 MB  | 315.1 | 259 |
+| 32 | 1 MB | 33.6 MB  | 191.1 | 248 |
+| 4  | 8 MB | 134.2 MB | 565.1 | **264** |
+
+- Marginal N=1->8: 29.4 MB / 111.6 us = 263 GB/s. The aggregate rises
+  monotonically to N=16 and the knee is at ~8-16 streams; the shared
+  ceiling = **~260-265 GB/s per core**, NOT a per-engine 14 GB/s wall.
+- Slice size matters mildly: 8 MB slices (264) > 4 MB (250-259) >
+  1 MB (248) at saturation.
+- The compiler GEMV ring (228 GB/s, 578 descs on the 16-sem/16-queue
+  qPoolDynamic set) behaves like ~1-2 EFFECTIVE concurrent streams,
+  not 16: the ring's descriptor chain is serialized despite the 16
+  semaphores. That is the gap.
+- Both ranks in layer_bench already read concurrently: 210 GB/s per
+  core = 420 GB/s chip aggregate, well under chip HBM (~820). The
+  per-core multi-stream ceiling (260-265) is therefore the real
+  per-core limit, and the layer sits 20-25% below it.
+- fp8-matvec dequant exposure (arithmetic): 1065 us total - 56 floor
+  - 151 MB/228 GB/s (=662 us, if the DMA ran at the single-stream
+  read rate) = ~347 us (~33%) of exposed dequant/gaps. With the
+  multi-stream DMA (260+) the exposed fraction grows unless the
+  dequant is overlapped better.
+
+Verdict (brief 10 item 6): there IS read-side headroom: splitting the
+weight stream into >=8 concurrent descriptor streams with >=4-8 MB
+contiguous runs should lift the per-core read from ~210-228 to
+~260-265 GB/s = the dec1_128 layer from 1.32 to ~1.06-1.15 ms ->
+t/s = 1000/(40*1.10+5) ~= 20-21. Unverified: whether the layer's
+consumer pacing (NKI attention, tiled MLP) tolerates the deeper
+concurrency, and cross-core DMA behavior beyond the 2-rank layer bench.
