@@ -252,3 +252,49 @@ Numerics (`tests/test_qwen35_device.py`, single MoE blocks with random weights o
 `ROUTER=shard` changes the router logits in the last f32 bit (32 partial sums instead of one dot product): block output
 max |diff| 1.4e-6..9e-5 (rel 5e-7..1.4e-5) against `pad64` at R = 1..8, all 32 ranks bit-equal; the row forms are
 bit-identical to the union form on top of that. Device vs CPU mirror unchanged (3.2e-2..3.6e-2 rel L2, the fp8 level).
+
+## 9. Result of this pass (engine step log, distinct prompts of `prompts8.txt`, 100 new tokens, quiet box)
+
+Bucket set T3 / T3F (50 NEFFs: prefill sub-block graphs of g4 + decode `seg20` R in {1, 2, 3, 4, 6, 8, 16} + heads),
+`OMP_NUM_THREADS=8 OMP_WAIT_POLICY=active`. "before" = the configuration of docs/neuron-qwen397.md 8.13 (g10).
+
+| streams | bucket | g10 (8.13) | T2 (section 4) | **T3: ms per step** | `layers_ms` | **aggregate tok/s** |
+|---|---|---|---|---|---|---|
+| 1 | R = 1 | 24.5 ms, 41 | 19.1, 52.3 | **15.6** | 14.9 | **64.0** |
+| 2 | R = 2 | (R = 4 bucket) | 26.3, 75.5 | **22.8** | 22.0 | **87.6** |
+| 3 | R = 3 | | 30.1, 99.3 | **25.8** | 24.9 | **116** |
+| 4 | R = 4 | 41.4, 96.5 | 33.9, 117.5 | **30.3** | 29.3 | **132** |
+| 6 | R = 6 | | 41.3, 145 | 40.8 | 39.8 | 147 |
+| 8 | R = 8 | 56.2, 128 | 47.6 (8 rows) / 44.9 (7 rows), 168 | **42.7** | 41.6 | **187** (8 full rows; 171 over the run with 7.3 rows on average) |
+| 16 | R = 16 (`MOE_SPLIT=8`: two unions of 80 slots) | 258, 59 | 87.8, 174 (2 x R = 8) | **73.3** | 71.6 | **218** |
+| 1 after an 8k fill | R = 1, P = 512 (`ATT_BF16=1`) | 25.7, 38.8 | | **16.9** | | 59.0 |
+
+* Tokens: the R = 1 stream is identical to the validated configuration's (100 / 100, and the 8k continuation 32 / 32
+  against both of agent A's references). Batched rows: 5 of 8 identical to T2's over 100 tokens, the others leave at
+  tokens 26-45 (near ties; the sharded router changes the logits in the last f32 bit, and a row's bucket depends on
+  arrival timing as before). Oracle: section 12.
+* All 50 NEFFs of T3F load next to the weights (12.05 GiB + 1.04 GiB state per core).
+
+## 10. Is 300 tok/s at 8 streams reachable? No
+
+The step at 8 rows is 42.7 ms; 300 tok/s needs 26.7. What is left, per step:
+
+| at 8 rows | ms | floor | comment |
+|---|---|---|---|
+| 80 expert slices per MoE block: gather, gate / up, SiLU, down | 15.3 | 7.6 (bytes at 250 GB/s) .. 11.4 (166 GB/s) | 1.9 GB per step and core. The tensor engine ingests 128 weight elements per cycle whatever the operand roles, and every selected slice must pass through it once: this part cannot go below the byte floor |
+| MoE router + top-10 + slot union | 7.6 | ~3 | compiler schedule (the union is needed at >= 6 rows, 8.2) |
+| MoE base (norm, shared expert, all-reduce, residual) | 4.7 | 4.7 | op count, same as R = 1 |
+| gdn | 7.4 | 4.1 (R = 1) | per-row state slots |
+| gqa | 4.1 | 2.2 | per-row K\|V gather |
+| launches, head, host | 2.0 | 1.5 | |
+| **total** | **42.7** | **~24-28 only if every item reached its floor at once** | |
+
+Even with a perfect MoE kernel (expert part at the byte floor: -4 to -8 ms) the step is 35-39 ms (205-230 tok/s): the
+non-expert work alone (router, base, gdn, gqa, launches, host = 26 ms) already is the whole 26.7 ms budget. Reaching 300
+tok/s at 8 streams would need BOTH the expert part at the 250 GB/s wall AND the per-row overheads of everything else
+removed (the R = 1 cost of 14.5 ms + 7 rows x 1.0 ms of bytes = 21.5 ms is the true floor of this layout), i.e. a
+hand-written kernel for the whole layer, not only the MoE. A second instance (2 x 4 streams = 2 x 132 = 264 tok/s; 2 x 8
+= 374) or a model-side change (fewer experts per token) are the other ways.
+
+What does scale: the aggregate keeps growing with more streams only up to 8 rows per launch (187), 16 rows in one
+launch give 218, and beyond that the gathered MoE falls off (section 7).
