@@ -18,6 +18,7 @@
 #include <nrt/nrt_experimental.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -79,6 +80,31 @@ float bf16_to_f32(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+
+// All rank threads meet here after every launch when BEHEMOTH_NEURON_QWEN35_BARRIER=1: no rank starts launch i + 1 (whose
+// all-reduce pairs with the other ranks' launch i + 1) before every rank has returned from launch i. Spins (launches are
+// sub-millisecond); a failed rank releases the others.
+struct SpinBarrier {
+    std::atomic<int> count{0}, generation{0};
+    std::atomic<bool> failed{false};
+    int n;
+    explicit SpinBarrier(int ranks) : n(ranks) {}
+    void wait() {
+        const int g = generation.load();
+        if (count.fetch_add(1) + 1 == n) {
+            count.store(0);
+            generation.fetch_add(1);
+            return;
+        }
+        while (generation.load() == g) {
+            if (failed.load())
+                throw std::runtime_error("Qwen35: another rank failed");
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+};
 
 // One NEFF: a sub-block kind ("gdn", "gqa", "dense", "moe"), a whole layer ("layer_<attn>_<mlp>": both sub-blocks,
 // weights named a.* / m.*) or "head", for one bucket.
@@ -650,8 +676,11 @@ class Qwen35Model final : public Backend {
         std::vector<std::vector<float>> out(static_cast<size_t>(tp));
         std::vector<std::future<void>> jobs;
         double t_layers = 0, t_head = 0;
+        static const bool use_barrier = std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER"));
+        SpinBarrier barrier(tp);
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
+              try {
                 auto &st = steps.at({L.R, L.Q})[size_t(r)];
                 const auto t0 = Clock::now();
                 put(st.x[0], L.x.data(), L.x.size() * 4);
@@ -670,6 +699,8 @@ class Qwen35Model final : public Backend {
                         auto [in, o] = layer_set(*g, l, parity, r);
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
                         parity ^= 1;
+                        if (use_barrier)
+                            barrier.wait();
                         if (sync_bytes) { // BEHEMOTH_NEURON_QWEN35_SYNC=n: blocking read of n bytes of the new residual on EVERY rank
                             char probe[64]; // after every launch (the section-12 A/B: host-device synchronisation without the dump cost)
                             check(nrt_tensor_read(st.x[parity].t, probe, 0, size_t(std::min(sync_bytes, 64))), "sync read");
@@ -701,6 +732,10 @@ class Qwen35Model final : public Backend {
                     t_layers = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     t_head = ms_since(t1);
                 }
+              } catch (...) {
+                barrier.failed.store(true);
+                throw;
+              }
             }));
         for (auto &j : jobs)
             j.get();

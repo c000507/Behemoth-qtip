@@ -56,6 +56,11 @@ for cfg, tp in ((R.TINY397, 32), (R.TINY397, 2), (R.TINY, 2)):
                 assert {e['name'] for e in ents} == set(ref)
                 for e in ents:
                     assert raw[e['offset']:e['offset'] + e['bytes']] == RP.tensor_bytes(ref[e['name']]), e['name']
+        v = subprocess.run([sys.executable, str(Path(P.__file__).parent / 'qwen35_verify_prepared.py'), str(d / 'm'), str(d / 'o'), '--ranks', 'all', '--jobs', '2', '--tol', '0.2'], capture_output=True, text=True)
+        assert v.returncode == 0, v.stdout[-2000:] + v.stderr[-2000:]
+        raw = bytearray((d / 'o/r0/L001.bin').read_bytes()); raw[100] ^= 0x55; (d / 'o/r0/L001.bin').write_bytes(raw)   # a flipped byte must be caught
+        v = subprocess.run([sys.executable, str(Path(P.__file__).parent / 'qwen35_verify_prepared.py'), str(d / 'm'), str(d / 'o'), '--ranks', 'all', '--jobs', '2', '--tol', '0.2'], capture_output=True, text=True)
+        assert v.returncode == 1, 'corruption not detected'
         ref = P.shard_head(get, tp - 1, g, True)
         raw = (d / f'o/r{tp - 1}/head.bin').read_bytes()
         for e in man['files'][f'r{tp - 1}/head.bin']:
