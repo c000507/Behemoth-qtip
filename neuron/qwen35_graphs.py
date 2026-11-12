@@ -40,6 +40,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 
 PAGE = G.PAGE
 F8 = G.F8
+MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
 
@@ -269,9 +270,18 @@ def moe_block(n, t, g, allreduce, mode='all'):
     if mode == 'gather' and g.topk * T < E:
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, E]
-        rank = used - torch.arange(E, device=n.device).float().reshape(1, E) * (0.5 / E)
-        idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                         # (2-D topk: a 1-D one crashed the XLA trace)
-        comb = torch.index_select(comb, 1, idx)
+        ar = torch.arange(E, device=n.device).float().reshape(1, E)
+        if MOE_SLOTS == 'onehot':
+            # slot s <- the s-th used expert (ascending), empty slots <- expert 0 with combine weight 0. No top-k over the
+            # experts: the device's topk(k = 40 of 512) of the 4-row bucket returned non-finite output on trn1 (397B doc).
+            order = torch.matmul(used, torch.triu(torch.ones(E, E, device=n.device))) - 1.0   # [1, E]: rank among the used
+            sel = ((order == torch.arange(slots, device=n.device).float().reshape(slots, 1)) & (used > 0)).float()   # [slots, E]
+            idx = torch.matmul(sel, ar.reshape(E, 1)).reshape(slots).round().long()
+            comb = torch.matmul(comb, sel.T)                                            # [T, slots], 0 for empty slots
+        else:
+            rank = used - ar * (0.5 / E)
+            idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                     # (2-D topk: a 1-D one crashed the XLA trace)
+            comb = torch.index_select(comb, 1, idx)
         gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
@@ -434,7 +444,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
