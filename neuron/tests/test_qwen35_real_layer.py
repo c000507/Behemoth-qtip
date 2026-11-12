@@ -63,7 +63,7 @@ def main():
             w = {ck.prefix + n: ck.tensor(ck.prefix + n) for n in layer_names(g, l)}
             ref = R.Ref(cfg, w)
             get = P.Getter(w)
-            shards = [P.shard_layer(get, l, r, g, meta['fp8']) for r in range(g.TP)]
+            shards = P.pack_layer(get, l, g, meta['fp8'])
             print(f'layer {l} ({g.kind(l)}) weights read + sharded in {time.time() - t0:.0f}s', flush=True)
             results[f'L{l}/{d.name}'] = check(d, meta, l, g, ref, shards, neff_io)
     print(json.dumps(results))
@@ -88,7 +88,8 @@ def check(d, meta, l, g, ref, shards, neff_io):
         conv = torch.zeros(2 * kd + g.Hv * g.Dv, g.K - 1)
         for r in range(g.TP):   # rank r's heads / channels of the shared random slot 0
             S[r * g.hl:(r + 1) * g.hl] = states['kstate'][0]
-            rows = torch.cat((r * g.hk * g.Dk + torch.arange(g.hk * g.Dk), kd + r * g.hk * g.Dk + torch.arange(g.hk * g.Dk), 2 * kd + r * g.Wv + torch.arange(g.Wv)))
+            k0 = g.key_of(r) * g.Dk                                                      # replicated key head when Hk < TP: same slot data on its ranks
+            rows = torch.cat((k0 + torch.arange(g.hk * g.Dk), kd + k0 + torch.arange(g.hk * g.Dk), 2 * kd + r * g.Wv + torch.arange(g.Wv)))
             conv[rows] = states['cstate'][0]
         st_or = {'S': S, 'conv': conv}
     else:
@@ -97,7 +98,7 @@ def check(d, meta, l, g, ref, shards, neff_io):
         keys = kv.permute(1, 0, 3, 2, 4).reshape(2, P_ * 16, g.kvl, g.D)[:, :40]
         K = torch.zeros(40, g.kvh, g.D); V = torch.zeros(40, g.kvh, g.D)
         for r in range(g.TP):
-            K[:, r * g.kvl:(r + 1) * g.kvl] = keys[0]; V[:, r * g.kvl:(r + 1) * g.kvl] = keys[1]
+            K[:, g.kv_of(r):g.kv_of(r) + g.kvl] = keys[0]; V[:, g.kv_of(r):g.kv_of(r) + g.kvl] = keys[1]
         st_or = {'k': K, 'v': V}
     n = R.rms(x, ref.t(f'layers.{l}.input_layernorm.weight'), g.eps)
     y = ref.linear_attn(l, n, st_or) if g.kind(l) == 'gdn' else ref.full_attn(l, n, pos, st_or)
