@@ -113,6 +113,7 @@ struct Graph {
     std::string kind, attn, mlp; // attn / mlp: the sub-blocks it contains ("" for none)
     std::vector<std::string> seg; // "seg_gdn_gdn_gdn_gqa": the attention kinds of the consecutive whole layers it runs
     bool has_gqa = false;         // binds a page table (gqa sub-block, or a segment containing one)
+    bool has_gdn = false;         // runs gated-delta layers (gdn sub-block, or a segment containing one): defines a decode row bucket
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0, slots = 0;
     std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
     std::vector<nrt_model_t *> model;        // [rank]
@@ -278,6 +279,7 @@ class Qwen35Model final : public Backend {
             else if (gr.kind != "head")
                 gr.mlp = gr.kind;
             gr.has_gqa = gr.attn == "gqa" || std::find(gr.seg.begin(), gr.seg.end(), "gqa") != gr.seg.end();
+            gr.has_gdn = gr.attn == "gdn" || std::find(gr.seg.begin(), gr.seg.end(), "gdn") != gr.seg.end();
             gr.inputs = m.at("inputs").get<std::vector<std::string>>();
             gr.states = m.at("states").get<std::vector<std::string>>();
             gr.neff = dir.path() / "graph.neff";
@@ -316,11 +318,17 @@ class Qwen35Model final : public Backend {
             if (g.kind != "head")
                 groups.insert({g.R, g.Q});
         for (auto [R, Q] : groups) {
-            for (int l = 0; l < layers; ++l)
+            for (int l = 0; l < layers;) {
+                if (const Graph *sg = segment_graph(l, R, Q, 1)) { // row buckets may consist of segment NEFFs only
+                    l += int(sg->seg.size());
+                    continue;
+                }
                 if (!layer_graph(l, R, Q, 1) && (!find(attn_kind[size_t(l)], R, Q, 1) || !find(mlp_kind[size_t(l)], R, Q, 1)))
                     throw std::runtime_error("Qwen35 bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has neither a layer_" +
                                              attn_kind[size_t(l)] + "_" + mlp_kind[size_t(l)] + " NEFF nor both sub-block NEFFs for layer " +
                                              std::to_string(l));
+                ++l;
+            }
             if (!head_for(R * Q, 1))
                 throw std::runtime_error("Qwen35 bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has no head NEFF for " +
                                          std::to_string(R * Q) + " rows");
@@ -359,6 +367,14 @@ class Qwen35Model final : public Backend {
             if (same && (!best || g.seg.size() > best->seg.size() || (g.seg.size() == best->seg.size() && g.P < best->P)))
                 best = &g;
         }
+        return best;
+    }
+    // the smallest table width >= pages among the (R, Q) bucket's graphs with a gqa part (0: none)
+    int bucket_pages(int R, int Q, int pages) const {
+        int best = 0;
+        for (const auto &g : graphs)
+            if (g.has_gqa && g.R == R && g.Q == Q && g.P >= pages && (!best || g.P < best))
+                best = g.P;
         return best;
     }
     const Graph *head_for(int T, int S) const {
@@ -720,6 +736,9 @@ class Qwen35Model final : public Backend {
             else {
                 plan.push_back({find(attn_kind[size_t(l)], L.R, L.Q, L.P), l});
                 plan.push_back({find(mlp_kind[size_t(l)], L.R, L.Q, 0), l});
+                if (!plan[plan.size() - 2].first || !plan.back().first)
+                    throw std::runtime_error("Qwen35: bucket R=" + std::to_string(L.R) + " Q=" + std::to_string(L.Q) + " P=" + std::to_string(L.P) +
+                                             " has no graph for layer " + std::to_string(l));
             }
             ++l;
         }
@@ -836,20 +855,20 @@ class Qwen35Model final : public Backend {
     int max_decode_rows() const override {
         int r = 0;
         for (const auto &g : graphs)
-            if (g.attn == "gdn" && g.Q == 1) r = std::max(r, g.R);
+            if (g.has_gdn && g.Q == 1) r = std::max(r, g.R);
         return std::min(r, slots_total - 1);
     }
     int decode_bucket_pages(int pages) const override {
         int best = 0;
         for (const auto &g : graphs)
-            if (g.attn == "gqa" && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
+            if (g.has_gqa && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
         return best;
     }
     const std::vector<int> &eos() const override { return eos_; }
     int max_context() const override {
         int p = 0;
         for (const auto &g : graphs)
-            if (g.attn == "gqa") p = std::max(p, g.P);
+            if (g.has_gqa) p = std::max(p, g.P);
         return std::min(p * PAGE, max_context_);
     }
     json last_profile() const override { return profile; }
@@ -881,7 +900,7 @@ class Qwen35Model final : public Backend {
         std::set<int> decode_R;
         std::set<int> prefill_Q;
         for (const auto &g : graphs)
-            if (g.attn == "gdn") (g.Q == 1 ? decode_R.insert(g.R) : prefill_Q.insert(g.Q));
+            if (g.has_gdn) (g.Q == 1 ? decode_R.insert(g.R) : prefill_Q.insert(g.Q));
         const int maxR = std::min(decode_R.empty() ? 0 : *decode_R.rbegin(), slots_total - 1);
         for (size_t at = 0; at < rows.size();) {
             if (!maxR)
@@ -890,10 +909,25 @@ class Qwen35Model final : public Backend {
             int R = *decode_R.lower_bound(int(n)), pages = 1;
             for (size_t i = 0; i < n; ++i)
                 pages = std::max(pages, pages_needed(rows[at + i]));
-            const Graph *g = find_attn("gqa", R, 1, pages);
-            if (!g)
-                throw std::runtime_error("Qwen35: no decode bucket R=" + std::to_string(R) + " with " + std::to_string(pages) + " pages");
-            auto L = fresh(R, 1, g->P);
+            // the narrowest row bucket >= n that has a page bucket for these rows (wide buckets stop at fewer pages)
+            int P = 0;
+            for (auto it = decode_R.lower_bound(int(n)); it != decode_R.end() && !P; ++it)
+                if (*it <= slots_total - 1 && (P = bucket_pages(*it, 1, pages)))
+                    R = *it;
+            if (!P) { // no bucket holds n rows at this context: split the rows over narrower buckets that do
+                for (auto it = decode_R.rbegin(); it != decode_R.rend() && !P; ++it)
+                    if (*it < int(n) && (P = bucket_pages(*it, 1, pages)))
+                        R = *it;
+                if (!P)
+                    throw std::runtime_error("Qwen35: no decode bucket with " + std::to_string(pages) + " pages");
+                n = size_t(R);
+                P = 0;
+                pages = 1;
+                for (size_t i = 0; i < n; ++i)
+                    pages = std::max(pages, pages_needed(rows[at + i]));
+                P = bucket_pages(R, 1, pages);
+            }
+            auto L = fresh(R, 1, P);
             std::set<int> pinned;
             for (size_t i = 0; i < n; ++i) {
                 const int req = rows[at + i], ti = lay.query_offsets[size_t(req)], position = lay.positions[size_t(ti)];
@@ -919,10 +953,10 @@ class Qwen35Model final : public Backend {
                     Q = 1;
                 }
                 const int take = std::min(left, Q);
-                const Graph *g = find_attn("gqa", 1, Q, pages_needed(req));
-                if (!g)
+                const int PQ = bucket_pages(1, Q, pages_needed(req));
+                if (!PQ)
                     throw std::runtime_error("Qwen35: no prefill bucket Q=" + std::to_string(Q) + " with " + std::to_string(pages_needed(req)) + " pages");
-                auto L = fresh(1, Q, g->P);
+                auto L = fresh(1, Q, PQ);
                 std::set<int> pinned;
                 for (int i = 0; i < Q; ++i) {
                     if (i < take) {

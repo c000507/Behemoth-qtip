@@ -43,10 +43,13 @@ F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
 ATT_BF16 = os.environ.get('ATT_BF16', '0') == '1'   # gqa: scores / values contracted in bf16 straight from the paged cache (long-context decode lever)
 ATT_GATHER = os.environ.get('ATT_GATHER', 'index')   # gqa page gather: index (cache[table]) | flat (index_select over the flattened table)
+GDN_GATHER = os.environ.get('GDN_GATHER', 'index')   # gdn state read: index (state[slot]) | flat (index_select)
+GDN_EINSUM = os.environ.get('GDN_EINSUM', 'mm')       # decode recurrence contractions: mm (einsum -> batched matmul) | elem (multiply + sum)
 GDN_CHUNK = int(os.environ.get('GDN_CHUNK', '0'))     # prefill: chunk size (power of two) of the matmul-form recurrence; 0 = token loop
 AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank | rank2 | tour (no topk op: topk_mask)
 TOUR_GROUPS = int(os.environ.get('TOUR_GROUPS', '8'))
+MOE_SPLIT = int(os.environ.get('MOE_SPLIT', '0'))      # gathered decode MoE: rows in groups of this many, one slot union per group (0: one union)
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
@@ -164,7 +167,7 @@ def gdn_block(n, t, g, R, Q, allreduce):
     slot = t['slot']
     keep = (t['pos'].reshape(R, Q)[:, 0] != 0).float()
     proj = lin(n, t, 'qkv').reshape(R, Q, W)                                           # [R, Q, W]
-    cs = t['cstate'][slot] * keep.reshape(R, 1, 1)                                     # [R, W, K-1], oldest first
+    cs = (torch.index_select(t['cstate'], 0, slot) if GDN_GATHER == 'flat' else t['cstate'][slot]) * keep.reshape(R, 1, 1)                                     # [R, W, K-1], oldest first
     seq = torch.cat((cs.permute(0, 2, 1), proj), dim=1)                                # [R, K-1+Q, W]
     cw = t['conv']                                                                     # [W, K] f32
     conv = sum(seq[:, j:j + Q] * cw[:, j].reshape(1, 1, W) for j in range(K))          # [R, Q, W]
@@ -190,18 +193,20 @@ def gdn_block(n, t, g, R, Q, allreduce):
     a = lin(n, t, 'a').reshape(R, Q, hl)
     gg = -torch.exp(t['alog']).reshape(1, 1, hl) * torch.nn.functional.softplus(a + t['dt'].reshape(1, 1, hl))
     decay = torch.exp(gg)                                                              # [R, Q, hl]
-    st = t['kstate'][slot] * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
+    st = (torch.index_select(t['kstate'], 0, slot) if GDN_GATHER == 'flat' else t['kstate'][slot]) * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
     C = GDN_CHUNK
     if Q > 1 and C > 1 and Q % C == 0:
         st, y = gdn_chunks(st, qn, kn, v, beta, gg, valid, C)
     else:
         outs = []
+        elem = GDN_EINSUM == 'elem' and Q == 1
+        contract = (lambda m, x: (m * x.unsqueeze(-1)).sum(dim=-2)) if elem else (lambda m, x: torch.einsum('rhkd,rhk->rhd', m, x))
         for i in range(Q):                                                             # the recurrence, token by token
             nst = st * decay[:, i].reshape(R, hl, 1, 1)
-            mem = torch.einsum('rhkd,rhk->rhd', nst, kn[:, i])
+            mem = contract(nst, kn[:, i])
             delta = (v[:, i] - mem) * beta[:, i].unsqueeze(-1)
             nst = nst + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
-            outs.append(torch.einsum('rhkd,rhk->rhd', nst, qn[:, i]))
+            outs.append(contract(nst, qn[:, i]))
             st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 else nst
         y = torch.stack(outs, dim=1)                                                   # [R, Q, hl, Dv]
     kstate = t['kstate'].index_put((slot,), st)
@@ -362,10 +367,18 @@ def route(n, t, g):
     if ROUTE in ('rank', 'rank2', 'tour'):
         w = probs * topk_mask(probs, g.topk, ROUTE)
         return w / w.sum(dim=-1, keepdim=True)
-    if ROUTE == 'pad64' and T < 64:      # topk is fine at 64 rows: pad the rows (probe; not validated for serving)
-        top = torch.topk(torch.cat((probs, probs[:1].expand(64 - T, g.E) * 0.0), dim=0), g.topk, dim=-1)[1][:T]
-    else:
-        top = torch.topk(probs, g.topk, dim=-1)[1]                                     # [T, K]
+    if ROUTE.startswith('pad'):
+        # torch.topk on the rows padded to ROUTE=pad<N> rows (N = 64: the prefill shape, where the device's topk is correct;
+        # 4 and 8 rows are not, docs/neuron-qwen397.md 8.4), used for the MEMBERSHIP only: the weights are then computed
+        # exactly as in the rank forms, so the block output is bit-identical to ROUTE=rank whenever the mask is.
+        # 0.09 ms per MoE block cheaper than rank at 8 rows (docs/neuron-qwen397-batch.md).
+        N = int(ROUTE[3:])
+        padded = torch.cat((probs, torch.zeros(N - T, g.E, device=n.device) + probs[:1] * 0.0), dim=0) if T < N else probs
+        top = torch.topk(padded, g.topk, dim=-1)[1][:T]                                # [T, K]
+        mask = (top.unsqueeze(-1) == experts.reshape(1, 1, g.E)).float().sum(dim=1)    # [T, E]
+        w = probs * mask
+        return w / w.sum(dim=-1, keepdim=True)
+    top = torch.topk(probs, g.topk, dim=-1)[1]                                         # [T, K]
     onehot = (top.unsqueeze(-1) == experts.reshape(1, 1, g.E)).float()                 # [T, K, E]  (one-hot: see glm_graphs.route)
     w = torch.einsum('tke,te->tk', onehot, probs)
     w = w / w.sum(dim=-1, keepdim=True)
@@ -378,11 +391,30 @@ def moe_block(n, t, g, allreduce, mode='all'):
     sgate = torch.sigmoid(torch.matmul(n.float(), t['sgate'].reshape(1, -1).T))        # [T, 1] replicated
     shared = lin_partial(bf(silu_mul(lin(n, t, 'sg'), lin(n, t, 'su'))), t, 'sd') * sgate
     comb = route(n, t, g)                                                              # [T, E]
-    gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [E, 2EIl, H], [E, EIl, H]
     if MOE_DEBUG in ('route', 'probs'):
         v = (comb if MOE_DEBUG == 'route' else torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)).reshape(T, -1).float()[:, :g.H]
         alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
+    groups = MOE_SPLIT if (mode == 'gather' and MOE_SPLIT and T > MOE_SPLIT and T % MOE_SPLIT == 0 and not MOE_DEBUG) else T
+    if groups != T:
+        # rows in groups of MOE_SPLIT, each with its own slot union: the gathered slices of one group stay small
+        # (docs/neuron-qwen397-batch.md: the 160-slot gather of 16 rows falls off a cliff, 2 x 80 slots does not)
+        routed = torch.cat([moe_routed(n[i:i + groups], comb[i:i + groups], t, g, mode)[0] for i in range(0, T, groups)], dim=0)
+        return allreduce(shared + routed), {}
+    routed, stage = moe_routed(n, comb, t, g, mode)
+    if MOE_DEBUG:
+        v = shared if MOE_DEBUG == 'shared' else stage
+        v = v.reshape(T, -1).float()[:, :g.H]
+        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0   # every input stays a graph parameter
+        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
+    return allreduce(shared + routed), {}
+
+
+def moe_routed(n, comb, t, g, mode):
+    """This rank's partial of the routed experts for rows n [T, H] with combine weights comb [T, E] -> (routed [T, H] f32,
+    the MOE_DEBUG stage tensor or None)."""
+    T, E, EIl = n.shape[0], g.E, g.EIl
+    gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [E, 2EIl, H], [E, EIl, H]
     if mode == 'gather' and g.topk * T < E:
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, E]
@@ -404,27 +436,22 @@ def moe_block(n, t, g, allreduce, mode='all'):
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_ = gu.shape[0]
-
-    def dbg(v):   # an intermediate as the block output: first H columns, zero-padded
-        v = v.reshape(T, -1).float()[:, :g.H]
-        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0   # every input stays a graph parameter
-        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     if MOE_DEBUG == 'comb':
-        return dbg(comb)
+        return None, comb
     if MOE_DEBUG == 'shared':
-        return dbg(shared)
+        return None, None
     tt = {'w': gu.reshape(E_ * 2 * EIl, g.H)}
     if gus is not None:
         tt['w_s'] = gus.reshape(-1)
     hgu = lin(n, tt, 'w').reshape(T, E_, 2, EIl)
     if MOE_DEBUG == 'hgu':
-        return dbg(hgu)
+        return None, hgu
     act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * comb.unsqueeze(-1)
     if dc is not None:
         act = act * dc.reshape(1, E_, EIl)
     a2 = act.reshape(T, E_ * EIl)
     if MOE_DEBUG == 'act':
-        return dbg(a2)
+        return None, a2
     wd = dw.reshape(E_ * EIl, g.H)
     if dc is not None:
         a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
@@ -433,9 +460,7 @@ def moe_block(n, t, g, allreduce, mode='all'):
         routed = torch.matmul(a2, wd.float())
     else:
         routed = torch.matmul(a2.to(torch.bfloat16), wd.to(torch.bfloat16)).float()
-    if MOE_DEBUG == 'routed':
-        return dbg(routed)
-    return allreduce(shared + routed), {}
+    return routed, routed
 
 
 def silu_mul(gate, up):
@@ -631,7 +656,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
