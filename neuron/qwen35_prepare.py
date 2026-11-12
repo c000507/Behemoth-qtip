@@ -15,15 +15,19 @@ stored [E, I/TP, H] with a per-input-channel scale (the graph folds the gathered
 weights are stored as (1 + w) (Qwen's zero-centred RMSNorm) except linear_attn.norm (plain). --weights bf16 keeps bf16.
 `shard_layer(get, l, rank, g, fp8)` is the sharding used by the CPU tests on random weights (get = HF name -> f32 tensor).
 
-usage: qwen35_prepare.py MODEL OUT [--tp N] [--weights fp8|bf16] [--layers N]
+usage: qwen35_prepare.py MODEL OUT [--tp N] [--weights fp8|bf16] [--layers N] [--jobs J --threads T] [--only l,l,..]
+pack_layer() quantises the experts once for all ranks (resumable per layer); see docs/neuron-qwen397.md for TP = 32.
 MTP (`mtp.*`) and vision (`model.visual.*`) tensors are ignored. One layer at a time in RAM (~0.9 GB bf16 at E = 128).
 """
 import argparse
 import json
+import multiprocessing
 import shutil
 import sys
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -43,7 +47,7 @@ def store(w):
     return w.float() if Q.EXACT else RP.bf16(w)
 
 
-def shard_layer(get, l, rank, g, fp8=True):
+def shard_layer(get, l, rank, g, fp8=True, experts=True):
     """-> {'attn.<name>': tensor, 'mlp.<name>': tensor} of layer l for one rank (names / shapes = qwen35_graphs.weight_shapes)."""
     p = f'layers.{l}.'
     attn, mlp = {}, {}
@@ -82,6 +86,8 @@ def shard_layer(get, l, rank, g, fp8=True):
     proj(mlp, 'sd', get(m + 'shared_expert.down_proj.weight')[:, sr], fp8)
     mlp['sgate'] = get(m + 'shared_expert_gate.weight').float().reshape(-1)
     mlp['rw'] = get(m + 'gate.weight').float()
+    if not experts:                                                                       # pack_layer adds them (quantised once for all ranks)
+        return {**{'attn.' + k: v for k, v in attn.items()}, **{'mlp.' + k: v for k, v in mlp.items()}}
     er = slice(rank * g.EIl, (rank + 1) * g.EIl)
     gu_all = get(m + 'experts.gate_up_proj').float()                                    # [E, 2I, H]
     gu = torch.cat((gu_all[:, er], gu_all[:, g.I + er.start:g.I + er.stop]), dim=1)      # [E, 2 EIl, H]
@@ -119,11 +125,101 @@ class Getter:
         else:
             self.prefix = source.prefix
 
+        self.cache = None                                                              # dict: memoise (pack_layer, many ranks)
+
     def __call__(self, name):
+        if self.cache is not None and name in self.cache:
+            return self.cache[name]
         full = name if name.startswith('lm_head') else self.prefix + name
+        t = self.src[full].float() if isinstance(self.src, dict) else self.src.tensor(full)
+        if self.cache is not None:
+            self.cache[name] = t
+        return t
+
+    def chunk(self, name, e0, e1):
+        """f32 [e1 - e0, ...] of a 3-D expert tensor without materialising the whole tensor (13 GB bf16 per layer at E = 512)."""
+        full = self.prefix + name
         if isinstance(self.src, dict):
-            return self.src[full].float()
-        return self.src.tensor(full)
+            return self.src[full][e0:e1].float()
+        dtype, shape, arr = self.src.raw(full)
+        per = 1
+        for d in shape[1:]:
+            per *= d
+        a = np.array(arr[e0 * per:e1 * per])                                           # a private copy (the memmap is read-only)
+        if dtype == 'BF16':
+            t = torch.from_numpy(a.view(np.int16)).view(torch.bfloat16).float()
+        else:
+            t = torch.from_numpy(a.astype(np.float32, copy=False)).float()
+        return t.reshape(e1 - e0, *shape[1:])
+
+
+def pack_layer(get, l, g, fp8=True, chunk=32):
+    """-> [rank] dicts equal to shard_layer(get, l, rank, g, fp8), computed once for all ranks: the expert tensors are
+    converted chunk by chunk and (fp8) quantised once - the scales are per gate/up output row and per down input channel,
+    so they do not depend on the rank's slice - then sliced along the intermediate axis. This is what makes TP = 32 over
+    512 experts (6.4 B expert parameters per layer) a matter of seconds per layer instead of 32 full passes."""
+    get.cache = {}
+    ranks = [shard_layer(get, l, r, g, fp8, experts=False) for r in range(g.TP)]
+    get.cache = None
+    m = f'layers.{l}.mlp.experts.'
+    E, I, H = g.E, g.I, g.H
+    if fp8:
+        gu, gs = torch.empty((E, 2 * I, H), dtype=Q.F8), torch.empty((E, 2 * I), dtype=torch.float32)
+        dn, dc = torch.empty((E, I, H), dtype=Q.F8), torch.empty((E, I), dtype=torch.float32)
+    else:
+        dt = torch.float32 if Q.EXACT else torch.bfloat16
+        gu, dn = torch.empty((E, 2 * I, H), dtype=dt), torch.empty((E, I, H), dtype=dt)
+    for e0 in range(0, E, chunk):
+        e1 = min(E, e0 + chunk)
+        a = get.chunk(m + 'gate_up_proj', e0, e1)                                          # [e, 2I, H]
+        b = get.chunk(m + 'down_proj', e0, e1).transpose(1, 2).contiguous()                # [e, I, H]: rows = input channels
+        if fp8:
+            gu[e0:e1], gs[e0:e1] = RP.to_fp8_rows(a)
+            dn[e0:e1], dc[e0:e1] = RP.to_fp8_rows(b)
+        else:
+            gu[e0:e1], dn[e0:e1] = store(a), store(b)
+    for r in range(g.TP):
+        er = slice(r * g.EIl, (r + 1) * g.EIl)
+        ur = slice(I + er.start, I + er.stop)
+        ranks[r]['mlp.egu'] = torch.cat((gu[:, er], gu[:, ur]), dim=1)
+        if fp8:
+            ranks[r]['mlp.egu_s'] = torch.cat((gs[:, er], gs[:, ur]), dim=1)
+        ranks[r]['mlp.ed'] = dn[:, er].contiguous()
+        if fp8:
+            ranks[r]['mlp.ed_c'] = dc[:, er].contiguous()
+    return ranks
+
+
+def pack_heads(get, g, fp8=True):
+    get.cache = {}
+    out = [shard_head(get, r, g, fp8) for r in range(g.TP)]
+    get.cache = None
+    return out
+
+
+_W = {}
+
+
+def _layer_job(l):
+    """worker: one layer -> its per-rank files; returns the manifest entries (resumable: a .done marker per layer)."""
+    a, g, out = _W['a'], _W['g'], _W['out']
+    mark = out / f'.done/L{l:03d}.json'
+    if mark.exists():
+        return l, json.loads(mark.read_text()), 0.0
+    t0 = time.time()
+    if 'get' not in _W:
+        _W['get'] = Getter(RP.Checkpoint(a.model))
+        torch.set_num_threads(max(1, a.threads))
+    ranks = pack_layer(_W['get'], l, g, a.weights == 'fp8')
+    files = {}
+    for r, tensors in enumerate(ranks):
+        tmp = out / f'r{r}/L{l:03d}.bin.tmp'
+        files[f'r{r}/L{l:03d}.bin'] = RP.write_file(tmp, tensors)
+        tmp.rename(out / f'r{r}/L{l:03d}.bin')
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.with_suffix('.tmp').write_text(json.dumps(files))
+    mark.with_suffix('.tmp').rename(mark)
+    return l, files, time.time() - t0
 
 
 def main():
@@ -132,6 +228,9 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--tp', type=int, default=2)
     ap.add_argument('--weights', default='fp8', choices=['fp8', 'bf16'])
+    ap.add_argument('--jobs', type=int, default=1, help='layers packed in parallel (worker processes)')
+    ap.add_argument('--threads', type=int, default=8, help='torch threads per worker')
+    ap.add_argument('--only', default='', help='comma-separated layers (partial run for validation; no prepared.json)')
     ap.add_argument('--layers', type=int, default=None, help='keep only the first N layers (reduced-size validation)')
     a = ap.parse_args()
     cfg = json.loads((Path(a.model) / 'config.json').read_text())
@@ -143,12 +242,25 @@ def main():
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     files = {'embed.bin': RP.write_file(out / 'embed.bin', {'embed': RP.bf16(get('embed_tokens.weight'))})}
-    for r in range(g.TP):
-        files[f'r{r}/head.bin'] = RP.write_file(out / f'r{r}/head.bin', shard_head(get, r, g, fp8))
-    for l in range(g.L):
-        for r in range(g.TP):
-            files[f'r{r}/L{l:03d}.bin'] = RP.write_file(out / f'r{r}/L{l:03d}.bin', shard_layer(get, l, r, g, fp8))
-        print(f'layer {l} ({g.kind(l)}, moe) packed', flush=True)
+    for r, tensors in enumerate(pack_heads(get, g, fp8)):
+        files[f'r{r}/head.bin'] = RP.write_file(out / f'r{r}/head.bin', tensors)
+    print('embed + heads packed', flush=True)
+    todo = [int(x) for x in a.only.split(',')] if a.only else list(range(g.L))
+    _W.update(a=a, g=g, out=out)
+    if a.jobs > 1:
+        with multiprocessing.get_context('fork').Pool(a.jobs) as pool:
+            for l, fl, dt in pool.imap_unordered(_layer_job, todo):
+                files.update(fl)
+                print(f'layer {l} ({g.kind(l)}, moe) packed in {dt:.0f}s', flush=True)
+    else:
+        _W['get'] = get
+        for l in todo:
+            l, fl, dt = _layer_job(l)
+            files.update(fl)
+            print(f'layer {l} ({g.kind(l)}, moe) packed in {dt:.0f}s', flush=True)
+    if a.only:
+        print('partial run (--only): no prepared.json written')
+        return
     kinds = [{'attn': g.kind(l), 'mlp': 'moe'} for l in range(g.L)]
     manifest = {'format': 'qwen35-moe-neuron-prepared', 'version': 1, 'geometry': g.meta(), 'weights': a.weights, 'layers': kinds,
                 'eos': g.eos, 'max_context': g.max_context, 'files': files, 'source': str(Path(a.model).resolve()), 'config': cfg}
