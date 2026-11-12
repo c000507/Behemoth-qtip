@@ -234,7 +234,9 @@ class Qwen35Model final : public Backend {
         if (fd < 0)
             throw std::runtime_error("cannot open " + path.string());
         embed_map_bytes = std::filesystem::file_size(path);
-        embed_map = mmap(nullptr, embed_map_bytes, PROT_READ, MAP_SHARED, fd, 0);
+        // MAP_POPULATE: every embedding page resident and mapped before serving. Without it the first use of a token's row
+        // was a page fault in the step (cold page cache: a disk read; 8 fresh rows cost ~3 ms of a 45 ms step).
+        embed_map = mmap(nullptr, embed_map_bytes, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
         ::close(fd);
         if (embed_map == MAP_FAILED)
             throw std::runtime_error("mmap embed.bin");

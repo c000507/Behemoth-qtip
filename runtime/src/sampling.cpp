@@ -244,6 +244,33 @@ int sample_logits(std::span<const float> low, std::span<const float> high, const
     const size_t n = low.size() + high.size();
     if (!n)
         throw std::invalid_argument("Empty logits");
+    if (high.empty() && !allowed && p.temperature == 0) {
+        // Greedy over one contiguous row: one vectorised pass for the maximum and the finite check (x * 0 is NaN for a
+        // non-finite x), then the first index holding the maximum (the scalar loop's tie rule). The scalar form below cost
+        // ~0.9 ms per 248k-logit row, 5 % of a 19 ms decode step (docs/neuron-qwen397-batch.md).
+        const float *x = low.data();
+        float m = -std::numeric_limits<float>::infinity(), acc = 0;
+#pragma omp simd reduction(max : m) reduction(+ : acc)
+        for (size_t i = 0; i < n; ++i) {
+            m = x[i] > m ? x[i] : m;
+            acc += x[i] * 0.f;
+        }
+        if (!(acc == 0))
+            throw std::runtime_error("Nonfinite model logits");
+        const size_t block = 1024;
+        for (size_t at = 0; at < n; at += block) {
+            const size_t end = std::min(n, at + block);
+            int hit = 0;
+#pragma omp simd reduction(| : hit)
+            for (size_t i = at; i < end; ++i)
+                hit |= int(x[i] == m);
+            if (hit)
+                for (size_t i = at; i < end; ++i)
+                    if (x[i] == m)
+                        return int(i);
+        }
+        return 0;
+    }
     auto value = [&](size_t i) -> float { return i < low.size() ? low[i] : high[i - low.size()]; };
     for (size_t i = 0; i < n; ++i)
         if (!std::isfinite(value(i)))

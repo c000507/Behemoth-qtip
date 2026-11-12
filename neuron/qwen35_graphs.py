@@ -55,6 +55,8 @@ MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selectio
 MOE_BMM = os.environ.get('MOE_BMM', '0') == '1'  # with MOE_SLOTS=row: every row contracts only its own K slots (batched matmul) instead of all rows x all slots
 ROUTER = os.environ.get('ROUTER', 'full')        # full: replicated f32 router [E, H] on every rank (8.4 MB read per MoE block) | shard: rank r holds the
 #                                                  router columns of its hidden slice ('rws' [E, H / TP], 'rcols' [H / TP]) and the logits are all-reduced
+GDN_DEC = os.environ.get('GDN_DEC', '0') == '1'    # decode (Q = 1): conv state = the last K-1 inputs by a static slice (no gather by the valid count)
+ROW_FORM = os.environ.get('ROW_FORM', '')         # probes of MOE_SLOTS=row: full | sort | launder | topk (see moe_routed)
 LIN_CSE = os.environ.get('LIN_CSE', '0') == '1'  # share the fp8 activation scaling (amax, divide, cast) between the projections of one input
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
@@ -195,7 +197,9 @@ def gdn_block(n, t, g, R, Q, allreduce):
     cw = t['conv']                                                                     # [W, K] f32
     conv = sum(seq[:, j:j + Q] * cw[:, j].reshape(1, 1, W) for j in range(K))          # [R, Q, W]
     valid = t['pos'].reshape(R, Q) >= 0
-    if K > 1:                                                                          # state = the K-1 inputs before the first padding token
+    if K > 1 and Q == 1 and GDN_DEC:                                                   # decode rows are never padding: the new state is the last K-1 inputs
+        cstate = t['cstate'].index_put((slot,), seq[:, 1:].permute(0, 2, 1))
+    elif K > 1:                                                                        # state = the K-1 inputs before the first padding token
         nvalid = valid.long().sum(dim=1)
         idx = (nvalid.reshape(R, 1) + torch.arange(K - 1, device=n.device).reshape(1, K - 1)).reshape(R, K - 1, 1).expand(R, K - 1, W)
         cstate = t['cstate'].index_put((slot,), torch.gather(seq, 1, idx).permute(0, 2, 1))
@@ -462,10 +466,21 @@ def moe_routed(n, comb, t, g, mode):
         top, w = comb
         K = g.topk
         idx = top.reshape(T * K)
+        perm = None
+        if ROW_FORM == 'sort':      # probe: slots in ascending expert order (the union form's order), weights permuted to match
+            idx, perm = torch.sort(idx)
+        elif ROW_FORM == 'launder':  # probe: the indices through f32 and back
+            idx = (idx.float() + 0.0).round().long()
+        elif ROW_FORM == 'topk':    # probe: the indices re-derived by a [1, T K] topk (ascending expert order, duplicates kept)
+            order = torch.topk(-(idx.float() + torch.arange(T * K, device=n.device).float() / (2 * T * K)).reshape(1, T * K), T * K, dim=-1)[1].reshape(T * K)
+            idx, perm = torch.index_select(idx, 0, order), order
         gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
-        if MOE_BMM and not MOE_DEBUG and gus is not None and dc is not None and not EXACT:
+        if perm is not None:
+            comb = (w.unsqueeze(1) * torch.eye(T, device=n.device).reshape(T, T, 1)).reshape(T, T * K)
+            comb = torch.index_select(comb, 1, perm)
+        elif MOE_BMM and not MOE_DEBUG and gus is not None and dc is not None and not EXACT:
             a, n8 = quant8(n)                                                          # [T, 1], [T, H] fp8
             hgu = bmm8(n8, gu.reshape(T, K * 2 * EIl, g.H)).float() * a * gus.reshape(T, K * 2 * EIl)
             hgu = G.bf(hgu).reshape(T, K, 2, EIl)
@@ -474,7 +489,11 @@ def moe_routed(n, comb, t, g, mode):
             a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
             routed = bmm8t((a2 / a).to(F8), dw.reshape(T, K * EIl, g.H)).float() * a
             return routed, routed
-        comb = (w.unsqueeze(1) * torch.eye(T, device=n.device).reshape(T, T, 1)).reshape(T, T * K)   # row r uses its own K slots only
+        if perm is None:
+            comb = (w.unsqueeze(1) * torch.eye(T, device=n.device).reshape(T, T, 1)).reshape(T, T * K)   # row r uses its own K slots only
+        if ROW_FORM == 'full':      # probe: the combine weights through the [T, E] matrix and a gather, as the union form does
+            full = (w.unsqueeze(-1) * (top.unsqueeze(-1) == torch.arange(E, device=n.device).reshape(1, 1, E)).float()).sum(dim=1)
+            comb = torch.index_select(full, 1, idx) * torch.eye(T, device=n.device).repeat_interleave(K, dim=1)
     elif mode == 'gather' and g.topk * T < E:
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, E]
@@ -734,7 +753,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
