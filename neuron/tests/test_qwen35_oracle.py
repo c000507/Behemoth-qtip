@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -42,11 +43,28 @@ class LazyWeights:
                 self.cache = {n: v for n, v in self.cache.items() if '.layers.' not in n}
                 self.layer = l
         if k not in self.cache:
-            self.cache[k] = self.ck.tensor(k)
+            self.cache[k] = LazyExperts(self.ck, k) if k.endswith(('experts.gate_up_proj', 'experts.down_proj')) else self.ck.tensor(k)
         return self.cache[k]
 
     def items(self):
         raise RuntimeError('lazy')
+
+
+class LazyExperts:
+    """experts.gate_up_proj / down_proj [E, ., .] indexed by expert: only the selected experts are converted to f32 (the
+    oracle's MoE indexes gu[e] / dn[e]; a whole 512-expert layer is 51 GB in f32)."""
+
+    def __init__(self, ck, name):
+        self.dtype, self.shape, self.arr = ck.raw(name)
+        self.per = self.shape[1] * self.shape[2]
+        self.cache = {}
+
+    def __getitem__(self, e):
+        if e not in self.cache:
+            a = np.array(self.arr[e * self.per:(e + 1) * self.per])
+            t = torch.from_numpy(a.view(np.int16)).view(torch.bfloat16).float() if self.dtype == 'BF16' else torch.from_numpy(a.astype(np.float32))
+            self.cache[e] = t.reshape(self.shape[1], self.shape[2])
+        return self.cache[e]
 
 
 def main():
