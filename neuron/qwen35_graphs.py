@@ -41,6 +41,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
+AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank (pairwise counting, no topk op)
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
@@ -345,6 +346,9 @@ def sublayer(kind, t, g, R, Q, P, allreduce, moe_mode='all'):
     """One sub-block with its pre-norm and residual -> (x_new, updated states)."""
     x = t['x']
     n = bf(rms(x, t['norm'], g.eps))
+    if AR_BF16 == '1' or (AR_BF16 == 'moe' and kind == 'moe'):
+        full = allreduce
+        allreduce = lambda v: full(v.to(torch.bfloat16)).float()   # each rank's partial rounded to bf16, summed in bf16
     if kind == 'gdn':
         y, st = gdn_block(n, t, g, R, Q, allreduce)
     elif kind == 'gqa':
@@ -503,7 +507,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

@@ -7,7 +7,8 @@ from pathlib import Path
 import torch
 
 out, tp, T, K = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-rms = len(sys.argv) > 5
+rms = len(sys.argv) > 5 and sys.argv[5] == 'rms'
+b16 = len(sys.argv) > 5 and sys.argv[5] == 'bf16'
 import torch_neuronx
 import torch_xla.core.xla_model as xm
 os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')
@@ -19,11 +20,11 @@ def fn(x, w):
         y = x * 1.0001
         if rms:
             y = y * torch.rsqrt(torch.mean(y * y, dim=-1, keepdim=True) + 1e-6) * w
-        x = xm.all_reduce(xm.REDUCE_SUM, y, groups=groups) * (1.0 / tp)
+        x = (xm.all_reduce(xm.REDUCE_SUM, y.to(torch.bfloat16), groups=groups).float() if b16 else xm.all_reduce(xm.REDUCE_SUM, y, groups=groups)) * (1.0 / tp)
     return x + w if K == 0 else x + 0.0 * w
 
 
-d = Path(out) / f'ar_{T}_{K}{"_rms" if rms else ""}'
+d = Path(out) / f'ar_{T}_{K}{"_rms" if rms else ""}{"_bf16" if b16 else ""}'
 d.mkdir(parents=True, exist_ok=True)
 torch_neuronx.trace(fn, (torch.zeros(T, 4096), torch.ones(4096)), compiler_workdir=str(d))
 subprocess.run(['neuronx-cc', 'compile', 'model', '--framework', 'XLA', '--target', 'trn1', '--output', 'graph.neff'], cwd=d, check=True, stdout=subprocess.DEVNULL)
