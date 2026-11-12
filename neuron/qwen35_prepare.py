@@ -200,6 +200,10 @@ def pack_heads(get, g, fp8=True):
 _W = {}
 
 
+def _init_worker(a, cfg, tp, out):
+    _W.update(a=a, g=Q.Geo(cfg, tp), out=Path(out))
+
+
 def _layer_job(l):
     """worker: one layer -> its per-rank files; returns the manifest entries (resumable: a .done marker per layer)."""
     a, g, out = _W['a'], _W['g'], _W['out']
@@ -248,7 +252,9 @@ def main():
     todo = [int(x) for x in a.only.split(',')] if a.only else list(range(g.L))
     _W.update(a=a, g=g, out=out)
     if a.jobs > 1:
-        with multiprocessing.get_context('fork').Pool(a.jobs) as pool:
+        # spawn, not fork: this process has already run multi-threaded torch ops (embed / heads), and forked children of
+        # a process with live OpenMP threads deadlock in their first parallel region (seen on the 397B run: 16 idle workers)
+        with multiprocessing.get_context('spawn').Pool(a.jobs, initializer=_init_worker, initargs=(a, cfg, a.tp, str(out))) as pool:
             for l, fl, dt in pool.imap_unordered(_layer_job, todo):
                 files.update(fl)
                 print(f'layer {l} ({g.kind(l)}, moe) packed in {dt:.0f}s', flush=True)

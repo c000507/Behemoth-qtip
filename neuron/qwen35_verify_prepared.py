@@ -44,6 +44,12 @@ class SliceGetter(P.Getter):
         return f(gu), f(dn).transpose(1, 2).contiguous()
 
 
+def _init_worker(a):
+    man = json.loads((Path(a.prepared) / 'prepared.json').read_text())
+    _W.update(a=a, g=Q.Geo(man['config'], man['geometry']['tp']), man=man, get=SliceGetter(RP.Checkpoint(a.model)))
+    torch.set_num_threads(4)
+
+
 def check_layer(l):
     a, g, man, get = _W['a'], _W['g'], _W['man'], _W['get']
     fp8 = man['weights'] == 'fp8'
@@ -112,11 +118,9 @@ def main():
     if set(man['files']) != expect:
         fails.append(f'file set differs: {len(set(man["files"]) ^ expect)} names')
     print(f'{len(man["files"])} files listed, {len(fails)} structural failures', flush=True)
-    _W.update(a=a, g=g, man=man, get=SliceGetter(RP.Checkpoint(a.model)))
     layers = [int(x) for x in a.layers.split(',')] if a.layers else list(range(g.L))
     worst, n = 0.0, 0
-    torch.set_num_threads(4)
-    with multiprocessing.get_context('fork').Pool(a.jobs) as pool:
+    with multiprocessing.get_context('spawn').Pool(a.jobs, initializer=_init_worker, initargs=(a,)) as pool:
         for l, k, w, f in pool.imap_unordered(check_layer, layers):
             n += k; worst = max(worst, w); fails += f
             print(f'layer {l}: {k} tensors, expert rel L2 max {w:.3e}, {len(f)} failures', flush=True)
