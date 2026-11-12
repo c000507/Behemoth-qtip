@@ -274,10 +274,12 @@ def moe_block(n, t, g, allreduce, mode='all'):
         if MOE_SLOTS == 'onehot':
             # slot s <- the s-th used expert (ascending), empty slots <- expert 0 with combine weight 0. No top-k over the
             # experts: the device's topk(k = 40 of 512) of the 4-row bucket returned non-finite output on trn1 (397B doc).
-            order = torch.matmul(used, torch.triu(torch.ones(E, E, device=n.device))) - 1.0   # [1, E]: rank among the used
+            # (written with masks and sums only: the matmul forms hit NCC_ITCT901 in neuronx-cc 2.26)
+            before = (ar.reshape(E, 1) >= ar.reshape(1, E)).float()                     # [e, e'] = 1 when e' <= e
+            order = (used * before).sum(dim=-1).reshape(1, E) - 1.0                     # rank of expert e among the used ones
             sel = ((order == torch.arange(slots, device=n.device).float().reshape(slots, 1)) & (used > 0)).float()   # [slots, E]
-            idx = torch.matmul(sel, ar.reshape(E, 1)).reshape(slots).round().long()
-            comb = torch.matmul(comb, sel.T)                                            # [T, slots], 0 for empty slots
+            idx = (sel * ar).sum(dim=-1).round().long()                                 # [slots]
+            comb = (comb.unsqueeze(1) * sel.unsqueeze(0)).sum(dim=-1)                   # [T, slots], 0 for empty slots
         else:
             rank = used - ar * (0.5 / E)
             idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                     # (2-D topk: a 1-D one crashed the XLA trace)
