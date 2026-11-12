@@ -41,6 +41,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
+ATT_BF16 = os.environ.get('ATT_BF16', '0') == '1'   # gqa: scores / values contracted in bf16 straight from the paged cache (long-context decode lever)
 GDN_CHUNK = int(os.environ.get('GDN_CHUNK', '0'))     # prefill: chunk size (power of two) of the matmul-form recurrence; 0 = token loop
 AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank (pairwise counting, no topk op)
@@ -290,17 +291,18 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
     cache = cache.index_put(at, torch.stack((k, bf(v)), dim=1).to(cache.dtype))         # [T, 2, kvl, D]
     table = t['table']                                                                 # [R, P]
     keys = P * PAGE
-    kv = cache[table].float()                                                          # [R, P, 2, kvl, 16, D]
+    lowp = ATT_BF16 and not EXACT                                                      # contract the gathered K | V in bf16 (no f32 copy of the keys)
+    kv = cache[table] if lowp else cache[table].float()                                # [R, P, 2, kvl, 16, D]
     kk = kv[:, :, 0].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D)
     vv = kv[:, :, 1].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D)
     rep = hq // kvl
     qh = q.reshape(R, Q, kvl, rep, D)
-    s = torch.einsum('rqhgd,rhkd->rqhgk', qh, kk) / math.sqrt(D)
+    s = torch.einsum('rqhgd,rhkd->rqhgk', qh.to(kk.dtype), kk).float() / math.sqrt(D)
     kpos = torch.arange(keys, dtype=torch.int64, device=n.device).reshape(1, 1, 1, 1, keys)
     visible = kpos <= t['pos'].reshape(R, Q, 1, 1, 1)
     s = torch.where(visible, s, torch.full_like(s, -3e38))
     p = bf(torch.softmax(s, dim=-1))
-    o = torch.einsum('rqhgk,rhkd->rqhgd', p, vv).reshape(T, hq, D)
+    o = torch.einsum('rqhgk,rhkd->rqhgd', p.to(vv.dtype), vv).float().reshape(T, hq, D)
     if gate is not None:
         o = o * torch.sigmoid(gate)
     out = allreduce(lin_partial(bf(o).reshape(T, hq * D), t, 'o'))
@@ -563,7 +565,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
