@@ -399,4 +399,32 @@ CPU mirror vs oracle unchanged (tiny models: 8.7e-3 -> 8.2e-3, 3.59e-2 -> 3.61e-
 | 64k | 66.0 | **40.0 ms, 25.0 tok/s** |
 
 Tokens: the 8k / 32k / 64k continuations are identical to the baseline's; the short prompt takes the other branch of the
-0.007-margin near tie at token 22 (reproducibly: 6/6 sequential runs identical). Oracle on its 200 tokens: status log.
+0.007-margin near tie at token 22 (reproducibly: 6/6 sequential runs identical). **Oracle on its 200 tokens: 198/200**
+(f32-key segments 197/200, sub-block baseline 194/200).
+
+## 9. Serving the fastest validated configuration
+
+* **Instance**: trn1.32xlarge (16 Trainium, 32 NeuronCores, 512 GB HBM), >= 450 GB of local disk for the prepared set
+  (instance-store NVMe), Neuron packages as pinned (aws-neuronx-runtime-lib 2.33.10.0, -collectives 2.33.10.0, -dkms
+  2.29.0.0). `/dev/cpu_dma_latency` must be writable by the server process (root, or `chmod 666`), else decode is 2-4x
+  slower and jittery.
+* **Model**: `s3://912935854432-neuron-build/qwen397/prepared/Qwen3.5-397B-A17B-tp32-fp8/` (1963 objects, 415.6 GB,
+  `MANIFEST.sha256`) -> a local directory.
+* **Graphs**: `s3://912935854432-neuron-build/qwen397/graphs/Qwen3.5-397B-A17B-tp32-fp8-fast/` (69 buckets:
+  `<bucket>/graph.neff` + `meta.json`, `MANIFEST.json` with md5s; `graphs_full.tgz` = the same with compiler logs):
+  sub-block graphs R {1, 4, 8, 16} / Q {64, 256} (the R=16 ones only up to 512 pages), prefill segments
+  `seg_gdn_gdn_gdn_gqa_1_256_P`, decode segments `seg_(gdn_gdn_gdn_gqa)x5_{1,4,8}_1_P` built with `ATT_BF16=1
+  ROUTE=rank`; `PAGES=4097` (64k-token KV pool shared by all requests), `SLOTS=17` (16 concurrent sequences on the
+  device, more spill to host RAM).
+  (`...-tp32-fp8-seg/` is the same set with f32-key decode segments.)
+* **Process**: `NEURON_RT_VISIBLE_CORES=0-31 NEURON_RT_ROOT_COMM_ID=127.0.0.1:62128 BEHEMOTH_NEURON_NEFF_DIR=<graphs>
+  BEHEMOTH_MODEL_NAME=qwen3.5-397b-a17b neuron_server --model <prepared dir> --host 0.0.0.0 --port 8080
+  --prefill-chunk 256` (binary from this branch: `neuron/cpp/build.sh OUT server`). Ready in 130-170 s (weights resident in
+  62 s from the page cache, 80-130 s from NVMe). Checked on the instance: `/health`, `/v1/models`, three
+  `/v1/chat/completions` requests of 200 tokens in 5.9-7.7 s each (27 ms/token in the engine log), identical answers.
+* ECS stack (`deploy/ecs-neuron`): as section 11 of the 35B doc with `backend_extra_env = { STREAM_LOAD = "0",
+  NEURON_RT_VISIBLE_CORES = "0-31" }`, a trn1.32xlarge capacity provider, the container privileged enough to open
+  `/dev/cpu_dma_latency`; not applied or tested here.
+* Limits: context 64k tokens per pool (the 4096-page bucket); R=16 decode is slower than R=8 (serve at most 8 rows per
+  step: `--max-batch-requests 8`); no prefix cache / speculation (recurrent state), as for the 35B; tool-call output
+  parsing for Qwen's format is still missing in the runtime; thinking is on by default in the chat template.
