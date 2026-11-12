@@ -41,6 +41,9 @@ class Backend {
 // options.model is a GLM prepared directory (prepared.json written by neuron/glm_repack.py).
 bool is_glm_prepared(const std::filesystem::path &);
 std::unique_ptr<Backend> make_glm_backend(const ModelOptions &);
+// options.model is a Qwen3.5 MoE prepared directory (prepared.json written by neuron/qwen35_prepare.py): qwen35_model.cpp.
+bool is_qwen35_prepared(const std::filesystem::path &);
+std::unique_ptr<Backend> make_qwen35_backend(const ModelOptions &);
 
 class NeuronModel {
     struct Impl;

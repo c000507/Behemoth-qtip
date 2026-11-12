@@ -11,6 +11,7 @@ LIBS="-L/opt/aws/neuron/lib -lnrt -Wl,-rpath,/opt/aws/neuron/lib"
 g++ $FLAGS -c "$ROOT/neuron/cpp/qtip_expand.cpp" -o "$OUT/qtip_expand.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_model.cpp" -o "$OUT/neuron_model.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/glm_model.cpp" -o "$OUT/glm_model.o" &
+g++ $FLAGS -c "$ROOT/neuron/cpp/qwen35_model.cpp" -o "$OUT/qwen35_model.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_engine.cpp" -o "$OUT/neuron_engine.o" &
 g++ $FLAGS -c "$ROOT/neuron/cpp/neuron_engine_cli.cpp" -o "$OUT/neuron_engine_cli.o" &
 for f in $CORE; do g++ $FLAGS -c "$f" -o "$OUT/$(basename "$f" .cpp).o" & done
@@ -28,7 +29,7 @@ if [ -n "$SERVER" ]; then
   SFLAGS="$FLAGS -I$ROOT/glm53/include -I$ROOT/third_party -DBOOST_ERROR_CODE_HEADER_ONLY"
   for f in $SRV; do g++ $SFLAGS -c "$f" -o "$OUT/srv/$(basename "$f" .cpp).o" & done
   for job in $(jobs -p); do wait "$job" || { echo "compile failed"; exit 1; }; done
-  g++ $SFLAGS "$OUT/srv"/*.o "$OUT/qtip_expand.o" "$OUT/neuron_model.o" "$OUT/glm_model.o" "$OUT/neuron_engine.o" \
+  g++ $SFLAGS "$OUT/srv"/*.o "$OUT/qtip_expand.o" "$OUT/neuron_model.o" "$OUT/glm_model.o" "$OUT/qwen35_model.o" "$OUT/neuron_engine.o" \
       $(for f in $CORE; do echo "$OUT/$(basename "$f" .cpp).o"; done) $LIBS -lpcre2-8 -o "$OUT/neuron_server"
   echo built "$OUT/neuron_server"
 fi

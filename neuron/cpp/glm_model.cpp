@@ -27,6 +27,7 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -118,6 +119,7 @@ class GlmModel final : public Backend {
     std::map<std::pair<int, int>, std::vector<Step>> steps;
     // tensor sets per (graph, layer, parity, rank)
     std::map<std::tuple<const Graph *, int, int, int>, std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *>> sets;
+    std::mutex sets_mutex; // layer_set / head_set run on every rank's worker thread concurrently
     std::vector<float> logits;
     json profile = json::object();
     // KDA state slots: sequence (first page) -> slot, LRU order; spilled states on the host
@@ -406,6 +408,7 @@ class GlmModel final : public Backend {
     // Input / output tensor sets of graph g for layer l reading residual buffer `parity`.
     std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> layer_set(const Graph &g, int l, int parity, int r) {
         auto key = std::make_tuple(&g, l, parity, r);
+        std::lock_guard lock(sets_mutex);
         if (auto it = sets.find(key); it != sets.end())
             return it->second;
         auto &st = steps.at({g.R, g.Q})[size_t(r)];
@@ -446,6 +449,7 @@ class GlmModel final : public Backend {
     }
     std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> head_set(const Graph &h, int R, int Q, int r) {
         auto key = std::make_tuple(&h, R * 1000 + Q, 0, r);
+        std::lock_guard lock(sets_mutex);
         if (auto it = sets.find(key); it != sets.end())
             return it->second;
         auto &st = steps.at({R, Q})[size_t(r)];

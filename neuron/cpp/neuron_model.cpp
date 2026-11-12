@@ -1598,6 +1598,8 @@ struct NeuronModel::Impl {
 NeuronModel::NeuronModel(const ModelOptions &o) {
     if (is_glm_prepared(o.model))
         backend_ = make_glm_backend(o);
+    else if (is_qwen35_prepared(o.model))
+        backend_ = make_qwen35_backend(o);
     else
         impl_ = std::make_unique<Impl>(o);
 }
