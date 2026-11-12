@@ -68,10 +68,12 @@ def weight_inputs(form, K, rand=None):
             egu, ed = G.zeros((E, 2 * EI, H), F8), G.zeros((E, EI, H), F8)
             egu_s, ed_c = torch.ones(E, 2 * EI), torch.ones(E, EI)
         else:
-            egu = torch.from_numpy(rand.integers(0, 256, (E, 2 * EI, H), dtype=np.uint8) & 0xF7).view(F8)   # |code| < 240: finite, FN == IEEE
-            ed = torch.from_numpy(rand.integers(0, 256, (E, EI, H), dtype=np.uint8) & 0xF7).view(F8)
-            egu_s = torch.from_numpy(rand.uniform(0.5, 1.5, (E, 2 * EI)).astype(np.float32) * 2e-4)
-            ed_c = torch.from_numpy(rand.uniform(0.5, 1.5, (E, EI)).astype(np.float32))
+            # row-scaled E4M3 codes with max |code| 224 like the prepared checkpoint (glm_repack.to_fp8_rows)
+            def q(wf):
+                sc = torch.amax(torch.abs(wf), dim=-1).clamp(min=1e-30) / 224.0
+                return (wf / sc.unsqueeze(-1)).to(F8), sc.float()
+            egu, egu_s = q(torch.from_numpy(rand.standard_normal((E, 2 * EI, H), dtype=np.float32)) / 64)
+            ed, ed_c = q(torch.from_numpy(rand.standard_normal((E, EI, H), dtype=np.float32)) / 16)
         if form == 'nki':
             import nki_moe
             egu = torch.from_numpy(nki_moe.relayout_egu(egu.view(torch.uint8).numpy())).view(F8)
@@ -131,6 +133,10 @@ def main():
     subprocess.run([neff_io, str(d / 'graph.neff'), str(io), '1'], check=True, stdout=subprocess.DEVNULL)
     y = torch.from_numpy(np.frombuffer((io / 'out0.r0').read_bytes(), np.float32).reshape(T, H).copy())
     rel = lambda a, b: float(torch.linalg.norm(a - b) / torch.linalg.norm(b))
+    other = Path(out) / f'num_torch_launder_{T}' / 'io' / 'out0.r0'
+    if form == 'nki' and other.exists():
+        yt = torch.from_numpy(np.frombuffer(other.read_bytes(), np.float32).reshape(T, H).copy())
+        print(f'NUM {tag} T={T}: kernel vs the torch form ON THE DEVICE: routed-part rel L2 {rel(y - x, yt - x):.3e}', flush=True)
     print(f'NUM {tag} T={T}: routed-part rel L2 {rel(y - x, ref - x):.3e}  (output {rel(y, ref):.3e}, |routed|/|x| {rel(ref, x):.3f}, finite {bool(torch.isfinite(y).all())})', flush=True)
 
 

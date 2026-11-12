@@ -326,3 +326,20 @@ but one is the oracle's second choice (margins 0.2-1.6). The three configuration
 * Engine: this branch (router shards derived at load: no change to the prepared set; `MAP_POPULATE` embedding; vectorised
   greedy sampling). Env `OMP_NUM_THREADS=8 OMP_WAIT_POLICY=active`, `/dev/cpu_dma_latency` writable.
 * `--max-batch-requests 16` only if 16-row steps (73 ms, 13.6 tok/s per stream) are acceptable; 8 otherwise.
+
+## 13. Beyond 16 streams: dense decode buckets (measured per segment, NOT working end to end)
+
+The all-experts MoE (`MOE=all`, the prefill form) costs ~1.95 ms per block whatever the row count (201 MB of expert
+weights per block and rank; 1.99 / 1.95 ms at 16 / 64 rows), so it overtakes the gather beyond ~32 rows. In-launch per
+block at 64 rows: moe 1.95, gdn 0.71, gqa 1.37 (P = 32). 20-layer decode segments at R = 64 (`SLOTS=65`):
+**54.3-57.6 ms per launch = 163-173 ms per step for 64 rows = 370-390 tok/s aggregate** (6 tok/s per stream; HBM: state
+1.04 -> 1.31 GiB per core, loads).
+
+End to end it does not run yet: the first 64-row launch returns non-finite residuals for every row. Device tests with
+random weights at 64 rows: gdn, gqa and the MoE block alone are fine (3.7e-2 / 2.8e-2 / 3.0e-2 against the CPU mirror) with
+`ROUTE=topk`; `ROUTE=pad64` + `ROUTER=shard` is NaN already as a single block; and the fused `layer_gdn_moe` at 64 rows is
+NaN with either router form, so the fault is in the compiled combination (as the 4 / 8-row `topk` of 8.4), not in one
+block. Not resolved in this pass. Next steps: bisect `layer_gdn_moe` at R = 16 / 32 / 64 with `MOE_DEBUG` stages, or run
+the 64-row bucket as sub-block launches (gdn / gqa / moe NEFFs: 120 launches x 0.3 ms more per step, still ~200 ms = 320
+tok/s). This is the only route found to more than 300 tok/s aggregate on this instance, and it is a 64-stream figure,
+not an 8-stream one.
