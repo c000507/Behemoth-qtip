@@ -218,8 +218,106 @@ layer at E = 128 -> ~1 ms per layer at the wall, so a 16-token chunk costs about
 * Head graph built (`head 1 1`, fp8) and benched; the gqa / gdn / moe buckets of the status table are in
   `/home/ubuntu/work/qw/{g128,g128b,gbf16,ghead}` on the box (persistent root disk), logs in `/home/ubuntu/work/qw/logs`.
 
+## 10. End to end (2026-11-11, second session)
+
+**Runtime** `neuron/cpp/qwen35_model.cpp` (generated from `glm_model.cpp`, same prepared format and step logic): sub-block kinds
+`gdn` / `gqa` / `moe` and fused `layer_gdn_moe` / `layer_gqa_moe`, the residual a plain [T, 2048] f32 vector, host-computed
+RoPE rows (`cos_sin`, double precision, 64 rotary dims, theta from the config), the KV cache as the gqa layers' aliased
+state, GDN recurrent + conv state in LRU slots keyed by the sequence's first page (spill / restore to host RAM as GLM),
+eos = config eos + `generation_config.json`'s (`<|im_end|>` 248046 for chat). `NeuronModel` dispatches on
+`prepared.json` `format: qwen35-moe-neuron-prepared`; `recurrent()` is true for any `Backend`, so the engine already
+disables prompt-lookup speculation (a rejected draft would have advanced the state) and the prefix cache (restored K/V
+pages carry no recurrent state) - the choice for this family: **no prefix cache, no speculation**; a preempted request is
+re-prefilled from position 0 (the graph zeroes its slot). Scheduler / page pool unchanged (16-token pages for the 10 gqa
+layers; the 30 linear layers have no pages). `NEURON_X_DUMP=1|2` reads the residual back after every launch (debug).
+Fix found on the way: `layer_set` / `head_set` of the GLM backend inserted into a shared `std::map` from both rank threads
+concurrently (UB; it hung the engine on the first runs) - now under a mutex in both backends.
+
+**Tokenizer / template**: the server path (`glm53::Tokenizer`: tokenizer.json ByteLevel BPE + minja) needed one change -
+accept Qwen's `NFC` normalizer (not applied; UTF-8 input is NFC in practice). `neuron/cpp/tok_check` +
+`tests/test_qwen35_tokenizer.py`: 7 texts (code, CJK, emoji, contractions, control tokens), 3 chat conversations (system,
+multi-turn with `<think>`), 1 tool conversation (tools offered, assistant tool_calls, tool result) = **0 mismatches** vs HF
+`AutoTokenizer` for both the Qwen and the Ornith tokenizer.json. Qwen's tool-call *output* format (`<tool_call><function=..>`
+XML) is not parsed by runtime/src/tools.cpp (GLM / Mistral formats only): tools render correctly into the prompt, but
+`tool_calls` in answers are not extracted for this family (gap).
+
+**Generation on the box** (prepared fp8 set from S3, `neuron_engine_cli`, greedy, enable_thinking=false), prompt
+"Explain in two paragraphs why the sky is blue.": *"The sky appears blue primarily due to how light interacts with the
+molecules of air in the atmosphere and how our eyes perceive those colors. Sunlight, which appears white to us, is actually
+composed of all the colors of the visible spectrum, each corresponding to a different wavelength. When this light travels
+through the sky, it collides with the gases and particles in the air, causing the light to scatter. Because blue light has a
+shorter wavelength than other colors like red or yellow, it gets scattered much more widely in all directions. This
+phenomenon, known as scattering, ..."*; the Fibonacci prompt gives a correct iterative function with a docstring.
+
+**Oracle** (`tests/test_qwen35_oracle.py`: the f32 CPU reference over the device's prompt + generated tokens in one pass,
+weights streamed from model.safetensors, ~70 s for 57 tokens): teacher-forced top-1 agreement **35/35** (sky, 48-token
+run), **34/35** (Fibonacci; the miss at margin 0.19), **107/112** over a 112-token sky answer (misses at margins
+0.02-0.55 = near ties, as expected from fp8). The fp8 CPU mirror in prefill form agrees 105/112 with the device.
+
+**Fused-layer fault**: with the fused `layer_gdn_moe` NEFF the residual becomes entirely non-finite after some gdn layer at
+a position that differs from run to run (104 / 122 / 144; layers 13 / 17 / 22), from finite inputs and state, and the CPU
+fp8 mirror of the same math is finite through all 40 layers; `-O1` and `--auto-cast none` do not change it. The
+sub-block graphs (`gdn` + `moe`, `gqa` + `moe`: two launches per layer) run 200 tokens clean. Non-deterministic failure of
+one compiled graph = a scheduling / DMA-ordering fault in that NEFF (compare SERVING.md's layer-31 anomaly); not fixable
+from the trace. **The served set uses sub-block graphs** (about +4.5 ms per token); fused gqa layers were not seen failing
+but are left out as well.
+
 **Not done**
-* The runtime backend (`neuron/cpp/qwen35_model.cpp`: the GLM backend generalised per section 7) and the server hookup
-  (dispatch on `prepared.json` format, Qwen tokenizer / chat template), hence no end-to-end logits or tok/s yet.
+* Qwen tool-call output parsing (above); vision / MTP ignored.
 * Wider decode buckets (R 8+), prefill chunks > 16 (the token loop unrolls), NKI kernels for the small ops,
   the 256-expert model (does not fit in fp8, section 5).
+
+## 10b. Buckets to 64k context and measurements (sub-block graph set, trn1.2xlarge, TP=2, fp8)
+
+Bucket set `s3://912935854432-neuron-build/qwen35/graphs/Ornith-REAP50/` (45 NEFFs, 42 MB, built by
+`qwen35_build_buckets.sh` with `PAGES=4097 SLOTS=9 MOE_DEC=gather HEAD=1 DECODE_R="1 4 8" PREFILL_Q="64 256"
+P="32 128 512 1024 2048 4096"`): `gdn` / `moe` x R {1, 4, 8} and Q {64, 256}; `gqa` x the same x P {32, 128, 512, 1024,
+2048, 4096}; heads 1/4/8 rows and 64/256-row prefill. Compile 10-50 s per NEFF, the 256-token gdn prefill (unrolled
+recurrence) 14 min. The fused `layer_*` set compiled as well (41 NEFFs) but is not served (section 10).
+HBM per core at load: **8.45 GiB weights + 0.90 GiB state** (KV 10 layers x 4097 pages x 16 KiB = 640 MiB bf16 for 64k
+tokens, 8 GDN slots 0.26 GiB), ~6.6 GiB free: 2048 more pages or 100+ slots would fit. The KV scatter is now the 4-index
+`index_put` of trace_model.py: the gqa layer costs the same at 4097 pages as at 65 (0.47 vs 0.48 ms), so long context
+only pays the key gather / softmax (below). KV in fp8 is not needed for memory here.
+
+Measured (engine step log, `tests/qwen35_measure.sh`, greedy, prompt + repeated filler text for the fills):
+
+| | decode ms/step | tok/s | prefill (256-token chunks) |
+|---|---|---|---|
+| 1 stream, short context (23-token prompt, 200 new) | **47.2** | 21.2 | |
+| 4 streams, short | 66.4 (4 rows) | 60.3 aggregate | |
+| 1 stream after an 8k fill | 49.0 | 20.4 | 8033 tokens in 13.6 s = **592 tok/s** |
+| 1 stream after a 32k fill | 60.4 | 16.6 | 32033 in 65.2 s = 491 tok/s |
+| 1 stream after a 64k fill (the 4096-page bucket) | 74.9 | 13.4 | 64033 in 165.7 s = 386 tok/s |
+| 4 streams after 8k fills each | 76.2 (4 rows) | 52.5 aggregate | 4 x 8k in 53.9 s = 596 tok/s |
+| implicit async launches (`BEHEMOTH_NEURON_QWEN35_ASYNC=1`) | 38.0 / 55.1 (4 rows) | 26.3 / 72.7 | **unsafe**: greedy output diverges from the synchronous run at token 11 (a race between the host-side input writes and in-flight launches); off by default, as for GLM |
+
+Where the time goes: 80 sub-block launches per token; layer_bench puts the device work at 30 x (0.34 + 0.25) + 10 x
+(0.38 + 0.25) + 2.2 (head) = 26 ms, the engine measures 47 ms, i.e. ~0.26 ms of host launch overhead per launch. The fused
+set did 31.5 ms/token (41 launches) before its fault showed; a race-free async path or fused NEFFs that compute correctly
+would give 25-30 ms/token (33-40 tok/s). Long context adds 0.35 ms per gqa layer per 32k keys (dense softmax + 64 MB
+gather at 64k). The 64k prefill at 386 tok/s is attention-bound in the Q=256 gqa graphs (dense scores over the bucket).
+
+Validation at long context: the f32 oracle over the 8k-fill run (prompt 8033 + 32 generated tokens, teacher forced, the
+512-page gqa buckets): **28/32 top-1 agreement**, the 4 misses at margins 0.045-0.67 (the filler prompt is repetitive text,
+so the continuation is a near-tie-rich list). ~45 CPU minutes; 8k is the longest feasible on the box - the 32k / 64k runs
+produced coherent continuations through the 2048 / 4096-page buckets but were not oracle-checked.
+
+## 11. Deploying this family (not applied; for the user)
+
+The ECS/Terraform stack (`deploy/ecs-neuron`) serves a model directory + a graph directory pulled from the deployment
+bucket (`aws_s3_bucket.models`, not the build bucket). For Ornith-REAP50:
+
+* copy `s3://912935854432-neuron-build/qwen35/prepared/Ornith-REAP50-tp2-fp8/` (89 objects, 19.2 GB: prepared.json,
+  embed.bin, r0/, r1/, config.json, tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json) to
+  `s3://<models bucket>/<model_s3_prefix>/` and `s3://912935854432-neuron-build/qwen35/graphs/Ornith-REAP50/` (45 buckets,
+  graph.neff + meta.json each, 42 MB, MANIFEST.json with md5s) to `s3://<models bucket>/<graphs_s3_prefix>/`;
+* `terraform.tfvars`: `model_s3_prefix = "models/ornith-reap50-tp2-fp8"`, `graphs_s3_prefix = "graphs/ornith-reap50"`,
+  `backend_model_name = "ornith-1.5-35b-a3b"`, `prepared_s3_prefix = ""` (the Llama streaming format does not apply),
+  `backend_extra_env = { STREAM_LOAD = "0" }` (the entrypoint's streaming path expects `model-layer-*` files; with
+  STREAM_LOAD=0 it pulls the whole prepared directory, then `neuron_server --model <dir>` dispatches on prepared.json),
+  `backend_image_tag` = an image built from this branch (the backend binary must contain qwen35_model.cpp and the NFC
+  tokenizer change; `deploy/ecs-neuron/backend/build_and_push.sh`), `backend_root_volume_gb` unchanged if the instance
+  store holds the data dir (19 GB prepared + graphs), else >= 60;
+* trn1.2xlarge per core: 8.45 GiB weights + 0.90 GiB state (640 MiB KV for 4096 pages = 64k tokens of context across all
+  requests, 0.26 GiB for 8 GDN slots) - the pool is the 4096 pages; `max_context` 65536 (the 4096-page bucket);
+* no Terraform resources change; nothing was applied here.
