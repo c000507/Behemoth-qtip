@@ -5,7 +5,7 @@ Each block: n = bf16(rms(x)); routed = experts(n, idx_k, w); x = x + bf16(routed
 expert indices ((top + offset_k) % 512, top a runtime input). layer_bench NEFF steps 1 times it; (K = 8 - K = 2) / 6 = ms per block.
 
   python bench_moe_nki.py build OUT T K {nki|torch} [key=value ...]   -> OUT/<form>[_opts]_T_K/graph.neff
-        nki options: gu=slot|grid act=slot|grid down=tile4|half pre=first|after static=0|1 parts=gu,down
+        nki options: gu=slot|grid act=slot|grid down=tile4|half pre=first|after pp=N static=0|1 parts=gu,down
         torch options: env ROW_FORM (default launder), MOE_BMM
   python bench_moe_nki.py num OUT T {nki|torch} NEFF_IO [key=value ...]   (device job: K = 1, random fp8 weights, vs the CPU mirror)
   python bench_moe_nki.py knum OUT T NEFF_IO [key=value ...]   (device job: the kernel alone on host-built inputs vs its exact mirror)
@@ -43,7 +43,7 @@ def make_fn(form, T, K, opts):
     if form == 'nki':
         import nki_moe
         kernel = nki_moe.make_moe(T, S, gu=opts.get('gu', 'slot'), act_form=opts.get('act', 'slot'), down=opts.get('down', 'tile4'),
-                                  static=opts.get('static', '0') == '1', parts=tuple(opts.get('parts', 'gu,down').split(',')), pre=opts.get('pre', ''))
+                                  static=opts.get('static', '0') == '1', parts=tuple(opts.get('parts', 'gu,down').split(',')), pre=opts.get('pre', ''), pp=int(opts.get('pp', '0')))
 
     def fn(x, top, w, *ws):
         for k in range(K):
@@ -115,7 +115,7 @@ def kernel_num(out, T, neff_io, opts):
     n8T, ga, cw, idxg, idxd = nki_moe.graph_inputs(n, idx, comb, egu_s, ed_c)
     egu_t = torch.from_numpy(nki_moe.relayout_egu(egu.view(torch.uint8).numpy())).view(F8)
     args = [n8T, ga, cw, idxg, idxd, egu_t, ed.reshape(E * EI, H)]
-    kernel = nki_moe.make_moe(T, S, gu=opts.get('gu', 'slot'), act_form=opts.get('act', 'slot'), down=opts.get('down', 'tile4'), pre=opts.get('pre', ''))
+    kernel = nki_moe.make_moe(T, S, gu=opts.get('gu', 'slot'), act_form=opts.get('act', 'slot'), down=opts.get('down', 'tile4'), pre=opts.get('pre', ''), pp=int(opts.get('pp', '0')))
     tag = 'knum' + ''.join('_' + k + v for k, v in sorted(opts.items())) + f'_{T}'
     d = build(out, tag, lambda *a: kernel(*a), args)
     io = d / 'io'

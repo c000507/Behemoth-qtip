@@ -36,12 +36,14 @@ def relayout_egu(egu):
     return np.ascontiguousarray(egu.reshape(E, O2, KT, 128).transpose(0, 3, 2, 1)).reshape(E * 128, KT * O2)
 
 
-def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts=('gu', 'down'), pre=''):
+def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts=('gu', 'down'), pre='', pp=0):
     """gu: 'slot' (one 64-column matmul per slot and K chunk) | 'grid' (one matmul per 8-slot group and K chunk over a strided moving view)
     act_form: 'slot' (SiLU pairing per slot) | 'grid' (3-D tiles)
     down: 'tile4' (4 slots per [128, 4096] tile) | 'half' (two passes of [128, 2048] half rows: 4 PSUM banks at a time)
     pre: 'first' | 'after': all down tiles are read into one SBUF buffer [128, ND * 4096] before / after the gate|up groups (the down
          DMAs do not depend on the activations, so they can overlap the gate|up matmuls); '' reads each tile inside the down loop.
+    pp: N > 0: the gate|up groups rotate over N explicitly allocated weight buffers (group g + 1 can be read while group g is in the PE
+        even if the allocator would otherwise give every group's buffer the same address); 0: one buffer per group, allocator's choice.
     static: the DMAs read fixed rows (no indirection): the DMA ceiling of the geometry (wrong result unless idx = arange).
     parts: timing probes ('gu' only skips the down projection, 'down' only feeds zeros-derived activations)."""
     ND = -(-S // 4)
@@ -73,8 +75,9 @@ def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts
         if pre == 'first':
             load_down()
         if 'gu' in parts:
+            bufs = [nl.ndarray((128, GS * KT * O2), dtype=egu_t.dtype, buffer=nl.sbuf) for _ in range(pp)]
             for s0, ns in groups:                                                     # Python-level: 8-slot groups
-                wraw = nl.ndarray((128, ns * KT * O2), dtype=egu_t.dtype, buffer=nl.sbuf)
+                wraw = bufs[(s0 // GS) % pp] if pp else nl.ndarray((128, ns * KT * O2), dtype=egu_t.dtype, buffer=nl.sbuf)
                 for j in nl.affine_range(ns):
                     if static:
                         wraw[:, nl.ds(j * KT * O2, KT * O2)] = nl.load(egu_t[nl.ds((s0 + j) * 128, 128), :])
