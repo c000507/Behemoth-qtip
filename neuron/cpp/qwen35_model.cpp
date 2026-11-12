@@ -18,6 +18,7 @@
 #include <nrt/nrt_experimental.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -644,6 +645,7 @@ class Qwen35Model final : public Backend {
         rope_row(L.cos_sin.data() + size_t(t) * size_t(2 * rot), position);
     }
     double layers_ms = 0, head_ms = 0;
+    std::vector<std::array<double, 7>> prof; // per rank, per forward(): see execute()
     int launches = 0;
     void execute(Launch &L, float *dest) {
         const Graph *head = nullptr;
@@ -691,13 +693,20 @@ class Qwen35Model final : public Backend {
                 for (const auto &[width, t] : tables)
                     put(st.table.at(width), t.data(), t.size() * 8);
                 int parity = 0;
+                double *pr = prof[size_t(r)].data(); // set lookup, gdn / gqa / moe execute, input writes, head execute, logits read
+                pr[4] += ms_since(t0);
                 static const int sync_bytes = std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC")) : 0;
                 static const int dump_x = std::getenv("NEURON_X_DUMP") ? std::atoi(std::getenv("NEURON_X_DUMP")) : 0; // 1: report non-finite layers, 2: every layer
                 std::vector<float> xr;
                 for (int l = 0; l < layers; ++l)
                     for (const Graph *g : plan[size_t(l)]) {
+                        const auto ts = Clock::now();
                         auto [in, o] = layer_set(*g, l, parity, r);
+                        const auto te = Clock::now();
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
+                        const auto tx = Clock::now();
+                        pr[0] += std::chrono::duration<double, std::milli>(te - ts).count();
+                        pr[g->attn == "gdn" ? 1 : g->attn == "gqa" ? 2 : 3] += std::chrono::duration<double, std::milli>(tx - te).count();
                         parity ^= 1;
                         if (use_barrier)
                             barrier.wait();
@@ -724,9 +733,13 @@ class Qwen35Model final : public Backend {
                 if (head) {
                     put(st.rows.at(head->S), rows.data(), rows.size() * 8);
                     auto [in, o] = head_set(*head, L.R, L.Q, r, parity);
+                    const auto th = Clock::now();
                     check(nrt_execute(head->model[size_t(r)], in, o), "head execute");
+                    const auto tr = Clock::now();
                     out[size_t(r)].resize(size_t(head->S) * size_t(vocab_shard));
                     check(nrt_tensor_read(st.logits.at(head->S).t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                    pr[5] += std::chrono::duration<double, std::milli>(tr - th).count();
+                    pr[6] += ms_since(tr);
                 }
                 if (r == 0) {
                     t_layers = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -780,6 +793,7 @@ class Qwen35Model final : public Backend {
     std::span<const float> forward(const InferenceBatch &batch) override {
         const auto t0 = Clock::now();
         layers_ms = head_ms = 0;
+        prof.assign(size_t(tp), {});
         launches = 0;
         const auto &lay = batch.layout;
         logits.resize(batch.sample_rows.size() * size_t(vocab_));
@@ -868,7 +882,13 @@ class Qwen35Model final : public Backend {
             std::ofstream f(dump, std::ios::binary | std::ios::app);
             f.write(reinterpret_cast<const char *>(logits.data()), std::streamsize(logits.size() * 4));
         }
+        std::array<double, 7> p0 = prof[0], pmax = prof[0];
+        for (const auto &p : prof)
+            for (size_t i = 0; i < 7; ++i)
+                pmax[i] = std::max(pmax[i], p[i]);
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"layers_ms", layers_ms}, {"head_ms", head_ms},
+                   {"r0", {{"set", p0[0]}, {"gdn", p0[1]}, {"gqa", p0[2]}, {"moe", p0[3]}, {"put", p0[4]}, {"head", p0[5]}, {"read", p0[6]}}},
+                   {"rmax", {{"set", pmax[0]}, {"gdn", pmax[1]}, {"gqa", pmax[2]}, {"moe", pmax[3]}, {"put", pmax[4]}, {"head", pmax[5]}, {"read", pmax[6]}}},
                    {"tokens", batch.tokens.size()}, {"kda_spills", spills}, {"kda_restores", restores}};
         return logits;
     }
