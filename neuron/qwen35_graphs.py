@@ -356,6 +356,23 @@ def sublayer(kind, t, g, R, Q, P, allreduce, moe_mode='all'):
     return x + bf(y), st
 
 
+def segment(seg, t, g, R, Q, P, allreduce, moe_mode='all'):
+    """Consecutive whole layers (attention kinds `seg`, each followed by its MoE) in one graph. Inputs l<i>.a.* / l<i>.m.* are
+    layer i's attention / MoE weights, l<i>.<state> its state; the step inputs are shared. -> (x, {l<i>.<state>: new})."""
+    common = {k: v for k, v in t.items() if '.' not in k}
+    x, states = t['x'], {}
+    for i, a_kind in enumerate(seg):
+        pre = f'l{i}.'
+        own = {k[len(pre):]: v for k, v in t.items() if k.startswith(pre)}
+        att = {k[2:]: v for k, v in own.items() if k.startswith('a.')}
+        mlp = {k[2:]: v for k, v in own.items() if k.startswith('m.')}
+        st_in = {k: v for k, v in own.items() if '.' not in k}
+        x, st = sublayer(a_kind, {**common, **att, **st_in, 'x': x}, g, R, Q, P, allreduce, moe_mode)
+        states.update({pre + k: v for k, v in st.items()})
+        x, _ = sublayer('moe', {**common, **mlp, 'x': x}, g, R, Q, P, allreduce, moe_mode)
+    return x, states
+
+
 def head(t, g, rows):
     x = torch.index_select(t['x'], 0, rows)
     h = bf(rms(x, t['norm'], g.eps))
@@ -439,13 +456,21 @@ def main():
         kwargs = {}
     else:
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+        seg = kind.split('_')[1:] if kind.startswith('seg_') else None       # seg_gdn_gdn_gdn_gqa: consecutive whole layers in one NEFF
         parts = kind.split('_')[1:] if kind.startswith('layer_') else [kind]
-        step, wsh = {}, {}
-        for i, part in enumerate(parts):
-            step.update(step_shapes(part, R, Q, P, g))
-            pre = ('a.', 'm.')[i] if len(parts) > 1 else ''
-            wsh.update({pre + k: v for k, v in weight_shapes(part, g, fp8).items()})
-        ssh = state_shapes(parts[0], g, pages, slots)
+        step, wsh, ssh = {}, {}, {}
+        if seg:
+            for i, a_kind in enumerate(seg):
+                step.update(step_shapes(a_kind, R, Q, P, g))
+                wsh.update({f'l{i}.a.{k}': v for k, v in weight_shapes(a_kind, g, fp8).items()})
+                wsh.update({f'l{i}.m.{k}': v for k, v in weight_shapes('moe', g, fp8).items()})
+                ssh.update({f'l{i}.{k}': v for k, v in state_shapes(a_kind, g, pages, slots).items()})
+        else:
+            for i, part in enumerate(parts):
+                step.update(step_shapes(part, R, Q, P, g))
+                pre = ('a.', 'm.')[i] if len(parts) > 1 else ''
+                wsh.update({pre + k: v for k, v in weight_shapes(part, g, fp8).items()})
+            ssh = state_shapes(parts[0], g, pages, slots)
         names = list(step) + list(wsh)
         snames = list(ssh)
         inputs = [zeros(*step[n]) for n in step] + [zeros(*wsh[n]) for n in wsh]
@@ -457,13 +482,15 @@ def main():
             def __init__(self):
                 super().__init__()
                 for n_ in snames:
-                    self.register_buffer(n_, zeros(*ssh[n_]))
+                    self.register_buffer(n_.replace('.', '_'), zeros(*ssh[n_]))
 
             def forward(self, *a):
                 t = dict(zip(names, a))
                 for n_ in snames:
-                    t[n_] = getattr(self, n_)
-                if len(parts) == 1:
+                    t[n_] = getattr(self, n_.replace('.', '_'))
+                if seg:
+                    x, st = segment(seg, t, g, R, Q, P, allreduce, moe_mode)
+                elif len(parts) == 1:
                     x, st = sublayer(kind, t, g, R, Q, P, allreduce, moe_mode)
                 else:
                     sub = lambda pre: {k[len(pre):]: v for k, v in t.items() if k.startswith(pre)}
@@ -471,11 +498,11 @@ def main():
                     x, st = sublayer(parts[0], {**common, **sub('a.')}, g, R, Q, P, allreduce, moe_mode)
                     x, _ = sublayer(parts[1], {**common, **sub('m.'), 'x': x}, g, R, Q, P, allreduce, moe_mode)
                 for n_ in snames:
-                    setattr(self, n_, st[n_])   # mutated buffers: aliased input -> output (in place on the device)
+                    setattr(self, n_.replace('.', '_'), st[n_])   # mutated buffers: aliased input -> output (in place on the device)
                 return x
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
-        meta = {'kind': 'qwen35_' + kind, 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
+        meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
                 'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE}
     meta['geometry'] = g.meta()
     try:
