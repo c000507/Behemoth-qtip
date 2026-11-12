@@ -292,7 +292,8 @@ def moe_block(n, t, g, allreduce, mode='all'):
 
     def dbg(v):   # an intermediate as the block output: first H columns, zero-padded
         v = v.reshape(T, -1).float()[:, :g.H]
-        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1]))), {}
+        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0   # every input stays a graph parameter
+        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     if MOE_DEBUG == 'comb':
         return dbg(comb)
     if MOE_DEBUG == 'shared':
