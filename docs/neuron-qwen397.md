@@ -277,3 +277,47 @@ scratchpad is the maximum over the loaded NEFFs (gqa 16 rows x 4096 pages gather
 and their DMA spill rings add up (1.26 GiB). With 12.04 GiB of weights + 1.04 GiB of state per core there are ~2.9 GiB
 for code + scratch + rings. Served ladder: R=1 up to 4096 pages, R=4 up to 2048, R=8 up to 1024, R=16 up to 512 (the
 4096-page pool is shared by all streams anyway: 16 streams average 256 pages).
+
+### 8.6 What a launch costs (micro NEFFs, `tests/bench_allreduce_graph.py`, layer_bench, 32 ranks, drained)
+
+| NEFF | ms/launch |
+|---|---|
+| x + w, no collective | 0.086 |
+| 1 all-reduce of [1, 4096] f32 over 32 ranks | 0.285 |
+| 4 / 16 all-reduces in one launch | 0.327 / 0.727 (0.52 with an RMSNorm between them) |
+| 4 all-reduces of [8, 4096] | 0.430 |
+| 1 / 4 all-reduces of [256, 4096] f32 (4 MB, the prefill chunk) | 0.545 / 2.70 |
+
+* A launch that contains a collective pays **~0.2 ms once** (the 32-rank rendezvous / collective setup), each further
+  all-reduce of a decode row costs only **15-30 us**. nccom-test's 10 us is the steady-state figure; the per-launch
+  0.2 ms is what made 121 single-all-reduce launches cost 80 ms. Segments amortise it: 20 layers per launch = 3 launches.
+* Model switching (+0.2-0.3 ms when consecutive launches use different NEFFs, section 8.2) is the second fixed cost;
+  one NEFF for the whole repeating pattern removes it.
+* With both gone a layer costs ~0.32 ms inside a segment (19.2 ms for 60 layers in 3 launches): 2 all-reduces ~0.05 ms,
+  the rest is the ~100 small ops of gdn + moe (norms, 5 projections, conv step, the recurrence, routing, gather, 3 expert
+  contractions), each far from the DMA wall: the weights a rank reads per layer (17 MB incl. the 8.4 MB f32 router)
+  need ~0.07 ms at 250 GB/s. This is op-count bound, not byte bound.
+* Prefill: an all-reduce of a 256-token chunk (4 MB f32) costs ~0.7 ms -> 120 per chunk = **~85 ms of the 520 ms chunk
+  (17 %) is the TP=32 collective**; reducing in bf16 would halve it.
+
+### 8.7 Would another sharding be faster? (measured prototypes of the MoE block alone, R = 1)
+
+| MoE layout per core | ms/launch |
+|---|---|
+| now: 512 experts x 32-wide slices (ETP=32), gather 10 slices (3.9 MB) | 0.333-0.361 |
+| stages of it: router + softmax only 0.280; + top-k weights 0.306; + gate/up contraction 0.311; + activation 0.349; + down 0.371; shared expert alone 0.318 (each is a full launch incl. its all-reduce, 0.285) | |
+| TP8 x EP4 shape: 128 local experts x 128-wide slices, 10 slots (15.7 MB worst case) | 0.324 |
+| EP=32 whole experts: 16 local experts x 1024 wide, 10 static slots (126 MB worst case) | **1.502** |
+
+* The expert contractions are ~0.06-0.09 ms of the 0.36 ms MoE launch; the rest is launch + all-reduce + router. The
+  32-wide tiles are **not** an inefficiency worth chasing: 128-wide tiles measure the same within noise (0.324 vs 0.333).
+* **EP=32 whole experts: no-go.** A static graph must provision the worst case on every core (all 10 selected experts
+  local: 10 x 12.6 MB), 4.2x slower per MoE launch (+1.15 ms x 60 layers = +69 ms/token). Provisioning fewer slots is
+  not exact (uniform routing already puts 3+ experts on one core in 8 % of the tokens; real routers are skewed).
+* **TP=2 x EP=16: does not fit** (non-expert weights 8.7 B fp8 / 2 = 4.35 GB + 12.08 GB experts = 16.4 GB > 16 GiB before
+  KV / scratch). **TP=8 x EP=4: no-go**: fits on paper (12.08 + 1.09 + KV 0.94 = 14.1 GB) but leaves < 1.5 GiB for NEFF
+  scratch + rings where ~2.9 GiB is already tight (8.5); the tile-width gain is nil (above); the attention all-reduce
+  shrinking from 32 to 8 ranks saves at most the incremental 15-30 us per layer; and the MoE needs worst-case 10 slots
+  of 128-wide slices on every core (4x the bytes of today). Data-parallel attention across EP groups would add an
+  all-gather of activations per layer for batch >= 4 and give each stream only 1/4 of the cores for its attention: the
+  decode is op-count bound, not attention bound, so nothing to win there either.
