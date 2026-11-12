@@ -298,3 +298,31 @@ hand-written kernel for the whole layer, not only the MoE. A second instance (2 
 
 What does scale: the aggregate keeps growing with more streams only up to 8 rows per launch (187), 16 rows in one
 launch give 218, and beyond that the gathered MoE falls off (section 7).
+
+## 11. Merged serving set (T3M) and oracle
+
+T3M = agent A's `g10` prefill ladder (sub-block Q = 64 / 256 / 512, prefill segments `seg_gdn_gdn_gdn_gqa_1_{256,512}_P`
+with `AR_BF16=1` (`ATT_BF16=1` at Q = 512)) + the decode buckets of this pass; 71 NEFFs, loads next to the weights (12.05
+GiB + 1.04 GiB state per core), `BEHEMOTH_PREFILL_CHUNK=512`. Archive: `s3://912935854432-neuron-build/qwen397/batch2/graphs/T3M.tar`
+(`<bucket>/graph.neff` + `meta.json`; md5s in `T3M.MANIFEST.txt` inside `logs_e2e.tgz`).
+
+| check on T3M | result |
+|---|---|
+| 1 stream | 15.8 ms per step, 63.2 tok/s; tokens = T3 = the validated configuration (100 / 100) |
+| 8 streams | 43.0 ms per step at 8 rows, 186 tok/s; all 8 rows identical to the T3 run |
+| 8k-token prompt (Q = 512 prefill segments) | prefill 881 tok/s after the first chunk; the 32 continuation tokens identical to both of agent A's references; decode 16.9 ms per token on a quiet box (T3F) |
+
+Oracle (f32 teacher-forced HF model on the CPU, `tests/test_qwen35_oracle.py`, the 8 rows of the 8-stream run, 100 new
+tokens each): **T3 722 / 734 (98.4 %)**; T2 725 / 733; agent A's configuration (`v20_d8`) 724 / 733. Every disagreement
+but one is the oracle's second choice (margins 0.2-1.6). The three configurations are equally valid fp8 realisations.
+
+## 12. Serving settings
+
+* Decode graphs (`MOE=gather PAGES=4097 SLOTS=17`, all with `ROUTE=pad64 ATT_GATHER=flat ROUTER=shard GDN_DEC=1 LIN_CSE=1`):
+  R = 1: `MOE_SLOTS=row`, P 32 .. 4096; R = 2 / 3: `MOE_SLOTS=row ROW_FORM=launder`, P 32 / 128 / 512; R = 4: the same,
+  P 32 .. 2048; R = 6 / 8: slot union (T2's R = 6 graphs; R = 8 P = 32 rebuilt with the sharded router), P to 512 / 1024;
+  R = 16: `MOE_SPLIT=8`, P = 32. `ATT_BF16=1` for the new P >= 128 buckets. Choose the variant per R by measuring the
+  20-layer segment: the compiler's lowering of the expert gather changes with the row count (section 8).
+* Engine: this branch (router shards derived at load: no change to the prepared set; `MAP_POPULATE` embedding; vectorised
+  greedy sampling). Env `OMP_NUM_THREADS=8 OMP_WAIT_POLICY=active`, `/dev/cpu_dma_latency` writable.
+* `--max-batch-requests 16` only if 16-row steps (73 ms, 13.6 tok/s per stream) are acceptable; 8 otherwise.

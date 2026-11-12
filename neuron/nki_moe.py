@@ -67,17 +67,24 @@ def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts
                         wraw[:, nl.ds(j * KT * O2, KT * O2)] = nl.load(egu_t[nl.ds((s0 + j) * 128, 128), :])
                     else:
                         nisa.dma_copy(src=egu_t[tabg[i1, s0 + j], jg], dst=wraw[:, nl.ds(j * KT * O2, KT * O2)])
+                if gu == 'grid':                                                      # 3-D tiles: [T, slot, 64]
+                    it, iq, i6 = nl.mgrid[:T, :ns, :O2]
+                    t2, q2, ii = nl.mgrid[:T, :ns, :EI]
+                    acc3 = nl.zeros((T, ns, O2), dtype=nl.float32, buffer=nl.psum)
+                    for kt in nl.sequential_range(KT):
+                        xk = _f8(hx[:, nl.ds(kt * T, T)], n8T.dtype)
+                        kp, kj, ko = nl.mgrid[:128, :ns, :O2]
+                        acc3 += nisa.nc_matmul(xk, wraw[kp, kj * (KT * O2) + kt * O2 + ko])
+                    hb3 = nl.multiply(acc3, gsa[it, s0 * O2 + iq * O2 + i6], dtype=nl.bfloat16)
+                    sg3 = nl.silu(hb3, dtype=nl.float32)
+                    pb3 = nl.multiply(sg3[t2, q2, ii], hb3[t2, q2, EI + ii], dtype=nl.bfloat16)
+                    act[t2, s0 * EI + q2 * EI + ii] = nl.multiply(pb3, cwt[t2, s0 * EI + q2 * EI + ii], dtype=nl.float32)
+                    continue
                 acc = nl.zeros((T, ns * O2), dtype=nl.float32, buffer=nl.psum)
-                if gu == 'grid':
-                    ip, ij, io = nl.mgrid[:128, :ns, :O2]
-                    for kt in nl.sequential_range(KT):
-                        xk = _f8(hx[:, nl.ds(kt * T, T)], n8T.dtype)
-                        acc += nisa.nc_matmul(xk, _f8(wraw, egu_t.dtype)[ip, ij * (KT * O2) + kt * O2 + io])
-                else:
-                    for kt in nl.sequential_range(KT):
-                        xk = _f8(hx[:, nl.ds(kt * T, T)], n8T.dtype)
-                        for j in nl.static_range(ns):
-                            acc[:, nl.ds(j * O2, O2)] += nl.matmul(xk, _f8(wraw[:, nl.ds(j * KT * O2 + kt * O2, O2)], egu_t.dtype), transpose_x=True)
+                for kt in nl.sequential_range(KT):
+                    xk = _f8(hx[:, nl.ds(kt * T, T)], n8T.dtype)
+                    for j in nl.static_range(ns):
+                        acc[:, nl.ds(j * O2, O2)] += nl.matmul(xk, _f8(wraw[:, nl.ds(j * KT * O2 + kt * O2, O2)], egu_t.dtype), transpose_x=True)
                 hb = nl.multiply(acc, gsa[:, nl.ds(s0 * O2, ns * O2)], dtype=nl.bfloat16)                 # [T, ns * 64] rounded to bf16
                 sg = nl.silu(hb, dtype=nl.float32)
                 if act_form == 'grid':
