@@ -100,9 +100,23 @@ again fixed-cost bound: **120 sub-block launches + head**, each with one all-red
 before measuring: 120 x (0.3 ms device + 0.26 ms host launch overhead + C) + ~1 ms head, C = the 32-core all-reduce
 latency (section 5): ~70 ms/token at C ~ 0, ~190 ms at C = 1 ms. The measured numbers are in the status log.
 
-## 5. Collectives (measured on the instance)
+## 5. Collectives (measured on the instance, 2026-11-12)
 
-See the status log (nccom-test all-reduce over 32 cores, and the in-graph all-reduce of a [1, 4096] f32 row).
+`neuron-ls`: 16 devices x 2 cores x 32 GB, each device linked to 4 neighbours (a 4 x 4 torus over NeuronLink), two NUMA
+nodes. `nccom-test -r N allr -d fp32 -n 200 -w 20` (libnrt / collectives 2.33.10.0), average latency of one all-reduce:
+
+| cores | 16 KiB (= one [1, 4096] f32 row) | 64 KiB (4 rows) |
+|---|---|---|
+| 2 (one chip) | 2.6 us | 4.1 us |
+| 8 | 7.8 us | 12.0 us |
+| 16 | 8.4 us | 12.2 us |
+| **32 (all 16 chips)** | **10.2 us** | **12.7 us** |
+
+(`-r 4` fails inside neuron-bench with this tool version; not pursued.) So the 32-core all-reduce of the residual costs
+4x the single-chip one but is still ~10 us: 120 all-reduces per token = **1.2 ms per token of pure collective time**,
+negligible next to the launch overhead. The in-graph all-reduce was 44-76 us at TP=2 (docs/neuron-nki-fusion.md) against
+2.7 us in nccom-test, so the number to trust is the per-launch time of the compiled sub-blocks (status log). No
+all-to-all is needed by this design (ETP + replicated heads: the only collective is the residual all-reduce).
 
 ## 6. Prepare at this scale
 
@@ -115,4 +129,17 @@ safetensors paths).
 
 ## 7. Status log
 
-(appended as gates are passed)
+**Gate (a), 2026-11-12 07:13 UTC: instance, toolchain, checkpoint**
+* `i-03935aa4aec5c547c` (trn1.32xlarge, ap-southeast-2c, capacity block `cr-0bc51abb2b32a0f50`), AMI
+  `ami-0231f8b9dcafcd361` (Deep Learning AMI Neuron Ubuntu 22.04 20260115), root gp3 300 GB, 4 instance-store NVMe in
+  RAID0 (xfs, 7.0 TB) at `/mnt/scratch`, 128 vCPU, 495 GiB RAM. SSM only.
+* The DLAMI ships an OLDER stack than the pin (neuronx-cc 2.22.12471, torch-neuronx 2.8.0.2.11, nki 0.1.0, runtime-lib
+  2.29.40.0, collectives 2.29.41.0, tools 2.27.33.0, dkms 2.25.4.0, python 3.10). Installed the pinned set instead
+  (neuron/requirements-neuron-build.txt): apt `aws-neuronx-runtime-lib 2.33.10.0-3dcef56f0`, `aws-neuronx-collectives
+  2.33.10.0-068180c7a`, `aws-neuronx-tools 2.31.13.0-a9e473f33`, `aws-neuronx-dkms 2.29.0.0` (module reloaded, 16
+  devices visible); venv `/opt/nb` (uv, CPython 3.12.16; the pin box has 3.12.3) with neuronx-cc 2.26.6360.0+6f180f47,
+  torch-neuronx 2.9.0.2.15.32035+de43f57c, torch-xla 2.9.0, torch 2.9.1, libneuronxla 2.2.17544.0+fb9962bf, nki
+  0.5.0+28631259367.ga768afa6, neuronx-distributed 0.19.28492, numpy 2.4.6, protobuf 7.35.1 - exact matches. Kernel is
+  6.8.0-1044-aws (pin box: 6.17). Extra, not part of the pin: transformers 5.22.2, tokenizers 0.23.3, safetensors 0.8.0.
+* Checkpoint: 107 files, 806 819 566 361 bytes, HF -> `/mnt/scratch/raw` in 12 min (40 parallel files, ~1.1 GB/s
+  average, 1.8 GB/s peak), every size equal to the HF manifest; sha256 against the LFS oids: see gate (c).
