@@ -41,6 +41,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
+GDN_CHUNK = int(os.environ.get('GDN_CHUNK', '0'))     # prefill: chunk size (power of two) of the matmul-form recurrence; 0 = token loop
 AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank (pairwise counting, no topk op)
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
@@ -187,20 +188,75 @@ def gdn_block(n, t, g, R, Q, allreduce):
     gg = -torch.exp(t['alog']).reshape(1, 1, hl) * torch.nn.functional.softplus(a + t['dt'].reshape(1, 1, hl))
     decay = torch.exp(gg)                                                              # [R, Q, hl]
     st = t['kstate'][slot] * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
-    outs = []
-    for i in range(Q):                                                                 # the recurrence, token by token
-        nst = st * decay[:, i].reshape(R, hl, 1, 1)
-        mem = torch.einsum('rhkd,rhk->rhd', nst, kn[:, i])
-        delta = (v[:, i] - mem) * beta[:, i].unsqueeze(-1)
-        nst = nst + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
-        outs.append(torch.einsum('rhkd,rhk->rhd', nst, qn[:, i]))
-        st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 else nst
+    C = GDN_CHUNK
+    if Q > 1 and C > 1 and Q % C == 0:
+        st, y = gdn_chunks(st, qn, kn, v, beta, gg, valid, C)
+    else:
+        outs = []
+        for i in range(Q):                                                             # the recurrence, token by token
+            nst = st * decay[:, i].reshape(R, hl, 1, 1)
+            mem = torch.einsum('rhkd,rhk->rhd', nst, kn[:, i])
+            delta = (v[:, i] - mem) * beta[:, i].unsqueeze(-1)
+            nst = nst + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+            outs.append(torch.einsum('rhkd,rhk->rhd', nst, qn[:, i]))
+            st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 else nst
+        y = torch.stack(outs, dim=1)                                                   # [R, Q, hl, Dv]
     kstate = t['kstate'].index_put((slot,), st)
-    y = torch.stack(outs, dim=1)                                                       # [R, Q, hl, Dv]
     z = lin(n, t, 'z').reshape(R, Q, hl, Dv)
     y = y * torch.rsqrt(torch.mean(y * y, dim=-1, keepdim=True) + g.eps) * t['onorm'] * (z * torch.sigmoid(z))
     out = allreduce(lin_partial(bf(y).reshape(T, g.Wv), t, 'o'))
     return out, {'kstate': kstate, 'cstate': cstate}
+
+
+def unit_lower_inverse(m):
+    """(I + m)^-1 for strictly lower-triangular m [..., C, C], C a power of two: exact block recursion
+    [[A, 0], [L, D]]^-1 = [[A^-1, 0], [-D^-1 L A^-1, D^-1]] bottom-up, batched over the diagonal blocks (matmuls only)."""
+    C = m.shape[-1]
+    lead = m.shape[:-2]
+    inv = torch.ones(*lead, C, 1, 1, dtype=m.dtype, device=m.device)                  # C blocks of size 1
+    s = 1
+    while s < C:
+        nb = C // (2 * s)
+        blocks = torch.diagonal(m.reshape(*lead, nb, 2 * s, nb, 2 * s), dim1=-4, dim2=-2).movedim(-1, -3)   # [..., nb, 2s, 2s]
+        low = blocks[..., s:, :s]                                                      # [..., nb, s, s]
+        pair = inv.reshape(*lead, nb, 2, s, s)
+        a_inv, d_inv = pair[..., 0, :, :], pair[..., 1, :, :]
+        ll = -torch.matmul(torch.matmul(d_inv, low), a_inv)
+        top = torch.cat((a_inv, torch.zeros_like(a_inv)), dim=-1)
+        bot = torch.cat((ll, d_inv), dim=-1)
+        inv = torch.cat((top, bot), dim=-2)                                            # [..., nb, 2s, 2s]
+        s *= 2
+    return inv.reshape(*lead, C, C)
+
+
+def gdn_chunks(st, qn, kn, v, beta, gg, valid, C):
+    """The gated delta rule over Q tokens in chunks of C (matmul form of the token loop; docs/neuron-qwen397.md 8.9):
+    with G = cumsum(g) inside the chunk, U = (I + M)^-1 (beta V - diag(beta e^G) K S0), M[t, j<t] = beta_t e^(G_t - G_j) k_t.k_j,
+    O = diag(e^G) Q S0 + N U (N[t, j<=t] = e^(G_t - G_j) q_t.k_j), S_C = e^(G_C) S0 + (diag(e^(G_C - G)) K)^T U.
+    Padding tokens (valid False) get beta = 0 and g = 0, which leaves the state untouched.
+    st [R, hl, Dk, Dv]; qn / kn [R, Q, hl, Dk]; v [R, Q, hl, Dv]; beta / gg [R, Q, hl] -> (state, y [R, Q, hl, Dv])."""
+    R, Q, hl, Dk = kn.shape
+    vf = valid.reshape(R, Q, 1).float()
+    beta, gg = beta * vf, gg * vf
+    ys = []
+    eye_low = torch.tril(torch.ones(C, C, device=st.device), diagonal=-1)
+    incl = torch.tril(torch.ones(C, C, device=st.device))
+    for c0 in range(0, Q, C):
+        K = kn[:, c0:c0 + C].permute(0, 2, 1, 3)                                       # [R, hl, C, Dk]
+        Qm = qn[:, c0:c0 + C].permute(0, 2, 1, 3)
+        V = v[:, c0:c0 + C].permute(0, 2, 1, 3)                                        # [R, hl, C, Dv]
+        b = beta[:, c0:c0 + C].permute(0, 2, 1)                                        # [R, hl, C]
+        G = (gg[:, c0:c0 + C].permute(0, 2, 1).unsqueeze(-2) * incl).sum(dim=-1)       # cumulative log decay [R, hl, C] (<= 0), mask-sum form
+        ratio = torch.exp((G.unsqueeze(-1) - G.unsqueeze(-2)) * incl)                  # e^(G_t - G_j) for j <= t (1 elsewhere, masked below)
+        M = b.unsqueeze(-1) * ratio * torch.matmul(K, K.transpose(-1, -2)) * eye_low
+        N = ratio * torch.matmul(Qm, K.transpose(-1, -2)) * incl
+        eG = torch.exp(G).unsqueeze(-1)                                                # [R, hl, C, 1]
+        rhs = b.unsqueeze(-1) * (V - eG * torch.matmul(K, st))                         # [R, hl, C, Dv]
+        U = torch.matmul(unit_lower_inverse(M), rhs)
+        ys.append(eG * torch.matmul(Qm, st) + torch.matmul(N, U))
+        last = G[..., -1:]                                                             # [R, hl, 1]
+        st = torch.exp(last).unsqueeze(-1) * st + torch.matmul((torch.exp(last - G).unsqueeze(-1) * K).transpose(-1, -2), U)
+    return st, torch.cat(ys, dim=2).permute(0, 2, 1, 3)
 
 
 def gqa_block(n, t, g, R, Q, P, allreduce):
@@ -507,7 +563,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
