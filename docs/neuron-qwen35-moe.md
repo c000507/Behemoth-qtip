@@ -321,3 +321,33 @@ bucket (`aws_s3_bucket.models`, not the build bucket). For Ornith-REAP50:
 * trn1.2xlarge per core: 8.45 GiB weights + 0.90 GiB state (640 MiB KV for 4096 pages = 64k tokens of context across all
   requests, 0.26 GiB for 8 GDN slots) - the pool is the 4096 pages; `max_context` 65536 (the 4096-page bucket);
 * no Terraform resources change; nothing was applied here.
+
+## 12. Recovery (2026-11-12) and the run-to-run nondeterminism it exposed
+
+The original clone (/tmp, commits 637b362..73e0556) was lost in a reboot. This branch was rebuilt from the S3 code snapshot
+(`qwen35/code/src.tgz` + `fix1..fix5.tgz`) and, for what postdated it (sections 10, 10b, 11, the 8k oracle line,
+`tests/qwen35_measure.sh`), from the session transcript. The original commit hashes cannot come back; the history here is a
+regrouped sequence with the same content. Off-host backup: `s3://912935854432-neuron-build/qwen35/code/qwen35-moe.bundle`
+(`git bundle` of 2c4f7af..qwen35-moe).
+
+Acceptance on the box from the recovered tree (engine rebuilt, prepared set + the 45 graph buckets pulled from S3, all
+md5s equal to MANIFEST.json): CPU tests identical to before (ref vs HF 4.28e-7; mirror EXACT 3.57e-7, bf16 8.70e-3, fp8
+1.00e-1), tokenizer test 0 mismatches, short-context decode **47.3 ms/token** (198 steps; 47.2 before).
+
+**Greedy output is not reproducible run to run** (this was missed on 2026-11-11, where each configuration ran once):
+* 200-token sky run today: forks from the 11 Nov `short1` stream at token 11 ("...interacts with matter..." instead of
+  "...with the molecules of air..."); both are fluent answers.
+* 5 further 40-token runs of the identical request: one equals the 11 Nov `short1` stream token for token, one equals the
+  11 Nov `run200` stream, others fork at tokens 11 / 32 / 37, and **one stopped at step 10 with "Nonfinite model logits"**
+  - on the sub-block graph set that section 10 called clean.
+* 8 runs with `NEURON_X_DUMP=1` (the residual read back after every launch, i.e. a host-device synchronisation between
+  launches): 8 / 8 finite, 7 identical streams, 1 fork at token 32.
+So nothing was lost in the recovery, but two conclusions of section 10 / 10b need correcting: the non-finite fault is not
+specific to the fused `layer_gdn_moe` NEFF (it is rarer with sub-block graphs, not absent), and the async divergence at
+token 11 does not by itself show async to be worse than the synchronous path, which forks at the same token. The
+dependence on launch timing (forks and faults mostly disappear when every launch is followed by a blocking read) points
+at an ordering problem between consecutive launches that share device tensors (the residual ping-pong buffers and the
+in-place aliased state: read-modify-write of `kstate` / `cstate` / `kv`), not at the math (the CPU mirror is finite and
+deterministic). **Open, and it blocks production use**: next steps are a per-launch synchronisation A/B without the dump
+cost, non-aliased state outputs (copy-out) for the gdn graphs, and the same repeat test on the GLM backend, which shares
+this code path.
