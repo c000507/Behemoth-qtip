@@ -347,3 +347,39 @@ Larger segments: 4 layers per launch 28.6 ms, 8 layers 29.0 (two NEFFs alternate
 * Decode at long context now grows only with the attention itself (15 gqa layers: dense scores over the bucket's keys +
   the f32 K|V gather, 3.7 ms per layer at 4096 pages in layer_bench): 24.5 -> 66 ms at 64k. That part needs the paged
   NKI attention kernel of the Llama path (bf16 keys, no f32 materialisation); not ported here.
+
+### 8.9 Batching (distinct prompts, 100 new tokens each, segment decode)
+
+| streams | bucket | ms/step | aggregate tok/s |
+|---|---|---|---|
+| 1 | R=1 seg20 | 24.3-24.6 | 40.9 |
+| 2 | R=4 seg20 (2 rows used) | 41.9 | 47.5 |
+| 4 | R=4 seg20 | 43.0 | **93.0** |
+| 8 | R=8 seg20 | 69.0 | **116** (7.3 rows on average as requests finish: 106) |
+| 16 | R=16, sub-block graphs (no R=16 segment was built) | 258 | 59 |
+| 4 streams after 8k fills each | R=4 seg20, P=512 | 63.4 | 62.6 (prefill 4 x 8k: 623-645 tok/s) |
+
+8 identical prompts gave 63 ms/step (127 tok/s): the gathered-expert MoE is cheaper when the rows share experts.
+Rows of a wide bucket do not always reproduce the R=1 stream token for token (8 / 16 identical rows: all rows equal to
+each other, but they leave the R=1 stream at token 22, an oracle near tie of margin 0.007): different bucket, different
+rounding order. R=16 is not worth serving on this instance: its MoE (160 gather slots) and attention (16 rows of keys)
+are disproportionately slow (208-258 ms/step) and its buckets cost the HBM headroom (8.5). **Serve R in {1, 4, 8}.**
+
+### 8.10 Prefill
+
+Per layer at Q=256 (layer_bench): gdn 3.1-3.2 ms, moe (all experts) 4.9-7.5 ms (varies between runs), gqa 1.0-1.1 ms
+(P=32) .. 6.8-7.3 (P=4096); an all-reduce of the [256, 4096] f32 chunk 0.6-0.77 ms.
+
+| lever | result |
+|---|---|
+| baseline sub-blocks, Q=256 | 440-495 tok/s |
+| + C-state hold | 546-575 (639 at 8k after the first chunk) |
+| + **prefill segments** (`seg_gdn_gdn_gdn_gqa` at Q=256, 15 launches per chunk; 11 min compile each) | **711 tok/s** at 8k (345 ms per chunk), tokens identical to the baseline |
+| MoE chunk size: Q = 64 / 256 / 512 / 1024 -> 3.07 / 7.5 / 7.5 / 17.5 ms per launch | Q=512 costs the same as Q=256 for the MoE (weight-stream bound up to there): the Q=512 probe is in the status log |
+| gqa Q=1024 vs 4 x Q=256: 3.08 vs 4.2 ms (P=32), 18.2 vs 27 ms (P=4096) | mild gain |
+| all-reduce in bf16 (`AR_BF16=1`): [256, 4096] 0.60 -> 0.50 ms (1 per launch), 2.91 -> 1.53 ms (4 per launch) | halves the incremental collective cost; block level: gdn 3.24 -> 2.98, gqa 1.04 -> 0.81; e2e + numerics in the status log |
+| **chunked (matmul-form) gated delta rule** (`GDN_CHUNK`, `gdn_chunks()`, exact block inverse; CPU: equal to the token loop to 5e-6 incl. padding / carried state) | **no speed gain on the device**: 3.96 / 3.38 / 3.27 ms at chunk 64 / 32 / 16 vs 3.24 for the unrolled loop - the loop was never the cost (the projections and the conv over 256 tokens are); compiles in 48-85 s instead of 200 s. **And the device result is wrong**: rel L2 1.15-1.2 vs its CPU mirror at chunk 64 / 32 (the loop form: 3.9e-2), not investigated (suspect: the f32 block-inverse matmuls being auto-cast). Not used; left behind `GDN_CHUNK` (default 0). |
+| grouped / capacity-padded expert MoE for prefill | **not built.** Estimate: at Q=256 the all-experts form does 51 GFLOP per core and layer; a capacity-32 grouped form 13 GFLOP plus a 512 x 32 x 4096 token gather and a scatter back, and it needs an exact fallback when one expert receives more than its capacity (stateless MoE: the engine can rerun the launch with the all-experts NEFF after reading an overflow flag). Since Q=512 already halves the MoE cost per token for free, the remaining gain is perhaps 1.5-2x on 55 % of the chunk; this is NKI-kernel work (grouped matmul over a sorted token list), not a tracer change. |
+
+What limits prefill now: per 256 tokens ~340 ms = 15 x (3 gdn x ~3 ms + gqa ~1 ms + 4 moe x ~3 ms); MoE-all and the gdn
+projections are roughly equal halves; the collective is ~70 ms of it in f32.
