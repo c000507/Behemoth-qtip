@@ -52,7 +52,7 @@ def shard_layer(get, l, rank, g, fp8=True):
     if g.kind(l) == 'gdn':
         a = p + 'linear_attn.'
         kd, vd = g.Hk * g.Dk, g.Hv * g.Dv
-        qr = slice(rank * g.hk * g.Dk, (rank + 1) * g.hk * g.Dk)
+        qr = slice(g.key_of(rank) * g.Dk, (g.key_of(rank) + g.hk) * g.Dk)           # replicated key head when Hk < TP
         vr = slice(rank * g.Wv, (rank + 1) * g.Wv)
         rows = torch.cat((torch.arange(qr.start, qr.stop), kd + torch.arange(qr.start, qr.stop), 2 * kd + torch.arange(vr.start, vr.stop)))
         proj(attn, 'qkv', get(a + 'in_proj_qkv.weight')[rows], fp8)
@@ -69,7 +69,7 @@ def shard_layer(get, l, rank, g, fp8=True):
         a = p + 'self_attn.'
         per = g.D * (2 if g.gate else 1)
         proj(attn, 'q', get(a + 'q_proj.weight')[rank * g.hq * per:(rank + 1) * g.hq * per], fp8)
-        kr = slice(rank * g.kvl * g.D, (rank + 1) * g.kvl * g.D)
+        kr = slice(g.kv_of(rank) * g.D, (g.kv_of(rank) + g.kvl) * g.D)             # replicated KV head when kv_heads < TP
         proj(attn, 'k', get(a + 'k_proj.weight')[kr], fp8)
         proj(attn, 'v', get(a + 'v_proj.weight')[kr], fp8)
         proj(attn, 'o', get(a + 'o_proj.weight')[:, rank * g.hq * g.D:(rank + 1) * g.hq * g.D], fp8)

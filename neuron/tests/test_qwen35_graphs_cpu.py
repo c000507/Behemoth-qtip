@@ -73,10 +73,11 @@ def rel(a, b):
 
 def main():
     torch.manual_seed(0)
-    cfg = dict(R.TINY)
+    cfg = dict(R.TINY397 if os.environ.get('SHAPE') == '397' else R.TINY)
+    tp = int(os.environ.get('TP', '2'))
     w = R.random_weights(cfg, seed=3)
     ref = R.Ref(cfg, w)
-    mir = Mirror(cfg, w)
+    mir = Mirror(cfg, w, tp)
     V = cfg['vocab_size']
     worst = 0.0
     # sequence A: prefill 6 real tokens in a Q = 8 chunk (2 padding rows), pages 0-1, slot 0

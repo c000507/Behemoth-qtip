@@ -269,3 +269,11 @@ TINY = {  # a few layers, 8 experts: the test configuration (same code path as t
     'max_position_embeddings': 4096, 'attention_bias': False, 'attention_dropout': 0.0, 'tie_word_embeddings': False,
     'mtp_num_hidden_layers': 0, 'mamba_ssm_dtype': 'float32',
 }
+
+TINY397 = {  # the Qwen3.5-397B-A17B shape class scaled down: 32 q heads / 2 KV heads, 16 key / 64 value linear heads (ratio 4),
+    # top-10 routing, expert and shared intermediates divisible by 32 -> shardable over TP = 32 with replicated KV / key heads
+    **TINY, 'hidden_size': 128, 'num_hidden_layers': 4, 'vocab_size': 160,
+    'linear_num_key_heads': 16, 'linear_key_head_dim': 8, 'linear_num_value_heads': 64, 'linear_value_head_dim': 8,
+    'num_attention_heads': 32, 'num_key_value_heads': 2, 'head_dim': 16,
+    'num_experts': 48, 'num_experts_per_tok': 10, 'moe_intermediate_size': 64, 'shared_expert_intermediate_size': 64,
+}

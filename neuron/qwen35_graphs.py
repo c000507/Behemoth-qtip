@@ -69,19 +69,37 @@ class Geo:
         self.set_parallel(tp)
 
     def set_parallel(self, tp):
+        """TP layout. Heads that are fewer than the ranks are REPLICATED (docs/neuron-qwen397.md): with kv_heads < TP every
+        rank holds the one KV head its query heads attend to (kvl = 1, head kv_of(rank)); with linear key heads < TP every
+        rank holds the one key head its value heads repeat (hk = 1, head key_of(rank)). The graphs are unchanged: they
+        only see per-rank counts hq / kvl / hk / hl."""
         self.TP = tp
-        bad = [n for n, v in (('linear key heads', self.Hk), ('linear value heads', self.Hv), ('attention heads', self.heads),
-                              ('kv heads', self.kvh), ('expert intermediate', self.I), ('shared intermediate', self.SI or tp)) if v % tp]
-        if not bad and (self.Hv // tp) % (self.Hk // tp):
-            bad.append('value heads per key head')
+        bad = [n for n, v in (('linear value heads', self.Hv), ('attention heads', self.heads),
+                              ('expert intermediate', self.I), ('shared intermediate', self.SI or tp)) if v % tp]
+        if self.kvh % tp and (tp % self.kvh or self.heads % self.kvh):
+            bad.append('kv heads')
+        if self.Hk % tp and (tp % self.Hk or self.Hv % self.Hk):
+            bad.append('linear key heads')
         if bad:
             raise ValueError(f'geometry not shardable over TP={tp}: ' + ', '.join(bad))
-        self.hk, self.hl = self.Hk // tp, self.Hv // tp                     # key / value heads per rank
+        self.hl = self.Hv // tp                                             # value heads per rank
+        self.hk = max(1, self.Hk // tp)                                     # key heads per rank (1 = replicated when Hk < TP)
+        self.hq = self.heads // tp
+        self.kvl = max(1, self.kvh // tp)                                   # kv heads per rank (1 = replicated when kvh < TP)
+        if self.hl % self.hk or self.hq % self.kvl:
+            raise ValueError(f'geometry not shardable over TP={tp}: value heads per key head / q heads per kv head')
         self.W3 = 2 * self.hk * self.Dk + self.hl * self.Dv                # conv channels per rank (q | k | v)
         self.Wv = self.hl * self.Dv
-        self.hq, self.kvl = self.heads // tp, self.kvh // tp
         self.EIl, self.SIl = self.I // tp, self.SI // tp
         self.VP = (self.V + tp - 1) // tp * tp
+
+    def key_of(self, rank):
+        """first linear key head held by this rank (hk heads from there)."""
+        return rank * self.hl // (self.Hv // self.Hk)
+
+    def kv_of(self, rank):
+        """first KV head held by this rank (kvl heads from there)."""
+        return rank * self.hq // (self.heads // self.kvh)
 
     def kind(self, l):
         return 'gdn' if self.attn[l] == 'linear_attention' else 'gqa'
