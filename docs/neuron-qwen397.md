@@ -402,6 +402,32 @@ Tokens: the 8k / 32k / 64k continuations are identical to the baseline's; the sh
 0.007-margin near tie at token 22 (reproducibly: 6/6 sequential runs identical). **Oracle on its 200 tokens: 198/200**
 (f32-key segments 197/200, sub-block baseline 194/200).
 
+### 8.13 Final configuration (bucket set `g10`, archived as `...-tp32-fp8-fast512`, 79 NEFFs)
+
+Sub-block graphs R {1, 4, 8} / Q {64, 256, 512}; decode segments `seg_(gdn_gdn_gdn_gqa)x5` R {1, 4, 8} with `ATT_BF16=1
+ROUTE=rank`; prefill segments `seg_gdn_gdn_gdn_gqa` at Q=256 (`AR_BF16=1`) and **Q=512 (`AR_BF16=1 ATT_BF16=1`)**;
+`PAGES=4097 SLOTS=17`; `BEHEMOTH_PREFILL_CHUNK=512`. Loads next to the weights: `TP 32, 79 NEFFs, 4096 pages, 16 GDN
+state slots; per core 12.04 GiB weights + 1.04 GiB state` on cores 0-31.
+
+| | decode ms/token (median) | tok/s | prefill tok/s (after the first chunk) |
+|---|---|---|---|
+| 1 stream, short context | 24.5 quiet (8.8); 27-33 while the second agent's CPU jobs ran (forward 22-24 ms of it) | 31-41 | |
+| 1 stream after 8k | **25.7** | 38.8 | **895** (8033 tokens in 10.6 s incl. the first chunk) |
+| 1 stream after 32k | **30.1** | 33.2 | **899** (32033 in 37.2 s) |
+| 1 stream after 64k | **36.0** | 27.7 | **870** (64033 in 75.5 s) |
+| 4 streams (distinct prompts) | 41.4 per step | **96.5** aggregate | |
+| 8 streams (distinct prompts) | 56.2 per step | **128** aggregate (7.2 rows on average) | |
+| 4 streams after 8k fills each | 46.1 per step | 61 (2.8 rows on average) | 887 |
+
+vs the first end-to-end numbers of this morning (82 / 91 / 148 / 190 ms, prefill 440-480 tok/s): **3.3x / 3.5x / 4.9x /
+5.3x faster decode, 1.9x faster prefill**, same prepared weights.
+
+Checks on this set: 8 sequential identical requests identical (and equal to the `ATT_BF16` segment run whose 200 tokens
+scored 198/200 against the oracle); the 8k and 32k continuations (32 tokens) identical to the baseline's, the 64k one
+identical for 31 of 32 tokens; 4 concurrent 8k-fill streams identical to each other; HTTP server: ready in 148 s, three
+200-token chat completions in 5.3-7.2 s. Oracle through the Q=512 bf16-reduce prefill path (600-token prompt + 100
+generated): see the status log.
+
 ## 9. Serving the fastest validated configuration
 
 * **Instance**: trn1.32xlarge (16 Trainium, 32 NeuronCores, 512 GB HBM), >= 450 GB of local disk for the prepared set
@@ -410,18 +436,17 @@ Tokens: the 8k / 32k / 64k continuations are identical to the baseline's; the sh
   slower and jittery.
 * **Model**: `s3://912935854432-neuron-build/qwen397/prepared/Qwen3.5-397B-A17B-tp32-fp8/` (1963 objects, 415.6 GB,
   `MANIFEST.sha256`) -> a local directory.
-* **Graphs**: `s3://912935854432-neuron-build/qwen397/graphs/Qwen3.5-397B-A17B-tp32-fp8-fast/` (69 buckets:
+* **Graphs**: `s3://912935854432-neuron-build/qwen397/graphs/Qwen3.5-397B-A17B-tp32-fp8-fast512/` (79 buckets, the set of 8.13:
   `<bucket>/graph.neff` + `meta.json`, `MANIFEST.json` with md5s; `graphs_full.tgz` = the same with compiler logs):
-  sub-block graphs R {1, 4, 8, 16} / Q {64, 256} (the R=16 ones only up to 512 pages), prefill segments
-  `seg_gdn_gdn_gdn_gqa_1_256_P`, decode segments `seg_(gdn_gdn_gdn_gqa)x5_{1,4,8}_1_P` built with `ATT_BF16=1
-  ROUTE=rank`; `PAGES=4097` (64k-token KV pool shared by all requests), `SLOTS=17` (16 concurrent sequences on the
+  sub-block graphs R {1, 4, 8} / Q {64, 256, 512}, prefill segments `seg_gdn_gdn_gdn_gqa_1_{256,512}_P`, decode
+  segments `seg_(gdn_gdn_gdn_gqa)x5_{1,4,8}_1_P` built with `ATT_BF16=1 ROUTE=rank`; `PAGES=4097` (64k-token KV pool shared by all requests), `SLOTS=17` (16 concurrent sequences on the
   device, more spill to host RAM).
-  (`...-tp32-fp8-seg/` is the same set with f32-key decode segments.)
+  (`...-tp32-fp8-fast/`: the same without the Q=512 prefill buckets, 69 buckets; `...-tp32-fp8-seg/`: f32-key decode segments.)
 * **Process**: `NEURON_RT_VISIBLE_CORES=0-31 NEURON_RT_ROOT_COMM_ID=127.0.0.1:62128 BEHEMOTH_NEURON_NEFF_DIR=<graphs>
   BEHEMOTH_MODEL_NAME=qwen3.5-397b-a17b neuron_server --model <prepared dir> --host 0.0.0.0 --port 8080
-  --prefill-chunk 256` (binary from this branch: `neuron/cpp/build.sh OUT server`). Ready in 130-170 s (weights resident in
+  --prefill-chunk 512` (binary from this branch: `neuron/cpp/build.sh OUT server`). Ready in 130-170 s (weights resident in
   62 s from the page cache, 80-130 s from NVMe). Checked on the instance: `/health`, `/v1/models`, three
-  `/v1/chat/completions` requests of 200 tokens in 5.9-7.7 s each (27 ms/token in the engine log), identical answers.
+  `/v1/chat/completions` requests of 200 tokens in 5.3-7.2 s each, identical answers.
 * ECS stack (`deploy/ecs-neuron`): as section 11 of the 35B doc with `backend_extra_env = { STREAM_LOAD = "0",
   NEURON_RT_VISIBLE_CORES = "0-31" }`, a trn1.32xlarge capacity provider, the container privileged enough to open
   `/dev/cpu_dma_latency`; not applied or tested here.
