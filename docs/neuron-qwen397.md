@@ -321,3 +321,29 @@ for code + scratch + rings. Served ladder: R=1 up to 4096 pages, R=4 up to 2048,
   of 128-wide slices on every core (4x the bytes of today). Data-parallel attention across EP groups would add an
   all-gather of activations per layer for batch >= 4 and give each stream only 1/4 of the cores for its attention: the
   decode is op-count bound, not attention bound, so nothing to win there either.
+
+### 8.8 The fast decode configuration: 20-layer segments (3 launches + head per token), validated
+
+Bucket set `g4` = sub-block graphs (prefill; fallback) + `seg_(gdn_gdn_gdn_gqa)x5` decode segments for R = 1 (P 32..4096),
+R = 4 (P..2048), R = 8 (P..1024); `PAGES=4097 SLOTS=17 ROUTE_DEC=rank`; all 32 cores (`NEURON_RT_VISIBLE_CORES=0-31`,
+`Qwen35: 60 layers, TP 32, 63 NEFFs, 4096 pages, 16 GDN state slots; per core 12.04 GiB weights + 1.04 GiB state`).
+Larger segments: 4 layers per launch 28.6 ms, 8 layers 29.0 (two NEFFs alternate), **20 layers 24.5**, 60 layers in one NEFF
+28.7 (compiles in 401 s; measured next to a running compile job, so not better than 20 in any case).
+
+| single stream | baseline (8.1) | **segments** | prefill tok/s |
+|---|---|---|---|
+| short context | 82.0 ms, 12.2 tok/s | **24.5 ms, 40.9 tok/s** | |
+| 8k (8033 prompt tokens) | 90.6 | **26.7 ms, 37.4 tok/s** | 556 (639 after the first chunk) |
+| 32k (32033) | 147.5 | **47.9 ms, 20.9 tok/s** | 546 |
+| 64k (64033) | 190.0 | **66.0 ms, 15.2 tok/s** | 564 |
+
+(prefill here is still the sub-block Q=256 path; it gained 20 % from the C-state hold alone.)
+
+* **Token identity**: 12 sequential requests in one process + 6 separate processes (64 tokens): all identical to each
+  other and to the baseline stream; the 8k / 32k / 64k continuations (32 tokens) are identical to the baseline's; the
+  200-token run equals the baseline for 104 tokens and then takes the other branch of a near tie (oracle margin 0.44 at
+  that position). **Oracle on the 200-token segment run: 197/200** (baseline 194/200): the two configurations are
+  equally valid fp8 realisations; within a configuration the output is reproducible.
+* Decode at long context now grows only with the attention itself (15 gqa layers: dense scores over the bucket's keys +
+  the f32 K|V gather, 3.7 ms per layer at 4096 pages in layer_bench): 24.5 -> 66 ms at 64k. That part needs the paged
+  NKI attention kernel of the Llama path (bf16 keys, no f32 materialisation); not ported here.
