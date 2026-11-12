@@ -201,3 +201,79 @@ safetensors paths).
   kernel 6.8 vs 6.17, a fresh driver load; the Neuron packages are the same pinned versions. This does not explain the
   TP=2 fault - it only shows the TP=32 build does not exhibit it in 57 runs. The switches stay in the backend for the
   TP=2 A/B.
+
+## 8. Measurements and speed work (2026-11-12, all 32 NeuronCores, `NEURON_RT_VISIBLE_CORES=0-31`, engine step log)
+
+### 8.1 Baseline: sub-block graphs (2 launches per layer, 121 per token), bucket set `/mnt/scratch/graphs`
+
+| | decode ms/token (median) | tok/s | prefill (Q=256 chunks) |
+|---|---|---|---|
+| short context (23-token prompt, 200 new) | 82.0 | 12.2 | |
+| after an 8k fill (8033 prompt tokens) | 90.6 | 11.0 | 8033 tokens in 18.3 s = 440 tok/s (495 after the first chunk) |
+| after a 32k fill (32033) | 147.5 | 6.8 | 469 tok/s |
+| after a 64k fill (64033, the 4096-page bucket) | 190.0 | 5.3 | 64033 in 138.7 s = 462 tok/s |
+
+64k of context prefills and decodes correctly through the whole page ladder (coherent continuation of the same answer).
+Oracle 194/200 and the 57-stream reproducibility test (section 7) were taken on this configuration.
+
+### 8.2 Where the 82 ms went
+
+`layer_bench` (one NEFF launched 200 times on 32 ranks, drained) vs the engine's per-rank profile (`r0` / `rmax` in the
+step log: time inside `nrt_execute` per sub-block kind):
+
+| NEFF | layer_bench ms/launch | in the engine |
+|---|---|---|
+| gdn 1x1 | 0.313 | 0.65-0.82 |
+| moe 1x1 (gather, 10 slots) | 0.361 | 0.60-0.70 |
+| gqa 1x1, P = 32 / 512 / 4096 pages | 0.315 / 0.569 / 3.67 | 0.61-0.67 (P=32) |
+| head 1 row | 0.359 | 0.5 |
+| fused layer_gdn_moe / layer_gqa_moe | 0.580 / 0.499 | |
+| prefill Q=256: gdn / moe (all experts) / gqa P=32 / gqa P=4096 | 3.06 / 4.91 / 1.14 / 7.28 | (prefill is device-bound: 450 ms per chunk predicted, 520 measured) |
+
+Sum of the device times for a token: 45 x (0.313 + 0.361) + 15 x (0.315 + 0.361) + 0.36 = **40.8 ms**; the engine spent 80
+ms inside the same `nrt_execute` calls. `cpp/bind_bench.cpp` isolates why: launching the same NEFF with a different
+tensor set every time costs nothing (0.312 ms vs 0.318), but **alternating between two loaded models on a core costs
++0.2-0.3 ms per launch** (gdn <-> moe alternation 0.50-0.57 ms per launch; even two instances of the same NEFF: 0.51).
+The sub-block plan switches model on every launch (gdn, moe, gdn, moe, ..., gqa, moe): ~120 switches = ~35 ms per
+token. Collectives are not the cost (nccom 10 us; in-graph they are inside the 0.31-0.36 ms). Host-side work is
+negligible (input writes 0.04 ms, tensor-set lookup 2 ms, logits read 0.02 ms, sampling 1-3 ms).
+
+### 8.3 Levers, in the order found
+
+| lever | decode ms/token, short context | tokens vs baseline |
+|---|---|---|
+| baseline sub-blocks | 82.0 (12.2 tok/s) | reference |
+| per-launch blocking read (`..._SYNC=4`) / inter-rank barrier (`..._BARRIER=1`) | 84.6 / 87.0 | identical |
+| fused layer NEFFs (61 launches, 30 model switches), as first measured | 97-112, very jittery (45-129 ms steps) | identical |
+| + **CPU idle states held off** (`/dev/cpu_dma_latency` = 0 us; now done by the backend itself) | fused **48.6** (20.6 tok/s), stable; sub-blocks unchanged at 80-83 | identical |
+| + **segment NEFF: 4 whole layers (gdn, gdn, gdn, gqa + their MoEs) per launch**, 15 launches per token, one model for the whole stack (no model switches), decode routing without `torch.topk` | **28.6** (35.0 tok/s); 23.6 ms of it in the 15 launches (1.5 ms each) + head 0.5 + sampling / engine 3-4 | identical (64 tokens) |
+
+* The fused-layer non-finite fault of the 35B doc (section 10) does **not** occur at TP=32 on this instance: fused
+  graphs gave 12/12 identical 64-token streams and the same tokens as the sub-block run over 200 tokens.
+* Jitter: every launch is a rendezvous of 32 rank threads in a sub-millisecond all-reduce, so one thread waking from a
+  deep C-state stalls all 32. The fused plan (longer launches, fewer of them) was hit hardest. The backend now opens
+  `/dev/cpu_dma_latency` and holds 0 us for the life of the process (`BEHEMOTH_NEURON_CPU_DMA_LATENCY=-1` disables; the
+  device node must be writable: root, or `chmod 666 /dev/cpu_dma_latency`).
+* Segment graphs (`qwen35_graphs.py ... seg_gdn_gdn_gdn_gqa R 1 P`, `segment()`; weights `l<i>.a.*` / `l<i>.m.*`, states
+  `l<i>.<state>`; backend `segment_graph()` in the launch plan, `BEHEMOTH_NEURON_QWEN35_NOSEG=1` falls back): the layer
+  pattern (3 gdn + 1 gqa) repeats 15 times, so one NEFF serves the whole stack and the core never changes model
+  between launches. `tests/test_qwen35_segment.py`: bit-identical to the sub-blocks on the CPU. Compiles in 24 s.
+
+### 8.4 Bug found: `torch.topk` in the router is non-finite on the device for 4 / 8 rows
+
+The first 4-stream run stopped with "Nonfinite model logits" at the first 4-row decode step. Bisection on the device
+(`MOE_DEBUG` stage outputs through `test_qwen35_device.py`): the shared expert and the softmax probabilities are fine,
+the combine weights are NaN - `torch.topk(probs [4, 512], 10)` (and [8, 512]) returns garbage on trn1 with neuronx-cc
+2.26, while [1, 512], [64, 512] and [256, 512] are fine (and [4, 128] k=8 was fine on the 35B). Fix: `ROUTE=rank`
+(`route()`): top-k membership by pairwise counting (`beats[e] = #{e' : p[e'] > p[e] or (p[e'] = p[e] and e' < e)} < k`),
+no topk op; CPU-identical to the topk form. Device vs mirror with it: moe gather R = 1 / 4 / 8 / 16: 3.64e-2 / 3.30e-2 /
+3.20e-2 / 3.20e-2. `ROUTE_DEC=rank` in `qwen35_build_buckets.sh` builds every decode bucket this way (prefill keeps
+topk: fine at Q = 64 / 256, and the [T, E, E] comparison would be large there).
+
+### 8.5 HBM headroom limits the bucket set
+
+Loading 54 NEFFs including R = 8 / 16 buckets at 2048 / 4096 pages failed with HBM exhausted: the NEFFs' shared
+scratchpad is the maximum over the loaded NEFFs (gqa 16 rows x 4096 pages gathers 16 x 65536 keys x 512 f32 = 2.0 GiB)
+and their DMA spill rings add up (1.26 GiB). With 12.04 GiB of weights + 1.04 GiB of state per core there are ~2.9 GiB
+for code + scratch + rings. Served ladder: R=1 up to 4096 pages, R=4 up to 2048, R=8 up to 1024, R=16 up to 512 (the
+4096-page pool is shared by all streams anyway: 16 streams average 256 pages).
