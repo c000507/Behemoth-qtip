@@ -268,6 +268,10 @@ def moe_block(n, t, g, allreduce, mode='all'):
     shared = lin_partial(bf(silu_mul(lin(n, t, 'sg'), lin(n, t, 'su'))), t, 'sd') * sgate
     comb = route(n, t, g)                                                              # [T, E]
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [E, 2EIl, H], [E, EIl, H]
+    if MOE_DEBUG in ('route', 'probs'):
+        v = (comb if MOE_DEBUG == 'route' else torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)).reshape(T, -1).float()[:, :g.H]
+        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0
+        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     if mode == 'gather' and g.topk * T < E:
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, E]
