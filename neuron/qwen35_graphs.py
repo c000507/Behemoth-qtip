@@ -56,6 +56,7 @@ MOE_BMM = os.environ.get('MOE_BMM', '0') == '1'  # with MOE_SLOTS=row: every row
 ROUTER = os.environ.get('ROUTER', 'full')        # full: replicated f32 router [E, H] on every rank (8.4 MB read per MoE block) | shard: rank r holds the
 #                                                  router columns of its hidden slice ('rws' [E, H / TP], 'rcols' [H / TP]) and the logits are all-reduced
 GDN_DEC = os.environ.get('GDN_DEC', '0') == '1'    # decode (Q = 1): conv state = the last K-1 inputs by a static slice (no gather by the valid count)
+GDN_FORM = os.environ.get('GDN_FORM', '')          # fused: decode recurrence with one state contraction (see gdn_block)
 ROW_FORM = os.environ.get('ROW_FORM', '')         # probes of MOE_SLOTS=row: full | sort | launder | topk (see moe_routed)
 LIN_CSE = os.environ.get('LIN_CSE', '0') == '1'  # share the fp8 activation scaling (amax, divide, cast) between the projections of one input
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
@@ -222,7 +223,15 @@ def gdn_block(n, t, g, R, Q, allreduce):
     decay = torch.exp(gg)                                                              # [R, Q, hl]
     st = (torch.index_select(t['kstate'], 0, slot) if GDN_GATHER == 'flat' else t['kstate'][slot]) * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
     C = GDN_CHUNK
-    if Q > 1 and C > 1 and Q % C == 0:
+    if Q == 1 and GDN_FORM == 'fused':
+        # one contraction of the stored state with (k | q) instead of two contractions of two materialised states:
+        # mem = d (S k), out = (d S + k (x) delta) q = d (S q) + (k . q) delta. Equal to the loop form up to f32 rounding.
+        d = decay[:, 0].reshape(R, hl, 1)
+        c = torch.einsum('rhkd,rhkc->rhcd', st, torch.stack((kn[:, 0], qn[:, 0]), dim=-1))     # [R, hl, 2, Dv]
+        delta = (v[:, 0] - d * c[:, :, 0]) * beta[:, 0].unsqueeze(-1)
+        y = (d * c[:, :, 1] + (kn[:, 0] * qn[:, 0]).sum(dim=-1, keepdim=True) * delta).unsqueeze(1)
+        st = st * d.unsqueeze(-1) + kn[:, 0].unsqueeze(-1) * delta.unsqueeze(-2)
+    elif Q > 1 and C > 1 and Q % C == 0:
         st, y = gdn_chunks(st, qn, kn, v, beta, gg, valid, C)
     else:
         outs = []
@@ -753,7 +762,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'gdn_form': GDN_FORM, 'row_form': ROW_FORM, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
