@@ -428,3 +428,15 @@ Tokens: the 8k / 32k / 64k continuations are identical to the baseline's; the sh
 * Limits: context 64k tokens per pool (the 4096-page bucket); R=16 decode is slower than R=8 (serve at most 8 rows per
   step: `--max-batch-requests 8`); no prefix cache / speculation (recurrent state), as for the 35B; tool-call output
   parsing for Qwen's format is still missing in the runtime; thinking is on by default in the chat template.
+
+### 8.12 Prefill A/B on the device (8033-token prompt, tok/s after the first chunk; the box was shared with compile jobs)
+
+| prefill path | tok/s | tokens after the prompt |
+|---|---|---|
+| sub-blocks Q=256, f32 all-reduce | 575-639 | reference |
+| segments Q=256, f32 all-reduce | 662-711 | identical (32) |
+| segments Q=256, **bf16 all-reduce** (`AR_BF16=1`) | 741 | identical (32); a 233-token prompt + 100 generated tokens: identical to the f32-reduce run |
+| segments **Q=512**, f32 all-reduce (unrolled 3 x 512-step recurrence: 41 min compile per bucket) | **897** | identical (32) |
+
+Rounding the 32 partial sums to bf16 before the 120 all-reduces of a chunk did not change a single token in these
+tests, so the Q=512 ladder is being built with it (and with `ATT_BF16=1`); result in the status log.
