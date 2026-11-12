@@ -116,8 +116,7 @@ def check(d, meta, kind, parts, g, shards, neff_io):
         y_dev = torch.from_numpy(out.copy()) - x
         y_ref = ref[0] - x
         rel = float(torch.linalg.norm(y_dev - y_ref) / torch.linalg.norm(y_ref))
-        other = np.frombuffer(Path(io, 'out0.r1').read_bytes(), np.float32).reshape(T, -1) if g.TP > 1 else out
-        same = float(np.abs(other - out).max())
+        same = max([float(np.abs(np.frombuffer(Path(io, f'out0.r{r}').read_bytes(), np.float32).reshape(T, -1) - out).max()) for r in range(1, g.TP)] or [0.0])
     print(f'{d.name:22s} {kind:14s} R={R_} Q={Q_} P={P_} ({"fp8" if meta["fp8"] else "bf16"}, moe={moe_mode}): block output rel L2 vs CPU mirror '
           f'{rel:.3e}; ranks differ by {same:.1e}; neff_io {dt:.1f}s', flush=True)
     return rel
