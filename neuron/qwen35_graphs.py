@@ -42,9 +42,11 @@ PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
 ATT_BF16 = os.environ.get('ATT_BF16', '0') == '1'   # gqa: scores / values contracted in bf16 straight from the paged cache (long-context decode lever)
+ATT_GATHER = os.environ.get('ATT_GATHER', 'index')   # gqa page gather: index (cache[table]) | flat (index_select over the flattened table)
 GDN_CHUNK = int(os.environ.get('GDN_CHUNK', '0'))     # prefill: chunk size (power of two) of the matmul-form recurrence; 0 = token loop
 AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
-ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank (pairwise counting, no topk op)
+ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank | rank2 | tour (no topk op: topk_mask)
+TOUR_GROUPS = int(os.environ.get('TOUR_GROUPS', '8'))
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
@@ -292,7 +294,11 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
     table = t['table']                                                                 # [R, P]
     keys = P * PAGE
     lowp = ATT_BF16 and not EXACT                                                      # contract the gathered K | V in bf16 (no f32 copy of the keys)
-    kv = cache[table] if lowp else cache[table].float()                                # [R, P, 2, kvl, 16, D]
+    if ATT_GATHER == 'flat':
+        kv = torch.index_select(cache, 0, table.reshape(R * P)).reshape(R, P, 2, kvl, PAGE, D)
+    else:
+        kv = cache[table]
+    kv = kv if lowp else kv.float()                                                    # [R, P, 2, kvl, 16, D]
     kk = kv[:, :, 0].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D)
     vv = kv[:, :, 1].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D)
     rep = hq // kvl
@@ -309,21 +315,57 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
     return out, {'kv': cache}
 
 
+def topk_mask(probs, k, form):
+    """Exact top-k membership mask [T, E] (f32 0 / 1) of probs [T, E] under torch.topk's order (value descending, ties: the
+    lower index wins), without a topk op (on trn1 / neuronx-cc 2.26 topk over [4, 512] / [8, 512] with k = 10 is non-finite,
+    docs/neuron-qwen397.md 8.4). Forms (all select the same set, so the combine weights are bit-identical):
+      rank  expert e is selected iff fewer than k experts beat it: one [T, E, E] comparison (6 passes over T * E * E elements;
+            at E = 512 that is 2 M elements per 8 rows and was 20 % of the 8-row decode step, docs/neuron-qwen397-batch.md)
+      rank2 the same matrix in 3 passes (where(e' < e, p' >= p, p' > p))
+      tour  tournament: rank inside G groups of E / G experts ([T, G, S, S]), keep each group's k best as candidates
+            (an expert of the global top-k is in its group's top-k), rank the G * k candidates ([T, Gk, Gk]), map back.
+            8x fewer elements than rank at E = 512, G = 8."""
+    T, E = probs.shape
+    dev = probs.device
+    if form in ('rank', 'rank2'):
+        ex = torch.arange(E, device=dev)
+        a, b = probs.unsqueeze(2), probs.unsqueeze(1)                                  # [T, E, 1] (e), [T, 1, E] (e')
+        lower = (ex.reshape(1, 1, E) < ex.reshape(1, E, 1))                            # e' < e
+        if form == 'rank':
+            beats = ((b > a) | ((b == a) & lower)).float().sum(dim=-1)                 # [T, E]
+        else:
+            beats = torch.where(lower, b >= a, b > a).float().sum(dim=-1)
+        return (beats < k).float()
+    G = TOUR_GROUPS
+    S = E // G
+    if E % G or S < k:
+        raise ValueError(f'tournament routing: {E} experts do not split into {G} groups of >= {k}')
+    p = probs.reshape(T, G, S)
+    ex = torch.arange(S, device=dev)
+    lower = (ex.reshape(1, S) < ex.reshape(S, 1))                                      # [e, e']: e' < e
+    lrank = torch.where(lower, p.unsqueeze(2) >= p.unsqueeze(3), p.unsqueeze(2) > p.unsqueeze(3)).float().sum(dim=-1)   # [T, G, S]
+    m = (lrank.unsqueeze(2) == torch.arange(k, device=dev).float().reshape(1, 1, k, 1)).float()     # [T, G, k, S]: the s-th best of group g
+    cand = (m * p.unsqueeze(2)).sum(dim=-1).reshape(T, G * k)                          # candidate values, index order = (group, local rank)
+    C = G * k
+    cx = torch.arange(C, device=dev)
+    clower = (cx.reshape(1, C) < cx.reshape(C, 1))                                     # candidate c' before c: lower expert index on ties
+    crank = torch.where(clower, cand.unsqueeze(1) >= cand.unsqueeze(2), cand.unsqueeze(1) > cand.unsqueeze(2)).float().sum(dim=-1)   # [T, C]
+    csel = (crank < k).float().reshape(T, G, k, 1)
+    return (m * csel).sum(dim=2).reshape(T, E)
+
+
 def route(n, t, g):
     """Softmax over all experts, top-k, renormalised -> combine weights [T, E] (0 for unselected experts)."""
     probs = torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)                  # [T, E] f32
     T = n.shape[0]
     experts = torch.arange(g.E, device=n.device)
-    if ROUTE == 'rank':
-        # top-k membership by counting: expert e is selected iff fewer than k experts beat it (ties: lower index wins, as
-        # torch.topk). No topk op: on trn1 (neuronx-cc 2.26) topk over [4, 512] / [8, 512] with k = 10 made the whole
-        # routing non-finite on the device (T = 1, 64 and 256 are fine) - docs/neuron-qwen397.md.
-        a, b = probs.unsqueeze(2), probs.unsqueeze(1)                                  # [T, E, 1] (e), [T, 1, E] (e')
-        lower = (experts.reshape(1, 1, g.E) < experts.reshape(1, g.E, 1))              # e' < e
-        beats = ((b > a) | ((b == a) & lower)).float().sum(dim=-1)                     # [T, E]
-        w = probs * (beats < g.topk).float()
+    if ROUTE in ('rank', 'rank2', 'tour'):
+        w = probs * topk_mask(probs, g.topk, ROUTE)
         return w / w.sum(dim=-1, keepdim=True)
-    top = torch.topk(probs, g.topk, dim=-1)[1]                                         # [T, K]
+    if ROUTE == 'pad64' and T < 64:      # topk is fine at 64 rows: pad the rows (probe; not validated for serving)
+        top = torch.topk(torch.cat((probs, probs[:1].expand(64 - T, g.E) * 0.0), dim=0), g.topk, dim=-1)[1][:T]
+    else:
+        top = torch.topk(probs, g.topk, dim=-1)[1]                                     # [T, K]
     onehot = (top.unsqueeze(-1) == experts.reshape(1, 1, g.E)).float()                 # [T, K, E]  (one-hot: see glm_graphs.route)
     w = torch.einsum('tke,te->tk', onehot, probs)
     w = w / w.sum(dim=-1, keepdim=True)
@@ -589,7 +631,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

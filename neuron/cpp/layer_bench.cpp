@@ -37,12 +37,13 @@ static void check(NRT_STATUS status, const char* what, int rank) {
 }
 
 struct RankResult {
-    double load_s = 0, sec = 0;
+    double load_s = 0, batch[8] = {};
     size_t in_bytes = 0, out_bytes = 0;
     int n_in = 0, n_out = 0;
 };
 
 static int g_states = 0;
+static const int BATCHES = 8;
 static void run_rank(int rank, int ranks, const std::vector<char>& neff, int steps, std::barrier<>& sync,
                      RankResult& result, bool print_tensors) {
     nrt_model_t* model = nullptr;
@@ -98,30 +99,25 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
 
     // Collectives rendezvous across ranks, so every rank must execute the same number of times.
     for (int i = 0; i < 4; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute(warmup)", rank);
-    sync.arrive_and_wait();
-    auto t1 = std::chrono::steady_clock::now();
-    for (int i = 0; i < steps; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute", rank);
-    // drain: read one (small) output tensor so the clock stops when the DEVICE finished, not the host submit
-    {
-        size_t best = SIZE_MAX;
-        const nrt_tensor_t* dev = nullptr;
-        size_t best_idx = 0;
-        for (size_t i = 0; i < tensors.size(); ++i) {
-            const nrt_tensor_info_t& ti = info->tensor_array[i];
-            if (std::string(ti.name) == "output0" && ti.size < best) {
-                best = ti.size;
-                dev = tensors[i];
-                best_idx = i;
-            }
+    // drain target: the residual output (clock stops when the DEVICE finished, not the host submit)
+    nrt_tensor_t* drain = nullptr;
+    size_t drain_bytes = 0;
+    for (size_t i = 0; i < tensors.size(); ++i)
+        if (std::string(info->tensor_array[i].name) == "output0") {
+            drain = tensors[i];
+            drain_bytes = std::min<size_t>(info->tensor_array[i].size, 64);
         }
-        if (dev) {
-            std::vector<uint8_t> sink(best ? best : 1);
-            check(nrt_tensor_read(const_cast<nrt_tensor_t*>(dev), sink.data(), 0, best ? best : 1), "drain read", rank);
-        }
-        (void)best_idx;
+    // BATCHES timed batches of steps / BATCHES launches each; the result is the fastest batch (and the median): one stalled
+    // rendezvous (another process on the box, a CPU hiccup) no longer ruins a measurement
+    std::vector<uint8_t> sink(64);
+    for (int b = 0; b < BATCHES; ++b) {
+        sync.arrive_and_wait();
+        auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < steps / BATCHES; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute", rank);
+        if (drain) check(nrt_tensor_read(drain, sink.data(), 0, drain_bytes), "drain read", rank);
+        sync.arrive_and_wait();
+        result.batch[b] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / (steps / BATCHES);
     }
-    sync.arrive_and_wait();
-    result.sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 
     nrt_destroy_tensor_set(&inputs);
     nrt_destroy_tensor_set(&outputs);
@@ -137,7 +133,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s graph.neff [steps] [ranks]\n", argv[0]);
         return 1;
     }
-    const int steps = argc > 2 ? std::atoi(argv[2]) : 64;
+    const int steps = std::max(BATCHES, argc > 2 ? std::atoi(argv[2]) : 64);
     const int ranks = argc > 3 ? std::atoi(argv[3]) : 2;
     g_states = argc > 4 ? std::atoi(argv[4]) : 0;
     if (!std::getenv("LAYER_BENCH_NO_LATENCY")) {   // hold the CPUs out of deep idle states, as the engine does
@@ -161,11 +157,13 @@ int main(int argc, char** argv) {
     for (auto& t : threads) t.join();
 
     const RankResult& r0 = results[0];
-    double sec = 0;
-    for (auto& r : results) sec = std::max(sec, r.sec);
+    std::vector<double> bt(BATCHES, 0.0);
+    for (int b = 0; b < BATCHES; ++b)
+        for (auto& r : results) bt[size_t(b)] = std::max(bt[size_t(b)], r.batch[b]);
+    std::sort(bt.begin(), bt.end());
     std::printf("{\"neff\":\"%s\",\"ranks\":%d,\"load_s\":%.2f,\"inputs\":%d,\"outputs\":%d,\"input_MB_per_rank\":%.1f,"
-                "\"steps\":%d,\"ms_per_step\":%.3f,\"steps_per_s\":%.1f}\n",
-                argv[1], ranks, r0.load_s, r0.n_in, r0.n_out, r0.in_bytes / 1e6, steps, sec / steps * 1000.0, steps / sec);
+                "\"steps\":%d,\"ms_per_step\":%.3f,\"median_ms\":%.3f,\"max_ms\":%.3f}\n",
+                argv[1], ranks, r0.load_s, r0.n_in, r0.n_out, r0.in_bytes / 1e6, steps, bt[0] * 1000.0, bt[BATCHES / 2] * 1000.0, bt[BATCHES - 1] * 1000.0);
     nrt_close();
     return 0;
 }
