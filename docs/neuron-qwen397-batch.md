@@ -343,3 +343,50 @@ block. Not resolved in this pass. Next steps: bisect `layer_gdn_moe` at R = 16 /
 the 64-row bucket as sub-block launches (gdn / gqa / moe NEFFs: 120 launches x 0.3 ms more per step, still ~200 ms = 320
 tok/s). This is the only route found to more than 300 tok/s aggregate on this instance, and it is a 64-stream figure,
 not an 8-stream one.
+
+## 14. NKI kernel for the gathered expert part (micro-kernel only, not integrated) and the 16-32 stream scope
+
+`neuron/nki_moe.py`, `neuron/tests/bench_moe_nki.py` (commits 3e7e822, e9fd487). Expert part of one MoE block (gather, gate / up,
+SiLU, down) as an NKI kernel with the weights as the moving operand: gate / up from a re-laid-out expert tensor
+`egu_t[e * 128 + p, kt * 64 + o] = egu[e, o, kt * 128 + p]` (2 KB partition rows, one indirect [128, 2048] DMA per slot), down
+from `ed` as stored (4 KB rows, 4 slots per [128, 4096] tile). One NeuronCore, drained, slope of 8 vs 2 chained blocks; each
+block also carries a norm, the quantisation and the residual:
+
+| rows (slots) | torch `moe_routed` (row slots), ms per block | NKI, first version | NKI best (`pp=4 pre=after`) |
+|---|---|---|---|
+| 1 (10) | 0.077 | 0.070 | 0.069 |
+| 2 (20) | 0.120 | 0.107 | 0.102 |
+| 4 (40) | 0.222 | 0.164 | 0.159 |
+| 8 (80) | 0.378 | 0.310 | 0.273 (single run) |
+
+* 28 % under the torch form of the same harness at 4 and 8 rows, but that harness uses the row-slot form, which is the slow
+  one at 8 rows; against the union form that is served (~0.31 ms of expert work per block) the kernel is ~12 % ahead:
+  about -2 ms per step at 8 rows, not the -8 to -11 ms hoped for in section 5.
+* Why: the stream is the bound. Profile at 8 rows: dynamic DMA 188 GB/s while active (torch 156, the same geometry with static
+  rows 226 GB/s and 0.211 ms per block), DMA active 70 % of the kernel's time; matmul instructions 2840 against 6720. The
+  instruction count halves, the block time does not, as section 10 argues (every weight byte passes the tensor engine once).
+* Numerics of the kernel alone against an exact f32 mirror: 6e-8..1.2e-7 rel L2. Not yet shown: agreement with the torch
+  block on the device inside a 32-rank NEFF with collectives (in the chained single-core harness both forms sit 3-4.5e-2 from
+  the CPU mirror and 1-2e-2 from each other, not pinned down).
+* Not attempted: the data-dependent loop over DISTINCT experts (sort / unique of the selected ids on the device, each expert
+  streamed once and applied to the rows that chose it). It is the only form that would lower the bytes (135 instead of 160
+  slices at 16 rows, ~250 instead of 320 at 32) and it would avoid the compiler's 140-160-slot cliff, but the kernel as written
+  has static trip counts (S = 10 R slots) and fits the SBUF only to 80 slots (two passes at 16 rows); whether NKI 0.5.0 can run
+  a masked fixed-trip loop over a device-computed unique list is open.
+* Integration would need the re-laid-out `egu_t` bound in place of `egu` for the decode buckets (no second 8 GiB copy: the
+  prefill `MOE=all` graphs would have to read the new layout too) and the kernel called from `moe_routed`.
+
+Streams beyond 8 with the gathered graphs (the 64-row dense path of section 13 is dropped; target is at most 32 streams):
+
+| streams | launches per step | ms per step | aggregate tok/s | status |
+|---|---|---|---|---|
+| 8 | R = 8 | 42.7 | 187 | measured |
+| 16 | R = 16 (two unions of 80 slots) | 73.3 | 218 | measured |
+| 24 | R = 16 + R = 8 | ~116 | ~207 | sum of the measured launches |
+| 32 | 2 x R = 16 | ~147 | ~218 | sum of the measured launches |
+
+The served maximum is 16 rows per step: the graphs carry `SLOTS=17` (16 GDN state slots on the device), so more than 16
+concurrent sequences spill state to the host at every step. 24 / 32 streams need every gdn-holding graph rebuilt with
+`SLOTS=33` (state 1.04 -> ~1.2 GiB per core); R = 24 / 32 single-launch buckets (`MOE_SPLIT=8`: 3 / 4 unions of 80 slots) were
+not built. Per block the 16-row MoE costs 0.87 ms against 0.46 at 8 rows, so wider buckets add rows at ~the same cost as a
+second launch: the aggregate stays near 220 tok/s from 16 to 32 streams.
