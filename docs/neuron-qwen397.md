@@ -173,3 +173,31 @@ safetensors paths).
 | 59 (gqa) | 5.34e-2 | 6.78e-2 | 5.76e-2 |
 
   The same level as the 35B port (5.5-6.8e-2 per layer): the fp8 format, not the TP=32 sharding.
+
+**Gate (d), 2026-11-12 07:41 UTC: first tokens; reproducibility; oracle**
+* Engine (`neuron_engine_cli`, `qwen35_model.cpp` unchanged apart from the two debug switches below, 32 rank threads,
+  `NEURON_RT_VISIBLE_CORES=0-31`, `nrt_load_collectives(..., rank, 32)`): 36 NEFFs loaded on every core, **weights
+  resident in 62-64 s** (32 threads, files in the page cache), `per core 12.036 GiB weights + 0.989 GiB state` (4096 KV
+  pages + 8 GDN slots) - as budgeted, and it loads next to all 36 NEFFs' scratch.
+* First generation (greedy, chat template, enable_thinking=false, "Explain in two paragraphs why the sky is blue.",
+  200 new tokens): *"The sky appears blue primarily due to a phenomenon known as Rayleigh scattering, which occurs when
+  sunlight interacts with the gases and particles in Earth's atmosphere. Sunlight, or white light, is composed of all
+  the colors of the visible spectrum, each traveling in waves of different lengths. As this light enters the
+  atmosphere, it collides with nitrogen and oxygen molecules; shorter wavelengths, such as blue and violet, are
+  scattered much more strongly than longer wavelengths like red and yellow ... Although violet light has an even shorter
+  wavelength than blue and is scattered more intensely, the sky does not appear violet to us for two main reasons.
+  First, the sun emits less violet light than blue light to begin with. Second, the human eye is significantly more
+  sensitive to blue light than to violet ..."* - coherent and correct; decode median 83 ms/token.
+* **Oracle** (`test_qwen35_oracle.py`, f32 CPU reference over the 23 prompt + 200 generated tokens, teacher forced,
+  540 s): top-1 agreement **194/200**; the 6 misses are near ties (oracle margin 0.007-1.07, the device token is the
+  oracle's rank-2 token every time). Same picture as the 35B (107/112).
+* **Reproducibility (the section-12 problem of the 35B doc): not reproduced here.** Same prompt, greedy, 64 tokens:
+  12 sequential requests in one engine process x 4 processes (plain, `BEHEMOTH_NEURON_QWEN35_BARRIER=1`,
+  `BEHEMOTH_NEURON_QWEN35_SYNC=4`, plain again) + 8 further separate plain processes + the first 64 tokens of the
+  200-token run = **57 streams from 13 engine processes, all token-identical; no non-finite logits**. The switches make
+  no difference to the output (barrier: +5 ms/token). Since the plain path is already deterministic on this
+  instance, the non-aliased-state variant was not built. What differs from the trn1.2xlarge where 1 in 6 runs faulted:
+  32 ranks instead of 2 (every launch waits on a 16-chip all-reduce, so ranks cannot run ahead of each other by much),
+  kernel 6.8 vs 6.17, a fresh driver load; the Neuron packages are the same pinned versions. This does not explain the
+  TP=2 fault - it only shows the TP=32 build does not exhibit it in 57 runs. The switches stay in the backend for the
+  TP=2 A/B.
