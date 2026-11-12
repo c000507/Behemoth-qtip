@@ -4,7 +4,9 @@
 //
 // build: g++ -std=c++20 -O2 -pthread -I/opt/aws/neuron/include neuron/cpp/layer_bench.cpp \
 //            -L/opt/aws/neuron/lib -lnrt -Wl,-rpath,/opt/aws/neuron/lib -o layer_bench
-// run:   layer_bench graph.neff [steps] [ranks]      (ranks defaults to 2: tensor parallelism is always on)
+// run:   layer_bench graph.neff [steps] [ranks] [states]   (ranks defaults to 2: tensor parallelism is always on)
+//        states = n: the NEFF's last n inputs are aliased state buffers (meta.json "states"); output<s+1> is bound to the
+//        SAME device tensor as that input, as the engine does. Without it every launch copies the whole state (KV cache).
 //
 // The same NEFF is loaded on every rank (SPMD). Inputs are filled with small deterministic values
 // (a timing harness; numerics are checked separately against the C++ oracle). Tensors of 8 bytes or
@@ -12,12 +14,15 @@
 #include <nrt/nrt.h>
 #include <nrt/nrt_experimental.h>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -37,6 +42,7 @@ struct RankResult {
     int n_in = 0, n_out = 0;
 };
 
+static int g_states = 0;
 static void run_rank(int rank, int ranks, const std::vector<char>& neff, int steps, std::barrier<>& sync,
                      RankResult& result, bool print_tensors) {
     nrt_model_t* model = nullptr;
@@ -53,13 +59,24 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
     nrt_tensor_set_t *inputs = nullptr, *outputs = nullptr;
     check(nrt_allocate_tensor_set(&inputs), "nrt_allocate_tensor_set(in)", rank);
     check(nrt_allocate_tensor_set(&outputs), "nrt_allocate_tensor_set(out)", rank);
-    std::vector<nrt_tensor_t*> tensors;
+    std::vector<nrt_tensor_t*> tensors(info->tensor_count, nullptr);
+    int n_inputs = 0;
+    for (uint64_t i = 0; i < info->tensor_count; ++i) n_inputs += info->tensor_array[i].usage == NRT_TENSOR_USAGE_INPUT;
+    std::vector<nrt_tensor_t*> state_of(size_t(g_states), nullptr);   // input<n_inputs - states + s> <-> output<s + 1>
+    for (int pass = 0; pass < 2; ++pass)
     for (uint64_t i = 0; i < info->tensor_count; ++i) {
         const nrt_tensor_info_t& t = info->tensor_array[i];
-        nrt_tensor_t* dev = nullptr;
-        check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, rank, t.size, t.name, &dev), "nrt_tensor_allocate", rank);
-        tensors.push_back(dev);
         const bool is_input = t.usage == NRT_TENSOR_USAGE_INPUT;
+        if (is_input != (pass == 0)) continue;                       // inputs first, so the aliased outputs find their tensor
+        nrt_tensor_t* dev = nullptr;
+        const int idx = std::atoi(t.name + (is_input ? 5 : 6));
+        const int sidx = is_input ? idx - (n_inputs - g_states) : idx - 1;
+        if (!is_input && sidx >= 0 && sidx < g_states && state_of[size_t(sidx)])
+            dev = state_of[size_t(sidx)];
+        else
+            check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, rank, t.size, t.name, &dev), "nrt_tensor_allocate", rank);
+        if (is_input && sidx >= 0 && sidx < g_states) state_of[size_t(sidx)] = dev;
+        tensors[i] = dev;
         if (is_input) {
             std::vector<uint8_t> fill(t.size);
             // int64 tensors (dtype 8) are indices/positions: keep them zero so gathers stay in bounds.
@@ -91,7 +108,7 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
         size_t best_idx = 0;
         for (size_t i = 0; i < tensors.size(); ++i) {
             const nrt_tensor_info_t& ti = info->tensor_array[i];
-            if (ti.usage != NRT_TENSOR_USAGE_INPUT && ti.size < best) {
+            if (std::string(ti.name) == "output0" && ti.size < best) {
                 best = ti.size;
                 dev = tensors[i];
                 best_idx = i;
@@ -108,6 +125,8 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
 
     nrt_destroy_tensor_set(&inputs);
     nrt_destroy_tensor_set(&outputs);
+    std::sort(tensors.begin(), tensors.end());
+    tensors.erase(std::unique(tensors.begin(), tensors.end()), tensors.end());
     for (auto* t : tensors) nrt_tensor_free(&t);
     nrt_free_model_tensor_info(info);
     nrt_unload(model);
@@ -120,6 +139,12 @@ int main(int argc, char** argv) {
     }
     const int steps = argc > 2 ? std::atoi(argv[2]) : 64;
     const int ranks = argc > 3 ? std::atoi(argv[3]) : 2;
+    g_states = argc > 4 ? std::atoi(argv[4]) : 0;
+    if (!std::getenv("LAYER_BENCH_NO_LATENCY")) {   // hold the CPUs out of deep idle states, as the engine does
+        static int fd = ::open("/dev/cpu_dma_latency", O_WRONLY);
+        const int32_t us = 0;
+        if (fd < 0 || ::write(fd, &us, sizeof us) != sizeof us) std::fprintf(stderr, "cannot hold /dev/cpu_dma_latency\n");
+    }
     std::ifstream in(argv[1], std::ios::binary);
     std::vector<char> neff((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     if (neff.empty()) {

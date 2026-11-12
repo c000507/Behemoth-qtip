@@ -435,6 +435,22 @@ def segment(seg, t, g, R, Q, P, allreduce, moe_mode='all'):
     return x, states
 
 
+def sequence(kinds, t, g, R, Q, P, allreduce, moe_mode='all'):
+    """Bench graphs (kind seq_<k>_<k>...): consecutive SUB-blocks (gdn | gqa | moe), each with its own weights l<i>.a.* (attention)
+    or l<i>.m.* (moe) and states l<i>.<state>. layer_bench times them; the slope over the repeat count is the in-launch cost
+    of one sub-block (docs/neuron-qwen397-batch.md)."""
+    common = {k: v for k, v in t.items() if '.' not in k}
+    x, states = t['x'], {}
+    for i, kind in enumerate(kinds):
+        pre = f'l{i}.'
+        own = {k[len(pre):]: v for k, v in t.items() if k.startswith(pre)}
+        w = {k[2:]: v for k, v in own.items() if k[:2] in ('a.', 'm.')}
+        st_in = {k: v for k, v in own.items() if '.' not in k}
+        x, st = sublayer(kind, {**common, **w, **st_in, 'x': x}, g, R, Q, P, allreduce, moe_mode)
+        states.update({pre + k: v for k, v in st.items()})
+    return x, states
+
+
 def head(t, g, rows):
     x = torch.index_select(t['x'], 0, rows)
     h = bf(rms(x, t['norm'], g.eps))
@@ -519,9 +535,15 @@ def main():
     else:
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
         seg = kind.split('_')[1:] if kind.startswith('seg_') else None       # seg_gdn_gdn_gdn_gqa: consecutive whole layers in one NEFF
+        seq = kind.split('_')[1:] if kind.startswith('seq_') else None       # seq_moe_moe_...: sub-blocks (bench only)
         parts = kind.split('_')[1:] if kind.startswith('layer_') else [kind]
         step, wsh, ssh = {}, {}, {}
-        if seg:
+        if seq:
+            for i, k_ in enumerate(seq):
+                step.update(step_shapes(k_, R, Q, P, g))
+                wsh.update({f'l{i}.{"m" if k_ == "moe" else "a"}.{k}': v for k, v in weight_shapes(k_, g, fp8).items()})
+                ssh.update({f'l{i}.{k}': v for k, v in state_shapes(k_, g, pages, slots).items()})
+        elif seg:
             for i, a_kind in enumerate(seg):
                 step.update(step_shapes(a_kind, R, Q, P, g))
                 wsh.update({f'l{i}.a.{k}': v for k, v in weight_shapes(a_kind, g, fp8).items()})
@@ -550,7 +572,9 @@ def main():
                 t = dict(zip(names, a))
                 for n_ in snames:
                     t[n_] = getattr(self, n_.replace('.', '_'))
-                if seg:
+                if seq:
+                    x, st = sequence(seq, t, g, R, Q, P, allreduce, moe_mode)
+                elif seg:
                     x, st = segment(seg, t, g, R, Q, P, allreduce, moe_mode)
                 elif len(parts) == 1:
                     x, st = sublayer(kind, t, g, R, Q, P, allreduce, moe_mode)
