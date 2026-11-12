@@ -712,10 +712,11 @@ class Qwen35Model final : public Backend {
         L.wslot[size_t(t)] = int64_t(page) * PAGE + position % PAGE;
         rope_row(L.cos_sin.data() + size_t(t) * size_t(2 * rot), position);
     }
-    double layers_ms = 0, head_ms = 0;
+    double layers_ms = 0, head_ms = 0, exec_ms = 0, plan_ms = 0; // exec: submit -> all ranks joined; plan: execute() before the submit
     std::vector<std::array<double, 7>> prof; // per rank, per forward(): see execute()
     int launches = 0;
     void execute(Launch &L, float *dest) {
+        const auto tp0 = Clock::now();
         const Graph *head = nullptr;
         if (!L.head_rows.empty()) {
             head = head_for(L.R * L.Q, int(L.head_rows.size()));
@@ -757,11 +758,12 @@ class Qwen35Model final : public Backend {
         std::vector<int64_t> rows(head ? size_t(head->S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
-        std::vector<std::vector<float>> out(static_cast<size_t>(tp));
         std::vector<std::future<void>> jobs;
         double t_layers = 0, t_head = 0;
         static const bool use_barrier = std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER"));
         SpinBarrier barrier(tp);
+        plan_ms += ms_since(tp0);
+        const auto te0 = Clock::now();
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
               try {
@@ -819,8 +821,15 @@ class Qwen35Model final : public Backend {
                     const auto th = Clock::now();
                     check(nrt_execute(head->model[size_t(r)], in, o), "head execute");
                     const auto tr = Clock::now();
-                    out[size_t(r)].resize(size_t(head->S) * size_t(vocab_shard));
-                    check(nrt_tensor_read(st.logits.at(head->S).t, out[size_t(r)].data(), 0, out[size_t(r)].size() * 4), "read logits");
+                    // each rank reads its vocabulary shard of every sampled row straight into the row's place in the
+                    // logits buffer (32 threads in parallel; no per-step shard vectors, no serial 1 MB-per-row copy)
+                    const size_t first = size_t(r) * size_t(vocab_shard);
+                    if (first < size_t(vocab_)) {
+                        const size_t n = std::min(size_t(vocab_) - first, size_t(vocab_shard));
+                        for (size_t i = 0; i < L.head_rows.size(); ++i)
+                            check(nrt_tensor_read(st.logits.at(head->S).t, dest + size_t(L.destination[i]) * size_t(vocab_) + first,
+                                                  i * size_t(vocab_shard) * 4, n * 4), "read logits");
+                    }
                     pr[5] += std::chrono::duration<double, std::milli>(tr - th).count();
                     pr[6] += ms_since(tr);
                 }
@@ -835,18 +844,10 @@ class Qwen35Model final : public Backend {
             }));
         for (auto &j : jobs)
             j.get();
+        exec_ms += ms_since(te0);
         layers_ms += t_layers;
         head_ms += t_head;
         ++launches;
-        for (size_t i = 0; i < L.head_rows.size(); ++i) {
-            float *row = dest + size_t(L.destination[i]) * size_t(vocab_);
-            for (int r = 0; r < tp; ++r) {
-                const size_t first = size_t(r) * size_t(vocab_shard);
-                if (first >= size_t(vocab_))
-                    continue;
-                std::copy_n(out[size_t(r)].data() + i * size_t(vocab_shard), std::min(size_t(vocab_) - first, size_t(vocab_shard)), row + first);
-            }
-        }
     }
 
     // ---- Backend --------------------------------------------------------------------------------------------------
@@ -875,7 +876,7 @@ class Qwen35Model final : public Backend {
 
     std::span<const float> forward(const InferenceBatch &batch) override {
         const auto t0 = Clock::now();
-        layers_ms = head_ms = 0;
+        layers_ms = head_ms = exec_ms = plan_ms = 0;
         prof.assign(size_t(tp), {});
         launches = 0;
         const auto &lay = batch.layout;
@@ -984,7 +985,7 @@ class Qwen35Model final : public Backend {
         for (const auto &p : prof)
             for (size_t i = 0; i < 7; ++i)
                 pmax[i] = std::max(pmax[i], p[i]);
-        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"layers_ms", layers_ms}, {"head_ms", head_ms},
+        profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"layers_ms", layers_ms}, {"head_ms", head_ms}, {"exec_ms", exec_ms}, {"plan_ms", plan_ms},
                    {"r0", {{"set", p0[0]}, {"gdn", p0[1]}, {"gqa", p0[2]}, {"moe", p0[3]}, {"put", p0[4]}, {"head", p0[5]}, {"read", p0[6]}}},
                    {"rmax", {{"set", pmax[0]}, {"gdn", pmax[1]}, {"gqa", pmax[2]}, {"moe", pmax[3]}, {"put", pmax[4]}, {"head", pmax[5]}, {"read", pmax[6]}}},
                    {"tokens", batch.tokens.size()}, {"kda_spills", spills}, {"kda_restores", restores}};

@@ -113,6 +113,9 @@ def check(d, meta, kind, parts, g, shards, neff_io):
         subprocess.run([neff_io, str(d / 'graph.neff'), io, str(g.TP)], check=True, stdout=subprocess.DEVNULL, env=env)
         dt = time.time() - t0
         out = np.frombuffer(Path(io, 'out0.r0').read_bytes(), np.float32).reshape(T, -1)
+        if os.environ.get('DEVICE_OUT'):   # keep the device output (bit-level A/B of two NEFF variants on the same inputs)
+            np.save(Path(os.environ['DEVICE_OUT']) / f'{d.name}.npy', out)
+            np.save(Path(os.environ['DEVICE_OUT']) / f'{d.name}.ref.npy', ref[0].numpy())
         y_dev = torch.from_numpy(out.copy()) - x
         y_ref = ref[0] - x
         rel = float(torch.linalg.norm(y_dev - y_ref) / torch.linalg.norm(y_ref))
