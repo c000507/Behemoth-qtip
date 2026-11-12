@@ -183,6 +183,7 @@ class Qwen35Model final : public Backend {
         // step relies on the previous launch having finished.
         if (const char *a = std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC"); a && std::atoi(a))
             setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "8", 0);
+        hold_cpu_latency();
         check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
         ranks.resize(size_t(tp));
         for (int r = 0; r < tp; ++r)
@@ -202,6 +203,27 @@ class Qwen35Model final : public Backend {
     ~Qwen35Model() override {
         if (embed_map)
             munmap(embed_map, embed_map_bytes);
+    }
+
+    // Keep the CPUs out of deep idle states for the life of the process (PM QoS: an open fd on /dev/cpu_dma_latency holding
+    // 0 us). Every launch is a rendezvous of all rank threads in a sub-millisecond all-reduce; a rank thread waking from a
+    // deep C-state stalls all of them. Measured on trn1.32xlarge, TP=32, fused decode: 81-106 ms/token with jitter (45-129)
+    // without it, 48.6 ms with it. Needs write access to the device (root, or chmod); BEHEMOTH_NEURON_CPU_DMA_LATENCY=-1 disables.
+    int latency_fd = -1;
+    void hold_cpu_latency() {
+        const char *e = std::getenv("BEHEMOTH_NEURON_CPU_DMA_LATENCY");
+        const int32_t us = e ? std::atoi(e) : 0;
+        if (us < 0)
+            return;
+        latency_fd = ::open("/dev/cpu_dma_latency", O_WRONLY);
+        if (latency_fd < 0 || ::write(latency_fd, &us, sizeof us) != sizeof us) {
+            std::cerr << "Qwen35: cannot hold /dev/cpu_dma_latency at " << us << " us (" << std::strerror(errno)
+                      << "): decode will be slower and jittery; run as root or make the device writable\n";
+            if (latency_fd >= 0)
+                ::close(latency_fd);
+            latency_fd = -1;
+        } else if (options.verbose)
+            std::cerr << "Qwen35: holding /dev/cpu_dma_latency at " << us << " us\n";
     }
 
     void map_embedding() {
