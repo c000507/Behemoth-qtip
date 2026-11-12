@@ -41,6 +41,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
+ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank (pairwise counting, no topk op)
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
@@ -254,6 +255,15 @@ def route(n, t, g):
     probs = torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)                  # [T, E] f32
     T = n.shape[0]
     experts = torch.arange(g.E, device=n.device)
+    if ROUTE == 'rank':
+        # top-k membership by counting: expert e is selected iff fewer than k experts beat it (ties: lower index wins, as
+        # torch.topk). No topk op: on trn1 (neuronx-cc 2.26) topk over [4, 512] / [8, 512] with k = 10 made the whole
+        # routing non-finite on the device (T = 1, 64 and 256 are fine) - docs/neuron-qwen397.md.
+        a, b = probs.unsqueeze(2), probs.unsqueeze(1)                                  # [T, E, 1] (e), [T, 1, E] (e')
+        lower = (experts.reshape(1, 1, g.E) < experts.reshape(1, g.E, 1))              # e' < e
+        beats = ((b > a) | ((b == a) & lower)).float().sum(dim=-1)                     # [T, E]
+        w = probs * (beats < g.topk).float()
+        return w / w.sum(dim=-1, keepdim=True)
     top = torch.topk(probs, g.topk, dim=-1)[1]                                         # [T, K]
     onehot = (top.unsqueeze(-1) == experts.reshape(1, 1, g.E)).float()                 # [T, K, E]  (one-hot: see glm_graphs.route)
     w = torch.einsum('tke,te->tk', onehot, probs)
@@ -466,7 +476,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'route': ROUTE}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
