@@ -129,7 +129,10 @@ Tokenizer::Tokenizer(const fs::path &path) {
     pre(j.at("pre_tokenizer"));
     check(bytelevel, "ByteLevel pre-tokenizer required");
     check(j.at("decoder").at("type") == "ByteLevel", "ByteLevel decoder required");
-    check(!j.contains("normalizer") || j["normalizer"].is_null(), "tokenizer normalizer unsupported");
+    // Qwen tokenizers declare an NFC normalizer: accepted without normalising (UTF-8 input is NFC in practice; a
+    // decomposed input would be encoded as its decomposed bytes)
+    check(!j.contains("normalizer") || j["normalizer"].is_null() || j["normalizer"].value("type", "") == "NFC",
+          "tokenizer normalizer unsupported");
     // tokenizer.json's serialized truncation/padding is deliberately not applied.
 }
 void Tokenizer::bpe(std::string_view word, std::vector<int> &out) const {
