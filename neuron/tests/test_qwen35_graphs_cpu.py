@@ -56,6 +56,9 @@ class Mirror:
                 xr, st = Q.sublayer(kind, t, g, R_, Q_, table.shape[1], ar(r))
                 self.state[r][l].update(st)
                 t = {**step, 'x': xr, **{k[4:]: v for k, v in self.layers[r][l].items() if k.startswith('mlp.')}}
+                if Q.ROUTER == 'shard':   # the engine derives the rank's router slice from the replicated router at load
+                    cols = torch.arange(g.H // g.TP) + r * (g.H // g.TP)
+                    t['rws'], t['rcols'] = t.pop('rw')[:, cols].contiguous(), cols
                 xr, _ = Q.sublayer('moe', t, g, R_, Q_, table.shape[1], ar(r), moe_mode)
             rows = torch.arange(R_) * Q_ + (pos >= 0).long().sum(dim=1) - 1
             out[r] = (xr, Q.head({'x': xr, **self.heads[r]}, g, rows))

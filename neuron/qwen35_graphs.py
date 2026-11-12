@@ -50,7 +50,12 @@ AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial s
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank | rank2 | tour (no topk op: topk_mask)
 TOUR_GROUPS = int(os.environ.get('TOUR_GROUPS', '8'))
 MOE_SPLIT = int(os.environ.get('MOE_SPLIT', '0'))      # gathered decode MoE: rows in groups of this many, one slot union per group (0: one union)
-MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
+MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (union of the rows' experts, original) | onehot (no top-k over
+#                                                  experts) | row (slot r * K + j = the j-th expert of row r straight from the router's topk: no union)
+MOE_BMM = os.environ.get('MOE_BMM', '0') == '1'  # with MOE_SLOTS=row: every row contracts only its own K slots (batched matmul) instead of all rows x all slots
+ROUTER = os.environ.get('ROUTER', 'full')        # full: replicated f32 router [E, H] on every rank (8.4 MB read per MoE block) | shard: rank r holds the
+#                                                  router columns of its hidden slice ('rws' [E, H / TP], 'rcols' [H / TP]) and the logits are all-reduced
+LIN_CSE = os.environ.get('LIN_CSE', '0') == '1'  # share the fp8 activation scaling (amax, divide, cast) between the projections of one input
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
 
@@ -133,9 +138,27 @@ def bf(x):
     return x if EXACT else G.bf(x)
 
 
+_Q8 = {}   # LIN_CSE: id(input) -> (input, scale a, fp8 codes): the projections of one tensor share one quantisation
+
+
+def quant8(h2):
+    """h2 [T, in] -> (a [T, 1], fp8 codes of h2 / a), as G.lin computes them."""
+    hit = _Q8.get(id(h2)) if LIN_CSE else None
+    if hit is not None and hit[0] is h2:
+        return hit[1], hit[2]
+    a = torch.amax(torch.abs(h2.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+    h8 = (h2.float() / a).to(F8)
+    if LIN_CSE:
+        _Q8[id(h2)] = (h2, a, h8)
+    return a, h8
+
+
 def lin(h, t, name):
     if EXACT:
         return torch.matmul(h.reshape(-1, h.shape[-1]), t[name].float().T).reshape(*h.shape[:-1], t[name].shape[0])
+    if LIN_CSE and name + '_s' in t and h.dim() == 2:
+        a, h8 = quant8(h)
+        return G.bf(G.mm8(h8, t[name].T).float() * a * t[name + '_s'].reshape(1, -1))
     return G.lin(h, t, name)
 
 
@@ -359,10 +382,23 @@ def topk_mask(probs, k, form):
     return (m * csel).sum(dim=2).reshape(T, E)
 
 
-def route(n, t, g):
-    """Softmax over all experts, top-k, renormalised -> combine weights [T, E] (0 for unselected experts)."""
-    probs = torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)                  # [T, E] f32
+def route(n, t, g, allreduce=None, want_top=False):
+    """Softmax over all experts, top-k, renormalised -> combine weights [T, E] (0 for unselected experts).
+    want_top (MOE_SLOTS=row): -> (expert indices [T, K], their renormalised weights [T, K]) instead.
+    ROUTER=shard: this rank's partial logits over its hidden slice, summed by an f32 all-reduce (every rank receives the
+    same bits, so every rank selects the same experts)."""
+    if 'rws' in t:
+        logits = allreduce(torch.matmul(torch.index_select(n, 1, t['rcols']).float(), t['rws'].T))
+    else:
+        logits = torch.matmul(n.float(), t['rw'].T)
+    probs = torch.softmax(logits, dim=-1)                                              # [T, E] f32
     T = n.shape[0]
+    if want_top:
+        N = int(ROUTE[3:]) if ROUTE.startswith('pad') else T
+        padded = torch.cat((probs, torch.zeros(N - T, g.E, device=n.device) + probs[:1] * 0.0), dim=0) if T < N else probs
+        tk = torch.topk(padded, g.topk, dim=-1)
+        v = tk[0][:T]
+        return tk[1][:T], v / v.sum(dim=-1, keepdim=True)
     experts = torch.arange(g.E, device=n.device)
     if ROUTE in ('rank', 'rank2', 'tour'):
         w = probs * topk_mask(probs, g.topk, ROUTE)
@@ -385,15 +421,19 @@ def route(n, t, g):
     return torch.einsum('tke,tk->te', onehot, w)
 
 
-def moe_block(n, t, g, allreduce, mode='all'):
+def moe_block(n, t, g, allreduce, mode='all', ar_route=None):
     """Shared expert (TP-split, sigmoid-gated) + this rank's slices of the selected experts (glm_graphs.moe_block layout)."""
     T, E, EIl = n.shape[0], g.E, g.EIl
     sgate = torch.sigmoid(torch.matmul(n.float(), t['sgate'].reshape(1, -1).T))        # [T, 1] replicated
     shared = lin_partial(bf(silu_mul(lin(n, t, 'sg'), lin(n, t, 'su'))), t, 'sd') * sgate
-    comb = route(n, t, g)                                                              # [T, E]
+    rowslots = MOE_SLOTS == 'row' and mode == 'gather'
+    comb = route(n, t, g, ar_route or allreduce, want_top=rowslots)                    # [T, E] | ([T, K], [T, K])
+    if rowslots and MOE_DEBUG == 'route':
+        top, w = comb
+        comb = (w.unsqueeze(-1) * (top.unsqueeze(-1) == torch.arange(g.E, device=n.device).reshape(1, 1, g.E)).float()).sum(dim=1)
     if MOE_DEBUG in ('route', 'probs'):
         v = (comb if MOE_DEBUG == 'route' else torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)).reshape(T, -1).float()[:, :g.H]
-        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0
+        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm', 'rcols')) * 0.0
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     groups = MOE_SPLIT if (mode == 'gather' and MOE_SPLIT and T > MOE_SPLIT and T % MOE_SPLIT == 0 and not MOE_DEBUG) else T
     if groups != T:
@@ -405,7 +445,7 @@ def moe_block(n, t, g, allreduce, mode='all'):
     if MOE_DEBUG:
         v = shared if MOE_DEBUG == 'shared' else stage
         v = v.reshape(T, -1).float()[:, :g.H]
-        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm')) * 0.0   # every input stays a graph parameter
+        alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm', 'rcols')) * 0.0   # every input stays a graph parameter
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     return allreduce(shared + routed), {}
 
@@ -415,7 +455,27 @@ def moe_routed(n, comb, t, g, mode):
     the MOE_DEBUG stage tensor or None)."""
     T, E, EIl = n.shape[0], g.E, g.EIl
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [E, 2EIl, H], [E, EIl, H]
-    if mode == 'gather' and g.topk * T < E:
+    if isinstance(comb, tuple):
+        # MOE_SLOTS=row: slot r * K + j holds the j-th expert of row r (the router's topk indices, no union over the rows, no
+        # top-k over the experts, no [T, E] combine matrix). An expert selected by two rows is read twice; the union form
+        # pads its slots with unused experts instead, so the bytes are the same 10 R slices.
+        top, w = comb
+        K = g.topk
+        idx = top.reshape(T * K)
+        gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
+        gus = torch.index_select(gus, 0, idx) if gus is not None else None
+        dc = torch.index_select(dc, 0, idx) if dc is not None else None
+        if MOE_BMM and not MOE_DEBUG and gus is not None and dc is not None and not EXACT:
+            a, n8 = quant8(n)                                                          # [T, 1], [T, H] fp8
+            hgu = bmm8(n8, gu.reshape(T, K * 2 * EIl, g.H)).float() * a * gus.reshape(T, K * 2 * EIl)
+            hgu = G.bf(hgu).reshape(T, K, 2, EIl)
+            act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * w.unsqueeze(-1) * dc.reshape(T, K, EIl)
+            a2 = act.reshape(T, K * EIl)
+            a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+            routed = bmm8t((a2 / a).to(F8), dw.reshape(T, K * EIl, g.H)).float() * a
+            return routed, routed
+        comb = (w.unsqueeze(1) * torch.eye(T, device=n.device).reshape(T, T, 1)).reshape(T, T * K)   # row r uses its own K slots only
+    elif mode == 'gather' and g.topk * T < E:
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)                            # [1, E]
         ar = torch.arange(E, device=n.device).float().reshape(1, E)
@@ -463,6 +523,20 @@ def moe_routed(n, comb, t, g, mode):
     return routed, routed
 
 
+def bmm8(a8, w8):
+    """per-row fp8 contraction: a8 [T, H], w8 [T, O, H] -> [T, O] (f32 accumulate on the device; widened on the CPU mirror)."""
+    if a8.device.type == 'cpu':
+        return torch.einsum('th,toh->to', a8.float(), w8.float())
+    return torch.matmul(a8.unsqueeze(1), w8.transpose(1, 2)).squeeze(1)
+
+
+def bmm8t(a8, w8):
+    """per-row fp8 contraction over the first weight axis: a8 [T, I], w8 [T, I, H] -> [T, H]."""
+    if a8.device.type == 'cpu':
+        return torch.einsum('ti,tih->th', a8.float(), w8.float())
+    return torch.matmul(a8.unsqueeze(1), w8).squeeze(1)
+
+
 def silu_mul(gate, up):
     return gate * torch.sigmoid(gate) * up
 
@@ -471,15 +545,15 @@ def sublayer(kind, t, g, R, Q, P, allreduce, moe_mode='all'):
     """One sub-block with its pre-norm and residual -> (x_new, updated states)."""
     x = t['x']
     n = bf(rms(x, t['norm'], g.eps))
+    full = allreduce
     if AR_BF16 == '1' or (AR_BF16 == 'moe' and kind == 'moe'):
-        full = allreduce
         allreduce = lambda v: full(v.to(torch.bfloat16)).float()   # each rank's partial rounded to bf16, summed in bf16
     if kind == 'gdn':
         y, st = gdn_block(n, t, g, R, Q, allreduce)
     elif kind == 'gqa':
         y, st = gqa_block(n, t, g, R, Q, P, allreduce)
     elif kind == 'moe':
-        y, st = moe_block(n, t, g, allreduce, moe_mode)
+        y, st = moe_block(n, t, g, allreduce, moe_mode, ar_route=full)                # the router logits are always reduced in f32
     else:
         raise ValueError(kind)
     return x + bf(y), st
@@ -548,7 +622,11 @@ def weight_shapes(kind, g, fp8=True):
         s['qn'] = ((g.D,), f32); s['kn'] = ((g.D,), f32)
     elif kind == 'moe':
         proj('sg', g.SIl, H); proj('su', g.SIl, H); proj('sd', H, g.SIl)
-        s['sgate'] = ((H,), f32); s['rw'] = ((g.E, H), f32)
+        s['sgate'] = ((H,), f32)
+        if ROUTER == 'shard':
+            s['rws'] = ((g.E, H // g.TP), f32); s['rcols'] = ((H // g.TP,), torch.int64)
+        else:
+            s['rw'] = ((g.E, H), f32)
         s['egu'] = ((g.E, 2 * g.EIl, H), wt); s['ed'] = ((g.E, g.EIl, H), wt)
         if fp8:
             s['egu_s'] = ((g.E, 2 * g.EIl), f32); s['ed_c'] = ((g.E, g.EIl), f32)
@@ -656,7 +734,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

@@ -451,6 +451,15 @@ class Qwen35Model final : public Backend {
     void load_weights() {
         const auto t0 = Clock::now();
         const auto &files = prepared.at("files");
+        // ROUTER=shard graphs (inputs m.rws / m.rcols): rank r holds the router columns of its hidden slice, derived here
+        // from the prepared replicated router [E, H] f32. The full router is uploaded only when a loaded NEFF still binds
+        // it (60 x 8.4 MB per core otherwise saved).
+        bool need_rws = false, need_rw = false;
+        for (const auto &g : graphs)
+            for (const auto &n : g.inputs) {
+                need_rws |= n == "rws" || n.ends_with(".rws");
+                need_rw |= n == "rw" || n.ends_with(".rw");
+            }
         std::vector<std::future<void>> jobs;
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
@@ -461,6 +470,24 @@ class Qwen35Model final : public Backend {
                         const size_t bytes = e.at("bytes"), offset = e.at("offset");
                         if (offset > data.size() || bytes > data.size() - offset)
                             throw std::runtime_error(file + ": " + name + " lies outside the file");
+                        if (name.ends_with(".mlp.rw") && need_rws) {
+                            const size_t cols = size_t(hidden / tp), E = bytes / (4 * size_t(hidden));
+                            std::vector<float> slice(E * cols);
+                            const char *src = data.data() + offset;
+                            for (size_t x = 0; x < E; ++x)
+                                std::memcpy(slice.data() + x * cols, src + (x * size_t(hidden) + size_t(r) * cols) * 4, cols * 4);
+                            std::vector<int64_t> rc(cols);
+                            for (size_t c = 0; c < cols; ++c)
+                                rc[c] = int64_t(size_t(r) * cols + c);
+                            const std::string base = name.substr(0, name.size() - 2);
+                            Dev ds = alloc(r, slice.size() * 4, base + "rws"), dc = alloc(r, rc.size() * 8, base + "rcols");
+                            put(ds, slice.data(), slice.size() * 4);
+                            put(dc, rc.data(), rc.size() * 8);
+                            ranks[size_t(r)].t[base + "rws"] = ds;
+                            ranks[size_t(r)].t[base + "rcols"] = dc;
+                            if (!need_rw)
+                                continue;
+                        }
                         Dev d = alloc(r, bytes, name);
                         put(d, data.data() + offset, bytes);
                         ranks[size_t(r)].t[name] = d;
