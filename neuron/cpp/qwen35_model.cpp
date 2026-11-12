@@ -111,6 +111,8 @@ struct SpinBarrier {
 // weights named a.* / m.*) or "head", for one bucket.
 struct Graph {
     std::string kind, attn, mlp; // attn / mlp: the sub-blocks it contains ("" for none)
+    std::vector<std::string> seg; // "seg_gdn_gdn_gdn_gqa": the attention kinds of the consecutive whole layers it runs
+    bool has_gqa = false;         // binds a page table (gqa sub-block, or a segment containing one)
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0, slots = 0;
     std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
     std::vector<nrt_model_t *> model;        // [rank]
@@ -243,10 +245,17 @@ class Qwen35Model final : public Backend {
                 const size_t us = gr.kind.find('_', 6);
                 gr.attn = gr.kind.substr(6, us - 6);
                 gr.mlp = gr.kind.substr(us + 1);
+            } else if (gr.kind.rfind("seg_", 0) == 0) {
+                for (size_t at = 4; at < gr.kind.size();) {
+                    const size_t us = std::min(gr.kind.find('_', at), gr.kind.size());
+                    gr.seg.push_back(gr.kind.substr(at, us - at));
+                    at = us + 1;
+                }
             } else if (gr.kind == "gdn" || gr.kind == "gqa")
                 gr.attn = gr.kind;
             else if (gr.kind != "head")
                 gr.mlp = gr.kind;
+            gr.has_gqa = gr.attn == "gqa" || std::find(gr.seg.begin(), gr.seg.end(), "gqa") != gr.seg.end();
             gr.inputs = m.at("inputs").get<std::vector<std::string>>();
             gr.states = m.at("states").get<std::vector<std::string>>();
             gr.neff = dir.path() / "graph.neff";
@@ -299,7 +308,7 @@ class Qwen35Model final : public Backend {
     const Graph *find(const std::string &kind, int R, int Q, int P) const {
         const Graph *best = nullptr;
         for (const auto &g : graphs)
-            if (g.kind == kind && g.R == R && g.Q == Q && (g.attn != "gqa" || g.P >= P) && (!best || g.P < best->P))
+            if (g.kind == kind && g.R == R && g.Q == Q && (!g.has_gqa || g.P >= P) && (!best || g.P < best->P))
                 best = &g;
         return best;
     }
@@ -314,6 +323,21 @@ class Qwen35Model final : public Backend {
     // the fused graph of layer l (attention + MLP in one NEFF) for (R, Q), if traced
     const Graph *layer_graph(int l, int R, int Q, int P) const {
         return find("layer_" + attn_kind[size_t(l)] + "_" + mlp_kind[size_t(l)], R, Q, P);
+    }
+    // a segment graph whose layers are exactly layers l.. of the model, for (R, Q), at least P pages
+    const Graph *segment_graph(int l, int R, int Q, int P) const {
+        static const bool off = std::getenv("BEHEMOTH_NEURON_QWEN35_NOSEG") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_NOSEG"));
+        const Graph *best = nullptr;
+        for (const auto &g : graphs) {
+            if (off || g.seg.empty() || g.R != R || g.Q != Q || (g.has_gqa && g.P < P) || l + int(g.seg.size()) > layers)
+                continue;
+            bool same = true;
+            for (size_t i = 0; i < g.seg.size(); ++i)
+                same &= g.seg[i] == attn_kind[size_t(l) + i];
+            if (same && (!best || g.seg.size() > best->seg.size() || (g.seg.size() == best->seg.size() && g.P < best->P)))
+                best = &g;
+        }
+        return best;
     }
     const Graph *head_for(int T, int S) const {
         const Graph *best = nullptr;
@@ -380,7 +404,7 @@ class Qwen35Model final : public Backend {
                         }
                 }
             }
-            if (gr.attn == "gqa" && !v[0].table.count(gr.P))
+            if (gr.has_gqa && !v[0].table.count(gr.P))
                 for (int r = 0; r < tp; ++r)
                     v[size_t(r)].table[gr.P] = alloc(r, size_t(gr.R) * size_t(gr.P) * 8, "table");
         }
@@ -480,6 +504,12 @@ class Qwen35Model final : public Backend {
             if (name == "cos_sin") return st.cos_sin;
             if (name == "table") return st.table.at(g.P);
             std::string full = layer_prefix(l) + sub + name;
+            if (!g.seg.empty()) { // "l<i>.a.<w>" / "l<i>.m.<w>" / "l<i>.<state>" of layer l + i
+                const size_t dot = name.find('.');
+                const int li = l + std::stoi(name.substr(1, dot - 1));
+                const std::string rest = name.substr(dot + 1);
+                full = layer_prefix(li) + (rest.rfind("a.", 0) == 0 ? "attn." + rest.substr(2) : rest.rfind("m.", 0) == 0 ? "mlp." + rest.substr(2) : "attn." + rest);
+            } else
             if (name.rfind("a.", 0) == 0) full = layer_prefix(l) + "attn." + name.substr(2);
             if (name.rfind("m.", 0) == 0) full = layer_prefix(l) + "mlp." + name.substr(2);
             auto it = rank.t.find(full);
@@ -654,24 +684,35 @@ class Qwen35Model final : public Backend {
             if (!head)
                 throw std::runtime_error("Qwen35: no head NEFF for " + std::to_string(L.head_rows.size()) + " rows");
         }
-        // per layer: the fused layer NEFF when traced for this bucket, else the attention and MLP sub-block NEFFs
-        std::vector<std::vector<const Graph *>> plan(static_cast<size_t>(layers));
-        for (int l = 0; l < layers; ++l) {
+        // the launch plan: a segment NEFF covering the next layers when traced for this bucket, else the fused layer NEFF,
+        // else the attention and MLP sub-block NEFFs; each entry is (graph, first layer)
+        std::vector<std::pair<const Graph *, int>> plan;
+        for (int l = 0; l < layers;) {
+            if (const Graph *sg = segment_graph(l, L.R, L.Q, L.P)) {
+                plan.push_back({sg, l});
+                l += int(sg->seg.size());
+                continue;
+            }
             if (const Graph *f = layer_graph(l, L.R, L.Q, L.P))
-                plan[size_t(l)] = {f};
-            else
-                plan[size_t(l)] = {find(attn_kind[size_t(l)], L.R, L.Q, L.P), find(mlp_kind[size_t(l)], L.R, L.Q, 0)};
+                plan.push_back({f, l});
+            else {
+                plan.push_back({find(attn_kind[size_t(l)], L.R, L.Q, L.P), l});
+                plan.push_back({find(mlp_kind[size_t(l)], L.R, L.Q, 0), l});
+            }
+            ++l;
         }
         // every table width the bucket's mla graphs use gets the request pages, padded with the scratch page
         std::map<int, std::vector<int64_t>> tables;
-        for (const auto &v : plan)
-            for (const Graph *g : v)
-                if (g->attn == "gqa" && !tables.count(g->P)) {
+        for (const auto &entry : plan)
+            {
+                const Graph *g = entry.first;
+                if (g->has_gqa && !tables.count(g->P)) {
                     auto &t = tables[g->P];
                     t.assign(size_t(L.R) * size_t(g->P), pages_total - 1);
                     for (int r = 0; r < L.R; ++r)
                         std::copy_n(L.table.begin() + std::ptrdiff_t(r * L.P), std::min(L.P, g->P), t.begin() + std::ptrdiff_t(r * g->P));
                 }
+            }
         std::vector<int64_t> rows(head ? size_t(head->S) : 0, 0);
         for (size_t i = 0; i < L.head_rows.size(); ++i)
             rows[i] = L.head_rows[i];
@@ -698,8 +739,8 @@ class Qwen35Model final : public Backend {
                 static const int sync_bytes = std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC")) : 0;
                 static const int dump_x = std::getenv("NEURON_X_DUMP") ? std::atoi(std::getenv("NEURON_X_DUMP")) : 0; // 1: report non-finite layers, 2: every layer
                 std::vector<float> xr;
-                for (int l = 0; l < layers; ++l)
-                    for (const Graph *g : plan[size_t(l)]) {
+                for (const auto &[g, l] : plan) {
+                    {
                         const auto ts = Clock::now();
                         auto [in, o] = layer_set(*g, l, parity, r);
                         const auto te = Clock::now();
@@ -729,6 +770,7 @@ class Qwen35Model final : public Backend {
                                 std::cerr << "x after layer " << l << " (" << g->kind << ", pos " << L.pos[0] << "):" << rows << "\n";
                         }
                     }
+                }
                 const auto t1 = Clock::now();
                 if (head) {
                     put(st.rows.at(head->S), rows.data(), rows.size() * 8);
