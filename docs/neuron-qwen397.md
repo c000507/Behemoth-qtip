@@ -383,3 +383,20 @@ Per layer at Q=256 (layer_bench): gdn 3.1-3.2 ms, moe (all experts) 4.9-7.5 ms (
 
 What limits prefill now: per 256 tokens ~340 ms = 15 x (3 gdn x ~3 ms + gqa ~1 ms + 4 moe x ~3 ms); MoE-all and the gdn
 projections are roughly equal halves; the collective is ~70 ms of it in f32.
+
+### 8.11 Long-context decode: bf16 contraction of the paged keys (`ATT_BF16=1`)
+
+`gqa_block` gathered the request's pages and converted K|V to f32 before the two contractions (134 MB per row at 4096
+pages). With `ATT_BF16=1` the gathered bf16 pages are contracted directly (scores and values in bf16, softmax in f32).
+layer_bench gqa 1x1: P=512 0.535 -> 0.411 ms, **P=4096 3.58 -> 1.76 ms**; device vs CPU mirror 2.88e-2 (f32 form 2.84e-2);
+CPU mirror vs oracle unchanged (tiny models: 8.7e-3 -> 8.2e-3, 3.59e-2 -> 3.61e-2).
+
+| decode, 20-layer segments | f32 keys (8.8) | **`ATT_BF16=1`** |
+|---|---|---|
+| short | 24.5 ms | 24.5-27 (same graph cost at P=32; measured next to compile jobs) |
+| 8k | 26.7 | 28.0 (ditto) |
+| 32k | 47.9 | **33.9 ms, 29.5 tok/s** |
+| 64k | 66.0 | **40.0 ms, 25.0 tok/s** |
+
+Tokens: the 8k / 32k / 64k continuations are identical to the baseline's; the short prompt takes the other branch of the
+0.007-margin near tie at token 22 (reproducibly: 6/6 sequential runs identical). Oracle on its 200 tokens: status log.
