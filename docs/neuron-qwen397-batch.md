@@ -176,3 +176,79 @@ What would change the picture (not done):
 * Engine env: `OMP_NUM_THREADS=8 OMP_WAIT_POLICY=active` (the sampling loop has at most 8 rows per launch; a 128-thread
   team costs 1-5 ms per step). `BEHEMOTH_NEURON_STEP_LOG=1` prints `exec_ms` / `plan_ms` next to `layers_ms`.
 * Do not serve R = 16 (section 4).
+
+---
+
+# Part 2 (branch `qwen397-batch2`, 2026-11-12/13): second pass over the same question
+
+Continues sections 1-6 (bucket set T2 = `ROUTE=pad64 ATT_GATHER=flat`, 45.9 ms per step at 8 streams). Same instance, same
+method (`seq_<kind>...` chains at N = 2 / 8 for the in-launch cost of one block, 20-layer segments in `layer_bench`, the
+engine step log). Bucket sets of this part: **T3** (gathered decode, R = 1..16) and **T64** (dense decode, R = 64).
+
+## 7. Decomposition against the row count, as served now (T3)
+
+In-launch ms per sub-block (best variant per R, see 8), x 45 gdn + 15 gqa + 60 moe + 3 launches = one decode step:
+
+| per block, ms | R = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| gdn | 0.092 | 0.143 | | 0.163 | | | | 0.165 | | | 0.287 |
+| gqa, P = 32 (`flat`) | 0.149 | 0.184 | | 0.196 | | | | 0.271 | | | 0.522 |
+| moe, T2 (`pad64`, replicated router, slot union) | 0.171 | 0.257 | | 0.352 | | | | 0.472 | | | 2.99 |
+| moe, now | 0.123 | 0.202 | 0.278 | 0.325 | 0.380 | 0.454 | 0.457 | 0.459 | 0.785 | 0.720 | 0.871 (2 unions of 80) / 2.77 |
+
+| per decode step, ms | R = 1 | 2 | 3 | 4 | 6 | 8 | slope 1 -> 8 per extra row | what bounds it |
+|---|---|---|---|---|---|---|---|---|
+| gdn x 45 (5 projections, conv, recurrence, per-row state slot read / write) | 4.1 | 6.4 | | 7.3 | | 7.4 | 0.47 | op count; 5.7 MB per block = 1.0 ms per step at the DMA wall |
+| gqa x 15 (512 keys per row, per-row K\|V gather) | 2.2 | 2.8 | | 2.9 | | 4.1 | 0.27 | op count; per-row gather |
+| moe: norm, shared expert, all-reduce, residual | ~4.4 | | | 4.4 | | 4.7 | ~0 | op count |
+| moe: router (+ its all-reduce), softmax, top-10 | 1.5 | | | ~3 | | ~4.5 | 0.4 | was 8.4 MB of f32 router per block and rank (T2: 3.3 ms at R = 1); now 0.26 MB |
+| moe: slot selection (union of the rows' experts) | 0 (row slots) | 0 | 0 | 0 | 3 | 3.1 | 0.45 | topk(10 R of 512) + combine-weight gather; only R <= 4 can skip it (8.2) |
+| moe: 10 R expert slices, gate / up, SiLU, down | 1.5 | | | ~12 | | 15.3 | 2.0 | 3.9 MB per row and block: 0.94 ms per step and row at 250 GB/s, 1.42 at the 166 GB/s the gathered stream reaches |
+| launches (3 x 0.3) | 0.9 | 0.9 | 0.9 | 0.9 | 0.9 | 0.9 | 0 | |
+| **segments (3 launches), layer_bench** | **14.5** | 21.5 | 24.4 | 28.3 | 39.0 | **41.2** | 3.8 | |
+| segments, engine `layers_ms` | 14.9 | 22.0 | 24.9 | 29.3 | 39.8 | 41.6 | 3.8 | |
+| head (R rows x 7760 logits per rank) | 0.48 | 0.59 | 0.60 | 0.62 | 0.62 | 0.56 | 0.01 | |
+| host: logits read, greedy argmax over 248k logits per row, scheduler | 0.2 | 0.2 | 0.3 | 0.4 | 0.4 | 0.55 | 0.05 | was 1.0-1.6 ms (and +3 ms on steps with 8 fresh rows, 8.3) |
+| **step wall** | **15.6** | **22.8** | **25.8** | **30.3** | **40.8** | **42.7** | 3.9 | |
+| aggregate tok/s | 64.0 | 87.6 | 116 | 132 | 147 | **187** | | |
+
+The cost of one more row is not constant:
+
+* **1 -> 2 rows costs 7 ms, 2 -> 4 rows 3.7 ms per row, 6 -> 8 rows 1.0 ms per row.** The last figure is the byte floor
+  (3.9 MB of expert slices per row and block = 0.94 ms per step at 250 GB/s): at 6-8 rows a further row is already as
+  cheap as this layout allows. The whole excess sits below 6 rows, in steps of the compiler's schedule, not in bytes:
+  per block the second row adds 0.079 ms to the MoE (0.024 would be its bytes), 0.051 ms to gdn (the two rows' state
+  slots), 0.035 to gqa.
+* **The MoE block has plateaus and cliffs in the slot count**: 0.325 ms at 40 slots, 0.380 at 50, **0.454 / 0.457 /
+  0.459 at 60 / 70 / 80** (rows 7 and 8 are free once the sixth is paid), then 0.72-0.79 at 100-120 slots and 2.8-2.9 ms at
+  140-160 (the gather becomes a static scan of the expert tensors, section 2). **8 rows is the last good gathered
+  bucket**; 16 rows as two unions of 80 slots (`MOE_SPLIT=8`) cost 0.87 ms per block.
+* A plain MLP-like block (RMSNorm, fp8 quantisation, two fp8 matmuls, SiLU, residual: `tests/bench_layout_graph.py`)
+  costs 0.034 / 0.037 / 0.037 ms at 1 / 2 / 8 rows, so row-major activations are not the problem (a column-major
+  variant, hidden axis first, is slower: 0.044-0.047). What scales badly with rows is everything indexed per row:
+  the expert gather, the state slots, the K|V page gather, the router's top-k.
+
+## 8. Fixes of this pass
+
+| fix | effect |
+|---|---|
+| **`ROUTER=shard`**: every rank held the whole f32 router (8.4 MB read per MoE block = 65 % of the block's bytes at one row). Now rank r holds the router columns of its hidden slice (`rws` [512, 128], `rcols`; the engine derives them at load from the prepared replicated router) and the partial logits are summed by one more f32 all-reduce (15-30 us inside a launch). Every rank receives the same bits, so every rank selects the same experts (device test: ranks differ by 0) | moe block 0.171 -> 0.144 (R = 1), 0.257 -> 0.221 (2), 0.352 -> 0.339 (4), 0.472 -> 0.459 (8); 20-layer segment 5.68 -> 5.10 ms at R = 1 |
+| **`MOE_SLOTS=row`** (R <= 4): slot r K + j = the j-th expert of row r, straight from the router's top-k; no union over the rows, no top-k over the experts, no [T, E] combine matrix. `ROW_FORM=launder` (the indices through f32 and back) is the variant that the compiler streams at 2-4 rows | segment 5.10 -> **4.83** (R = 1), 7.92 -> **7.20** (2), 8.88 -> **8.12** (3), 10.22 -> **9.43** (4) ms per launch. At 6 / 8 rows every row form is a cliff (the gather is materialised through HBM: 38 MB written per block, 1.1-5 ms), so R >= 6 keeps the union |
+| sampling: greedy argmax + finite check of a contiguous row in one vectorised pass (`runtime/src/sampling.cpp`) | 0.92 -> 0.10-0.27 ms per step (75 us per 248k-logit row instead of 900) |
+| embedding table mapped with `MAP_POPULATE` | the first use of a token's embedding row was a page fault inside the step: steps with 8 fresh rows spent 3.1 ms between `forward` entry and the launch (T2: 46.6 ms forward for 43.5 ms exec); now 0.1 ms |
+| `GDN_DEC=1` (decode conv state by a static slice), `LIN_CSE=1` (one fp8 quantisation per projected tensor) | bit-identical; within noise (gdn 0.177 -> 0.165 at R = 8) |
+
+Measured and not used:
+
+| idea | result |
+|---|---|
+| `MOE_BMM=1` (every row contracts only its own 10 slots, batched matmul) | equal to `row` at R = 1 / 2 (4.84 / 7.18 ms per launch), worse at 3 / 4 (9.63 / 11.2), 5 ms per block at 8 rows |
+| row slots at 8 rows through a second top-k (`ROW_FORM=topk`), which the compiler streams | 0.468 ms per block against 0.459 for the union: the union stage itself was never the cost |
+| `GDN_FORM=fused` (decode recurrence with ONE contraction of the stored state: mem = d (S k), out = d (S q) + (k . q) delta; equal up to f32 rounding) | sub-block: 0.163 -> 0.135 (R = 4), 0.156 -> 0.145 (R = 8), but 0.72 ms at R = 1 (!); in the 20-layer segments -0.1..-0.25 ms per launch at best, not reproducible between runs. Not served (it is not bit-identical) |
+| column-major activations (hidden axis first) | slower (section 7) |
+| R = 10 / 12 / 14 buckets | cliff (section 7); R = 5 / 7 would cost 0.380 / 0.457 ms per MoE block: an R = 5 bucket would save ~4 ms per step for exactly 5 streams, not built |
+
+Numerics (`tests/test_qwen35_device.py`, single MoE blocks with random weights of the real shapes, device vs device):
+`ROUTER=shard` changes the router logits in the last f32 bit (32 partial sums instead of one dot product): block output
+max |diff| 1.4e-6..9e-5 (rel 5e-7..1.4e-5) against `pad64` at R = 1..8, all 32 ranks bit-equal; the row forms are
+bit-identical to the union form on top of that. Device vs CPU mirror unchanged (3.2e-2..3.6e-2 rel L2, the fp8 level).
