@@ -87,6 +87,11 @@ def check(d, meta, kind, parts, g, shards, neff_io):
             w = {k[len(sub) + 1:]: v for k, v in shards[r].items() if k.startswith(sub + '.')}
         else:
             w = {('a.' if k.startswith('attn.') else 'm.') + k.split('.', 1)[1]: v for k, v in shards[r].items()}
+        if any(n == 'rws' or n.endswith('.rws') for n in meta['inputs']):   # ROUTER=shard: the rank's router columns, as the engine derives them
+            cols = torch.arange(g.H // g.TP, dtype=torch.int64) + r * (g.H // g.TP)
+            for k in [k for k in w if k == 'rw' or k.endswith('.rw')]:
+                rw = w.pop(k)
+                w[k + 's'], w[k[:-2] + 'rcols'] = rw[:, cols].contiguous(), cols
         per_rank.append({**step, **w, **{k: v.clone() for k, v in states.items()}})
     ar, ref = ThreadAllReduce(g.TP), [None] * g.TP
     moe_mode = meta.get('moe', 'all')
