@@ -40,6 +40,7 @@ import glm_graphs as G  # noqa: E402  (bf, lin, lin_partial, mm8, F8, PAGE, zero
 
 PAGE = G.PAGE
 F8 = G.F8
+MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')  # gathered-expert slot selection: topk (original) | onehot (no top-k over experts)
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
@@ -288,14 +289,26 @@ def moe_block(n, t, g, allreduce, mode='all'):
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_ = gu.shape[0]
+
+    def dbg(v):   # an intermediate as the block output: first H columns, zero-padded
+        v = v.reshape(T, -1).float()[:, :g.H]
+        return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1]))), {}
+    if MOE_DEBUG == 'comb':
+        return dbg(comb)
+    if MOE_DEBUG == 'shared':
+        return dbg(shared)
     tt = {'w': gu.reshape(E_ * 2 * EIl, g.H)}
     if gus is not None:
         tt['w_s'] = gus.reshape(-1)
     hgu = lin(n, tt, 'w').reshape(T, E_, 2, EIl)
+    if MOE_DEBUG == 'hgu':
+        return dbg(hgu)
     act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * comb.unsqueeze(-1)
     if dc is not None:
         act = act * dc.reshape(1, E_, EIl)
     a2 = act.reshape(T, E_ * EIl)
+    if MOE_DEBUG == 'act':
+        return dbg(a2)
     wd = dw.reshape(E_ * EIl, g.H)
     if dc is not None:
         a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
@@ -304,6 +317,8 @@ def moe_block(n, t, g, allreduce, mode='all'):
         routed = torch.matmul(a2, wd.float())
     else:
         routed = torch.matmul(a2.to(torch.bfloat16), wd.to(torch.bfloat16)).float()
+    if MOE_DEBUG == 'routed':
+        return dbg(routed)
     return allreduce(shared + routed), {}
 
 
