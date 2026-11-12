@@ -21,7 +21,7 @@ build() {
   set -- $1
   if [ "$1" = head ]; then n=head_$2_$3; args="head $2 $3"; else n=$1_$2_$3_$4; args="$1 $2 $3 $4"; fi
   [ -f "$OUT/$n/graph.neff" ] && return 0
-  if [[ $1 == *moe ]] && [ "$5" = pre ]; then export MOE=all; else export MOE=${MOE_DEC:-all}; fi
+  if [[ $1 == *moe ]] && [ "$5" = pre ]; then export MOE=all ROUTE=topk; else export MOE=${MOE_DEC:-all} ROUTE=${ROUTE_DEC:-topk}; fi   # ROUTE_DEC=rank: decode buckets without torch.topk (required for R > 1 at E = 512)
   t0=$(date +%s)
   ( cd "$OUT" && python "$H/qwen35_graphs.py" "$OUT/$n" $args > "$OUT/$n.log" 2>&1 ) && echo "$n ok $(( $(date +%s) - t0 ))s" || echo "$n FAILED (see $OUT/$n.log)"
 }
