@@ -662,6 +662,7 @@ class Qwen35Model final : public Backend {
                 for (const auto &[width, t] : tables)
                     put(st.table.at(width), t.data(), t.size() * 8);
                 int parity = 0;
+                static const int sync_bytes = std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC")) : 0;
                 static const int dump_x = std::getenv("NEURON_X_DUMP") ? std::atoi(std::getenv("NEURON_X_DUMP")) : 0; // 1: report non-finite layers, 2: every layer
                 std::vector<float> xr;
                 for (int l = 0; l < layers; ++l)
@@ -669,6 +670,10 @@ class Qwen35Model final : public Backend {
                         auto [in, o] = layer_set(*g, l, parity, r);
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
                         parity ^= 1;
+                        if (sync_bytes) { // BEHEMOTH_NEURON_QWEN35_SYNC=n: blocking read of n bytes of the new residual on EVERY rank
+                            char probe[64]; // after every launch (the section-12 A/B: host-device synchronisation without the dump cost)
+                            check(nrt_tensor_read(st.x[parity].t, probe, 0, size_t(std::min(sync_bytes, 64))), "sync read");
+                        }
                         if (dump_x && r == 0) { // residual after this launch: max |x| per row, first non-finite layer
                             xr.resize(L.x.size());
                             check(nrt_tensor_read(st.x[parity].t, xr.data(), 0, xr.size() * 4), "read x");
