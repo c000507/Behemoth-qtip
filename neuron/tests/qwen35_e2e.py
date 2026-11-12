@@ -4,7 +4,8 @@ neuron_engine_cli (the real Engine / scheduler / NeuronModel on the prepared fp8
 writes run_<i>.json ({"prompt": ids, "generated": ids}) for test_qwen35_oracle.py.
 
 usage: BEHEMOTH_NEURON_NEFF_DIR=GRAPHS python neuron/tests/qwen35_e2e.py PREPARED_DIR CLI_BINARY OUT_DIR [max_new] [prompt...]
-  env: CONCURRENT=n (the same prompt n times in one submission), THINK=0 (template with enable_thinking=false), FILL=n
+  env: CONCURRENT=n (the same prompt n times in one submission; SEQUENTIAL=1: one after the other in the same engine
+       process - the run-to-run reproducibility test without reloading the weights), THINK=0 (template with enable_thinking=false), FILL=n
        (prepend ~n tokens of filler text to the prompt: long-context timing)
 """
 import json
@@ -73,7 +74,7 @@ def main():
             metas.append({'prompt': p[-80:], 'ids': ids})
     (out / 'requests.json').write_text(json.dumps(reqs))
     t0 = time.time()
-    r = subprocess.run([cli, str(model), str(out / 'requests.json')], capture_output=True, text=True)
+    r = subprocess.run([cli, str(model), str(out / 'requests.json')] + (['sequential'] if os.environ.get('SEQUENTIAL', '0') != '0' else []), capture_output=True, text=True)
     wall = time.time() - t0
     (out / 'cli_stderr.log').write_text(r.stderr)
     (out / 'cli_stdout.log').write_text(r.stdout)
@@ -98,6 +99,10 @@ def main():
         text = tok.decode(gen, skip_special_tokens=False)
         (out / f'run_{i}.json').write_text(json.dumps({'prompt': m['ids'], 'generated': gen, 'text': text, 'finish': req.get('finish')}))
         print(f'--- request {i}: prompt {len(m["ids"])} ids, {len(gen)} new tokens, finish={req.get("finish")}\n{text}\n')
+    if conc > 1:   # identical requests: first differing token index of each vs request 0 (None = identical)
+        g0 = res['requests'][0]['tokens']
+        fd = [next((i for i, (x, y) in enumerate(zip(r_['tokens'], g0)) if x != y), None if len(r_['tokens']) == len(g0) else min(len(r_['tokens']), len(g0))) for r_ in res['requests']]
+        print('REPRO first-diff vs request 0:', fd, 'lengths', [len(r_['tokens']) for r_ in res['requests']], 'errors', [r_.get('error') for r_ in res['requests'] if r_.get('error')])
     print(json.dumps({'wall_s': wall, 'engine_s': res.get('seconds'), 'new_tokens': total_new, 'metrics': res.get('metrics')}, indent=1))
 
 
