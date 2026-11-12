@@ -5,9 +5,10 @@ Each block: n = bf16(rms(x)); routed = experts(n, idx_k, w); x = x + bf16(routed
 expert indices ((top + offset_k) % 512, top a runtime input). layer_bench NEFF steps 1 times it; (K = 8 - K = 2) / 6 = ms per block.
 
   python bench_moe_nki.py build OUT T K {nki|torch} [key=value ...]   -> OUT/<form>[_opts]_T_K/graph.neff
-        nki options: gu=slot|grid act=slot|grid down=tile4|half static=0|1 parts=gu,down
+        nki options: gu=slot|grid act=slot|grid down=tile4|half pre=first|after static=0|1 parts=gu,down
         torch options: env ROW_FORM (default launder), MOE_BMM
   python bench_moe_nki.py num OUT T {nki|torch} NEFF_IO [key=value ...]   (device job: K = 1, random fp8 weights, vs the CPU mirror)
+  python bench_moe_nki.py knum OUT T NEFF_IO [key=value ...]   (device job: the kernel alone on host-built inputs vs its exact mirror)
 """
 import os
 import subprocess
@@ -42,7 +43,7 @@ def make_fn(form, T, K, opts):
     if form == 'nki':
         import nki_moe
         kernel = nki_moe.make_moe(T, S, gu=opts.get('gu', 'slot'), act_form=opts.get('act', 'slot'), down=opts.get('down', 'tile4'),
-                                  static=opts.get('static', '0') == '1', parts=tuple(opts.get('parts', 'gu,down').split(',')))
+                                  static=opts.get('static', '0') == '1', parts=tuple(opts.get('parts', 'gu,down').split(',')), pre=opts.get('pre', ''))
 
     def fn(x, top, w, *ws):
         for k in range(K):
@@ -98,8 +99,44 @@ def build(out, name, fn, inputs):
     return d
 
 
+def kernel_num(out, T, neff_io, opts):
+    """The kernel alone (host-quantised activation codes and host-built small inputs) vs the exact f32 mirror of its math."""
+    import nki_moe
+    import glm_repack as RP
+    S = T * TOPK
+    rand = np.random.default_rng(5)
+    n = G.bf(torch.from_numpy(rand.standard_normal((T, H)).astype(np.float32)))
+    idx = torch.from_numpy(np.concatenate([rand.permutation(E)[:TOPK] for _ in range(T)])).long()
+    if T > 1:
+        idx[TOPK:TOPK + 3] = idx[:3]
+    w = torch.softmax(torch.from_numpy(rand.standard_normal((T, TOPK)).astype(np.float32)), dim=-1)
+    comb = (w.unsqueeze(1) * torch.eye(T).reshape(T, T, 1)).reshape(T, S)
+    egu, egu_s, ed, ed_c = weight_inputs('torch', 1, rand)
+    n8T, ga, cw, idxg, idxd = nki_moe.graph_inputs(n, idx, comb, egu_s, ed_c)
+    egu_t = torch.from_numpy(nki_moe.relayout_egu(egu.view(torch.uint8).numpy())).view(F8)
+    args = [n8T, ga, cw, idxg, idxd, egu_t, ed.reshape(E * EI, H)]
+    kernel = nki_moe.make_moe(T, S, gu=opts.get('gu', 'slot'), act_form=opts.get('act', 'slot'), down=opts.get('down', 'tile4'), pre=opts.get('pre', ''))
+    tag = 'knum' + ''.join('_' + k + v for k, v in sorted(opts.items())) + f'_{T}'
+    d = build(out, tag, lambda *a: kernel(*a), args)
+    io = d / 'io'
+    io.mkdir(exist_ok=True)
+    for i, t in enumerate(args):
+        (io / f'in{i}').write_bytes(RP.tensor_bytes(t) if t.dtype != torch.int32 else t.contiguous().numpy().tobytes())
+    subprocess.run([neff_io, str(d / 'graph.neff'), str(io), '1'], check=True, stdout=subprocess.DEVNULL)
+    y = torch.from_numpy(np.frombuffer((io / 'out0.r0').read_bytes(), np.float32).reshape(T, H).copy())
+    hgu = G.bf((n8T.float().T @ torch.index_select(egu, 0, idx).reshape(S * 2 * EI, H).float().T) * ga).reshape(T, S, 2, EI)
+    act = (G.bf(hgu[:, :, 0] * torch.sigmoid(hgu[:, :, 0]) * hgu[:, :, 1]).reshape(T, S * EI) * cw)
+    a2 = torch.amax(torch.abs(act), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+    wd = torch.index_select(ed, 0, idx).reshape(S * EI, H).float()
+    rel = lambda a, b: float(torch.linalg.norm(a - b) / torch.linalg.norm(b))
+    print(f'KNUM {tag}: kernel vs exact mirror rel L2: act/a2 RNE {rel(y, ((act / a2).to(F8).float() @ wd) * a2):.3e} | '
+          f'act*(1/a2) RNE {rel(y, ((act * (1 / a2)).to(F8).float() @ wd) * a2):.3e} | unquantised act {rel(y, act @ wd):.3e} | finite {bool(torch.isfinite(y).all())}', flush=True)
+
+
 def main():
     mode, out, T = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    if mode == 'knum':
+        return kernel_num(out, T, sys.argv[4], dict(a.split('=') for a in sys.argv[5:]))
     if mode == 'build':
         K, form, rest = int(sys.argv[4]), sys.argv[5], sys.argv[6:]
     else:

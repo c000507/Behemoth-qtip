@@ -36,10 +36,12 @@ def relayout_egu(egu):
     return np.ascontiguousarray(egu.reshape(E, O2, KT, 128).transpose(0, 3, 2, 1)).reshape(E * 128, KT * O2)
 
 
-def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts=('gu', 'down')):
+def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts=('gu', 'down'), pre=''):
     """gu: 'slot' (one 64-column matmul per slot and K chunk) | 'grid' (one matmul per 8-slot group and K chunk over a strided moving view)
     act_form: 'slot' (SiLU pairing per slot) | 'grid' (3-D tiles)
     down: 'tile4' (4 slots per [128, 4096] tile) | 'half' (two passes of [128, 2048] half rows: 4 PSUM banks at a time)
+    pre: 'first' | 'after': all down tiles are read into one SBUF buffer [128, ND * 4096] before / after the gate|up groups (the down
+         DMAs do not depend on the activations, so they can overlap the gate|up matmuls); '' reads each tile inside the down loop.
     static: the DMAs read fixed rows (no indirection): the DMA ceiling of the geometry (wrong result unless idx = arange).
     parts: timing probes ('gu' only skips the down projection, 'down' only feeds zeros-derived activations)."""
     ND = -(-S // 4)
@@ -59,6 +61,17 @@ def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts
         _, jg = nl.mgrid[:128, :KT * O2]
         _, jd = nl.mgrid[:128, :H]
         act = nl.zeros((T, ND * 128), dtype=nl.float32, buffer=nl.sbuf)
+        if pre:
+            wdall = nl.ndarray((128, ND * H), dtype=ed.dtype, buffer=nl.sbuf)
+
+        def load_down():
+            for d in nl.affine_range(ND):
+                if static:
+                    wdall[:, nl.ds(d * H, H)] = nl.load(ed[nl.ds(d * 128, 128), :])
+                else:
+                    nisa.dma_copy(src=ed[tabd[i1, d], jd], dst=wdall[:, nl.ds(d * H, H)])
+        if pre == 'first':
+            load_down()
         if 'gu' in parts:
             for s0, ns in groups:                                                     # Python-level: 8-slot groups
                 wraw = nl.ndarray((128, ns * KT * O2), dtype=egu_t.dtype, buffer=nl.sbuf)
@@ -98,6 +111,8 @@ def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts
                     act[:, nl.ds(s0 * EI, ns * EI)] = nl.multiply(pb, cwt[:, nl.ds(s0 * EI, ns * EI)], dtype=nl.float32)
         else:
             act[:, 0:S * EI] = nl.copy(cwt)
+        if pre == 'after':
+            load_down()
         if 'down' not in parts:
             for jj in nl.affine_range(H // NC):
                 nl.store(y[:, nl.ds(jj * NC, NC)], nl.copy(act[:, 0:NC]) if S * EI >= NC else nl.zeros((T, NC), dtype=nl.float32, buffer=nl.sbuf))
@@ -108,7 +123,14 @@ def make_moe(T, S, gu='slot', act_form='slot', down='tile4', static=False, parts
         ax = nl.ndarray((128, ND * T), dtype=nl.float8_e4m3, buffer=nl.sbuf)
         for d in nl.affine_range(ND):
             ax[:, nl.ds(d * T, T)] = nl.copy(nisa.nc_transpose(a8[:, nl.ds(d * 128, 128)]), dtype=nl.float8_e4m3)
-        if down == 'tile4':
+        if pre:
+            accd = [nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum) for _ in nl.static_range(H // NC)]
+            for d in nl.sequential_range(ND):
+                for jj in nl.static_range(H // NC):
+                    accd[jj] += nl.matmul(ax[:, nl.ds(d * T, T)], _f8(wdall[:, nl.ds(d * H + jj * NC, NC)], ed.dtype), transpose_x=True)
+            for jj in nl.static_range(H // NC):
+                nl.store(y[:, nl.ds(jj * NC, NC)], nl.multiply(accd[jj], aa))
+        elif down == 'tile4':
             accd = [nl.zeros((T, NC), dtype=nl.float32, buffer=nl.psum) for _ in nl.static_range(H // NC)]
             for d in nl.sequential_range(ND):
                 wd = nl.ndarray((128, H), dtype=ed.dtype, buffer=nl.sbuf)
