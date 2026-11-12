@@ -143,3 +143,33 @@ safetensors paths).
   6.8.0-1044-aws (pin box: 6.17). Extra, not part of the pin: transformers 5.22.2, tokenizers 0.23.3, safetensors 0.8.0.
 * Checkpoint: 107 files, 806 819 566 361 bytes, HF -> `/mnt/scratch/raw` in 12 min (40 parallel files, ~1.1 GB/s
   average, 1.8 GB/s peak), every size equal to the HF manifest; sha256 against the LFS oids: see gate (c).
+
+**Gate (c), 2026-11-12 07:38 UTC: prepared set, graphs, single-launch device validation**
+* Raw checkpoint: sha256 of all 94 safetensors shards equal to the HF LFS oids (`verify_raw.sh`: bad=0).
+* Prepare (`qwen35_prepare.py /mnt/scratch/raw /mnt/scratch/prepared --tp 32 --weights fp8 --jobs 16 --threads 8`):
+  **283 s** for the 60 layers (43-63 s per layer, 16 in parallel), 1962 files, 415 624 443 408 bytes: 32 x (60 layer files of
+  205-215 MB + a 31.8 MB head) + 2.03 GB `embed.bin` + tokenizer / config files. Per core 12.01 GiB of weights, as
+  budgeted. (First attempt hung: forked pool workers of a process with live OpenMP threads; the pools now use spawn.)
+* `qwen35_verify_prepared.py` (2 ranks per layer, all 60 layers, 3192 tensors): 0 failures; dense shards bit-equal to
+  the per-rank reference `shard_layer`, expert codes x scales vs the bf16 source rel L2 max **2.65e-2** (E4M3 level),
+  heads and embedding bit-equal.
+* Archived: `s3://912935854432-neuron-build/qwen397/prepared/Qwen3.5-397B-A17B-tp32-fp8/` - 1963 objects (the set +
+  `MANIFEST.sha256` of every file + `VERIFY.log`), 415 624 443 408 bytes, equal to the local tree (128 parallel presigned
+  PUTs, ~5 min, ~1.4 GB/s Sydney -> us-east-1).
+* Graphs (`qwen35_build_buckets.sh`, TP=32, PAGES=4097, SLOTS=9, fp8, MOE_DEC=gather): gdn / moe / gqa x R {1, 4} and
+  Q {64, 256}, gqa P {32, 128, 512, 1024, 2048, 4096}, heads 1/1, 4/4, 64/1, 256/1: every bucket compiled in 9-31 s
+  (the unrolled Q=256 gdn recurrence 205 s, the fused layer NEFFs 202 s).
+* Device vs CPU mirror, random weights of the real per-rank shapes, one launch on all 32 cores (`test_qwen35_device.py`):
+  gdn 2.88e-2, gqa 2.84e-2, moe-gather 3.64e-2, fused layer_gdn_moe 7.09e-2, layer_gqa_moe 4.30e-2; **all 32 ranks'
+  outputs bit-identical** (the all-reduce over 16 chips is consistent).
+* Real layers (`test_qwen35_real_layer.py`, fused NEFFs, random input + state, f32 oracle `qwen35_moe_ref`):
+
+| layer | device vs mirror | fp8 mirror vs oracle | **device vs oracle** |
+|---|---|---|---|
+| 0 (gdn) | 3.33e-2 | 6.18e-2 | 5.83e-2 |
+| 3 (gqa) | 2.66e-2 | 3.79e-2 | 3.92e-2 |
+| 30 (gdn) | 4.16e-2 | 8.10e-2 | 7.35e-2 |
+| 58 (gdn) | 4.01e-2 | 7.19e-2 | 6.60e-2 |
+| 59 (gqa) | 5.34e-2 | 6.78e-2 | 5.76e-2 |
+
+  The same level as the 35B port (5.5-6.8e-2 per layer): the fp8 format, not the TP=32 sharding.
