@@ -104,6 +104,8 @@ resource "aws_iam_role_policy" "execution_secrets" {
 }
 
 # ------------------------------------------------------------------ backend task role: read-only on the model bucket
+# One role for every model's task (the pipeline's apply role may pass only the fixed stack role names, see
+# pipeline/iam.tf stack_role_arns), with one inline policy per model scoped to that model's prefixes.
 resource "aws_iam_role" "backend_task" {
   name                 = "${var.name}-backend-task"
   assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
@@ -111,6 +113,8 @@ resource "aws_iam_role" "backend_task" {
 }
 
 data "aws_iam_policy_document" "backend_task" {
+  for_each = local.models
+
   statement {
     sid       = "ListPrefixes"
     actions   = ["s3:ListBucket"]
@@ -119,9 +123,9 @@ data "aws_iam_policy_document" "backend_task" {
       test     = "StringLike"
       variable = "s3:prefix"
       values = [
-        var.model_s3_prefix, "${var.model_s3_prefix}/*",
-        var.graphs_s3_prefix, "${var.graphs_s3_prefix}/*",
-        local.prepared_prefix, "${local.prepared_prefix}/*",
+        each.value.model_s3_prefix, "${each.value.model_s3_prefix}/*",
+        each.value.graphs_s3_prefix, "${each.value.graphs_s3_prefix}/*",
+        each.value.prepared_iam_prefix, "${each.value.prepared_iam_prefix}/*",
       ]
     }
   }
@@ -129,9 +133,9 @@ data "aws_iam_policy_document" "backend_task" {
     sid     = "ReadObjects"
     actions = ["s3:GetObject"]
     resources = [
-      "${aws_s3_bucket.models.arn}/${var.model_s3_prefix}/*",
-      "${aws_s3_bucket.models.arn}/${var.graphs_s3_prefix}/*",
-      "${aws_s3_bucket.models.arn}/${local.prepared_prefix}/*",
+      "${aws_s3_bucket.models.arn}/${each.value.model_s3_prefix}/*",
+      "${aws_s3_bucket.models.arn}/${each.value.graphs_s3_prefix}/*",
+      "${aws_s3_bucket.models.arn}/${each.value.prepared_iam_prefix}/*",
     ]
   }
   dynamic "statement" {
@@ -144,9 +148,11 @@ data "aws_iam_policy_document" "backend_task" {
 }
 
 resource "aws_iam_role_policy" "backend_task" {
-  name   = "s3-read-models"
+  for_each = local.models
+
+  name   = each.value.policy_name
   role   = aws_iam_role.backend_task.id
-  policy = data.aws_iam_policy_document.backend_task.json
+  policy = data.aws_iam_policy_document.backend_task[each.key].json
 }
 
 # ------------------------------------------------------------------ router task role: control the backend service only
@@ -160,7 +166,7 @@ data "aws_iam_policy_document" "router_task" {
   statement {
     sid       = "BackendService"
     actions   = ["ecs:UpdateService", "ecs:DescribeServices"]
-    resources = [aws_ecs_service.backend.id] # service ARN
+    resources = [for k, s in aws_ecs_service.backend : s.id] # service ARNs
   }
   statement {
     sid       = "ListBackendTasks"
@@ -176,12 +182,12 @@ data "aws_iam_policy_document" "router_task" {
   statement {
     sid       = "ScaleBackendAsg"
     actions   = ["autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection"]
-    resources = [aws_autoscaling_group.backend.arn]
+    resources = local.backend_asg_arns
   }
   statement {
     sid       = "DescribeAsgs"
-    actions   = ["autoscaling:DescribeAutoScalingGroups"]
-    resources = ["*"] # Describe* takes no resource scoping
+    actions   = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:DescribeScalingActivities"] # activities: spot launch failures
+    resources = ["*"]                                                                              # Describe* takes no resource scoping
   }
   # Warm-pool reuse leaves a restarted instance DRAINING; the router sets idle ones back to ACTIVE during a startup.
   statement {

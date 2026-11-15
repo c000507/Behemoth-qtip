@@ -1,5 +1,10 @@
 # Scale-to-zero Neuron serving on ECS (spot trn1.2xlarge + Fargate router)
 
+**Several models:** the stack now serves N models (`models` map, one ECS service + ASG(s) + capacity provider(s) per
+model; the router wakes only the model a request names, caps how many run at once, and runs them on spot with an
+on-demand fallback). Design, variables, migration and rollback: [MULTI_MODEL.md](MULTI_MODEL.md). The single-model
+description below still holds per model.
+
 Nothing here has been applied. `terraform validate` and the router unit tests pass locally; every AWS-side
 assumption still has to be checked against the account (see "Unverified").
 

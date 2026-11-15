@@ -4,13 +4,13 @@ output "s3_bucket" {
 }
 
 output "model_s3_uri" {
-  description = "Where the checkpoint must be uploaded."
-  value       = "s3://${aws_s3_bucket.models.bucket}/${var.model_s3_prefix}/"
+  description = "Per model: where the checkpoint must be uploaded."
+  value       = { for k, m in local.models : k => "s3://${aws_s3_bucket.models.bucket}/${m.model_s3_prefix}/" }
 }
 
 output "graphs_s3_uri" {
-  description = "Where the compiled graph buckets must be uploaded."
-  value       = "s3://${aws_s3_bucket.models.bucket}/${var.graphs_s3_prefix}/"
+  description = "Per model: where the compiled graph buckets must be uploaded."
+  value       = { for k, m in local.models : k => "s3://${aws_s3_bucket.models.bucket}/${m.graphs_s3_prefix}/" }
 }
 
 output "backend_ecr_url" {
@@ -28,7 +28,26 @@ output "cluster_name" {
 }
 
 output "backend_service_name" {
-  value = aws_ecs_service.backend.name
+  description = "Per model: its ECS service."
+  value       = { for k, s in aws_ecs_service.backend : k => s.name }
+}
+
+output "backend_asg_name" {
+  description = "Per model: its primary ASG, and the on-demand fallback ASG of a spot model (null without one)."
+  value = { for k, _ in local.models : k => {
+    primary  = local.primary_asg[k]
+    fallback = lookup(local.fallback_asg, k, null)
+  } }
+}
+
+output "served_models" {
+  description = "Per model: the ids the router serves, capacity, idle timeout."
+  value = { for k, m in local.models : k => {
+    model_ids     = m.model_ids
+    capacity      = m.use_spot ? (m.spot_fallback ? "spot, on-demand fallback" : "spot") : "on-demand"
+    idle_timeout  = m.idle_timeout_seconds
+    default_model = k == local.default_model
+  } }
 }
 
 output "router_service_name" {

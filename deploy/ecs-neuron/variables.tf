@@ -109,20 +109,20 @@ variable "s3_kms_key_arn" {
 }
 
 variable "model_s3_prefix" {
-  description = "Key prefix of the checkpoint directory (no leading/trailing slash)."
+  description = "Single-model mode only (models = {}): Key prefix of the checkpoint directory (no leading/trailing slash)."
   type        = string
   default     = "models/cydonia-24b-fp8"
 }
 
 variable "graphs_s3_prefix" {
-  description = "Key prefix of the compiled graph bucket directory (one subdirectory per bucket with graph.neff + meta.json)."
+  description = "Single-model mode only (models = {}): Key prefix of the compiled graph bucket directory (one subdirectory per bucket with graph.neff + meta.json)."
   type        = string
   default     = "graphs/cydonia-24b-fp8-kv"
 }
 
 # ------------------------------------------------------------------ images
 variable "prepared_s3_prefix" {
-  description = "Optional prefix of prepared shards (neuron_server BEHEMOTH_NEURON_WRITE_PREPARED output: layout.json + model-layer-NNNNN.bin): the backend streams these instead of the safetensors layer files and skips the expansion pass. Must match the graphs' layout (the server checks layout.json)."
+  description = "Single-model mode only (models = {}): Optional prefix of prepared shards (neuron_server BEHEMOTH_NEURON_WRITE_PREPARED output: layout.json + model-layer-NNNNN.bin): the backend streams these instead of the safetensors layer files and skips the expansion pass. Must match the graphs' layout (the server checks layout.json)."
   type        = string
   default     = ""
 }
@@ -199,13 +199,13 @@ variable "backend_root_volume_gb" {
 }
 
 variable "backend_use_spot" {
-  description = "Run the trn backend on spot (true) or on-demand (false). Spot needs the 'All Trn Spot Instance Requests' vCPU quota; on-demand uses 'Running On-Demand Trn instances'. Switching only changes the ASG's instances distribution (in place)."
+  description = "Default of models[*].use_spot: run a model's trn instance on spot (true; a spot ASG, plus an on-demand fallback ASG with backend_spot_fallback) or on-demand (false). Spot needs the 'All Trn Spot Instance Requests' vCPU quota; on-demand uses 'Running On-Demand Trn instances'. Switching creates/destroys the model's spot ASG; an existing ASG is never converted."
   type        = bool
   default     = true
 }
 
 variable "backend_warm_pool" {
-  description = "On-demand only: keep one stopped, pre-initialised backend instance in an ASG warm pool (cold start skips launch, boot and the image pull; costs the stopped instance's root volume, ~$8/month for 100 GB gp3)."
+  description = "Default of models[*].warm_pool for on-demand models: keep one stopped, pre-initialised backend instance in an ASG warm pool (cold start skips launch, boot and the image pull; costs the stopped instance's root volume, ~$8/month for 100 GB gp3). Spot models use backend_fallback_warm_pool for their on-demand fallback ASG."
   type        = bool
   default     = true
 }
@@ -223,7 +223,7 @@ variable "backend_port" {
 }
 
 variable "backend_model_name" {
-  description = "BEHEMOTH_MODEL_NAME reported by the backend."
+  description = "Single-model mode only (models = {}): BEHEMOTH_MODEL_NAME reported by the backend."
   type        = string
   default     = "cydonia-24b"
 }
@@ -259,13 +259,13 @@ variable "backend_startup_grace_seconds" {
 }
 
 variable "backend_extra_env" {
-  description = "Extra environment for neuron_server (e.g. BEHEMOTH_NEURON_LOAD_THREADS)."
+  description = "Single-model mode only (models = {}): Extra environment for neuron_server (e.g. BEHEMOTH_NEURON_LOAD_THREADS)."
   type        = map(string)
   default     = {}
 }
 
 variable "backend_extra_server_args" {
-  description = "Extra neuron_server flags (e.g. \"--prefix-cache-slots 64\")."
+  description = "Single-model mode only (models = {}): Extra neuron_server flags (e.g. \"--prefix-cache-slots 64\")."
   type        = string
   default     = ""
 }
@@ -280,6 +280,130 @@ variable "s5cmd_workers" {
   description = "Parallel files for the S3 pull."
   type        = number
   default     = 64
+}
+
+# ------------------------------------------------------------------ models (MULTI_MODEL.md)
+variable "models" {
+  description = <<-EOT
+    Models to serve, keyed by a short name ([a-z0-9-], <= 20 chars). Each gets its own ECS service, task definition,
+    launch template, ASG(s), capacity provider(s) and S3 read policy; the router wakes only the model a request names.
+    Empty = one model built from the single-model variables (model_s3_prefix, model_ids, backend_extra_env, ...) under
+    the key "ornith" with the pre-multi-model resource names. Unset optional fields fall back to the global backend_* /
+    router variables. The entry keyed "ornith" with legacy_names = true keeps the resources (and names) that existed
+    before the refactor (moved blocks in models.tf); any other key creates new resources named <name>-...-<key>.
+  EOT
+  type = map(object({
+    model_s3_prefix    = string
+    graphs_s3_prefix   = string
+    prepared_s3_prefix = optional(string, "")
+    model_ids          = list(string)     # OpenAI `model` values served (first = BEHEMOTH_MODEL_NAME by default)
+    model_name         = optional(string) # BEHEMOTH_MODEL_NAME
+    extra_server_args  = optional(string, "")
+    extra_env          = optional(map(string), {}) # replaces backend_extra_env for this model
+    image              = optional(string)          # full image reference; default the stack's backend image
+    legacy_names       = optional(bool, false)
+
+    instance_types              = optional(list(string))
+    use_spot                    = optional(bool)
+    spot_fallback               = optional(bool) # spot only: an on-demand fallback ASG + capacity provider
+    spot_fallback_after_seconds = optional(number)
+    spot_max_price              = optional(string)
+    warm_pool                   = optional(bool) # on-demand ASG (primary, or the spot fallback): stopped warm instance
+    cpu                         = optional(number)
+    memory_reservation_mib      = optional(number)
+    memory_hard_limit_mib       = optional(number)
+    shm_size_mib                = optional(number)
+    startup_grace_seconds       = optional(number)
+
+    idle_timeout_seconds = optional(number)
+    max_wait_seconds     = optional(number)
+    cold_nonstream_mode  = optional(string)
+    min_count            = optional(number, 0) # 1 = always running (never idle-stopped or evicted)
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for k, _ in var.models : can(regex("^[a-z0-9][a-z0-9-]{0,19}$", k))])
+    error_message = "models keys must match ^[a-z0-9][a-z0-9-]{0,19}$ (they become parts of AWS resource names)."
+  }
+  validation {
+    condition     = alltrue([for k, m in var.models : !m.legacy_names || k == "ornith"])
+    error_message = "legacy_names is only valid on the key \"ornith\" (the moved blocks in models.tf point there)."
+  }
+  validation {
+    condition     = length(flatten([for m in var.models : m.model_ids])) == length(distinct(flatten([for m in var.models : m.model_ids])))
+    error_message = "model_ids must be unique across models."
+  }
+  validation {
+    condition     = alltrue([for m in var.models : length(m.model_ids) > 0 && contains([0, 1], m.min_count)])
+    error_message = "every model needs at least one model id; min_count is 0 or 1."
+  }
+  validation {
+    condition     = alltrue([for m in var.models : m.cold_nonstream_mode == null ? true : contains(["keepalive", "wait", "reject"], m.cold_nonstream_mode)])
+    error_message = "cold_nonstream_mode must be keepalive, wait or reject."
+  }
+}
+
+variable "default_model" {
+  description = "Model key used for requests without a `model` field (and listed first by /v1/models). Empty = \"ornith\" if present, else the first key."
+  type        = string
+  default     = ""
+}
+
+variable "max_active_models" {
+  description = "Most models starting or running at once (each holds one trn instance: bounds spot/on-demand vCPU quota use and cost)."
+  type        = number
+  default     = 2
+  validation {
+    condition     = var.max_active_models >= 1
+    error_message = "max_active_models must be >= 1."
+  }
+}
+
+variable "cap_policy" {
+  description = "Cold request for a model while max_active_models are active: \"evict\" stops the longest-idle active model (nothing in flight, idle >= cap_min_idle_seconds, min_count 0) and starts the new one, else 503; \"reject\" always answers 503 + Retry-After."
+  type        = string
+  default     = "evict"
+  validation {
+    condition     = contains(["evict", "reject"], var.cap_policy)
+    error_message = "cap_policy must be evict or reject."
+  }
+}
+
+variable "cap_min_idle_seconds" {
+  description = "An active model must have been idle this long before cap_policy = evict may stop it."
+  type        = number
+  default     = 30
+}
+
+variable "backend_spot_fallback" {
+  description = "With spot: also create an on-demand ASG + capacity provider per model; the router moves a model's service there when its spot ASG cannot launch (failed launch activity, or no instance after spot_fallback_after_seconds). false = spot only (a spot shortage leaves the model down until capacity returns)."
+  type        = bool
+  default     = true
+}
+
+variable "spot_fallback_after_seconds" {
+  description = "Spot fallback: seconds into a startup without any spot instance (pending or in service) before the router falls back to on-demand. A failed spot launch falls back at once."
+  type        = number
+  default     = 240
+}
+
+variable "backend_fallback_warm_pool" {
+  description = "Warm pool (one stopped, pre-initialised instance) on each on-demand fallback ASG: a fallback start skips launch + boot + image pull. Costs the stopped root volume (~$8/month for 100 GB gp3) per model."
+  type        = bool
+  default     = true
+}
+
+variable "router_lost_retries" {
+  description = "Times the router re-wakes a model and re-sends a request whose backend vanished (spot interruption, crash) before any byte was returned. 0 = 503 at once."
+  type        = number
+  default     = 1
+}
+
+variable "router_stream_loss_error" {
+  description = "Backend lost mid-stream: end the SSE stream with an error event + [DONE] (true) instead of a bare EOF."
+  type        = bool
+  default     = true
 }
 
 # ------------------------------------------------------------------ router
@@ -302,7 +426,7 @@ variable "router_memory" {
 }
 
 variable "model_ids" {
-  description = "Model ids returned by the router's GET /v1/models."
+  description = "Single-model mode only (models = {}): Model ids returned by the router's GET /v1/models."
   type        = list(string)
   default     = ["cydonia-24b"]
 }

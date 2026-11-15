@@ -17,6 +17,8 @@ backend_instance_types = ["trn1.2xlarge"]
 backend_image_tag      = "latest"    # or the git short sha printed by backend/build_and_push.sh
 router_image_tag       = "latest"
 
+# Several models: see models.auto.tfvars and MULTI_MODEL.md (one service/ASG per model, the router wakes the one a
+# request names). The single-model variables below are used only while `models` is empty.
 model_s3_prefix    = "models/cydonia-24b-fp8"
 graphs_s3_prefix   = "graphs/cydonia-24b-fp8-kv"
 backend_model_name = "cydonia-24b"

@@ -440,6 +440,7 @@ data "aws_iam_policy_document" "workload_boundary" {
     sid = "BackendAsg" # the router scales the backend ASG directly
     actions = [
       "autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection",
+      "autoscaling:DescribeScalingActivities", # spot launch failures -> on-demand fallback (MULTI_MODEL.md)
     ]
     resources = ["*"]
   }

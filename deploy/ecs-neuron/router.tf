@@ -6,14 +6,34 @@ resource "aws_cloudwatch_log_group" "router" {
 locals {
   router_image = "${aws_ecr_repository.router.repository_url}:${var.router_image_tag}${var.router_image_digest != "" ? "@${var.router_image_digest}" : ""}"
 
+  # router.py ModelSpec fields, one entry per model (the router maps a request's `model` to its entry)
+  router_models = [for k, m in local.models : {
+    name                       = k
+    ids                        = m.model_ids
+    service                    = aws_ecs_service.backend[k].name
+    asg_name                   = local.primary_asg[k]
+    capacity_provider          = local.primary_cp[k]
+    fallback_asg_name          = lookup(local.fallback_asg, k, null)
+    fallback_capacity_provider = lookup(local.fallback_cp, k, null)
+    spot_fallback_after_s      = m.fallback_after
+    idle_timeout_s             = m.idle_timeout_seconds
+    max_wait_s                 = m.max_wait_seconds
+    cold_nonstream_mode        = m.cold_nonstream_mode
+    min_count                  = m.min_count
+  }]
+
   router_env = {
     AWS_REGION          = var.region
     ECS_CLUSTER         = aws_ecs_cluster.this.name
-    ECS_SERVICE         = aws_ecs_service.backend.name
-    BACKEND_ASG         = aws_autoscaling_group.backend.name
+    MODELS_JSON         = jsonencode(local.router_models)
+    DEFAULT_MODEL       = local.default_model
+    MAX_ACTIVE_MODELS   = tostring(var.max_active_models)
+    CAP_POLICY          = var.cap_policy
+    CAP_MIN_IDLE_S      = tostring(var.cap_min_idle_seconds)
+    LOST_RETRIES        = tostring(var.router_lost_retries)
+    STREAM_LOSS_ERROR   = tostring(var.router_stream_loss_error)
     BACKEND_PORT        = tostring(var.backend_port)
     LISTEN_PORT         = tostring(var.router_port)
-    MODEL_IDS           = join(",", var.model_ids)
     MODEL_OWNED_BY      = var.model_owned_by
     PROXY_PATHS         = join(",", var.proxy_paths)
     IDLE_TIMEOUT_S      = tostring(var.idle_timeout_seconds)
@@ -100,7 +120,7 @@ resource "aws_ecs_service" "router" {
   }
 
 
-  # single router: its in-memory state (in-flight count, idle timer) must not be split across replicas
+  # single router: its in-memory state (in-flight counts, idle timers, the active-model cap) must not be split across replicas
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 

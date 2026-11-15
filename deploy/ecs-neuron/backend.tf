@@ -6,27 +6,28 @@ resource "aws_cloudwatch_log_group" "backend" {
 locals {
   backend_image = "${data.aws_ecr_repository.backend.repository_url}:${var.backend_image_tag}${var.backend_image_digest != "" ? "@${var.backend_image_digest}" : ""}"
 
-  # IAM needs some prefix even when prepared shards are off; a name nothing is ever written under
-  prepared_prefix = var.prepared_s3_prefix != "" ? var.prepared_s3_prefix : "prepared/unused"
-  backend_env = merge({
+  backend_env = { for k, m in local.models : k => merge({
     AWS_REGION              = var.region
     S3_BUCKET               = aws_s3_bucket.models.bucket
-    MODEL_S3_PREFIX         = var.model_s3_prefix
-    GRAPHS_S3_PREFIX        = var.graphs_s3_prefix
-    PREPARED_S3_PREFIX      = var.prepared_s3_prefix
+    MODEL_S3_PREFIX         = m.model_s3_prefix
+    GRAPHS_S3_PREFIX        = m.graphs_s3_prefix
+    PREPARED_S3_PREFIX      = m.prepared_s3_prefix
     DATA_DIR                = "/data"
     PORT                    = tostring(var.backend_port)
     S5CMD_WORKERS           = tostring(var.s5cmd_workers)
-    STARTUP_GRACE_S         = tostring(var.backend_startup_grace_seconds)
+    STARTUP_GRACE_S         = tostring(m.startup_grace)
     NEURON_RT_VISIBLE_CORES = "0-1"
     NEURON_RT_ROOT_COMM_ID  = "127.0.0.1:62128"
-    BEHEMOTH_MODEL_NAME     = var.backend_model_name
-    EXTRA_SERVER_ARGS       = var.backend_extra_server_args
-  }, var.backend_extra_env)
+    BEHEMOTH_MODEL_NAME     = m.model_name
+    EXTRA_SERVER_ARGS       = m.extra_server_args
+  }, m.extra_env) }
 }
 
+# One task definition + service per model (local.models). The legacy entry keeps family/service "<name>-backend".
 resource "aws_ecs_task_definition" "backend" {
-  family                   = "${var.name}-backend"
+  for_each = local.models
+
+  family                   = each.value.service_name
   requires_compatibilities = ["EC2"]
   network_mode             = "awsvpc" # task gets its own ENI; DescribeTasks reports its private IP to the router
   execution_role_arn       = aws_iam_role.execution.arn
@@ -41,20 +42,20 @@ resource "aws_ecs_task_definition" "backend" {
   # null-valued keys (e.g. no hard memory limit) are dropped so the provider sees no perpetual diff
   container_definitions = jsonencode([{ for k, v in {
     name              = "neuron-server"
-    image             = local.backend_image
+    image             = each.value.image
     essential         = true
-    cpu               = var.backend_cpu
-    memoryReservation = var.backend_memory_reservation_mib
-    memory            = var.backend_memory_hard_limit_mib > 0 ? var.backend_memory_hard_limit_mib : null
+    cpu               = each.value.cpu
+    memoryReservation = each.value.mem_reservation
+    memory            = each.value.mem_hard_limit > 0 ? each.value.mem_hard_limit : null
     # hostPort / volumesFrom / capabilities.drop / configure_at_launch spelled out as ECS stores them: otherwise every plan
     # replaces the task definition, and each apply restarts a running backend
     portMappings = [{ containerPort = var.backend_port, hostPort = var.backend_port, protocol = "tcp" }]
     volumesFrom  = []
-    environment  = [for k, v in local.backend_env : { name = k, value = v }]
+    environment  = [for k, v in local.backend_env[each.key] : { name = k, value = v }]
     mountPoints  = [{ sourceVolume = "data", containerPath = "/data", readOnly = false }]
     linuxParameters = {
       devices            = [{ hostPath = "/dev/neuron0", containerPath = "/dev/neuron0", permissions = ["read", "write"] }]
-      sharedMemorySize   = var.backend_shm_size_mib
+      sharedMemorySize   = each.value.shm_size_mib
       initProcessEnabled = true
       capabilities       = { add = ["IPC_LOCK"], drop = [] } # pinned host memory for Neuron DMA (with memlock ulimit)
     }
@@ -76,20 +77,24 @@ resource "aws_ecs_task_definition" "backend" {
       options = {
         awslogs-group         = aws_cloudwatch_log_group.backend.name
         awslogs-region        = var.region
-        awslogs-stream-prefix = "backend"
+        awslogs-stream-prefix = each.value.log_prefix
       }
     }
   } : k => v if v != null }])
 }
 
 resource "aws_ecs_service" "backend" {
-  name            = "${var.name}-backend"
+  for_each = local.models
+
+  name            = each.value.service_name
   cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.backend.arn
+  task_definition = aws_ecs_task_definition.backend[each.key].arn
   desired_count   = 0 # the router owns desiredCount (0 <-> 1)
 
+  # the model's spot (or, without spot, on-demand) capacity provider; the router moves a spot model to its on-demand
+  # provider when spot cannot launch and back on its next stop
   capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.trn_spot.name
+    capacity_provider = local.primary_cp[each.key]
     weight            = 1
     base              = 0
   }
@@ -112,6 +117,9 @@ resource "aws_ecs_service" "backend" {
   enable_ecs_managed_tags = true
   propagate_tags          = "SERVICE"
   wait_for_steady_state   = false
+  # required to change capacity_provider_strategy (spot <-> on-demand, and resetting a router fallback left in place
+  # when Terraform runs); with desiredCount 0 a new deployment starts nothing, a running task is replaced
+  force_new_deployment = true
 
   lifecycle {
     ignore_changes = [desired_count]
