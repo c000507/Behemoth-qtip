@@ -36,8 +36,8 @@ models = {
       BEHEMOTH_NEURON_PREFIX_HOST_GB         = "4"
     }
 
-    use_spot      = true # spot trn1.2xlarge; no warm pool on spot
-    spot_fallback = true # on-demand fallback ASG (with a warm pool) when spot cannot launch
+    use_spot      = false # spot disabled (spot placement score 1/10: launches fail); on-demand with a warm pool
+    spot_fallback = false
   }
 
   # Cydonia 24B FP8 (Mistral-Small architecture: the Llama/Mistral engine path, as Devstral), TP=2, fp8 KV, 32k context.
@@ -59,7 +59,7 @@ models = {
       BEHEMOTH_NEURON_EMBED_RESIDENT = "1"
     }
 
-    use_spot      = true
-    spot_fallback = true
+    use_spot      = false # spot disabled, see ornith
+    spot_fallback = false
   }
 }
