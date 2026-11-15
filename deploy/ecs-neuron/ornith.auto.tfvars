@@ -3,7 +3,7 @@
 # Everything else (network, images, router, tunnel) still comes from that file. Contains no secrets.
 # Revert: delete this file (or git revert the commit) and run the pipeline: the Devstral prefixes are untouched in S3.
 model_s3_prefix    = "models/ornith-reap20-v3-fp8"
-graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8"
+graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-bound"
 prepared_s3_prefix = "" # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
 backend_model_name = "ornith-1.5-35b-a3b-reap20-v3"
 model_ids          = ["ornith-1.5-35b-a3b-reap20-v3"]
@@ -16,7 +16,8 @@ backend_extra_server_args = "--prefill-chunk 256 --max-batch-requests 8 --prefix
 # STREAM_AHEAD, EMBED_RESIDENT) do not apply. STREAM_LOAD=0: the prepared dir has no model-layer-*.bin files to stream.
 backend_extra_env = {
   STREAM_LOAD                         = "0"
-  BEHEMOTH_NEURON_QWEN35_MIN_DECODE_R = "4" # workaround for the 1-row gdn NEFF race ("Nonfinite model logits"); 15.1 tok/s at 1 stream
+  # MIN_DECODE_R removed: the graph set's gdn_{1,2,4}_1_32 are GDN_SLOT=bound NEFFs (no dynamic state DMA; behemoth-reap-perf
+  # docs/neuron-reap-nonfinite.md); needs the engine change in neuron/cpp/qwen35_model.cpp. 1 stream 15.1 -> 22.1 tok/s.
   # prefix cache with recurrent-state snapshots (docs/neuron-reap-prefix-cache.md): 62.8 MiB per snapshot, every 2048 tokens
   # on the 256-token chunk grid (ALIGN: cached output == cache-off output), <= 4 GB of snapshots + <= 4 GB of K/V host pages
   BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE    = "1"

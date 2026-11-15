@@ -117,6 +117,10 @@ struct Graph {
     std::vector<std::string> seg; // "seg_gdn_gdn_gdn_gqa": the attention kinds of the consecutive whole layers it runs
     bool has_gqa = false;         // binds a page table (gqa sub-block, or a segment containing one)
     bool has_gdn = false;         // runs gated-delta layers (gdn sub-block, or a segment containing one): defines a decode row bucket
+    bool bound = false;           // meta gdn_slot "bound": a gdn graph that takes every row's state as its own one-slot tensor (no slot / vslot
+                                  // input); the engine binds the slices of the launch's slots (docs/neuron-reap-nonfinite.md: no dynamic state DMA)
+    std::vector<std::string> bound_states; // bound: the NEFF's state inputs in order ("kstate" or "kstate_<row>"); states then holds the base names
+    std::vector<std::string> extra;        // bound verify: outputs 1.. before the states, "kstate@<i>": the state after position i -> slot vslot[i]
     bool verify = false;          // speculative verify bucket (R = 1, Q tokens of one request, input vslot: per-position gdn state slots)
     bool mtp = false;             // the MTP head (kind mtp): outputs z, logits, then the aliased MTP KV cache
     size_t out0 = 0;              // mtp graphs: bytes of output 0
@@ -156,7 +160,9 @@ class Qwen35Model final : public Backend {
         std::map<int, Dev> table, rows, logits; // table by P; head rows / logits by the head's S
     };
     std::map<std::pair<int, int>, std::vector<Step>> steps;
-    // tensor sets per (graph, layer, parity, rank)
+    // tensor sets per (graph, layer, parity, rank); bound graphs (Graph::bound) also per the launch's slots
+    std::map<std::tuple<std::string, int, int>, Dev> state_slices; // (layer state name, slot, rank): one slot of a layer state
+    std::map<std::tuple<const Graph *, int, int, int, std::vector<int64_t>>, std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *>> bound_sets;
     std::map<std::tuple<const Graph *, int, int, int>, std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *>> sets;
     std::mutex sets_mutex; // layer_set / head_set run on every rank's worker thread concurrently
     std::vector<float> logits;
@@ -353,7 +359,19 @@ class Qwen35Model final : public Backend {
             gr.has_gdn = gr.attn == "gdn" || std::find(gr.seg.begin(), gr.seg.end(), "gdn") != gr.seg.end();
             gr.inputs = m.at("inputs").get<std::vector<std::string>>();
             gr.verify = std::find(gr.inputs.begin(), gr.inputs.end(), "vslot") != gr.inputs.end();
+            gr.bound = m.value("gdn_slot", std::string()) == "bound";
             gr.states = m.at("states").get<std::vector<std::string>>();
+            if (gr.bound) {
+                gr.verify = m.value("verify", false);
+                gr.bound_states = gr.states;
+                gr.states.clear();
+                for (const auto &n : gr.bound_states) { // "kstate_2" -> "kstate"
+                    const std::string base = n.substr(0, n.find('_'));
+                    if (std::find(gr.states.begin(), gr.states.end(), base) == gr.states.end())
+                        gr.states.push_back(base);
+                }
+                gr.extra = m.value("extra_outputs", std::vector<std::string>());
+            }
             if (std::any_of(gr.inputs.begin(), gr.inputs.end(), [](const std::string &n) { return n == "egu" || n.ends_with(".egu"); }))
                 gr.egu_t = m.value("egu_t", false) ? 1 : 0;
             gr.neff = dir.path() / "graph.neff";
@@ -476,7 +494,7 @@ class Qwen35Model final : public Backend {
                 j.get();
             nrt_tensor_info_array_t *info = nullptr;
             check(nrt_get_model_tensor_info(gr.model[0], &info), "tensor info");
-            const size_t n = gr.inputs.size() + gr.states.size();
+            const size_t n = gr.inputs.size() + (gr.bound ? gr.bound_states.size() : gr.states.size());
             gr.input_bytes.assign(n, 0);
             for (uint64_t i = 0; i < info->tensor_count; ++i) {
                 const auto &t = info->tensor_array[i];
@@ -487,8 +505,10 @@ class Qwen35Model final : public Backend {
                     throw std::runtime_error(gr.neff.string() + ": input " + t.name + " beyond meta inputs + states");
                 gr.input_bytes[index] = t.size;
             }
-            for (size_t s = 0; s < gr.states.size(); ++s)
-                gr.state_bytes.push_back(gr.input_bytes[gr.inputs.size() + s]);
+            if (gr.bound && (gr.attn != "gdn" || !gr.seg.empty() || (gr.verify && gr.R != 1)))
+                throw std::runtime_error(gr.neff.string() + ": gdn_slot bound needs a gdn sub-block graph (verify: R = 1)");
+            for (size_t s = 0; s < gr.states.size(); ++s) // state_bytes: the whole layer state (all slots), also for bound graphs
+                gr.state_bytes.push_back(gr.input_bytes[gr.inputs.size() + s] * (gr.bound ? size_t(gr.slots) : 1)); // bound: row 0's kstate, cstate first
             if (gr.mtp) { // outputs: z [1, hidden] f32, logits [1, vocab shard] f32, then the aliased KV cache
                 std::map<std::string, size_t> out;
                 for (uint64_t i = 0; i < info->tensor_count; ++i)
@@ -782,10 +802,16 @@ class Qwen35Model final : public Backend {
     }
 
     // Input / output tensor sets of graph g for layer l reading residual buffer `parity`.
-    std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> layer_set(const Graph &g, int l, int parity, int r) {
+    // Bound graphs: `slots` = the launch's state slots (decode / prefill: one per row; verify: vslot, one per position).
+    std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> layer_set(const Graph &g, int l, int parity, int r, const std::vector<int64_t> *slots = nullptr) {
+        if (g.bound && !slots)
+            throw std::runtime_error("Qwen35: bound gdn graph launched without slots");
         auto key = std::make_tuple(&g, l, parity, r);
         std::lock_guard lock(sets_mutex);
-        if (auto it = sets.find(key); it != sets.end())
+        if (g.bound) {
+            if (auto it = bound_sets.find({&g, l, parity, r, *slots}); it != bound_sets.end())
+                return it->second;
+        } else if (auto it = sets.find(key); it != sets.end())
             return it->second;
         auto &st = steps.at({g.R, g.Q})[size_t(r)];
         auto &rank = ranks[size_t(r)];
@@ -814,21 +840,44 @@ class Qwen35Model final : public Backend {
                 throw std::runtime_error("Qwen35: layer " + std::to_string(l) + " has no tensor " + full + " for the " + g.kind + " NEFF");
             return it->second;
         };
+        // bound graphs: "kstate" / "kstate_<i>" / "kstate@<i>" -> the slice of the layer's kstate at slot (*slots)[i]
+        auto bind_state = [&](const std::string &name) -> const Dev & {
+            if (!g.bound)
+                return bind(name);
+            const size_t cut = name.find_first_of("_@");
+            const int i = cut == std::string::npos ? 0 : std::stoi(name.substr(cut + 1));
+            const Dev &whole = bind(name.substr(0, cut));
+            const int slot = int(slots->at(size_t(i)));
+            if (slot < 0 || slot >= slots_total)
+                throw std::runtime_error("Qwen35: bound gdn graph: slot " + std::to_string(slot) + " out of range");
+            const std::string full = layer_prefix(l) + sub + name.substr(0, cut);
+            auto &sl = state_slices[{full, slot, r}];
+            if (!sl.t) {
+                sl.bytes = whole.bytes / size_t(slots_total);
+                check(nrt_tensor_allocate_slice(whole.t, size_t(slot) * sl.bytes, sl.bytes, (full + ".slot").c_str(), &sl.t), "state slice");
+            }
+            return sl;
+        };
         nrt_tensor_set_t *in = nullptr, *out = nullptr;
         check(nrt_allocate_tensor_set(&in), "set");
         check(nrt_allocate_tensor_set(&out), "set");
+        const std::vector<std::string> &snames = g.bound ? g.bound_states : g.states;
         std::vector<std::string> names = g.inputs;
-        names.insert(names.end(), g.states.begin(), g.states.end());
+        names.insert(names.end(), snames.begin(), snames.end());
         for (size_t i = 0; i < names.size(); ++i) {
-            const Dev &d = bind(names[i]);
+            const Dev &d = i < g.inputs.size() ? bind(names[i]) : bind_state(names[i]);
             if (d.bytes != g.input_bytes[i])
                 throw std::runtime_error("Qwen35: " + g.kind + " input " + names[i] + " of layer " + std::to_string(l) + " expects " +
                                          std::to_string(g.input_bytes[i]) + " B, has " + std::to_string(d.bytes));
             check(nrt_add_tensor_to_tensor_set(in, ("input" + std::to_string(i)).c_str(), d.t), "add input");
         }
         check(nrt_add_tensor_to_tensor_set(out, "output0", st.x[1 - parity].t), "add output");
-        for (size_t s = 0; s < g.states.size(); ++s)
-            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(s + 1)).c_str(), bind(g.states[s]).t), "add state output");
+        for (size_t e = 0; e < g.extra.size(); ++e) // bound verify: per-position states, not aliased
+            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(e + 1)).c_str(), bind_state(g.extra[e]).t), "add extra output");
+        for (size_t s = 0; s < snames.size(); ++s)
+            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(g.extra.size() + s + 1)).c_str(), bind_state(snames[s]).t), "add state output");
+        if (g.bound)
+            return bound_sets[{&g, l, parity, r, *slots}] = {in, out};
         return sets[key] = {in, out};
     }
     std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> head_set(const Graph &h, int R, int Q, int r, int parity) {
@@ -1265,7 +1314,7 @@ class Qwen35Model final : public Backend {
                 for (const auto &[g, l] : plan) {
                     {
                         const auto ts = Clock::now();
-                        auto [in, o] = layer_set(*g, l, parity, r);
+                        auto [in, o] = layer_set(*g, l, parity, r, g->bound ? (g->verify ? &L.vslot : &L.slot) : nullptr);
                         const auto te = Clock::now();
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
                         const auto tx = Clock::now();
