@@ -6,6 +6,8 @@
 // preemption and cancellation. Built and run by host_test.sh.
 #include "behemoth/engine.hpp"
 #include <condition_variable>
+#include <fstream>
+#include <unistd.h>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -35,9 +37,17 @@ struct Result {
 };
 using Env = std::map<std::string, std::string>;
 
+static long rss_kb() { // resident set of this process (/proc/self/statm), kB
+    std::ifstream f("/proc/self/statm");
+    long size = 0, resident = 0;
+    f >> size >> resident;
+    return resident * (sysconf(_SC_PAGESIZE) / 1024);
+}
+static long engine_rss_kb = 0; // RSS while the last run()'s engine was alive, after its rounds
+
 // One engine for all the `rounds`: the jobs of a round are submitted together (concurrent) and awaited.
 static std::vector<std::vector<Result>> run(const std::vector<std::vector<Job>> &rounds, Env env, nlohmann::json *metrics = nullptr,
-                                            size_t slots = 8) {
+                                            size_t slots = 8, double gb = 0.01) {
     env.try_emplace("BEHEMOTH_FAKE_RECURRENT", "1");
     env.try_emplace("BEHEMOTH_FAKE_CONTEXT", "8192");
     env.try_emplace("BEHEMOTH_FAKE_PAGES", "1024");
@@ -49,7 +59,7 @@ static std::vector<std::vector<Result>> run(const std::vector<std::vector<Job>> 
     o.prefill_chunk = 64;
     o.prefix_cache.slots = slots;
     o.prefix_cache.min_tokens = 16;
-    o.prefix_cache_gb = 0.01;
+    o.prefix_cache_gb = gb;
     std::vector<std::vector<Result>> out;
     {
         Engine engine(o);
@@ -97,6 +107,7 @@ static std::vector<std::vector<Result>> run(const std::vector<std::vector<Job>> 
         }
         if (metrics)
             *metrics = engine.metrics();
+        engine_rss_kb = rss_kb();
     }
     for (const auto &round : out)
         for (const auto &r : round)
@@ -179,6 +190,38 @@ int main() {
         CHECK(r[1][0].cached == XA.size() && r[1][0].tokens == cold2[0][0].tokens);
         CHECK(r[2][0].cached == 768 && r[2][0].tokens == cold[0][0].tokens);
 
+        // 3b. ALIGN=1: snapshots only on the prefill-chunk grid (64 here), the tail one at the last grid point at or before
+        // prompt - 8, no chunk split, no end snapshot; every restore position is on the grid
+        Env align = on;
+        align["BEHEMOTH_NEURON_QWEN35_PREFIX_ALIGN"] = "1";
+        r = run({{{XA}}, {{XA}}, {{XB}}, {{turn2e}}, {{turn2}}, {{S}}, {{S}}}, align, &m);
+        CHECK(r[0][0].cached == 0 && r[0][0].tokens == cold[0][0].tokens);
+        CHECK(r[1][0].cached == (XA.size() - 8) / 64 * 64 && r[1][0].tokens == cold[0][0].tokens);
+        CHECK(r[2][0].cached == 640 && r[2][0].tokens == cold[1][0].tokens);
+        CHECK(r[3][0].cached == (XA.size() - 8) / 64 * 64 && r[3][0].tokens == cold2[1][0].tokens);
+        CHECK(r[4][0].cached % 64 == 0 && r[4][0].cached >= (XA.size() - 8) / 64 * 64 && r[4][0].tokens == cold2[0][0].tokens);
+        CHECK(r[6][0].cached == 0 && r[6][0].tokens == cold[3][0].tokens); // 40 tokens: no grid point >= min_tokens below 32
+        std::cout << "  align: same prompt " << r[1][0].cached << ", partial " << r[2][0].cached << ", next turn " << r[3][0].cached << " / " << r[4][0].cached << "\n";
+        // budget-shortened chunks under concurrency (5 prefills + a decode in a 256-token budget) get back on the grid
+        r = run({{{XA}}, {{XB}, {XC}, {XA}, {XB}, {X}}, {{XA}, {XC}}}, align, &m);
+        CHECK(r[1][0].tokens == cold[1][0].tokens && r[1][1].tokens == cold[2][0].tokens && r[1][2].tokens == cold[0][0].tokens &&
+              r[1][3].tokens == cold[1][0].tokens && r[1][4].tokens == cold[4][0].tokens);
+        CHECK(r[2][0].tokens == cold[0][0].tokens && r[2][1].tokens == cold[2][0].tokens);
+        for (const auto &round : r)
+            for (const auto &x : round)
+                CHECK(x.cached % 64 == 0);
+        CHECK(r[2][0].cached >= 640 && r[2][1].cached >= 640);
+        // sequences without a snapshot (short prompts, END off under ALIGN) are not cached: 12 of them (more than the 8
+        // slots) must not evict the conversation that can be restored
+        {
+            std::vector<std::vector<Job>> many{{{XA}}};
+            for (int i = 0; i < 12; ++i)
+                many.push_back({{tokens(20), 60}});
+            many.push_back({{XA}});
+            r = run(many, align, &m);
+            CHECK(r.back()[0].cached == (XA.size() - 8) / 64 * 64 && r.back()[0].tokens == cold[0][0].tokens);
+        }
+
         // 4. concurrent requests sharing a cached prefix (one takes the device tier, the others host copies)
         r = run({{{XA}}, {{XB}, {XC}, {XA}, {XB}}}, on, &m);
         CHECK(r[1][0].tokens == cold[1][0].tokens && r[1][1].tokens == cold[2][0].tokens && r[1][2].tokens == cold[0][0].tokens && r[1][3].tokens == cold[1][0].tokens);
@@ -228,6 +271,19 @@ int main() {
             CHECK(r[1][0].tokens == cold[0][0].tokens && r[2][0].tokens == cold[1][0].tokens);
             std::cout << "  cancel after " << ms << " ms: " << r[0][0].reason << " with " << r[0][0].tokens.size() << " tokens; then " << r[1][0].cached << " and "
                       << r[2][0].cached << " tokens restored\n";
+        }
+        // 8. the host K/V arena is not made resident at start: a 1 GB cap with two short requests (one save, one restore)
+        // must not cost ~1 GB of RSS (it did: the arena was a zero-filled vector, +7.8 GB RSS for 8 GB on the 2xlarge)
+        {
+            Env big = on;
+            big["BEHEMOTH_NEURON_PREFIX_HOST_GB"] = "1";
+            const long before = rss_kb();
+            r = run({{{XA}}, {{XA}}}, big, &m, 8, 1.0);
+            const long grew = engine_rss_kb - before;
+            CHECK(r[1][0].tokens == cold[0][0].tokens && r[1][0].cached > 0);
+            CHECK(grew < 400 * 1024);
+            std::cout << "  1 GB host arena: RSS +" << grew / 1024 << " MB while serving (lazily backed)\n";
+            setenv("BEHEMOTH_NEURON_PREFIX_HOST_GB", "0.01", 1);
         }
         std::cout << "PASS " << checks << " checks\n";
         return 0;

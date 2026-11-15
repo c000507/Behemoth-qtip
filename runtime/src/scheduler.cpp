@@ -121,6 +121,9 @@ size_t Scheduler::pending() const {
 void Scheduler::set_prefill_split(uint64_t id, size_t position) {
     requests_.at(id).prefill_split = position;
 }
+void Scheduler::set_prefill_align(uint64_t id, size_t chunk) {
+    requests_.at(id).prefill_align = chunk;
+}
 ScheduledBatch Scheduler::schedule() {
     ScheduledBatch batch;
     std::vector<uint64_t> decode, prefill;
@@ -162,6 +165,8 @@ ScheduledBatch Scheduler::schedule() {
                                  is_decode ? size_t(1) : std::min(chunk_, prefill_cap - prefill_tokens)});
         if (!is_decode && r.prefill_split > r.cached && r.cached + count > r.prefill_split)
             count = r.prefill_split - r.cached;
+        if (!is_decode && r.prefill_align && r.cached % r.prefill_align)
+            count = std::min(count, r.prefill_align - r.cached % r.prefill_align);
         if (!count)
             return;
         // Queued prefills cannot evict older work. Decode growth may reclaim newest unpinned

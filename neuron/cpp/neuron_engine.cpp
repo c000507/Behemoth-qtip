@@ -162,7 +162,11 @@ struct Engine::Impl {
     std::unique_ptr<PrefixCache> cache;
     std::map<uint64_t, PrefixCache::Lease> leases;
     std::vector<uint64_t> awaiting;
-    std::vector<std::byte> arena; // host tier: host page h at h * model.kv_page_bytes()
+    // host tier: host page h at h * model.kv_page_bytes(). Default-initialised (new[] without ()), NOT a vector: a vector's
+    // resize zero-fills every byte, which made the whole --prefix-cache-gb cap resident at start (measured: +7.8 GB RSS for
+    // 8 GB on the Ornith 2xlarge, docs/neuron-reap-prefix-cache.md); this way a page is backed when a save first writes it.
+    std::unique_ptr<std::byte[]> arena;
+    size_t arena_bytes = 0;
     uint64_t gpu_hits = 0, host_hits = 0, restored_tokens = 0, saves = 0, saved_pages = 0, failed_saves = 0;
     double save_ms = 0, restore_ms = 0;
     // Recurrent models with state snapshots (Qwen3.5; BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE=1, docs/neuron-qwen35-prefix-cache.md):
@@ -186,6 +190,13 @@ struct Engine::Impl {
     bool state_cache = false;
     size_t snap_interval = 1024, snap_tail = 8, state_cap = 0, state_total = 0;
     bool snap_end = true;
+    // BEHEMOTH_NEURON_QWEN35_PREFIX_ALIGN=1: snapshots only at multiples of the prefill chunk, the tail one at the last such
+    // boundary at or before prompt_size - snap_tail, no extra chunk split, no end snapshot by default. A cold run is then
+    // chunked exactly like the cache-off engine and a restored run continues on the same chunk grid, so cached output ==
+    // cache-off output bit for bit (the gdn prefill's arithmetic depends on the chunk partition; docs/neuron-reap-prefix-cache.md).
+    // Cost: a hit recomputes up to one chunk more than with the split tail.
+    bool snap_align = false;
+    size_t snap_chunk = 256;
     std::map<uint64_t, Snapshots> request_snaps;                                // by request id
     std::map<uint64_t, std::pair<PrefixCache::SlotPtr, Snapshots>> slot_snaps; // by cache slot id
     std::map<uint64_t, Snapshot> pending_state;                                // requests waiting for their restore
@@ -266,10 +277,12 @@ struct Engine::Impl {
                     snap_tail = 2;
                 // the end-of-sequence snapshot needs the state of the last ACCEPTED token: with MTP speculation that is a
                 // commit (rename) of the final verify step, a path not yet verified on a device, so it is opt-in there
-                snap_end = env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_END", spec_mtp > 0 ? 0 : 1) != 0;
+                snap_align = env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_ALIGN", 0) != 0;
+                snap_chunk = std::max<size_t>(1, o.prefill_chunk);
+                snap_end = env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_END", spec_mtp > 0 || snap_align ? 0 : 1) != 0;
                 const char *sg = std::getenv("BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB");
                 state_cap = size_t((sg ? std::atof(sg) : 4.0) * 1e9);
-                co.turn_slack = snap_tail;
+                co.turn_slack = snap_tail + (snap_align ? snap_chunk : 0); // a restore this close to the slot's prompt end continues it
             }
             // host tier: --prefix-cache-gb, capped by BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8: the instance's RAM also
             // holds the embeddings and the load-time staging)
@@ -279,19 +292,21 @@ struct Engine::Impl {
             if (!co.host_pages)
                 throw std::invalid_argument("Prefix cache memory cap below one page");
             cache = std::make_unique<PrefixCache>(co);
-            arena.resize(co.host_pages * model.kv_page_bytes()); // untouched pages stay unbacked
+            arena_bytes = co.host_pages * model.kv_page_bytes();
+            arena.reset(new std::byte[arena_bytes]); // untouched pages stay unbacked (large new[] = fresh anonymous mmap)
             scheduler.set_retain_finished(true);
             scheduler.set_reclaim([this](size_t need) {
                 std::vector<int> pages;
                 cache->reclaim_gpu(need, pages);
                 return pages;
             });
-            std::cerr << "Prefix cache: " << co.slots << " slots, host tier " << double(arena.size()) / 1e9 << " GB ("
+            std::cerr << "Prefix cache: " << co.slots << " slots, host tier " << double(arena_bytes) / 1e9 << " GB ("
                       << co.host_pages << " pages of " << model.kv_page_bytes() / 1024 << " KiB), device tier "
                       << (co.gpu_tier ? "on" : "off") << "\n";
             if (state_cache)
                 std::cerr << "Prefix cache: recurrent state snapshots of " << double(model.state_bytes()) / (1 << 20) << " MiB every " << snap_interval
-                          << " prefill tokens, " << snap_tail << " tokens before the prompt's end" << (snap_end ? " and at the sequence's end" : "")
+                          << " prefill tokens, " << (snap_align ? "on the " + std::to_string(snap_chunk) + "-token chunk grid, the last boundary " : std::string())
+                          << snap_tail << " tokens before the prompt's end" << (snap_end ? " and at the sequence's end" : "")
                           << ", cap " << double(state_cap) / 1e9 << " GB\n";
         }
         thread = std::thread([this] { loop(); });
@@ -326,11 +341,6 @@ struct Engine::Impl {
             auto pages = scheduler.take_pages(id);
             std::vector<int> release;
             PrefixCache::SavePlan plan;
-            if (!failed && r.cached && pages.size() >= ceil_div(r.cached, 16)) {
-                const PrefixCache::Lease *restored =
-                    lease != leases.end() && r.restored && r.restored == lease->second.tokens ? &lease->second : nullptr;
-                plan = cache->insert(std::span<const int>(r.history.data(), r.cached), r.prompt_size, restored, release);
-            }
             // recurrent state: the request's snapshots (those its cached tokens cover) and the state it ends with
             Snapshots snaps;
             if (state_cache) {
@@ -339,6 +349,16 @@ struct Engine::Impl {
                     request_snaps.erase(rs);
                 }
                 snaps.erase(snaps.upper_bound(r.cached), snaps.end());
+            }
+            // a recurrent sequence without any snapshot (and none to come at its end) can never be restored: caching it
+            // would only evict slots that can (e.g. short prompts with long answers when PREFIX_ALIGN turns END off)
+            const bool restorable_seq = !state_cache || snap_end || !snaps.empty();
+            if (!failed && r.cached && pages.size() >= ceil_div(r.cached, 16) && restorable_seq) {
+                const PrefixCache::Lease *restored =
+                    lease != leases.end() && r.restored && r.restored == lease->second.tokens ? &lease->second : nullptr;
+                plan = cache->insert(std::span<const int>(r.history.data(), r.cached), r.prompt_size, restored, release);
+            }
+            if (state_cache) {
                 if (plan.slot && snap_end && !pages.empty() && !snaps.count(r.cached))
                     if (auto snap = take_snapshot(pages[0]))
                         snaps[r.cached] = std::move(snap);
@@ -355,7 +375,7 @@ struct Engine::Impl {
                     try {
                         const auto t0 = Clock::now();
                         model.kv_save(std::span<const int>(pages.data() + first, n - first),
-                                      std::span<const int>(plan.slot->host.data() + first, n - first), arena.data());
+                                      std::span<const int>(plan.slot->host.data() + first, n - first), arena.get());
                         save_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                         ++saves;
                         saved_pages += n - first;
@@ -446,7 +466,11 @@ struct Engine::Impl {
                 last = std::max(last, it->first);
                 break;
             }
-        const bool tail = snap_tail ? r.prefill_split && end == r.prefill_split : end == r.prompt_size;
+        if (snap_align && end % snap_chunk)
+            return;
+        const size_t target = r.prompt_size - std::min(r.prompt_size, snap_tail);
+        const bool tail = snap_align ? end <= target && end + snap_chunk > target
+                                     : snap_tail ? r.prefill_split && end == r.prefill_split : end == r.prompt_size;
         if (!tail && end - std::min(end, last) < snap_interval)
             return;
         if (auto snap = take_snapshot(r.pages[0]))
@@ -530,7 +554,7 @@ struct Engine::Impl {
             scheduler.begin_restore(id, table);
             try {
                 const auto t0 = Clock::now();
-                model.kv_restore(std::span<const int>(lease.host.data(), ceil_div(m, 16)), std::span<const int>(table.data(), ceil_div(m, 16)), arena.data());
+                model.kv_restore(std::span<const int>(lease.host.data(), ceil_div(m, 16)), std::span<const int>(table.data(), ceil_div(m, 16)), arena.get());
                 restore_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 restore_state(table[0]);
                 scheduler.finish_restore(id, m);
@@ -1056,7 +1080,9 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
         PrefixCache::Usable usable;
         if (impl_->state_cache) {
             usable = [&](const PrefixCache::Slot &slot, size_t limit) { return impl_->restorable(slot, limit); };
-            if (impl_->snap_tail && prompt.size() >= impl_->snap_tail + impl_->cache->options().min_tokens)
+            if (impl_->snap_align)
+                impl_->scheduler.set_prefill_align(id, impl_->snap_chunk);
+            else if (impl_->snap_tail && prompt.size() >= impl_->snap_tail + impl_->cache->options().min_tokens)
                 impl_->scheduler.set_prefill_split(id, prompt.size() - impl_->snap_tail);
         }
         if (auto lease = impl_->cache->lookup(prompt, usable)) {

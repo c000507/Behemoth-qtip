@@ -37,6 +37,10 @@ struct Request {
     // A prefill chunk never crosses this position (0: none): the engine wants a step boundary there (a recurrent
     // model's state can only be snapshotted between steps). Set by set_prefill_split().
     size_t prefill_split = 0;
+    // A prefill chunk that starts off a multiple of this (0: off) ends at the next multiple: after a chunk shortened by
+    // the token budget, the request's chunk boundaries are on the absolute grid again (aligned prefix-cache snapshots of
+    // recurrent models; set_prefill_align()).
+    size_t prefill_align = 0;
     std::string reason;
 };
 struct ScheduledRequest {
@@ -130,6 +134,7 @@ class Scheduler {
     // Grows `table` to cover `tokens` from the pool (reclaiming cache pages if needed).
     bool allocate_pages(std::vector<int> &table, size_t tokens);
     void set_prefill_split(uint64_t id, size_t position);
+    void set_prefill_align(uint64_t id, size_t chunk);
     // A queued request waits for a prefix restore (not scheduled until finish/abort_restore).
     void wait_restore(uint64_t id);
     // Restore copies into `pages` (the request's first pages) are in flight.
