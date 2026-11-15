@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cctype>
+#include <cmath>
 #include <random>
 #include <set>
 
@@ -251,11 +252,135 @@ std::string glm_tool_call_grammar(const ToolRequest &r) {
         return r.parallel ? call + " ( " + call + " )*" : call; // back to back: the grammar runs in JSON mode (no whitespace after a complete answer)
     });
 }
+
+// The JSON types a schema admits: `type` (a name or a list), else the union over anyOf / oneOf, else what
+// properties / items / enum imply. Empty: unknown.
+void schema_types(const ojson &s, std::vector<std::string> &out, int depth = 0) {
+    if (!s.is_object() || depth > 8)
+        return;
+    if (s.contains("type")) {
+        const auto &t = s.at("type");
+        if (t.is_string())
+            out.push_back(t.get<std::string>());
+        else if (t.is_array())
+            for (const auto &e : t)
+                if (e.is_string())
+                    out.push_back(e.get<std::string>());
+        return;
+    }
+    for (const char *k : {"anyOf", "oneOf"})
+        if (s.contains(k) && s.at(k).is_array())
+            for (const auto &b : s.at(k))
+                schema_types(b, out, depth + 1);
+    if (!out.empty())
+        return;
+    if (s.contains("properties"))
+        out.push_back("object");
+    else if (s.contains("items"))
+        out.push_back("array");
+    else if (s.contains("enum") && s.at("enum").is_array())
+        for (const auto &e : s.at("enum"))
+            out.push_back(e.is_string() ? "string" : e.is_number_integer() ? "integer" : e.is_number() ? "number"
+                          : e.is_boolean() ? "boolean" : e.is_null() ? "null" : e.is_object() ? "object" : "array");
+}
+bool admits_string(const ojson &s) {
+    std::vector<std::string> types;
+    schema_types(s, types);
+    return std::find(types.begin(), types.end(), "string") != types.end();
+}
+
+std::string qwen_tool_call_grammar(const ToolRequest &r) {
+    struct Prop { std::string key; const ojson *schema; bool required; int rule; };
+    struct Tool { std::string name; std::vector<Prop> props; };
+    std::vector<Tool> tools;
+    std::vector<ojson> schemas; // the property schemas written as JSON (those that do not admit a string)
+    for (const auto &t : r.tools) {
+        const auto &fn = t.at("function");
+        if (r.choice == ToolRequest::Named && fn.at("name") != r.name)
+            continue;
+        Tool tool{fn.at("name"), {}};
+        const auto &params = fn.at("parameters");
+        std::set<std::string> required;
+        if (params.contains("required") && params.at("required").is_array())
+            for (const auto &k : params.at("required"))
+                if (k.is_string())
+                    required.insert(k.get<std::string>());
+        if (params.contains("properties") && params.at("properties").is_object())
+            for (auto it = params.at("properties").begin(); it != params.at("properties").end(); ++it) {
+                Prop p{it.key(), &it.value(), required.count(it.key()) > 0, -1};
+                if (!admits_string(it.value())) {
+                    p.rule = int(schemas.size());
+                    schemas.push_back(it.value());
+                }
+                tool.props.push_back(p);
+            }
+        tools.push_back(std::move(tool));
+    }
+    if (tools.empty())
+        throw std::invalid_argument("No tools to call");
+    if (schemas.empty())
+        schemas.push_back(ojson::object()); // json_schemas_grammar needs one schema; this rule stays unused
+    return grammar::json_schemas_grammar(schemas, [&](const std::vector<std::string> &rules) {
+        std::string call = "(";
+        for (size_t i = 0; i < tools.size(); ++i) {
+            call += (i ? " | " : " ") + grammar::gbnf_literal("<tool_call>\n" + std::string(qwen_function_open) + tools[i].name + ">\n");
+            for (const auto &p : tools[i].props) {
+                std::string value;
+                if (p.rule >= 0)
+                    value = rules[size_t(p.rule)];
+                else if (p.schema->contains("enum") && p.schema->at("enum").is_array() && !p.schema->at("enum").empty()) {
+                    value = "(";
+                    bool first = true;
+                    for (const auto &e : p.schema->at("enum")) {
+                        value += (first ? " " : " | ") + grammar::gbnf_literal(e.is_string() ? e.get<std::string>() : e.dump());
+                        first = false;
+                    }
+                    value += " )";
+                } else
+                    value = "( [^<] | \"<\" [^/] )*"; // raw text up to </parameter>
+                const std::string kv = grammar::gbnf_literal(std::string(qwen_parameter_open) + p.key + ">\n") + " " + value + " " +
+                                       grammar::gbnf_literal(std::string("\n") + qwen_parameter_close + "\n");
+                call += " " + (p.required ? kv : "( " + kv + " )?");
+            }
+            call += " " + grammar::gbnf_literal(std::string(qwen_function_close) + "\n" + glm_call_end);
+        }
+        call += " )";
+        return r.parallel ? call + " ( " + call + " )*" : call; // back to back: JSON mode (no whitespace after a complete answer)
+    });
+}
 } // namespace
+
+nlohmann::json coerce_tool_argument(const std::string &text, const ojson &schema) {
+    std::vector<std::string> types;
+    schema_types(schema, types);
+    const auto parsed = nlohmann::json::parse(text, nullptr, false);
+    if (types.empty())
+        return parsed.is_discarded() ? nlohmann::json(text) : parsed;
+    if (parsed.is_discarded())
+        return text;
+    for (const auto &t : types) {
+        if (t == "string")
+            continue;
+        if (t == "integer") {
+            if (parsed.is_number_integer())
+                return parsed;
+            if (parsed.is_number_float()) {
+                const double d = parsed.get<double>();
+                if (std::abs(d) < 9e15 && d == double(int64_t(d)))
+                    return int64_t(d);
+            }
+        } else if (t == "number" ? parsed.is_number() : t == "boolean" ? parsed.is_boolean() : t == "null" ? parsed.is_null()
+                   : t == "object" ? parsed.is_object() : t == "array" ? parsed.is_array() : true)
+            return parsed;
+    }
+    return text; // a string, or typed and not that type: the text rather than no argument
+}
 
 std::string tool_call_grammar(const ToolRequest &r, const ToolFormat &f) {
     if (f.glm)
         return glm_tool_call_grammar(r);
+    if (f.qwen)
+        return qwen_tool_call_grammar(r);
     std::vector<ojson> schemas;
     std::vector<std::string> names;
     for (const auto &t : r.tools) {
@@ -376,6 +501,131 @@ ToolCallParser::ToolCallParser(ToolFormat format, const ToolRequest *fallback) :
     if (fallback)
         tools_ = fallback->tools; // GLM values are typed by the tool's parameters schema
     fallback_ = fallback && fallback->choice == ToolRequest::Auto;
+}
+
+// One step of a Qwen call: <tool_call> was consumed; "<function=name>", then "<parameter=key>\nvalue\n</parameter>"
+// blocks, then "</function>" (the "</tool_call>" after it is dropped as all text after a call). False: needs more text.
+bool ToolCallParser::qwen_step(Delta &d, bool finish) {
+    const std::string_view fn_open = qwen_function_open, fn_close = qwen_function_close, p_open = qwen_parameter_open,
+                           p_close = qwen_parameter_close, call_end = glm_call_end;
+    auto close = [&]() {
+        add_arguments(glm_args_.empty() ? "{}" : "}", d);
+        glm_args_ = ojson::object();
+        mode_ = Content;
+    };
+    auto starts = [&](std::string_view marker) { return buffer_.compare(0, marker.size(), marker) == 0; };
+    auto partial = [&](std::string_view marker) { // may still become the marker
+        return !finish && buffer_.size() < marker.size() && marker.substr(0, buffer_.size()) == buffer_;
+    };
+    size_t space = 0;
+    while (space < buffer_.size() && is_space(buffer_[space]))
+        ++space;
+    switch (mode_) {
+    case QwenHead: {
+        auto invalid = [&]() { // not a call: content as written (after a call: dropped, as all text there)
+            if (calls_.empty())
+                d.content += qwen_raw_;
+            qwen_raw_.clear();
+            mode_ = Content;
+            return true;
+        };
+        qwen_raw_.append(buffer_, 0, space);
+        buffer_.erase(0, space);
+        if (partial(fn_open))
+            return false;
+        if (!starts(fn_open))
+            return invalid();
+        const size_t end = buffer_.find('>', fn_open.size());
+        const std::string name = trim(std::string_view(buffer_).substr(fn_open.size(), end == std::string::npos ? end : end - fn_open.size()));
+        const bool bad = name.find_first_of("<\n\r\t ") != std::string::npos;
+        if (end == std::string::npos && !finish && !bad)
+            return false;
+        if (end == std::string::npos || bad || name.empty())
+            return invalid();
+        buffer_.erase(0, end + 1);
+        qwen_raw_.clear();
+        start_call(name, d);
+        glm_args_ = ojson::object();
+        mode_ = QwenArgs;
+        return true;
+    }
+    case QwenArgs: {
+        buffer_.erase(0, space);
+        if (buffer_.empty()) {
+            if (finish)
+                close();
+            return false;
+        }
+        if (starts(p_open)) {
+            buffer_.erase(0, p_open.size());
+            mode_ = QwenKey;
+            return true;
+        }
+        for (const std::string_view marker : {fn_close, call_end, std::string_view(format_.calls)})
+            if (starts(marker)) { // a new <tool_call> (the block was not closed) is left for the next call
+                buffer_.erase(0, marker == format_.calls ? 0 : marker.size());
+                close();
+                return true;
+            }
+        if (partial(p_open) || partial(fn_close) || partial(call_end) || partial(format_.calls))
+            return false;
+        const size_t next = buffer_.find('<', 1); // stray text between parameters: dropped
+        buffer_.erase(0, next == std::string::npos ? buffer_.size() : next);
+        return !buffer_.empty() || finish;
+    }
+    case QwenKey: {
+        const size_t end = buffer_.find('>');
+        if (end == std::string::npos) {
+            if (finish) { // cut inside a parameter's name: the parameters before it
+                buffer_.clear();
+                close();
+            }
+            return false;
+        }
+        glm_key_ = trim(std::string_view(buffer_).substr(0, end));
+        buffer_.erase(0, end + 1);
+        mode_ = QwenValue;
+        return true;
+    }
+    case QwenValue: {
+        // the value ends at </parameter>; when that is missing, at </function> or </tool_call> (left to close the call)
+        size_t at = std::string::npos, skip = 0;
+        for (const std::string_view marker : {p_close, fn_close, call_end})
+            if (const size_t pos = buffer_.find(marker); pos < at)
+                at = pos, skip = marker == p_close ? marker.size() : 0;
+        if (at == std::string::npos) {
+            if (!finish)
+                return false;
+            at = buffer_.size(); // cut inside the value: kept up to the end
+        }
+        std::string value = buffer_.substr(0, at); // one newline after the name and one before </parameter> are the format's
+        if (!value.empty() && value.front() == '\n')
+            value.erase(0, 1);
+        if (!value.empty() && value.back() == '\n')
+            value.pop_back();
+        buffer_.erase(0, at + skip);
+        if (!glm_key_.empty() && !glm_args_.contains(glm_key_)) { // a repeated parameter: the first one stands
+            const ojson *schema = nullptr;
+            for (const auto &t : tools_) {
+                const auto &fn = t.at("function");
+                if (fn.at("name") != calls_.back().name || !fn.contains("parameters"))
+                    continue;
+                const auto &params = fn.at("parameters");
+                if (params.is_object() && params.contains("properties") && params.at("properties").is_object() &&
+                    params.at("properties").contains(glm_key_))
+                    schema = &params.at("properties").at(glm_key_);
+            }
+            const auto v = coerce_tool_argument(value, schema ? *schema : ojson());
+            add_arguments((glm_args_.empty() ? "{" : ",") + nlohmann::json(glm_key_).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) +
+                              ":" + v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), d);
+            glm_args_[glm_key_] = true;
+        }
+        mode_ = QwenArgs;
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 // GLM: a value is raw text when the property's schema is a string, else JSON (raw text when it does not parse).
@@ -615,7 +865,25 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
             // whitespace before anything else is held: dropped when the answer turns out to be calls only (and, GLM,
             // between consecutive calls)
             const bool leading = (content_.empty() && d.content.empty()) || (format_.glm && !calls_.empty());
+            const bool after = format_.qwen && !calls_.empty(); // Qwen: text after a call is dropped
             const size_t at = buffer_.find(format_.calls);
+            if (at != std::string::npos && format_.qwen) {
+                // whitespace before the call is dropped (kept in qwen_raw_ in case the block is not a call)
+                size_t end = at;
+                while (end > 0 && is_space(buffer_[end - 1]))
+                    --end;
+                if (!after && end > 0)
+                    d.content += buffer_.substr(0, end);
+                qwen_raw_ = after ? "" : buffer_.substr(end, at - end) + format_.calls;
+                buffer_.erase(0, at + format_.calls.size());
+                mode_ = QwenHead;
+                progress = true;
+                break;
+            }
+            if (after) {
+                buffer_.erase(0, buffer_.size() - (finish ? 0 : partial_suffix(buffer_, format_.calls)));
+                break;
+            }
             if (at != std::string::npos) {
                 if (!leading || !trim(std::string_view(buffer_).substr(0, at)).empty())
                     d.content += buffer_.substr(0, at);
@@ -637,6 +905,9 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
                         --emit;
                 }
             }
+            if (format_.qwen && !finish) // whitespace that a call may follow is held
+                while (emit > 0 && is_space(buffer_[emit - 1]))
+                    --emit;
             d.content += buffer_.substr(0, emit);
             buffer_.erase(0, emit);
             break;
@@ -700,6 +971,12 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
         case GlmValue:
             progress = glm_step(d, finish);
             break;
+        case QwenHead:
+        case QwenArgs:
+        case QwenKey:
+        case QwenValue:
+            progress = qwen_step(d, finish);
+            break;
         }
     }
     if (finish)
@@ -733,7 +1010,9 @@ TokenConstraint::Allowed TriggeredConstraint::allowed() {
 }
 
 void TriggeredConstraint::advance(int token) {
-    if (!triggered_ && token == trigger_)
+    if (!triggered_ && think_open_ >= 0 && (token == think_open_ || token == think_close_))
+        thinking_ = token == think_open_;
+    if (!triggered_ && token == trigger_ && !thinking_)
         triggered_ = true;
     if (triggered_)
         inner_->advance(token);

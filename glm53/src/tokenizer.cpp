@@ -28,8 +28,11 @@ std::vector<std::string> split(const std::string &text, const std::string &patte
     std::vector<std::string> out;
     size_t cursor = 0;
     while (cursor < text.size()) {
-        int rc = pcre2_match(code.get(), reinterpret_cast<PCRE2_SPTR>(text.data()), text.size(), cursor, 0,
-                             match.get(), nullptr);
+        // PCRE2_UTF validates the WHOLE subject on every call unless told not to: checked once (first call), then
+        // skipped (cursor always lands on a character boundary: the end of the previous match). Without this the
+        // split is quadratic in the text length (a 110k-token prompt spent ~70 s here before reaching the engine).
+        int rc = pcre2_match(code.get(), reinterpret_cast<PCRE2_SPTR>(text.data()), text.size(), cursor,
+                             cursor ? PCRE2_NO_UTF_CHECK : 0, match.get(), nullptr);
         if (rc == PCRE2_ERROR_NOMATCH) {
             out.push_back(text.substr(cursor));
             break;

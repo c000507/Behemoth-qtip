@@ -155,6 +155,16 @@ int main() {
             "additionalProperties":false}}},{"type":"function","function":{"name":"ping"}}],"tool_choice":"required",
             "parallel_tool_calls":false})")); // one call: the fake model would repeat calls up to the token limit
         const std::string tool_grammar = tool_call_grammar(tools, format);
+        // Qwen format (<tool_call> <function=name> <parameter=key> value): all plain text in this vocabulary
+        ToolFormat qwen;
+        qwen.calls = "<tool_call>";
+        qwen.qwen = true;
+        // (values the grammar bounds: the fake model would not end a free-text value)
+        const auto qwen_tools = parse_tools(ojson::parse(R"({"tools":[{"type":"function","function":{"name":"get_weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string","enum":["Paris","Oslo"]},"days":{"type":"integer"},
+            "metric":{"type":"boolean"}},"required":["city","metric"]}}},{"type":"function","function":{"name":"ping"}}],
+            "tool_choice":"required","parallel_tool_calls":false})"));
+        const std::string qwen_grammar = tool_call_grammar(qwen_tools, qwen);
         // prompts with the answer's patterns in them, so the induction head (and prompt lookup) copies them
         auto prompt = [](const std::string &s, int pad) {
             auto p = bytes(s);
@@ -173,6 +183,8 @@ int main() {
             jobs.push_back({prompt("q\n[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}\nq\n", 3 + 20 * i), 80, greedy, tool_grammar});
             jobs.push_back({prompt("Ok:Yes [TOOL_CALLS]ping[ARGS]{}\nOk:", 11 + 20 * i), 60, greedy, tool_grammar, true});
             jobs.push_back({prompt("free text free text free text ", 5 + 20 * i), 40, greedy, ""});
+            jobs.push_back({prompt("q\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n</function>\n</tool_call>\nq\n",
+                                   13 + 20 * i), 240, greedy, qwen_grammar});
         }
         // the [TOOL_CALLS] marker of the prompts above as its control token
         for (auto &j : jobs)
@@ -197,6 +209,13 @@ int main() {
                 CHECK(v.is_array() && v.size() == 10);
                 for (const auto &x : v)
                     CHECK(x == "ab" || x == "cd");
+            } else if (jobs[i].grammar == qwen_grammar) {
+                ToolCallParser p(qwen, &qwen_tools);
+                const auto d = p.feed(answer, true);
+                CHECK(p.calls().size() == 1 && p.content().empty() && d.tool_calls.size() >= 2);
+                const auto args = nlohmann::json::parse(p.calls()[0].arguments);
+                CHECK(p.calls()[0].name == "ping" ? args.empty() : p.calls()[0].name == "get_weather" && (args.at("city") == "Paris" || args.at("city") == "Oslo") && args.at("metric").is_boolean() &&
+                                                         (args.size() == 2 || args.at("days").is_number_integer()));
             } else {
                 ToolCallParser p(format);
                 p.feed(answer, true);
@@ -208,7 +227,7 @@ int main() {
                 }
             }
         }
-        CHECK(m_ref["structured_output"]["requests"] == 12 && m_ref["structured_output"]["tokens"] > 0);
+        CHECK(m_ref["structured_output"]["requests"] == 15 && m_ref["structured_output"]["tokens"] > 0);
         // 2. speculation: the same tokens, greedy and sampled, with drafts verified under the constraints
         const auto spec = run(jobs, {{"BEHEMOTH_NEURON_SPEC_TOKENS", "6"}, {"BEHEMOTH_NEURON_SPEC_ROWS", "8"}}, true, &m_spec);
         for (size_t i = 0; i < jobs.size(); ++i)

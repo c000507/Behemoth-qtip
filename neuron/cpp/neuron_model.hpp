@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <stdexcept>
 
 namespace neuron {
 struct ModelOptions {
@@ -37,6 +38,19 @@ class Backend {
     virtual int max_context() const = 0;
     virtual std::span<const float> forward(const behemoth::InferenceBatch &) = 0;
     virtual nlohmann::json last_profile() const = 0;
+    // MTP speculative decoding (qwen35_model.cpp): 0 / {} for backends without it
+    virtual int mtp_max_drafts() const { return 0; }
+    virtual int mtp_max_drafts(int, int) const { return 0; } // per request, in a step of n decode requests at a page count
+    virtual std::vector<int> mtp_draft(std::span<const int>, int, std::span<const int>, int) { return {}; }
+    // Prefix cache of a recurrent family (qwen35_model.cpp): 0 / no-ops for backends without it (the engine then keeps
+    // the cache off). K/V pages as NeuronModel::kv_save / kv_restore; the recurrent state of ONE sequence (identified by
+    // its first page) as state_bytes() host bytes.
+    virtual size_t kv_page_bytes() const { return 0; }
+    virtual void kv_copy(std::span<const int>, std::span<const int>, std::byte *, bool) { throw std::logic_error("no K/V copies for this family"); }
+    virtual size_t state_bytes() const { return 0; }
+    virtual void state_save(int, std::byte *) { throw std::logic_error("no state snapshots for this family"); }
+    virtual void state_restore(int, const std::byte *) { throw std::logic_error("no state snapshots for this family"); }
+    virtual void state_drop(int) {}
 };
 // options.model is a GLM prepared directory (prepared.json written by neuron/glm_repack.py).
 bool is_glm_prepared(const std::filesystem::path &);
@@ -70,10 +84,26 @@ class NeuronModel {
     bool device_argmax_used() const;
     int device_token(size_t logits_row) const;
     nlohmann::json last_profile() const;
+    // MTP speculative decoding by the checkpoint's own draft head (Qwen3.5; docs/neuron-qwen397-mtp.md): the largest number of
+    // drafts a verify step takes (0: none), and after the sampling of a step that was one decode request at `position` whose
+    // emitted tokens are `next`: commit the recurrent state of the accepted prefix and draft `want` tokens after next.back().
+    int mtp_max_drafts() const;
+    int mtp_max_drafts(int requests, int pages) const;
+    std::vector<int> mtp_draft(std::span<const int> pages, int position, std::span<const int> next, int want);
     // Prefix cache: host bytes of one 16-token page (K/V and FP8 scales of every layer and rank), and synchronous copies
     // between pool pages and host pages of `arena` (host page h at arena + h * kv_page_bytes()). Call between forward()s.
     size_t kv_page_bytes() const;
     void kv_save(std::span<const int> device_pages, std::span<const int> host_pages, std::byte *arena);
     void kv_restore(std::span<const int> host_pages, std::span<const int> device_pages, const std::byte *arena);
+    // Recurrent families with state snapshots (Qwen3.5; docs/neuron-qwen35-prefix-cache.md): host bytes of one sequence's
+    // recurrent state over all layers and ranks (0: the family has none or cannot snapshot it: no prefix cache then).
+    // A sequence is identified by its first page. Call between forward()s, at a COMMITTED position only (after
+    // mtp_draft() of a verify step): state_save copies the state the sequence has now (the state after its last
+    // forwarded / accepted token), state_restore makes `src` the state of the sequence that will continue on that first
+    // page (its next token is at the snapshot's position, > 0), state_drop forgets a finished sequence's state.
+    size_t state_bytes() const;
+    void state_save(int first_page, std::byte *dst);
+    void state_restore(int first_page, const std::byte *src);
+    void state_drop(int first_page);
 };
 } // namespace neuron

@@ -2,6 +2,9 @@
 #include <algorithm>
 
 namespace behemoth {
+// 262144 = the longest context any backend serves (Qwen3.5 max_position_embeddings, the 16384-page long-context set); the
+// model's own max_context and the page pool still bound every request
+constexpr size_t kMaxRequestTokens = 262144;
 Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy policy, int vocab)
     : pool_(pages), token_budget_(budget), chunk_(chunk), policy_(policy), vocab_(vocab) {
     if (!budget || !chunk || chunk > budget)
@@ -10,8 +13,8 @@ Scheduler::Scheduler(int pages, size_t budget, size_t chunk, SchedulerPolicy pol
         throw std::invalid_argument("Invalid scheduler policy");
 }
 uint64_t Scheduler::submit(std::span<const int> prompt, size_t max_new, SamplingOptions sampling) {
-    if (prompt.empty() || prompt.size() > 131072 || max_new > 131072 ||
-        prompt.size() + max_new > 131072 || ceil_div(prompt.size(), 16) > size_t(pool_.capacity()))
+    if (prompt.empty() || prompt.size() > kMaxRequestTokens || max_new > kMaxRequestTokens ||
+        prompt.size() + max_new > kMaxRequestTokens || ceil_div(prompt.size(), 16) > size_t(pool_.capacity()))
         throw std::invalid_argument("Request exceeds context or standalone KV capacity");
     for (int t : prompt)
         if (t < 0 || t >= vocab_)
@@ -115,6 +118,9 @@ size_t Scheduler::pending() const {
     }
     return n;
 }
+void Scheduler::set_prefill_split(uint64_t id, size_t position) {
+    requests_.at(id).prefill_split = position;
+}
 ScheduledBatch Scheduler::schedule() {
     ScheduledBatch batch;
     std::vector<uint64_t> decode, prefill;
@@ -122,7 +128,7 @@ ScheduledBatch Scheduler::schedule() {
         if (!r.done && !r.restoring) {
             if (r.inflight)
                 throw std::logic_error("Previous GPU step not completed");
-            if (r.history.size() > 131072 ||
+            if (r.history.size() > kMaxRequestTokens ||
                 ceil_div(r.history.size(), 16) > size_t(pool_.capacity())) {
                 pool_.release(r.pages);
                 r.done = true;
@@ -154,6 +160,8 @@ ScheduledBatch Scheduler::schedule() {
             return;
         size_t count = std::min({r.history.size() - r.cached, token_budget_ - batch.tokens,
                                  is_decode ? size_t(1) : std::min(chunk_, prefill_cap - prefill_tokens)});
+        if (!is_decode && r.prefill_split > r.cached && r.cached + count > r.prefill_split)
+            count = r.prefill_split - r.cached;
         if (!count)
             return;
         // Queued prefills cannot evict older work. Decode growth may reclaim newest unpinned
@@ -236,7 +244,7 @@ void Scheduler::accept(uint64_t id, int token, bool eos) {
         ++r.cached;
     r.history.push_back(token);
     ++r.generated;
-    if (eos || r.generated >= r.max_new || r.history.size() >= 131072) {
+    if (eos || r.generated >= r.max_new || r.history.size() >= kMaxRequestTokens) {
         r.done = true;
         r.reason = eos ? "stop" : "length";
         if (!retain_finished_)

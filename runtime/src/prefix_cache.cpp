@@ -56,7 +56,7 @@ bool PrefixCache::evict_one(const Slot *keep, std::vector<int> &release_gpu) {
     ++stats_.evictions;
     return true;
 }
-std::optional<PrefixCache::Lease> PrefixCache::lookup(std::span<const int> prompt) {
+std::optional<PrefixCache::Lease> PrefixCache::lookup(std::span<const int> prompt, const Usable &usable) {
     if (!options_.slots || prompt.size() < 2)
         return std::nullopt;
     SlotPtr best;
@@ -65,10 +65,12 @@ std::optional<PrefixCache::Lease> PrefixCache::lookup(std::span<const int> promp
         if (s->failed)
             continue;
         const size_t n = std::min(s->tokens.size(), prompt.size());
-        const size_t l = size_t(
+        size_t l = size_t(
             std::mismatch(prompt.begin(), prompt.begin() + std::ptrdiff_t(n), s->tokens.begin())
                 .first -
             prompt.begin());
+        if (usable)
+            l = std::min(l, usable(*s, std::min(l, prompt.size() - 1)));
         if (l > best_len || (l == best_len && best && l &&
                              (s->ready > best->ready ||
                               (s->ready == best->ready && s->last_use > best->last_use)))) {
@@ -132,7 +134,8 @@ PrefixCache::SavePlan PrefixCache::insert(std::span<const int> tokens, size_t pr
     // that ends inside its prompt, e.g. a shared system prompt or an edited earlier message,
     // keeps it).
     const Slot *previous_turn =
-        restored && restored->slot && restored->tokens >= restored->slot->prompt &&
+        restored && restored->slot &&
+                restored->tokens + options_.turn_slack >= restored->slot->prompt &&
                 restored->slot->prompt
             ? restored->slot.get()
             : nullptr;

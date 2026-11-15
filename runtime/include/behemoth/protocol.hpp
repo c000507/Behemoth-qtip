@@ -20,6 +20,9 @@ struct ChatBackend {
     // <think> block when the request gives no reasoning_effort: true for reasoning models (the Behemoth default);
     // false constrains from the first token, so a non-reasoning model cannot spend the token budget thinking.
     bool think = true;
+    // Templates whose generation prompt already opens the think block (Qwen3.5: it ends with "<think>\n"): the ids of
+    // the <think> / </think> tokens (their pieces are that text). An answer to such a prompt starts as reasoning.
+    int think_open = -1, think_close = -1;
 };
 const ChatBackend &chat_backend();
 void set_chat_backend(ChatBackend);

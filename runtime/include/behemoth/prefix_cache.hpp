@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -30,6 +31,10 @@ struct PrefixCacheOptions {
     size_t host_pages = 0;  // host page cap (one page = both ranks' 16-token page)
     size_t min_tokens = 64; // shortest sequence saved and shortest prefix restored
     bool gpu_tier = true;
+    // insert(): the restored-from slot also counts as the previous turn of the same conversation (and is superseded)
+    // when the restore ended up to this many tokens before the end of its prompt (engines that can only restore at
+    // snapshot positions, e.g. a little before the generation prompt; 0: the restore must cover the whole prompt)
+    size_t turn_slack = 0;
 };
 class PrefixCache {
   public:
@@ -71,7 +76,11 @@ class PrefixCache {
     // Longest common prefix over all indexed slots (ready or still saving), capped at
     // prompt.size() - 1 so at least one prompt token is prefilled (its logits are sampled).
     // Prefixes shorter than min_tokens are misses.
-    std::optional<Lease> lookup(std::span<const int> prompt);
+    // `usable` (optional; models with recurrent state, which can only be restored where a state snapshot exists): maps
+    // a slot and its capped common-prefix length to the longest restorable prefix of that slot (<= the length, 0:
+    // none); the slot with the longest restorable prefix wins.
+    using Usable = std::function<size_t(const Slot &, size_t)>;
+    std::optional<Lease> lookup(std::span<const int> prompt, const Usable &usable = {});
     void release(Lease &);
     // A sequence finished; KV for all `tokens` is on the GPU, the first `prompt_tokens` of them
     // were its prompt. `restored` (may be null): the lease whose host pages were restored into

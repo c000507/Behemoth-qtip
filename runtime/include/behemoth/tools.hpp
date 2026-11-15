@@ -29,10 +29,15 @@ namespace behemoth {
 //   Mistral: [TOOL_CALLS]name[ARGS]{json}   (calls = "[TOOL_CALLS]", args = "[ARGS]")
 //   GLM:     <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>, a string value raw, any other
 //            value as JSON (GLM-4.5 .. 5.x chat templates render tools themselves); calls = "<tool_call>", glm = true
+//   Qwen:    <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>\n...</function>\n</tool_call> (Qwen3-Coder,
+//            Qwen3.5; the chat template renders tools), a value typed by the parameter's schema (coerce_tool_argument);
+//            calls = "<tool_call>", qwen = true. <function= / <parameter= are plain text; <tool_call> is one token whose
+//            piece the backend streams as text (no markers needed)
 struct ToolFormat {
     std::string calls, args;               // marker texts ("[TOOL_CALLS]", "[ARGS]")
     int calls_token = -1, args_token = -1; // their control-token ids (streamed as the marker text)
     bool glm = false;
+    bool qwen = false;
     // Mistral Tekken v13+ (Devstral 2507, Magistral): [AVAILABLE_TOOLS] once after the system prompt, not before the
     // last [INST] (v11), and no tool_instruction(): the checkpoint was trained on this format
     bool tools_first = false;
@@ -58,6 +63,8 @@ struct ToolFormat {
 };
 inline constexpr const char *glm_call_end = "</tool_call>", *glm_key_open = "<arg_key>", *glm_key_close = "</arg_key>",
                             *glm_value_open = "<arg_value>", *glm_value_close = "</arg_value>";
+inline constexpr const char *qwen_function_open = "<function=", *qwen_function_close = "</function>",
+                            *qwen_parameter_open = "<parameter=", *qwen_parameter_close = "</parameter>";
 
 struct ToolRequest {
     enum Choice { None, Auto, Required, Named } choice = None; // None also when the request has no tools
@@ -76,6 +83,9 @@ ToolRequest parse_tools(const nlohmann::ordered_json &request);
 // for Named), each [calls]name[args] then a JSON value matching that function's parameters schema. JSON mode.
 // GLM: <tool_call>name, then the schema's properties in declared order (required ones mandatory) as
 // <arg_key>key</arg_key><arg_value>value</arg_value> (strings raw, other types as JSON matching their schema), </tool_call>.
+// Qwen: "<tool_call>\n<function=name>\n", the schema's properties in declared order (required ones mandatory) as
+// "<parameter=key>\nvalue\n</parameter>\n" (a schema that admits a string: raw text without "</", an enum as literals;
+// any other: JSON matching the schema), "</function>\n</tool_call>"; parallel calls back to back.
 std::string tool_call_grammar(const ToolRequest &, const ToolFormat &);
 
 // Mistral v11 prompt for a conversation with tools and/or tool messages. `system` is the system prompt used when
@@ -98,6 +108,12 @@ bool schema_accepts(const nlohmann::ordered_json &schema, const nlohmann::json &
 // offset in `text` (the fence's when fenced) and the value; the earliest start that parses as the whole rest.
 std::optional<std::pair<size_t, nlohmann::json>> trailing_json(std::string_view text);
 
+// Qwen: the JSON value of a parameter written as text, by the parameter's schema (null: unknown parameter). Only
+// "string" admitted: the text. Else the first non-string type the text is JSON of ("integer" takes 12 and 12.0, not
+// 12.5; number, boolean, null, object, array; `type` lists and anyOf / oneOf are unions), else the text. No type known:
+// the text's JSON value when it parses, else the text.
+nlohmann::json coerce_tool_argument(const std::string &text, const nlohmann::ordered_json &schema);
+
 struct ToolCall {
     std::string id, name, arguments;
     nlohmann::json openai() const; // {"id", "type": "function", "function": {"name", "arguments"}}
@@ -109,6 +125,9 @@ struct ToolCall {
 // {"index", "function": {"arguments": fragment}}).
 // `fallback` (tool_choice auto): an answer that ends with a JSON tool call written as text (no [TOOL_CALLS]; see
 // convert_trailing) becomes calls too. Streaming then holds the content from its first "{", "[" or "`" to the end.
+// Qwen: a call's arguments are streamed as one fragment per completed parameter ({"k":v then ,"k":v then }); text
+// after the first call is dropped, whitespace before it too; a <tool_call> that <function=name> does not follow is
+// content as written; a call the answer ends in is closed with the parameters read so far (a cut value kept).
 class ToolCallParser {
   public:
     explicit ToolCallParser(ToolFormat format, const ToolRequest *fallback = nullptr);
@@ -125,7 +144,7 @@ class ToolCallParser {
     }
 
   private:
-    enum Mode { Content, Head, Name, Args, List, GlmName, GlmArgs, GlmKey, GlmValue } mode_ = Content;
+    enum Mode { Content, Head, Name, Args, List, GlmName, GlmArgs, GlmKey, GlmValue, QwenHead, QwenArgs, QwenKey, QwenValue } mode_ = Content;
     ToolFormat format_;
     std::string buffer_, content_, list_;
     std::vector<ToolCall> calls_;
@@ -141,6 +160,10 @@ class ToolCallParser {
     std::string glm_key_;
     bool glm_step(Delta &, bool finish);
     nlohmann::json glm_value(const std::string &key, const std::string &text) const;
+    // Qwen calls: the block's text so far while it may still turn out not to be a call (then content); the keys of the
+    // call being parsed are kept in glm_args_
+    std::string qwen_raw_;
+    bool qwen_step(Delta &, bool finish);
 };
 
 // Lazy grammar (tool_choice auto): no constraint until `trigger` is sampled, then `inner` (a constraint whose answer
@@ -155,11 +178,17 @@ class TriggeredConstraint final : public TokenConstraint {
     bool triggered() const {
         return triggered_;
     }
+    // Reasoning models: the trigger does not count inside a think block (between the `open` and `close` tokens;
+    // `inside`: the prompt already opened one).
+    void set_think(int open, int close, bool inside) {
+        think_open_ = open, think_close_ = close, thinking_ = inside;
+    }
 
   private:
     int trigger_;
     std::shared_ptr<TokenConstraint> inner_;
-    bool triggered_ = false;
+    bool triggered_ = false, thinking_ = false;
+    int think_open_ = -1, think_close_ = -1;
     TokenMask all_;
     int count_;
 };

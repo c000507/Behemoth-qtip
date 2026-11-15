@@ -142,6 +142,13 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
                 throw std::invalid_argument("Only system, user and assistant roles are supported");
         }
     }
+    // enable_thinking=false (top level or chat_template_kwargs, as vLLM/HF): templates whose generation prompt opens
+    // "<think>\n" write the closed empty block instead ("<think>\n\n</think>\n\n"), exactly what Qwen3.5's template does
+    if (backend().think_open >= 0 && r.rendered.ends_with("<think>\n")) {
+        auto off = [](const nlohmann::json &v) { return v.is_object() && v.contains("enable_thinking") && v.at("enable_thinking") == false; };
+        if (off(j) || (j.contains("chat_template_kwargs") && off(j.at("chat_template_kwargs"))))
+            r.rendered += "\n</think>\n\n";
+    }
     if (j.contains("max_tokens") && j.contains("max_completion_tokens"))
         throw std::invalid_argument("Specify one output-token limit");
     auto maximum = j.contains("max_completion_tokens") ? j.at("max_completion_tokens")

@@ -80,8 +80,21 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
         tensors[i] = dev;
         if (is_input) {
             std::vector<uint8_t> fill(t.size);
-            // int64 tensors (dtype 8) are indices/positions: keep them zero so gathers stay in bounds.
-            if (t.size > 8 && int(t.dtype) != 8)
+            // LB_INPUTS=DIR: inputs from DIR/in<i>.r<rank> (or DIR/in<i>, the same on every rank), as neff_io reads them, when present
+            // (realistic routing for the gathered MoE). Otherwise: int64 tensors (dtype 8) are indices/positions: keep them zero so
+            // gathers stay in bounds.
+            bool from_file = false;
+            if (const char* dir = std::getenv("LB_INPUTS")) {
+                std::string p = std::string(dir) + "/in" + std::to_string(idx) + ".r" + std::to_string(rank);
+                std::ifstream f(p, std::ios::binary);
+                if (!f) { p = std::string(dir) + "/in" + std::to_string(idx); f.open(p, std::ios::binary); }
+                if (f) {
+                    f.read(reinterpret_cast<char*>(fill.data()), std::streamsize(fill.size()));
+                    if (size_t(f.gcount()) != fill.size()) { std::fprintf(stderr, "%s: short (%zu of %zu B)\n", p.c_str(), size_t(f.gcount()), fill.size()); std::exit(2); }
+                    from_file = true;
+                }
+            }
+            if (!from_file && t.size > 8 && int(t.dtype) != 8)
                 for (size_t k = 0; k < fill.size(); ++k) fill[k] = uint8_t((k * 2654435761u + rank) >> 24) & 0x3f;
             check(nrt_tensor_write(dev, fill.data(), 0, fill.size()), "nrt_tensor_write", rank);
             check(nrt_add_tensor_to_tensor_set(inputs, t.name, dev), "add input", rank);

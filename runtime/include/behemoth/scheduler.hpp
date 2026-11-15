@@ -34,6 +34,9 @@ struct Request {
     // tokens whose KV came from the cache (reset to 0 when the request is preempted).
     bool restoring = false;
     size_t restored = 0;
+    // A prefill chunk never crosses this position (0: none): the engine wants a step boundary there (a recurrent
+    // model's state can only be snapshotted between steps). Set by set_prefill_split().
+    size_t prefill_split = 0;
     std::string reason;
 };
 struct ScheduledRequest {
@@ -126,6 +129,7 @@ class Scheduler {
     void release_pages(std::vector<int> &pages);
     // Grows `table` to cover `tokens` from the pool (reclaiming cache pages if needed).
     bool allocate_pages(std::vector<int> &table, size_t tokens);
+    void set_prefill_split(uint64_t id, size_t position);
     // A queued request waits for a prefix restore (not scheduled until finish/abort_restore).
     void wait_restore(uint64_t id);
     // Restore copies into `pages` (the request's first pages) are in flight.

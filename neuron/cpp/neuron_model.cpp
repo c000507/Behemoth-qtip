@@ -1645,17 +1645,38 @@ std::span<const float> NeuronModel::forward(const InferenceBatch &b, bool want_a
 }
 bool NeuronModel::device_argmax_used() const { return !backend_ && impl_->device_argmax_used(); }
 int NeuronModel::device_token(size_t logits_row) const { return backend_ ? -1 : impl_->device_token(logits_row); }
+int NeuronModel::mtp_max_drafts() const { return backend_ ? backend_->mtp_max_drafts() : 0; }
+int NeuronModel::mtp_max_drafts(int requests, int pages) const { return backend_ ? backend_->mtp_max_drafts(requests, pages) : 0; }
+std::vector<int> NeuronModel::mtp_draft(std::span<const int> pages, int position, std::span<const int> next, int want) {
+    return backend_ ? backend_->mtp_draft(pages, position, next, want) : std::vector<int>{};
+}
 nlohmann::json NeuronModel::last_profile() const { return backend_ ? backend_->last_profile() : impl_->profile; }
-// Prefix-cache copies exist only for the Llama graphs (the engine disables the cache for recurrent models).
-size_t NeuronModel::kv_page_bytes() const { return backend_ ? 0 : impl_->kv_page_rank_bytes() * size_t(impl_->tp); }
+// Prefix-cache copies: the Llama graphs (Impl), or a backend that implements them (Qwen3.5: K/V pages of the gqa layers
+// plus snapshots of the recurrent state; GLM has none, so the engine keeps its cache off).
+size_t NeuronModel::kv_page_bytes() const { return backend_ ? backend_->kv_page_bytes() : impl_->kv_page_rank_bytes() * size_t(impl_->tp); }
 void NeuronModel::kv_save(std::span<const int> device_pages, std::span<const int> host_pages, std::byte *arena) {
     if (backend_)
-        throw std::logic_error("no prefix cache for this model");
+        return backend_->kv_copy(device_pages, host_pages, arena, true);
     impl_->kv_copy(device_pages, host_pages, arena, true);
 }
 void NeuronModel::kv_restore(std::span<const int> host_pages, std::span<const int> device_pages, const std::byte *arena) {
     if (backend_)
-        throw std::logic_error("no prefix cache for this model");
+        return backend_->kv_copy(device_pages, host_pages, const_cast<std::byte *>(arena), false);
     impl_->kv_copy(device_pages, host_pages, const_cast<std::byte *>(arena), false);
+}
+size_t NeuronModel::state_bytes() const { return backend_ ? backend_->state_bytes() : 0; }
+void NeuronModel::state_save(int first_page, std::byte *dst) {
+    if (!backend_)
+        throw std::logic_error("no recurrent state in this model");
+    backend_->state_save(first_page, dst);
+}
+void NeuronModel::state_restore(int first_page, const std::byte *src) {
+    if (!backend_)
+        throw std::logic_error("no recurrent state in this model");
+    backend_->state_restore(first_page, src);
+}
+void NeuronModel::state_drop(int first_page) {
+    if (backend_)
+        backend_->state_drop(first_page);
 }
 } // namespace neuron

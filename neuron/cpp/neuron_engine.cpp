@@ -18,6 +18,9 @@
 #include "behemoth/constraint.hpp"
 #include "behemoth/sampling.hpp"
 #include "neuron_model.hpp"
+#include <array>
+#include <initializer_list>
+#include <sstream>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,6 +28,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -108,6 +112,11 @@ struct Engine::Impl {
     std::map<uint64_t, std::mt19937_64> rng;
     std::set<uint64_t> cancellations;
     std::map<uint64_t, Clock::time_point> submitted, last_token;
+    struct RequestStats { // per request, for GenerationEvent (the server's request_metrics log)
+        double queue_wait_ms = -1;
+        size_t steps = 0, drafted = 0, accepted = 0;
+    };
+    std::map<uint64_t, RequestStats> request_stats;
     std::deque<double> ttft, itl;
     uint64_t completed = 0, tokens = 0, steps = 0, drafted_tokens = 0, accepted_drafts = 0;
     double model_seconds = 0;
@@ -128,6 +137,23 @@ struct Engine::Impl {
     double spec_page_cost = 0.01, plain_step_ms = 40;
     std::map<uint64_t, double> acceptance;
     Drafts drafts;
+    // MTP speculation (recurrent Qwen3.5 backends with the checkpoint's draft head loaded; docs/neuron-qwen397-mtp.md):
+    // BEHEMOTH_NEURON_SPEC_MTP = drafts per step (0: off). After every step that was ONE decode request the head drafts the
+    // tokens after the one just sampled; the next step verifies them as one chunk of that request (scheduled token + drafts,
+    // processed sequentially through the recurrence), the backend commits the state of the accepted prefix. Steps with
+    // several requests do not draft. BEHEMOTH_NEURON_SPEC_MTP_ADAPT=1: the draft count per step follows the running
+    // per-position acceptance and the measured step times (see mtp_choose).
+    int spec_mtp = 0;
+    bool mtp_adapt = false;
+    std::map<uint64_t, std::pair<size_t, std::vector<int>>> mtp_drafts; // request -> (the begin they follow, drafts)
+    std::vector<uint64_t> mtp_drafted, mtp_accepted;                    // by draft position: verified, accepted
+    std::vector<double> mtp_p, mtp_cost;                                // EMA: P(drafts 1..j accepted); step ms with k drafts (incl. drafting)
+    std::vector<uint64_t> mtp_steps_k;
+    std::vector<double> mtp_verify, mtp_draftc;                         // EMA by k: step ms up to the sampling with k drafts; mtp_draft ms for k drafts
+    std::vector<uint64_t> mtp_verify_n, mtp_draft_n;
+    uint64_t mtp_step_count = 0;
+    std::vector<int> mtp_by_rows;                                       // drafts per request for 2, 3, ... decode requests in a step
+    double mtp_ms_total = 0;
     // structured outputs: constraints of the constrained requests; per-token cost of the constraint calls
     std::map<uint64_t, std::shared_ptr<TokenConstraint>> constraints;
     uint64_t constrained_requests = 0;
@@ -139,6 +165,32 @@ struct Engine::Impl {
     std::vector<std::byte> arena; // host tier: host page h at h * model.kv_page_bytes()
     uint64_t gpu_hits = 0, host_hits = 0, restored_tokens = 0, saves = 0, saved_pages = 0, failed_saves = 0;
     double save_ms = 0, restore_ms = 0;
+    // Recurrent models with state snapshots (Qwen3.5; BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE=1, docs/neuron-qwen35-prefix-cache.md):
+    // K/V pages alone do not make a prefix, the recurrent state after its last token is needed too, and that exists only
+    // where it was copied out between two steps. A request collects snapshots of its sequence (position -> state): every
+    // snap_interval tokens of prefill (at the chunk boundary reaching it), at prompt_size - snap_tail (the scheduler
+    // splits the last chunk there: the next turn of the conversation usually matches up to a few tokens before the
+    // generation prompt's end) and at its end (all tokens with K/V; next turn when the client sends the answer back
+    // token-exact). They move to the cache slot of the sequence when the request retires; a lookup restores only at a
+    // snapshot position (PrefixCache::lookup's `usable`), and the new request inherits the slot's snapshots below it.
+    // Blobs are shared (never copied) and bounded by BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB (least recently used slots
+    // lose their snapshots first; a slot without snapshots cannot be hit).
+    struct StateBlob {
+        std::vector<std::byte> data;
+        size_t *total;
+        StateBlob(size_t n, size_t *t) : data(n), total(t) { *total += n; }
+        ~StateBlob() { *total -= data.size(); }
+    };
+    using Snapshot = std::shared_ptr<StateBlob>;
+    using Snapshots = std::map<size_t, Snapshot>; // by position = tokens the state has absorbed
+    bool state_cache = false;
+    size_t snap_interval = 1024, snap_tail = 8, state_cap = 0, state_total = 0;
+    bool snap_end = true;
+    std::map<uint64_t, Snapshots> request_snaps;                                // by request id
+    std::map<uint64_t, std::pair<PrefixCache::SlotPtr, Snapshots>> slot_snaps; // by cache slot id
+    std::map<uint64_t, Snapshot> pending_state;                                // requests waiting for their restore
+    uint64_t snapshots_taken = 0, snapshots_dropped = 0, state_restores = 0, snapshot_failures = 0;
+    double snapshot_ms = 0, state_restore_ms = 0;
     std::thread thread;
 
     static int env_int(const char *name, int fallback) {
@@ -178,10 +230,47 @@ struct Engine::Impl {
         spec_page_cost = model.has_shared_verify() ? 0.002 : 0.01;
         if (const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_PAGE_COST"))
             spec_page_cost = std::atof(v);
-        if (o.prefix_cache.slots && model.recurrent())
-            std::cerr << "Prefix cache: off (the model keeps recurrent state that restored K/V pages do not carry)\n";
-        if (o.prefix_cache.slots && env_int("BEHEMOTH_NEURON_PREFIX_CACHE", 1) && !model.recurrent()) {
+        spec_mtp = std::max(0, std::min(env_int("BEHEMOTH_NEURON_SPEC_MTP", 0), model.mtp_max_drafts()));
+        mtp_adapt = env_int("BEHEMOTH_NEURON_SPEC_MTP_ADAPT", 0) != 0;
+        {
+            const char *v = std::getenv("BEHEMOTH_NEURON_SPEC_MTP_BY_ROWS");
+            std::stringstream list(v ? v : "");
+            for (std::string item; std::getline(list, item, ',');)
+                mtp_by_rows.push_back(std::atoi(item.c_str()));
+        }
+        mtp_drafted.assign(size_t(spec_mtp), 0);
+        mtp_accepted.assign(size_t(spec_mtp), 0);
+        mtp_p.assign(size_t(spec_mtp), 0.3);
+        for (size_t j = 0; j < mtp_p.size() && j < 4; ++j)
+            mtp_p[j] = std::array<double, 4>{0.89, 0.69, 0.50, 0.36}[j];
+        mtp_verify.assign(size_t(spec_mtp) + 1, 0.0);
+        mtp_draftc.assign(size_t(spec_mtp) + 1, 0.0);
+        mtp_verify_n.assign(size_t(spec_mtp) + 1, 0);
+        mtp_draft_n.assign(size_t(spec_mtp) + 1, 0);
+        mtp_cost.assign(size_t(spec_mtp) + 1, 0.0);
+        mtp_steps_k.assign(size_t(spec_mtp) + 1, 0);
+        if (env_int("BEHEMOTH_NEURON_SPEC_MTP", 0) > 0)
+            std::cerr << "MTP speculation: " << (spec_mtp ? "up to " + std::to_string(spec_mtp) + " drafts per step" + (mtp_adapt ? " (adaptive)" : "")
+                                                           : std::string("off (the model has no usable MTP head / verify buckets)")) << "\n";
+        // recurrent family: only with state snapshots (backend support) and opted in
+        state_cache = model.recurrent() && model.state_bytes() && model.kv_page_bytes() && env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE", 0);
+        if (o.prefix_cache.slots && model.recurrent() && !state_cache)
+            std::cerr << "Prefix cache: off (the model keeps recurrent state that restored K/V pages do not carry"
+                      << (model.state_bytes() ? "; BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE=1 enables the cache with state snapshots)\n" : ")\n");
+        if (o.prefix_cache.slots && env_int("BEHEMOTH_NEURON_PREFIX_CACHE", 1) && (!model.recurrent() || state_cache)) {
             auto co = o.prefix_cache;
+            if (state_cache) {
+                snap_interval = size_t(std::max(1, env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_INTERVAL", 1024)));
+                snap_tail = size_t(std::max(0, env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_TAIL", 8)));
+                if (snap_tail == 1) // a one-token last piece would be scheduled as a decode step
+                    snap_tail = 2;
+                // the end-of-sequence snapshot needs the state of the last ACCEPTED token: with MTP speculation that is a
+                // commit (rename) of the final verify step, a path not yet verified on a device, so it is opt-in there
+                snap_end = env_int("BEHEMOTH_NEURON_QWEN35_PREFIX_END", spec_mtp > 0 ? 0 : 1) != 0;
+                const char *sg = std::getenv("BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB");
+                state_cap = size_t((sg ? std::atof(sg) : 4.0) * 1e9);
+                co.turn_slack = snap_tail;
+            }
             // host tier: --prefix-cache-gb, capped by BEHEMOTH_NEURON_PREFIX_HOST_GB (default 8: the instance's RAM also
             // holds the embeddings and the load-time staging)
             const char *cap_env = std::getenv("BEHEMOTH_NEURON_PREFIX_HOST_GB");
@@ -200,6 +289,10 @@ struct Engine::Impl {
             std::cerr << "Prefix cache: " << co.slots << " slots, host tier " << double(arena.size()) / 1e9 << " GB ("
                       << co.host_pages << " pages of " << model.kv_page_bytes() / 1024 << " KiB), device tier "
                       << (co.gpu_tier ? "on" : "off") << "\n";
+            if (state_cache)
+                std::cerr << "Prefix cache: recurrent state snapshots of " << double(model.state_bytes()) / (1 << 20) << " MiB every " << snap_interval
+                          << " prefill tokens, " << snap_tail << " tokens before the prompt's end" << (snap_end ? " and at the sequence's end" : "")
+                          << ", cap " << double(state_cap) / 1e9 << " GB\n";
         }
         thread = std::thread([this] { loop(); });
     }
@@ -238,6 +331,21 @@ struct Engine::Impl {
                     lease != leases.end() && r.restored && r.restored == lease->second.tokens ? &lease->second : nullptr;
                 plan = cache->insert(std::span<const int>(r.history.data(), r.cached), r.prompt_size, restored, release);
             }
+            // recurrent state: the request's snapshots (those its cached tokens cover) and the state it ends with
+            Snapshots snaps;
+            if (state_cache) {
+                if (auto rs = request_snaps.find(id); rs != request_snaps.end()) {
+                    snaps = std::move(rs->second);
+                    request_snaps.erase(rs);
+                }
+                snaps.erase(snaps.upper_bound(r.cached), snaps.end());
+                if (plan.slot && snap_end && !pages.empty() && !snaps.count(r.cached))
+                    if (auto snap = take_snapshot(pages[0]))
+                        snaps[r.cached] = std::move(snap);
+                if (!pages.empty())
+                    model.state_drop(pages[0]);
+                pending_state.erase(id);
+            }
             if (!plan.slot)
                 release.insert(release.end(), pages.begin(), pages.end());
             else {
@@ -256,6 +364,8 @@ struct Engine::Impl {
                         ok = false;
                         ++failed_saves;
                     }
+                if (ok && state_cache && !snaps.empty())
+                    slot_snaps[plan.slot->id] = {plan.slot, std::move(snaps)};
                 if (ok)
                     cache->saved(plan, std::move(pages), release);
                 else {
@@ -264,12 +374,83 @@ struct Engine::Impl {
                 }
             }
             scheduler.release_pages(release);
+            if (state_cache) {
+                for (auto it = slot_snaps.begin(); it != slot_snaps.end();) // evicted / superseded slots
+                    it = it->second.first->indexed ? std::next(it) : slot_snaps.erase(it);
+                trim_snapshots();
+            }
         }
         if (lease != leases.end()) {
             cache->release(lease->second);
             leases.erase(lease);
         }
         scheduler.erase(id);
+    }
+
+    // Under the lock, between steps: a copy of the recurrent state the sequence on first page `seq` has now (null: over
+    // the cap, or the copy failed: the position is then simply not restorable).
+    Snapshot take_snapshot(int seq) {
+        const size_t n = model.state_bytes();
+        if (state_total + n > state_cap) {
+            trim_snapshots(n);
+            if (state_total + n > state_cap) {
+                ++snapshots_dropped;
+                return nullptr;
+            }
+        }
+        try {
+            const auto t0 = Clock::now();
+            auto snap = std::make_shared<StateBlob>(n, &state_total);
+            model.state_save(seq, snap->data.data());
+            snapshot_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            ++snapshots_taken;
+            return snap;
+        } catch (const std::exception &e) {
+            std::cerr << "Prefix cache: state snapshot failed: " << e.what() << "\n";
+            ++snapshot_failures;
+            return nullptr;
+        }
+    }
+    // Keep the snapshot bytes (+ `room`) under the cap: the least recently used slots lose their snapshots (blobs shared
+    // with a newer slot or a running request stay alive through them).
+    void trim_snapshots(size_t room = 0) {
+        while (state_total + room > state_cap) {
+            auto victim = slot_snaps.end();
+            for (auto it = slot_snaps.begin(); it != slot_snaps.end(); ++it)
+                if (victim == slot_snaps.end() || it->second.first->last_use < victim->second.first->last_use)
+                    victim = it;
+            if (victim == slot_snaps.end())
+                return;
+            snapshots_dropped += victim->second.second.size();
+            slot_snaps.erase(victim);
+        }
+    }
+    // The longest prefix of `slot` not beyond `limit` tokens that has a state snapshot (0: none).
+    size_t restorable(const PrefixCache::Slot &slot, size_t limit) const {
+        auto it = slot_snaps.find(slot.id);
+        if (it == slot_snaps.end())
+            return 0;
+        auto s = it->second.second.upper_bound(limit);
+        return s == it->second.second.begin() ? 0 : std::prev(s)->first;
+    }
+    // After a step, under the lock: `request` ran a prefill chunk that ended at `end` tokens.
+    void snapshot_prefill(const Request &r, size_t end) {
+        if (r.pages.empty() || end < cache->options().min_tokens)
+            return;
+        auto &snaps = request_snaps[r.id];
+        if (snaps.count(end))
+            return;
+        size_t last = r.restored;
+        for (auto it = snaps.rbegin(); it != snaps.rend(); ++it)
+            if (it->first <= end) {
+                last = std::max(last, it->first);
+                break;
+            }
+        const bool tail = snap_tail ? r.prefill_split && end == r.prefill_split : end == r.prompt_size;
+        if (!tail && end - std::min(end, last) < snap_interval)
+            return;
+        if (auto snap = take_snapshot(r.pages[0]))
+            snaps[end] = std::move(snap);
     }
 
     // Under the lock, before scheduling: restore the prefixes of waiting requests, from the device tier (the slot's
@@ -283,6 +464,8 @@ struct Engine::Impl {
                 scheduler.abort_restore(id);
                 cache->release(lease);
                 leases.erase(id);
+                pending_state.erase(id);
+                request_snaps.erase(id);
                 it = awaiting.erase(it);
                 continue;
             }
@@ -291,11 +474,35 @@ struct Engine::Impl {
                 continue;
             }
             size_t m = lease.tokens;
+            // recurrent state: written (to the sequence's first page) before the request can be scheduled; a failure
+            // aborts the restore, the request then prefills from position 0
+            auto restore_state = [&](int first_page) {
+                if (!state_cache)
+                    return;
+                const auto t0 = Clock::now();
+                model.state_restore(first_page, pending_state.at(id)->data.data());
+                state_restore_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                ++state_restores;
+                pending_state.erase(id);
+            };
             std::vector<int> release;
             auto gpu = cache->take_gpu(slot, ceil_div(m, 16), release);
             scheduler.release_pages(release);
             if (!gpu.empty()) {
+                const int first_page = gpu[0];
                 scheduler.begin_restore(id, std::move(gpu));
+                try {
+                    restore_state(first_page);
+                } catch (const std::exception &e) {
+                    std::cerr << "Prefix cache: state restore failed: " << e.what() << "\n";
+                    scheduler.abort_restore(id);
+                    cache->release(lease);
+                    leases.erase(id);
+                    pending_state.erase(id);
+                    request_snaps.erase(id);
+                    it = awaiting.erase(it);
+                    continue;
+                }
                 scheduler.finish_restore(id, m);
                 ++gpu_hits;
                 restored_tokens += m;
@@ -304,18 +511,28 @@ struct Engine::Impl {
             }
             std::vector<int> table;
             if (!scheduler.allocate_pages(table, m)) {
-                const size_t fit = std::min(m, scheduler.free_pages() * 16);
-                if (fit < cache->options().min_tokens || !scheduler.allocate_pages(table, fit)) {
+                size_t fit = std::min(m, scheduler.free_pages() * 16);
+                if (state_cache) { // only a snapshot position can be restored: the deepest inherited one that fits
+                    auto &snaps = request_snaps[id];
+                    auto s = snaps.upper_bound(fit);
+                    fit = s == snaps.begin() ? 0 : std::prev(s)->first;
+                    if (fit)
+                        pending_state[id] = snaps.at(fit);
+                }
+                if (fit < cache->options().min_tokens || !fit || !scheduler.allocate_pages(table, fit)) {
                     ++it;
                     continue;
                 }
                 m = lease.tokens = fit;
+                if (state_cache)
+                    request_snaps[id].erase(request_snaps[id].upper_bound(m), request_snaps[id].end());
             }
             scheduler.begin_restore(id, table);
             try {
                 const auto t0 = Clock::now();
                 model.kv_restore(std::span<const int>(lease.host.data(), ceil_div(m, 16)), std::span<const int>(table.data(), ceil_div(m, 16)), arena.data());
                 restore_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                restore_state(table[0]);
                 scheduler.finish_restore(id, m);
                 ++host_hits;
                 restored_tokens += m;
@@ -324,19 +541,99 @@ struct Engine::Impl {
                 scheduler.abort_restore(id);
                 cache->release(lease);
                 leases.erase(id);
+                pending_state.erase(id);
+                request_snaps.erase(id);
             }
             it = awaiting.erase(it);
         }
     }
 
+    // Under the lock: the event with the request's queue wait and speculation counters filled in.
+    GenerationEvent timed(GenerationEvent e) const {
+        if (auto it = request_stats.find(e.id); it != request_stats.end()) {
+            e.queue_wait_ms = it->second.queue_wait_ms;
+            e.spec_steps = it->second.steps;
+            e.drafted = it->second.drafted;
+            e.accepted = it->second.accepted;
+        }
+        return e;
+    }
+
     void forget(uint64_t id) { // under the lock
         retire(id);
+        request_snaps.erase(id);
+        pending_state.erase(id);
+        request_stats.erase(id);
         callbacks.erase(id);
         rng.erase(id);
         submitted.erase(id);
         last_token.erase(id);
         acceptance.erase(id);
         constraints.erase(id);
+        mtp_drafts.erase(id);
+    }
+    // Drafts for the next step: fixed (spec_mtp), or (BEHEMOTH_NEURON_SPEC_MTP_ADAPT=1) the k maximising expected tokens per
+    // millisecond in the steady state "every step verifies k drafts and drafts k more":
+    //   (1 + sum_{j <= k} P(drafts 1..j accepted)) / (verify_ms(k) + draft_ms(k)).
+    // verify_ms(k) = EMA of the step time up to the sampling with k drafts attached, draft_ms(k) = EMA of mtp_draft for k
+    // drafts: the two are timed separately because the step that verifies k drafts drafts another count when k changes
+    // (one EMA per k over the whole step, the first version, mixed them and settled on the widest k). A k never timed is
+    // extrapolated from the nearest timed one (measured slopes: +6 ms per verify row, 1.65 ms per chained
+    // draft). P starts from the offline study (0.89 0.69 0.50 0.36) and is only updated for positions that are drafted,
+    // so every 32nd step tries one draft more than the best to keep the next position's estimate alive.
+    // Cost estimate per k. The first launch of every bucket / (Q, D) chain graph carries one-time setup (100+ ms), and a k
+    // that looks bad is only run by the exploration steps, so a seed outlier survives for hundreds of steps (plain EMA:
+    // stuck at the widest k, 68.8 tok/s; EMA without the first sample: stuck at k = 1, 78.6; 70 % pull towards a faster
+    // sample: 90 steps at k = 4 before settling, 80.6). Hence: the first sample of a k is dropped, a faster sample
+    // replaces the estimate at once, a slower one moves it by 5 % (clamped to 1.5 x).
+    static void mtp_ema(double &c, uint64_t &n, double v) {
+        if (++n < 2)
+            return;
+        if (n == 2 || v < c)
+            c = v;
+        else
+            c += 0.05 * (std::min(v, 1.5 * c) - c);
+    }
+    // a k not timed yet: the measured single-stream profile (section 9 / 11 of the doc: verify step ms and chain launch ms
+    // by k), scaled by timed / profile of the nearest timed k (long contexts scale the verify side)
+    static double mtp_profile(const std::vector<double> &timed, const std::vector<uint64_t> &n, int k, int first, std::initializer_list<double> base, double slope) {
+        auto prof = [&](int j) { return j < int(base.size()) ? base.begin()[j] : base.begin()[base.size() - 1] + slope * (j - int(base.size()) + 1); };
+        if (n[size_t(k)] >= 2)
+            return timed[size_t(k)];
+        int near = -1;
+        for (int j = first; j < int(timed.size()); ++j)
+            if (n[size_t(j)] >= 2 && (near < 0 || std::abs(j - k) < std::abs(near - k)))
+                near = j;
+        return near < 0 ? prof(k) : prof(k) * timed[size_t(near)] / prof(near);
+    }
+    double mtp_verify_ms(int k) const { return mtp_profile(mtp_verify, mtp_verify_n, k, 0, {15.8, 22.2, 25.0, 29.1, 39.8}, 11.0); }
+    double mtp_draft_ms(int k) const { return k <= 0 ? 0.0 : mtp_profile(mtp_draftc, mtp_draft_n, k, 1, {1.0, 1.5, 2.1, 2.7, 6.3}, 1.65); }
+    // Drafts per request in a step of n decode requests: spec_mtp alone; with company the measured table
+    // BEHEMOTH_NEURON_SPEC_MTP_BY_ROWS ("k for 2 requests,k for 3,..."; beyond the list 0: a verify row costs what a batch
+    // row costs, so speculation stops paying when the step is wide - docs/neuron-qwen397-mtp.md section 14)
+    int mtp_k_rows(int n) const {
+        if (n <= 1)
+            return spec_mtp;
+        return size_t(n - 2) < mtp_by_rows.size() ? std::min(spec_mtp, mtp_by_rows[size_t(n - 2)]) : 0;
+    }
+    int mtp_choose() {
+        if (!mtp_adapt || spec_mtp <= 1)
+            return spec_mtp;
+        int best = 0;
+        double best_rate = 0, tokens = 1;
+        for (int k = 0; k <= spec_mtp; ++k) {
+            if (k)
+                tokens += mtp_p[size_t(k - 1)];
+            const double rate = tokens / std::max(mtp_verify_ms(k) + mtp_draft_ms(k), 1e-3);
+            if (rate > best_rate)
+                best_rate = rate, best = k;
+        }
+        // every 16th step (8th at first) one draft more or fewer than the best, alternately: keeps the neighbours' timings and the next
+        // position's acceptance current (a k that is never run is never re-timed)
+        const uint64_t every = mtp_step_count < 96 ? 8 : 16; // (more often while the estimates are young)
+        if (++mtp_step_count % every == 0)
+            best = std::clamp(best + (mtp_step_count / every % 2 ? 1 : -1), 1, spec_mtp);
+        return best;
     }
 
     // One token of a constrained request from `row` (logits after processing), committed to the constraint.
@@ -399,6 +696,8 @@ struct Engine::Impl {
                         if (scheduler.request(*it).restoring) { // restores are synchronous: only a waiting one can be cancelled
                             awaiting.erase(std::find(awaiting.begin(), awaiting.end(), *it));
                             scheduler.abort_restore(*it);
+                            pending_state.erase(*it);
+                            request_snaps.erase(*it);
                         }
                         scheduler.cancel(*it);
                     }
@@ -408,7 +707,7 @@ struct Engine::Impl {
                         ++it;
                         continue;
                     }
-                    events.push_back({it->second, {r.id, -1, true, r.reason, "", r.prompt_size, r.generated, r.restored}});
+                    events.push_back({it->second, timed({r.id, -1, true, r.reason, "", r.prompt_size, r.generated, r.restored})});
                     const uint64_t id = r.id;
                     ++it;
                     forget(id);
@@ -416,6 +715,10 @@ struct Engine::Impl {
                 if (cache)
                     start_restores();
                 step = scheduler.schedule();
+                for (const auto &scheduled : step.requests)
+                    if (auto sub = submitted.find(scheduled.id); sub != submitted.end())
+                        if (request_stats.try_emplace(scheduled.id).second)
+                            request_stats[scheduled.id].queue_wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - sub->second).count();
                 drafts.clear();
                 if (!step.requests.empty()) {
                     // Draft only for small decode steps, and never past spec_rows rows in total: rows are the cost of a
@@ -440,6 +743,43 @@ struct Engine::Impl {
                                 drafts[s.id] = std::move(draft);
                             }
                         }
+                    if (spec_mtp > 0) { // the MTP head's drafts for exactly these positions; k by the step's request count (mtp_k_rows)
+                        const size_t n = step.requests.size();
+                        bool singles = true;
+                        size_t top = 0;
+                        for (const auto &s : step.requests) {
+                            singles = singles && s.count == 1 && s.sample;
+                            top = std::max(top, s.begin);
+                        }
+                        int kmax = singles ? mtp_k_rows(int(n)) : 0;
+                        if (kmax > 0 && n > 1)
+                            kmax = std::min(kmax, model.mtp_max_drafts(int(n), int((top + 1 + size_t(kmax) + 15) / 16)));
+                        for (const auto &s : step.requests) {
+                            auto it = mtp_drafts.find(s.id);
+                            if (it == mtp_drafts.end())
+                                continue;
+                            auto d = std::move(it->second.second);
+                            const bool follows = it->second.first == s.begin;
+                            mtp_drafts.erase(it);
+                            if (kmax <= 0 || !follows)
+                                continue;
+                            const auto &r = scheduler.request(s.id);
+                            const size_t room = r.max_new > r.generated ? r.max_new - r.generated - 1 : 0; // tokens after this step's own
+                            if (d.size() > std::min(room, size_t(kmax)))
+                                d.resize(std::min(room, size_t(kmax)));
+                            if (!d.empty() && s.begin + 1 + d.size() <= max_context && scheduler.reserve(s.id, s.begin + 1 + d.size())) {
+                                // test hook: BEHEMOTH_NEURON_SPEC_MTP_CORRUPT=percent of the verify steps get one wrong draft
+                                // (forces rejections at every draft position: the rollback must leave the stream unchanged)
+                                static const int corrupt = env_int("BEHEMOTH_NEURON_SPEC_MTP_CORRUPT", 0);
+                                static std::mt19937_64 crng(12345);
+                                if (corrupt > 0 && int(crng() % 100) < corrupt) {
+                                    const size_t at = crng() % d.size();
+                                    d[at] = (d[at] + 1) % model.vocab();
+                                }
+                                drafts[s.id] = std::move(d);
+                            }
+                        }
+                    }
                     input = make_inference_batch(scheduler, step, drafts);
                     for (const auto &s : step.requests) {
                         auto c = constraints.find(s.id);
@@ -542,13 +882,16 @@ struct Engine::Impl {
                 last_profile = model.last_profile();
                 last_profile["sample_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - t_sample0).count();
                 ++steps;
-                size_t step_tokens = 0, step_drafts = 0;
+                size_t step_tokens = 0, step_drafts = 0, step_accepted = 0;
+                std::vector<std::vector<int>> emitted_by(step.requests.size()); // per request: the tokens this step emitted, in order
+                std::vector<size_t> req_drafts(step.requests.size(), 0), req_accepted(step.requests.size(), 0);
                 for (size_t i = 0; i < step.requests.size(); ++i) {
                     const auto &request = step.requests[i];
                     auto emit = [&](int token) {
                         const auto &after = scheduler.request(request.id);
                         ++tokens;
                         ++step_tokens;
+                        emitted_by[i].push_back(token);
                         const auto now = Clock::now();
                         const bool later = last_token.contains(request.id);
                         (later ? itl : ttft).push_back(std::chrono::duration<double, std::milli>(now - (later ? last_token.at(request.id) : submitted.at(request.id))).count());
@@ -556,10 +899,33 @@ struct Engine::Impl {
                             if (samples->size() > 1024)
                                 samples->pop_front();
                         last_token[request.id] = now;
-                        events.push_back({callbacks.at(request.id), {request.id, token, false, "", "", after.prompt_size, after.generated, after.restored}});
+                        events.push_back({callbacks.at(request.id), timed({request.id, token, false, "", "", after.prompt_size, after.generated, after.restored})});
                     };
                     const int token = sampled[i].empty() ? -1 : sampled[i][0];
+                    // debug: BEHEMOTH_NEURON_MARGIN_LOG=file gets, per emitted greedy token, "id index token runner-up gap" (the
+                    // logit gap to the second choice: how close a near tie was when two configurations diverge)
+                    auto margin = [&](size_t j) {
+                        static const char *path = std::getenv("BEHEMOTH_NEURON_MARGIN_LOG");
+                        if (!path || greedy_step)
+                            return;
+                        const auto row = logits.subspan((logits_row[i] + j) * vocab, vocab);
+                        int a = 0, b = -1;
+                        for (int v = 1; v < int(vocab); ++v) {
+                            if (row[size_t(v)] > row[size_t(a)])
+                                b = a, a = v;
+                            else if (b < 0 || row[size_t(v)] > row[size_t(b)])
+                                b = v;
+                        }
+                        static std::ofstream f(path, std::ios::app);
+                        f << request.id << " " << scheduler.request(request.id).generated << " " << sampled[i][j] << " " << (sampled[i][j] == a ? b : a) << " "
+                          << row[size_t(a)] - row[size_t(b)] << "\n";
+                    };
+                    if (token >= 0)
+                        margin(0);
                     scheduler.complete(request, token, token >= 0 && eos.contains(token));
+                    // a prefill chunk of a recurrent model: its state is now the state after begin + count tokens
+                    if (state_cache && request.begin + request.count <= scheduler.request(request.id).prompt_size)
+                        snapshot_prefill(scheduler.request(request.id), request.begin + request.count);
                     if (token >= 0)
                         emit(token);
                     // verified drafts: row j's token was sampled after draft j - 1; it stands when that draft matched
@@ -568,25 +934,86 @@ struct Engine::Impl {
                         step_drafts += d->second.size();
                         size_t accepted = 0;
                         for (size_t j = 1; j < sampled[i].size() && !scheduler.request(request.id).done && sampled[i][j - 1] == d->second[j - 1]; ++j) {
+                            margin(j);
                             scheduler.accept(request.id, sampled[i][j], eos.contains(sampled[i][j]));
                             emit(sampled[i][j]);
                             ++accepted;
                         }
                         accepted_drafts += accepted;
+                        step_accepted += accepted;
+                        req_drafts[i] = d->second.size();
+                        req_accepted[i] = accepted;
                         if (auto a = acceptance.find(request.id); a != acceptance.end())
                             a->second = 0.5 * (a->second + double(accepted));
                     }
+                    if (token >= 0)
+                        if (auto stats = request_stats.find(request.id); stats != request_stats.end()) {
+                            ++stats->second.steps;
+                            stats->second.drafted += req_drafts[i];
+                            stats->second.accepted += req_accepted[i];
+                        }
                     const auto &after = scheduler.request(request.id);
                     if (after.done) {
                         ++completed;
-                        events.push_back({callbacks.at(request.id), {request.id, -1, true, after.reason, "", after.prompt_size, after.generated, after.restored}});
+                        events.push_back({callbacks.at(request.id), timed({request.id, -1, true, after.reason, "", after.prompt_size, after.generated, after.restored})});
                     }
                 }
                 drafted_tokens += step_drafts;
+                bool mtp_step = spec_mtp > 0; // every request of the step is one decode token (+ its drafts): the head drafts for each
+                for (const auto &request : step.requests)
+                    mtp_step = mtp_step && request.count == 1 && request.sample;
+                if (mtp_step) {
+                    const size_t n = step.requests.size();
+                    const double verify_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                    if (n == 1 && step_drafts < mtp_verify.size()) { // the verify side of the cost model: this step up to here
+                        mtp_ema(mtp_verify[step_drafts], mtp_verify_n[step_drafts], verify_ms);
+                    }
+                    double draft_ms = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        const auto &request = step.requests[i];
+                        const auto &emitted = emitted_by[i];
+                        if (emitted.empty())
+                            continue;
+                        const auto &rq = scheduler.request(request.id);
+                        for (size_t j = 0; j < req_drafts[i] && j < mtp_drafted.size(); ++j) {
+                            ++mtp_drafted[j];
+                            mtp_accepted[j] += j < req_accepted[i];
+                            mtp_p[j] = 0.95 * mtp_p[j] + 0.05 * (j < req_accepted[i] ? 1.0 : 0.0);
+                        }
+                        if (rq.done) {
+                            // the sequence's end state is snapshotted when it retires: commit the accepted prefix first
+                            if (state_cache && snap_end && emitted.size() > 1 && !rq.pages.empty())
+                                model.mtp_draft(rq.pages, int(request.begin), emitted, 0);
+                            continue;
+                        }
+                        const size_t next_begin = request.begin + emitted.size();
+                        const size_t room = rq.max_new > rq.generated ? rq.max_new - rq.generated - 1 : 0;
+                        int want = int(std::min<size_t>(size_t(n == 1 ? mtp_choose() : mtp_k_rows(int(n))), room));
+                        if (want > 0 && (next_begin + 1 + size_t(want) > max_context || !scheduler.reserve(request.id, next_begin + 1 + size_t(want))))
+                            want = 0;
+                        // always called: it also commits the recurrent state of the accepted prefix
+                        const auto td = Clock::now();
+                        auto d = model.mtp_draft(scheduler.request(request.id).pages, int(request.begin), emitted, want);
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                        draft_ms += ms;
+                        if (n == 1 && !d.empty() && d.size() < mtp_draftc.size()) {
+                            mtp_ema(mtp_draftc[d.size()], mtp_draft_n[d.size()], ms);
+                        }
+                        if (!d.empty())
+                            mtp_drafts[request.id] = {next_begin, std::move(d)};
+                    }
+                    last_profile["mtp_ms"] = draft_ms;
+                    mtp_ms_total += draft_ms;
+                    const double wall = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                    if (n == 1 && step_drafts < mtp_cost.size()) {
+                        double &c = mtp_cost[step_drafts];
+                        c = mtp_steps_k[step_drafts]++ ? 0.9 * c + 0.1 * wall : wall;
+                    }
+                }
                 if (!step_drafts && step.requests.size() == 1 && step.requests[0].count == 1) // a plain single decode step
                     plain_step_ms = 0.9 * plain_step_ms + 0.1 * std::chrono::duration<double, std::milli>(Clock::now() - start).count();
                 if (std::getenv("BEHEMOTH_NEURON_STEP_LOG"))
-                    std::cerr << "step rows=" << step.requests.size() << " drafts=" << step_drafts << " tokens=" << step_tokens << " wall_ms="
+                    std::cerr << "step rows=" << step.requests.size() << " drafts=" << step_drafts << " accepted=" << step_accepted << " tokens=" << step_tokens << " wall_ms="
                               << std::chrono::duration<double, std::milli>(Clock::now() - start).count() << " " << last_profile.dump() << "\n";
                 for (const auto &request : step.requests)
                     if (scheduler.request(request.id).done)
@@ -625,12 +1052,24 @@ uint64_t Engine::submit(std::span<const int> prompt, size_t max_new, SamplingOpt
     if (impl_->failed || impl_->stop)
         throw std::runtime_error("Engine unavailable");
     const uint64_t id = impl_->scheduler.submit(prompt, max_new, options);
-    if (impl_->cache)
-        if (auto lease = impl_->cache->lookup(prompt)) {
+    if (impl_->cache) {
+        PrefixCache::Usable usable;
+        if (impl_->state_cache) {
+            usable = [&](const PrefixCache::Slot &slot, size_t limit) { return impl_->restorable(slot, limit); };
+            if (impl_->snap_tail && prompt.size() >= impl_->snap_tail + impl_->cache->options().min_tokens)
+                impl_->scheduler.set_prefill_split(id, prompt.size() - impl_->snap_tail);
+        }
+        if (auto lease = impl_->cache->lookup(prompt, usable)) {
+            if (impl_->state_cache) { // the snapshot to restore, and the slot's snapshots below it (this sequence's too)
+                const auto &snaps = impl_->slot_snaps.at(lease->slot->id).second;
+                impl_->pending_state[id] = snaps.at(lease->tokens);
+                impl_->request_snaps[id] = Impl::Snapshots(snaps.begin(), snaps.upper_bound(lease->tokens));
+            }
             impl_->scheduler.wait_restore(id);
             impl_->leases.emplace(id, std::move(*lease));
             impl_->awaiting.push_back(id);
         }
+    }
     impl_->callbacks[id] = std::move(callback);
     impl_->rng.emplace(id, std::mt19937_64(options.seed));
     if (constraint) {
@@ -671,6 +1110,10 @@ nlohmann::json Engine::metrics() const {
             {"steps", impl_->steps},
             {"drafted_tokens", impl_->drafted_tokens},
             {"accepted_drafts", impl_->accepted_drafts},
+            {"mtp", {{"max_drafts", impl_->spec_mtp}, {"adaptive", impl_->mtp_adapt}, {"verified_by_position", impl_->mtp_drafted},
+                     {"accepted_by_position", impl_->mtp_accepted}, {"steps_by_drafts", impl_->mtp_steps_k}, {"step_ms_by_drafts", impl_->mtp_cost},
+                     {"verify_ms_by_drafts", impl_->mtp_verify}, {"draft_ms_by_drafts", impl_->mtp_draftc}, {"p_by_position", impl_->mtp_p},
+                     {"draft_ms_total", impl_->mtp_ms_total}}},
             {"model_seconds", impl_->model_seconds},
             {"ttft_ms_p50", percentile(impl_->ttft, .5)},
             {"ttft_ms_p95", percentile(impl_->ttft, .95)},
@@ -691,6 +1134,11 @@ nlohmann::json Engine::metrics() const {
                                                            {"host_hits", impl_->host_hits},
                                                            {"restored_tokens", impl_->restored_tokens},
                                                            {"cached_tokens", impl_->cache->cached_tokens()},
+                                                           {"evictions", impl_->cache->stats().evictions},
+                                                           {"state_snapshots", {{"enabled", impl_->state_cache}, {"taken", impl_->snapshots_taken}, {"dropped", impl_->snapshots_dropped},
+                                                                                {"failed", impl_->snapshot_failures}, {"restores", impl_->state_restores},
+                                                                                {"bytes", impl_->state_total}, {"slots", impl_->slot_snaps.size()},
+                                                                                {"snapshot_ms", impl_->snapshot_ms}, {"restore_ms", impl_->state_restore_ms}}},
                                                            {"device_pages", impl_->cache->gpu_pages()},
                                                            {"host_pages_used", impl_->cache->host_pages_used()},
                                                            {"saves", impl_->saves},

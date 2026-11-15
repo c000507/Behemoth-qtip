@@ -6,6 +6,8 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <csignal>
 #include <ctime>
 #include <deque>
@@ -17,6 +19,7 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <unistd.h>
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -33,6 +36,16 @@ struct StructuredContext {
     explicit StructuredContext(const Tokenizer &tokenizer) : vocabulary(vocabulary_pieces(tokenizer), vocabulary_eos(tokenizer)) {}
 };
 
+// Requests between submit and their request_metrics line (concurrency in the log); BEHEMOTH_REQUEST_LOG=0 silences it.
+static std::atomic<int> active_requests{0};
+static bool request_log_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("BEHEMOTH_REQUEST_LOG");
+        return !(v && (std::string(v) == "0" || std::string(v) == "false" || std::string(v) == "off"));
+    }();
+    return on;
+}
+
 class Session : public std::enable_shared_from_this<Session> {
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
@@ -46,11 +59,18 @@ class Session : public std::enable_shared_from_this<Session> {
     // tokens are streamed as their marker text (requests with tools or a constraint, which sees them as text).
     std::unique_ptr<ToolCallParser> tool_parser_;
     bool markers_ = false;
+    bool answer_lead_ = false; // the whitespace between a prompt-opened think block's </think> and the answer is dropped
     uint64_t id_ = 0;
     std::time_t created_ = std::time(nullptr);
     bool streaming_ = false, finished_ = false, header_done_ = false, writing_ = false,
          closed_ = false, first_piece_ = true, include_usage_ = false;
     std::string output_, reasoning_output_;
+    // Per-request metrics (one request_metrics line to stderr when the request ends; never any text)
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point submitted_at_, first_token_at_, last_token_at_;
+    bool counted_ = false, logged_ = false, got_token_ = false;
+    int active_start_ = 0;
+    GenerationEvent seen_; // the latest event: token counts, queue wait and speculation counters
     ReasoningStream reasoning_;
     std::string diagnostic_dir_;
     json diagnostic_;
@@ -79,8 +99,10 @@ class Session : public std::enable_shared_from_this<Session> {
             return;
         closed_ = true;
         heartbeat_.cancel();
-        if (id_ && !finished_)
+        if (id_ && !finished_) {
             engine_.cancel(id_);
+            log_request("cancelled", "client_disconnect");
+        }
         beast::error_code ec;
         stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
         stream_.socket().close(ec);
@@ -185,7 +207,9 @@ class Session : public std::enable_shared_from_this<Session> {
         }
         for (const auto &part : reasoning_.append(text, finish)) {
             if (!part.reasoning) {
-                answer(part.text, false);
+                const size_t lead = answer_lead_ ? std::min(part.text.find_first_not_of(" \t\r\n"), part.text.size()) : 0;
+                answer_lead_ = answer_lead_ && lead == part.text.size();
+                answer(lead ? part.text.substr(lead) : part.text, false);
                 continue;
             }
             reasoning_output_ += part.text;
@@ -200,6 +224,75 @@ class Session : public std::enable_shared_from_this<Session> {
                 {"completion_tokens", event.completion_tokens},
                 {"total_tokens", event.prompt_tokens + event.completion_tokens},
                 {"prompt_tokens_details", {{"cached_tokens", event.cached_tokens}}}};
+    }
+    static double ms(Clock::time_point from, Clock::time_point to) {
+        return std::round(std::chrono::duration<double, std::milli>(to - from).count() * 100) / 100;
+    }
+    // The request's timings (ms; null when unknown), also returned as `timings` next to `usage`. TTFT runs from submit;
+    // prefill is the part after the request was first scheduled; decode is first to last token.
+    json timings(const GenerationEvent &event) const {
+        const double queue = event.queue_wait_ms >= 0 ? std::round(event.queue_wait_ms * 100) / 100 : -1;
+        json t = {{"queue_wait_ms", queue >= 0 ? json(queue) : json(nullptr)}, {"ttft_ms", nullptr}, {"prefill_ms", nullptr},
+                  {"prefill_tokens", event.prompt_tokens - std::min(event.cached_tokens, event.prompt_tokens)},
+                  {"prefill_tokens_per_s", nullptr}, {"decode_ms", nullptr}, {"decode_tokens_per_s", nullptr},
+                  {"total_ms", ms(submitted_at_, Clock::now())}};
+        if (got_token_) {
+            const double ttft = ms(submitted_at_, first_token_at_);
+            t["ttft_ms"] = ttft;
+            if (queue >= 0 && ttft >= queue) {
+                const double prefill = std::round((ttft - queue) * 100) / 100;
+                t["prefill_ms"] = prefill;
+                if (prefill > 0)
+                    t["prefill_tokens_per_s"] = std::round(double(t["prefill_tokens"].get<size_t>()) / prefill * 1e5) / 100;
+            }
+            const double decode = ms(first_token_at_, last_token_at_);
+            t["decode_ms"] = decode;
+            if (event.completion_tokens > 1 && decode > 0)
+                t["decode_tokens_per_s"] = std::round(double(event.completion_tokens - 1) / decode * 1e5) / 100;
+        }
+        return t;
+    }
+    // One line per request, once: `request_metrics {json}`. status: ok | error | cancelled (client disconnect).
+    // active_start / active_end count the in-flight requests including this one at submit and at the end.
+    json log_request(const std::string &status, const std::string &reason, const GenerationEvent *final_event = nullptr,
+                     const std::string &error = "") {
+        if (logged_ || !counted_)
+            return nullptr;
+        logged_ = true;
+        const GenerationEvent &event = final_event ? *final_event : seen_;
+        json t = timings(event);
+        const int active_end = active_requests.fetch_sub(1);
+        if (!request_log_enabled())
+            return t;
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t sec = std::chrono::system_clock::to_time_t(now);
+        char stamp[32];
+        std::tm utc{};
+        gmtime_r(&sec, &utc);
+        std::strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%S", &utc);
+        const int millis = int(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+        json line = {{"id", completion_id()}, {"ts", std::string(stamp) + "." + std::to_string(1000 + millis).substr(1) + "Z"},
+                     {"status", status}, {"finish_reason", reason}, {"stream", streaming_},
+                     {"prompt_tokens", event.prompt_tokens}, {"completion_tokens", event.completion_tokens},
+                     {"cached_tokens", event.cached_tokens}};
+        for (auto it = t.begin(); it != t.end(); ++it)
+            line[it.key()] = it.value();
+        line["active_start"] = active_start_;
+        line["active_end"] = active_end;
+        if (event.drafted > 0) // speculation (prompt lookup or MTP) drafted for this request
+            line["spec"] = {{"steps", event.spec_steps}, {"drafted", event.drafted}, {"accepted", event.accepted},
+                            {"tokens_per_step", event.spec_steps ? std::round(double(event.completion_tokens) / double(event.spec_steps) * 100) / 100 : 0.0}};
+        if (!error.empty())
+            line["error"] = error;
+        // one write(2) per line: concurrent requests finishing together must not interleave their lines
+        const std::string out = "request_metrics " + line.dump() + "\n";
+        for (size_t off = 0; off < out.size();) {
+            const ssize_t n = ::write(STDERR_FILENO, out.data() + off, out.size() - off);
+            if (n <= 0)
+                break;
+            off += size_t(n);
+        }
+        return t;
     }
     void finish(const GenerationEvent &event, std::string reason) {
         if (finished_ || closed_)
@@ -229,6 +322,9 @@ class Session : public std::enable_shared_from_this<Session> {
             } catch (const std::exception &e) { std::cerr << "Diagnostic capture failed: " << e.what() << '\n'; }
         }
         finished_ = true;
+        GenerationEvent last = event;
+        last.queue_wait_ms = event.queue_wait_ms >= 0 ? event.queue_wait_ms : seen_.queue_wait_ms;
+        json time = log_request("ok", reason, &last);
         if (streaming_) {
             enqueue("data: " + chunk(json::object(), reason).dump() + "\n\n");
             if (include_usage_)
@@ -238,7 +334,8 @@ class Session : public std::enable_shared_from_this<Session> {
                              {"created", created_},
                              {"model", model_name()},
                              {"choices", json::array()},
-                             {"usage", usage(event)}}
+                             {"usage", usage(event)},
+                             {"timings", time}}
                             .dump() +
                         "\n\n");
             enqueue("data: [DONE]\n\n");
@@ -258,14 +355,19 @@ class Session : public std::enable_shared_from_this<Session> {
                      {"created", created_},
                      {"model", model_name()},
                      {"choices", {{{"index", 0}, {"message", std::move(message)}, {"finish_reason", reason}}}},
-                     {"usage", usage(event)}});
+                     {"usage", usage(event)},
+                     {"timings", time}});
         }
     }
     void on_event(const GenerationEvent &event) {
         if (closed_ || finished_)
             return;
+        if (event.queue_wait_ms >= 0 || event.spec_steps)
+            seen_.queue_wait_ms = event.queue_wait_ms, seen_.spec_steps = event.spec_steps,
+            seen_.drafted = event.drafted, seen_.accepted = event.accepted;
         if (!event.error.empty()) {
             finished_ = true;
+            log_request("error", event.reason.empty() ? "error" : event.reason, nullptr, event.error);
             json error = {{"error", {{"message", event.error}, {"type", "server_error"}}}};
             if (streaming_) {
                 enqueue("data: " + error.dump() + "\n\n");
@@ -276,6 +378,11 @@ class Session : public std::enable_shared_from_this<Session> {
             return;
         }
         if (event.token >= 0) {
+            last_token_at_ = Clock::now();
+            if (!got_token_)
+                got_token_ = true, first_token_at_ = last_token_at_;
+            seen_.prompt_tokens = event.prompt_tokens, seen_.completion_tokens = event.completion_tokens,
+            seen_.cached_tokens = event.cached_tokens;
             if (!diagnostic_dir_.empty()) diagnostic_["tokens"].push_back(event.token);
             const auto &format = chat_backend().tools;
             if (const std::string *marker = markers_ ? format.marker(event.token) : nullptr)
@@ -347,6 +454,8 @@ class Session : public std::enable_shared_from_this<Session> {
             include_usage_ = request.include_usage;
             text_ = TextStream(request.stops);
             std::shared_ptr<TokenConstraint> constraint;
+            // the prompt ends inside an open think block (ChatBackend::think_open): the answer starts as reasoning
+            const bool think_open = chat_backend().think_open >= 0 && request.rendered.ends_with("<think>\n");
             if (request.structured.kind != StructuredOutput::None) {
                 std::unique_ptr<GrammarEngine> grammar;
                 try {
@@ -384,22 +493,42 @@ class Session : public std::enable_shared_from_this<Session> {
                     constraint = std::move(calls);
                     constrained_ = true;
                     splitter_ = ThinkSplitter(request.structured.allow_think);
-                } else if (format.calls_token >= 0)
-                    constraint = std::make_shared<TriggeredConstraint>(format.calls_token, std::move(calls),
-                                                                       structured_.vocabulary.size());
+                } else if (format.calls_token >= 0) {
+                    auto triggered = std::make_shared<TriggeredConstraint>(format.calls_token, std::move(calls),
+                                                                           structured_.vocabulary.size());
+                    triggered->set_think(chat_backend().think_open, chat_backend().think_close, think_open);
+                    constraint = std::move(triggered);
+                }
                 tool_parser_ = std::make_unique<ToolCallParser>(format, &request.tools); // auto: JSON-as-text fallback
                 if (!diagnostic_dir_.empty())
                     diagnostic_["tools"] = {{"choice", int(request.tools.choice)}, {"grammar", request.tool_grammar}};
             }
             markers_ = (constrained_ || tool_parser_) && chat_backend().tools.supported();
+            if (think_open && !constrained_) {
+                reasoning_.append("<think>");
+                answer_lead_ = true;
+            } else if (think_open && request.structured.allow_think) { // the gate and its mirror here enter the block
+                constraint->advance(chat_backend().think_open);
+                splitter_.feed("<think>", nullptr, nullptr);
+            }
             std::weak_ptr<Session> weak = shared_from_this();
-            id_ = engine_.submit(prompt, request.max_new, request.sampling,
-                                 [weak](const GenerationEvent &event) {
-                                     if (auto self = weak.lock())
-                                         asio::post(self->stream_.get_executor(),
-                                                    [self, event] { self->on_event(event); });
-                                 },
-                                 std::move(constraint));
+            seen_.prompt_tokens = prompt.size();
+            submitted_at_ = Clock::now();
+            counted_ = true;
+            active_start_ = active_requests.fetch_add(1) + 1;
+            try {
+                id_ = engine_.submit(prompt, request.max_new, request.sampling,
+                                     [weak](const GenerationEvent &event) {
+                                         if (auto self = weak.lock())
+                                             asio::post(self->stream_.get_executor(),
+                                                        [self, event] { self->on_event(event); });
+                                     },
+                                     std::move(constraint));
+            } catch (...) {
+                counted_ = false;
+                active_requests.fetch_sub(1);
+                throw;
+            }
             stream_.expires_never();
             watch_disconnect();
             if (streaming_) {
@@ -524,6 +653,8 @@ int main(int argc, char **argv) {
                 options.scheduler.mixed_prefill_tokens = std::stoul(value);
             else if (key == "--prefill-interval")
                 options.scheduler.prefill_interval = std::stoul(value);
+            else if (key == "--spec-mtp") // Neuron Qwen3.5: MTP drafts per step (0: off); the engine reads the environment
+                setenv("BEHEMOTH_NEURON_SPEC_MTP", value.c_str(), 1);
             else if (key == "--max-batch-requests")
                 options.scheduler.max_requests = std::stoul(value);
             else if (key == "--max-queued-requests")

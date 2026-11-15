@@ -10,6 +10,7 @@
 #include "behemoth/tools.hpp"
 #include "structured_support.hpp"
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <regex>
@@ -1143,6 +1144,332 @@ static void glm_tool_tests() {
     CHECK(plain.feed("no calls <tool", true).content == "no calls <tool" && plain.calls().empty());
 }
 
+// Qwen format: <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call>
+struct QwenRun {
+    std::string content;
+    std::vector<ToolCall> calls;
+    std::vector<std::string> fragments; // per call: its streamed argument fragments joined by "|"
+    std::vector<std::string> streamed;  // per call: the fragments concatenated
+    size_t starts = 0;
+};
+static QwenRun qwen_run(const ToolFormat &f, const ToolRequest *r, const std::string &text, size_t chunk) {
+    ToolCallParser p(f, r);
+    QwenRun out;
+    auto take = [&](const ToolCallParser::Delta &d) {
+        out.content += d.content;
+        for (const auto &item : d.tool_calls) {
+            const size_t index = item.at("index");
+            if (item.contains("id")) {
+                CHECK(index == out.starts && item.at("type") == "function" && item.at("function").at("arguments") == "" &&
+                      !item.at("function").at("name").get<std::string>().empty());
+                ++out.starts;
+                out.fragments.push_back("");
+                out.streamed.push_back("");
+            } else {
+                CHECK(index + 1 == out.starts); // fragments belong to the call started last
+                const std::string a = item.at("function").at("arguments");
+                out.fragments[index] += (out.fragments[index].empty() ? "" : "|") + a;
+                out.streamed[index] += a;
+            }
+        }
+    };
+    for (size_t i = 0; i < text.size(); i += chunk)
+        take(p.feed(text.substr(i, chunk)));
+    take(p.feed("", true));
+    out.calls = p.calls();
+    CHECK(out.content == p.content() && out.starts == out.calls.size());
+    for (size_t i = 0; i < out.calls.size(); ++i) {
+        CHECK(out.streamed[i] == out.calls[i].arguments);
+        CHECK(nlohmann::json::parse(out.calls[i].arguments).is_object());
+    }
+    return out;
+}
+static void qwen_tool_tests() {
+    using ojson = nlohmann::ordered_json;
+    ToolFormat qwen;
+    qwen.calls = "<tool_call>";
+    qwen.calls_token = 248058;
+    qwen.qwen = true;
+    const ojson tools = ojson::parse(R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object",
+        "properties":{"city":{"type":"string"},"days":{"type":"integer"},"unit":{"type":"string","enum":["c","f"]}},
+        "required":["city"]}}},{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}},
+        {"type":"function","function":{"name":"typed","parameters":{"type":"object","properties":{
+        "n":{"type":"integer"},"x":{"type":"number"},"b":{"type":"boolean"},"opt":{"type":["string","null"]},
+        "obj":{"type":"object"},"arr":{"type":"array","items":{"type":"integer"}},"any":{},
+        "u":{"anyOf":[{"type":"integer"},{"type":"null"}]},"s":{"type":"string"}}}}}])");
+    const auto required = parse_tools(ojson{{"tools", tools}, {"tool_choice", "required"}});
+    const auto automatic = parse_tools(ojson{{"tools", tools}, {"tool_choice", "auto"}});
+    auto one = [&](const std::string &text) { return qwen_run(qwen, &required, text, 1000); };
+    auto args = [](const QwenRun &r, size_t i = 0) { return nlohmann::json::parse(r.calls.at(i).arguments); };
+    const std::string weather = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n"
+                                "</parameter>\n</function>\n</tool_call>";
+    const std::string ping = "<tool_call>\n<function=ping>\n</function>\n</tool_call>";
+
+    // single call: the stream is the name, then one fragment per parameter, then the closing brace
+    auto r = one(weather);
+    CHECK(r.content.empty() && r.calls.size() == 1 && r.calls[0].name == "get_weather");
+    CHECK(r.calls[0].arguments == R"({"city":"Paris","days":2})");
+    CHECK(r.fragments[0] == R"({"city":"Paris"|,"days":2|})");
+    CHECK(r.calls[0].id.rfind("call_", 0) == 0 && r.calls[0].openai().at("function").at("name") == "get_weather");
+    r = one(ping);
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "ping" && r.calls[0].arguments == "{}" && r.fragments[0] == "{}");
+    // prose before the call is content (the whitespace between them dropped), text after the last call is dropped
+    r = one("I'll check the weather.\n\n" + weather + "\nDone.");
+    CHECK(r.content == "I'll check the weather." && r.calls.size() == 1 && args(r) == nlohmann::json({{"city", "Paris"}, {"days", 2}}));
+    // several calls, whitespace between the blocks ignored; parallel or not the parser takes what is written
+    r = one(weather + "\n" + ping + "\n\n" + weather);
+    CHECK(r.content.empty() && r.calls.size() == 3 && r.calls[1].name == "ping" && r.calls[1].arguments == "{}" &&
+          r.calls[2].arguments == r.calls[0].arguments && r.calls[0].id != r.calls[2].id);
+    r = one("\n\n" + weather + weather);
+    CHECK(r.content.empty() && r.calls.size() == 2);
+    // an unknown function is still a call (its values untyped: JSON when they parse)
+    r = one("<tool_call>\n<function=nope>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\nx y\n</parameter>\n</function>\n</tool_call>");
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "nope" && r.calls[0].arguments == R"({"a":1,"b":"x y"})");
+
+    // coercion by the parameter's schema
+    auto coerce = [](const char *text, const char *schema) { return coerce_tool_argument(text, ojson::parse(schema)); };
+    CHECK(coerce("12", R"({"type":"integer"})") == 12 && coerce("12", R"({"type":"integer"})").is_number_integer());
+    CHECK(coerce("12.0", R"({"type":"integer"})") == 12 && coerce("12.0", R"({"type":"integer"})").is_number_integer());
+    CHECK(coerce("12.5", R"({"type":"integer"})") == "12.5");
+    CHECK(coerce("12.5", R"({"type":"number"})") == 12.5 && coerce("-3", R"({"type":"number"})") == -3);
+    CHECK(coerce("abc", R"({"type":"number"})") == "abc");
+    CHECK(coerce("true", R"({"type":"boolean"})") == true && coerce("false", R"({"type":"boolean"})") == false);
+    CHECK(coerce("True", R"({"type":"boolean"})") == "True");
+    CHECK(coerce("null", R"({"type":["string","null"]})").is_null() && coerce("nil", R"({"type":["string","null"]})") == "nil");
+    CHECK(coerce("null", R"({"type":"string"})") == "null" && coerce("123", R"({"type":"string"})") == "123");
+    CHECK(coerce("{\"a\": 1}", R"({"type":"string"})") == "{\"a\": 1}");
+    CHECK(coerce("[1]", R"({"type":"object"})") == "[1]" && coerce("{\"a\": [1, {\"b\": null}]}", R"({"type":"object"})") ==
+                                                                 nlohmann::json::parse(R"({"a":[1,{"b":null}]})"));
+    CHECK(coerce("[1, 2]", R"({"type":"array"})") == nlohmann::json::parse("[1,2]") && coerce("{}", R"({"type":"array"})") == "{}");
+    CHECK(coerce("\"quoted\"", "{}") == "quoted" && coerce("plain text", "{}") == "plain text" && coerce("7", "{}") == 7);
+    CHECK(coerce_tool_argument("\"quoted\"", ojson()) == "quoted" && coerce_tool_argument("[1]", ojson()) == nlohmann::json::parse("[1]"));
+    CHECK(coerce("7", R"({"anyOf":[{"type":"integer"},{"type":"null"}]})") == 7 &&
+          coerce("null", R"({"oneOf":[{"type":"integer"},{"type":"null"}]})").is_null() &&
+          coerce("x", R"({"anyOf":[{"type":"integer"},{"type":"null"}]})") == "x");
+    CHECK(coerce("7", R"({"anyOf":[{"type":"integer"},{"type":"string"}]})") == 7 &&
+          coerce("seven", R"({"anyOf":[{"type":"integer"},{"type":"string"}]})") == "seven");
+    CHECK(coerce("a", R"({"enum":["a","b"]})") == "a" && coerce("2", R"({"enum":[1,2]})") == 2 &&
+          coerce("{\"k\": 1}", R"({"properties":{"k":{}}})") == nlohmann::json::parse(R"({"k":1})") &&
+          coerce("[3]", R"({"items":{}})") == nlohmann::json::parse("[3]"));
+    // the same through the parser; no argument is ever dropped
+    r = one("<tool_call>\n<function=typed>\n<parameter=n>\n12\n</parameter>\n<parameter=x>\n1.5e3\n</parameter>\n<parameter=b>\ntrue\n"
+            "</parameter>\n<parameter=opt>\nnull\n</parameter>\n<parameter=obj>\n{\"a\": {\"b\": [1, 2]}}\n</parameter>\n<parameter=arr>\n"
+            "[1, 2,\n 3]\n</parameter>\n<parameter=any>\n\"quoted\"\n</parameter>\n<parameter=u>\nnull\n</parameter>\n<parameter=s>\n12\n"
+            "</parameter>\n<parameter=extra>\n[1]\n</parameter>\n</function>\n</tool_call>");
+    CHECK(r.calls.size() == 1);
+    CHECK(r.calls[0].arguments == R"({"n":12,"x":1500.0,"b":true,"opt":null,"obj":{"a":{"b":[1,2]}},"arr":[1,2,3],"any":"quoted","u":null,"s":"12","extra":[1]})");
+    r = one("<tool_call>\n<function=typed>\n<parameter=n>\n12.5\n</parameter>\n<parameter=obj>\n[1]\n</parameter>\n<parameter=b>\nyes\n"
+            "</parameter>\n</function>\n</tool_call>");
+    CHECK(r.calls[0].arguments == R"({"n":"12.5","obj":"[1]","b":"yes"})");
+    // string values are raw: several lines, < and >, quotes, leading / trailing blank lines beyond the format's own
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nif a < b:\n    print(\"<b>x</b>\")\n\n</parameter>\n</function>\n</tool_call>");
+    CHECK(args(r) == nlohmann::json({{"city", "if a < b:\n    print(\"<b>x</b>\")\n"}}));
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\n\n  New York \n\n</parameter>\n</function>\n</tool_call>");
+    CHECK(args(r) == nlohmann::json({{"city", "\n  New York \n"}}));
+    r = one("<tool_call><function=get_weather><parameter=city>Oslo</parameter></function></tool_call>"); // no newlines at all
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Oslo"})");
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nA\n</parameter>\n<parameter=city>\nB\n</parameter>\n</function>\n</tool_call>");
+    CHECK(r.calls[0].arguments == R"({"city":"A"})"); // a repeated parameter: the first stands (already streamed)
+
+    // tolerance: </parameter> missing (the value ends at </function>), </function> missing, </tool_call> missing
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</function>\n</tool_call>");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Paris"})");
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</tool_call>\n" + ping);
+    CHECK(r.calls.size() == 2 && r.calls[0].arguments == R"({"city":"Paris"})" && r.calls[1].name == "ping");
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Paris"})");
+    r = one("<tool_call>\n<function=ping>\n</function>\n<tool_call>\n<function=ping>\n<tool_call>\n<function=get_weather>\n</function>");
+    CHECK(r.calls.size() == 3 && r.calls[2].name == "get_weather" && r.calls[1].arguments == "{}");
+    // the answer ends inside a call: closed with what was read (a cut value kept, a cut parameter name not)
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nPar");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Par"})" && r.content.empty());
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=da");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Paris"})");
+    r = one("Hm. <tool_call>\n<function=get_weather>\n");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == "{}" && r.content == "Hm.");
+    r = one("<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</func");
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"city":"Paris"})");
+    // not a call: content exactly as written, no call
+    for (const std::string text : {"<tool_call></tool_call>", "<tool_call>\n</tool_call>", "Text <tool_call> oops", "<tool_call>",
+                                   "<tool_call>\n{\"name\": \"ping\", \"arguments\": {}}\n</tool_call>", "x\n\n<tool_call>\n<function=get_w",
+                                   "<tool_call>\n<function=>\n</function>\n</tool_call>", "<tool_call>\n<function=a b>\n</function>",
+                                   "a < b and <tool> and <tool_cal", "plain answer\n", "  two  <function=ping>\n</function> ",
+                                   "<tool_call>\n<tool_call>\n<func", "</tool_call> <parameter=x>\n1\n</parameter>"})
+        for (const size_t chunk : {size_t(1), size_t(3), size_t(7), size_t(1000)}) {
+            r = qwen_run(qwen, &required, text, chunk);
+            CHECK(r.calls.empty() && r.content == text);
+            r = qwen_run(qwen, nullptr, text, chunk);
+            CHECK(r.calls.empty() && r.content == text);
+        }
+    // ... but an invalid block before a real call stays content and the call is parsed; after a call it is dropped
+    r = one("<tool_call>\noops\n</tool_call>\n" + ping + "<tool_call>junk</tool_call>");
+    CHECK(r.calls.size() == 1 && r.content == "<tool_call>\noops\n</tool_call>");
+
+    // streaming: every chunk size gives the same content and calls, and the fragments add up to the arguments
+    const std::vector<std::string> texts = {
+        weather, ping, "I'll check the weather.\n\n" + weather + "\nDone.", weather + "\n" + ping + "\n\n" + weather,
+        "a < b, <tool> and <tool_cal are text.\n" + weather + "\n",
+        "<tool_call>\n<function=typed>\n<parameter=obj>\n{\"a\": {\"b\": [1, 2]}}\n</parameter>\n<parameter=s>\nline 1\nline <2>\n\n"
+        "</parameter>\n<parameter=arr>\n[1,\n2]\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nK\xC3\xB8""benhavn\n</parameter>\n<parameter=unit>\nc\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar", "no call here, just {braces} and `ticks`",
+        "<tool_call>\noops\n</tool_call>\n" + ping};
+    for (const auto &text : texts)
+        for (const ToolRequest *request : {&required, &automatic, static_cast<const ToolRequest *>(nullptr)}) {
+            const auto whole = qwen_run(qwen, request, text, 1000);
+            for (const size_t chunk : {size_t(1), size_t(3), size_t(7)}) {
+                const auto part = qwen_run(qwen, request, text, chunk);
+                CHECK(part.content == whole.content && part.calls.size() == whole.calls.size());
+                for (size_t i = 0; i < whole.calls.size(); ++i)
+                    CHECK(part.calls[i].name == whole.calls[i].name && part.calls[i].arguments == whole.calls[i].arguments &&
+                          part.fragments[i] == whole.fragments[i]);
+            }
+        }
+    CHECK(qwen_run(qwen, &required, texts[4], 1).content == "a < b, <tool> and <tool_cal are text.");
+    CHECK(qwen_run(qwen, &required, texts[5], 3).calls[0].arguments == R"({"obj":{"a":{"b":[1,2]}},"s":"line 1\nline <2>\n","arr":[1,2]})");
+    // content is not held longer than it may be the marker: all of it is out before the last byte
+    {
+        ToolCallParser p(qwen, &required);
+        CHECK(p.feed("a < b <tool").content == "a < b" && p.feed("s> ok").content == " <tools> ok" && p.feed(" <tool_call>\n<fun").content.empty());
+        const auto d = p.feed("ction=ping>");
+        CHECK(d.tool_calls.size() == 1 && d.tool_calls[0].at("function").at("name") == "ping" && p.feed("\n</function>", true).content.empty());
+        CHECK(p.content() == "a < b <tools> ok" && p.calls().size() == 1);
+    }
+    // tool_choice auto keeps its fallback: a JSON call written as text
+    r = qwen_run(qwen, &automatic, "Sure.\n{\"name\": \"ping\", \"arguments\": {}}", 3);
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "ping" && r.content == "Sure.");
+
+    // think blocks: the server splits reasoning off before the parser (the prompt already opened the block), so
+    // tool markup inside it is reasoning and calls after </think> are calls
+    for (const size_t chunk : {size_t(1), size_t(5), size_t(1000)}) {
+        const std::string answer = "The user wants weather. I could write <tool_call>\n<function=ping>\n</function>\n</tool_call> but\n"
+                                   "</think>\n\n" + weather;
+        ReasoningStream stream;
+        CHECK(stream.append("<think>").empty());
+        ToolCallParser p(qwen, &automatic);
+        std::string reasoning;
+        for (size_t i = 0; i <= answer.size(); i += chunk) {
+            const bool last = i + chunk > answer.size();
+            for (const auto &part : stream.append(answer.substr(i, chunk), last))
+                if (part.reasoning)
+                    reasoning += part.text;
+                else
+                    p.feed(part.text);
+        }
+        p.feed("", true);
+        CHECK(reasoning == "The user wants weather. I could write <tool_call>\n<function=ping>\n</function>\n</tool_call> but\n");
+        CHECK(p.content().empty() && p.calls().size() == 1 && p.calls()[0].name == "get_weather");
+    }
+
+    // reasoning splits after a prompt that opened <think>: golden strings, every chunking
+    {
+        struct Case { std::string out, reasoning, answer; };
+        const std::vector<Case> cases = {
+            {"Let me think.\n</think>\n\n391", "Let me think.\n", "\n\n391"},     // normal (answer lead is trimmed by the server)
+            {"</think>\n\n391", "", "\n\n391"},                                  // the model skips thinking
+            {"still thinking, cut by max_tokens", "still thinking, cut by max_tokens", ""}, // unterminated: all reasoning
+            {"hm</think>\n\n<tool_call>\n<function=ping>\n</function>\n</tool_call>", "hm", "\n\n<tool_call>\n<function=ping>\n</function>\n</tool_call>"}};
+        for (const size_t chunk : {size_t(1), size_t(3), size_t(1000)})
+            for (const auto &c : cases) {
+                ReasoningStream stream;
+                stream.append("<think>");
+                std::string reasoning, answer;
+                for (size_t i = 0; i <= c.out.size(); i += chunk)
+                    for (const auto &part : stream.append(c.out.substr(i, chunk), i + chunk > c.out.size()))
+                        (part.reasoning ? reasoning : answer) += part.text;
+                CHECK(reasoning == c.reasoning && answer == c.answer && answer.find("think>") == std::string::npos);
+            }
+    }
+
+    // grammar: required / named / parallel=false take canonical calls and nothing else
+    GrammarCache cache;
+    auto accepts = [&](const std::string &g, const std::string &text) {
+        auto c = std::make_shared<StructuredConstraint>(big_vocab(), cache.acquire(g, true), false, &cache);
+        return feed_text(*c, text) && bit(*c->allowed().mask, 2); // complete: EOS allowed
+    };
+    const std::string g = tool_call_grammar(required, qwen);
+    const std::string typed = "<tool_call>\n<function=typed>\n<parameter=n>\n-12\n</parameter>\n<parameter=b>\nfalse\n</parameter>\n"
+                              "<parameter=opt>\nfree <text>\n</parameter>\n<parameter=obj>\n{\"a\":[1,{\"b\":null}]}\n</parameter>\n"
+                              "<parameter=arr>\n[1,2]\n</parameter>\n<parameter=any>\n\"q\"\n</parameter>\n<parameter=u>\nnull\n</parameter>\n"
+                              "<parameter=s>\ntwo\nlines\n</parameter>\n</function>\n</tool_call>";
+    CHECK(accepts(g, weather) && accepts(g, ping) && accepts(g, typed));
+    CHECK(accepts(g, weather + ping + weather)); // parallel: back to back
+    CHECK(accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=city>\nNew <York> & co\n</parameter>\n<parameter=unit>\nf\n"
+                     "</parameter>\n</function>\n</tool_call>"));
+    CHECK(!accepts(g, "Sure, let me check."));                                           // prose
+    CHECK(!accepts(g, "Sure. " + weather) && !accepts(g, weather + "\nDone."));          // around the call
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>")); // city required
+    CHECK(!accepts(g, "<tool_call>\n<function=nope>\n</function>\n</tool_call>"));        // not offered
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=days>\n\"3\"\n</parameter>\n"
+                      "</function>\n</tool_call>"));                                     // days: integer
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=unit>\nk\n</parameter>\n"
+                      "</function>\n</tool_call>"));                                     // unit: enum
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=days>\n3\n</parameter>\n<parameter=city>\nX\n</parameter>\n"
+                      "</function>\n</tool_call>"));                                     // declared order
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=town>\nX\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(!accepts(g, "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n</function>")); // unclosed
+    const std::string single = tool_call_grammar(parse_tools(ojson{{"tools", tools}, {"tool_choice", "required"}, {"parallel_tool_calls", false}}), qwen);
+    CHECK(accepts(single, weather) && accepts(single, ping) && !accepts(single, weather + ping) && !accepts(single, "ok"));
+    const std::string named = tool_call_grammar(
+        parse_tools(ojson{{"tools", tools}, {"tool_choice", {{"type", "function"}, {"function", {{"name", "ping"}}}}}}), qwen);
+    CHECK(accepts(named, ping) && accepts(named, ping + ping) && !accepts(named, weather) && !accepts(named, "ping"));
+    // what the grammar accepts the parser reads back
+    r = one(typed);
+    CHECK(r.calls.size() == 1 && r.calls[0].arguments == R"({"n":-12,"b":false,"opt":"free <text>","obj":{"a":[1,{"b":null}]},"arr":[1,2],"any":"q","u":null,"s":"two\nlines"})");
+    r = one(weather + ping + weather);
+    CHECK(r.calls.size() == 3 && r.content.empty());
+
+    // tool_choice auto on a vocabulary with the format's tokens: the grammar starts at the <tool_call> token, but
+    // not inside a think block (the prompt's, or one the model opens); a gated answer may start inside the prompt's
+    static const Vocabulary qv = [] {
+        std::vector<Vocabulary::Token> t(1300);
+        for (size_t i = 0; i < 1000; ++i)
+            t[i].special = true;
+        const char *pieces[] = {"<tool_call>", "</tool_call>", "<think>", "</think>"};
+        for (size_t i = 0; i < 4; ++i)
+            t[10 + i].special = false, t[10 + i].first = t[10 + i].rest = pieces[i];
+        for (int b = 0; b < 256; ++b)
+            t[1000 + size_t(b)].first = t[1000 + size_t(b)].rest = std::string(1, char(b));
+        return Vocabulary(std::move(t), 2);
+    }();
+    auto ids = [](const std::string &text) { // the four markers as their tokens, the rest bytes
+        std::vector<int> out;
+        const char *pieces[] = {"<tool_call>", "</tool_call>", "<think>", "</think>"};
+        for (size_t i = 0; i < text.size();) {
+            size_t m = 0;
+            while (m < 4 && text.compare(i, std::strlen(pieces[m]), pieces[m]) != 0)
+                ++m;
+            out.push_back(m < 4 ? 10 + int(m) : 1000 + int(uint8_t(text[i])));
+            i += m < 4 ? std::strlen(pieces[m]) : 1;
+        }
+        return out;
+    };
+    auto lazy = [&](bool inside) {
+        auto inner = std::make_shared<StructuredConstraint>(qv, cache.acquire(single, true), false, &cache);
+        auto c = std::make_shared<TriggeredConstraint>(10, inner, qv.size());
+        c->set_think(12, 13, inside);
+        return c;
+    };
+    auto c = lazy(true);
+    CHECK(feed_ids(*c, ids("thinking <tool_call> anything </tool_call> goes")) && !c->triggered());
+    CHECK(feed_ids(*c, ids("</think>\n\nI'll check.\n\n")) && !c->triggered());
+    CHECK(feed_ids(*c, ids(weather)) && c->triggered() && bit(*c->allowed().mask, 2) && c->allowed().count == 1);
+    c = lazy(true);
+    CHECK(feed_ids(*c, ids("x</think>\n\n<tool_call>")) && c->triggered() && !feed_ids(*c, ids("ping")) && feed_ids(*c, ids("\n<function=ping>")));
+    c = lazy(false);
+    CHECK(feed_ids(*c, ids("<think>a <tool_call> b")) && !c->triggered() && feed_ids(*c, ids("</think>" + ping)) && c->triggered());
+    c = lazy(false);
+    CHECK(feed_ids(*c, ids("Hi <tool_call>")) && c->triggered() && !c->accepts(1000 + 'x'));
+    {
+        // required: the gate advanced with the <think> token, as the server does for a prompt that opened the block
+        StructuredConstraint gate(qv, cache.acquire(single, true), true, &cache);
+        gate.advance(12);
+        CHECK(gate.phase() == ThinkSplitter::Think);
+        CHECK(feed_ids(gate, ids("free reasoning <tool_call>x</tool_call>\n</think>\n\n")) && !gate.accepts(1000 + 'S'));
+        CHECK(feed_ids(gate, ids(weather)) && gate.complete());
+    }
+}
+
 int main() {
     try {
         for (auto [name, fn] : std::vector<std::pair<const char *, std::function<void()>>>{
@@ -1160,6 +1487,7 @@ int main() {
                  {"tools", tool_tests},
                  {"tool_fallback", tool_fallback_tests},
                  {"glm_tools", glm_tool_tests},
+                 {"qwen_tools", qwen_tool_tests},
                  {"timing", timing_report}}) {
             fn();
             std::cout << "PASS " << name << '\n';

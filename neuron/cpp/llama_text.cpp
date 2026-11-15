@@ -10,6 +10,11 @@
 // tokens; Cydonia / Mistral Small 3.2): their chat templates take no tools, so conversations with tools or tool
 // messages are rendered in Mistral's v11 form (render_mistral_tools) behind the template's own system prompt, or the
 // v13 form when the model directory ships a tekken.json of version v13 or later (Devstral 2507).
+// Qwen3-Coder / Qwen3.5 tokenizers (a template that writes calls as <tool_call> <function=name> <parameter=key>): tools
+// and tool messages go through the template too, answers are parsed in the Qwen format (ToolFormat::qwen). Their
+// <think> </think> <tool_call> </tool_call> <tool_response> tokens are added tokens that are not special: piece() gives
+// their text, as HF decoding does. When the template's generation prompt opens the think block ("<think>\n"),
+// ChatBackend::think_open tells the server that answers start as reasoning.
 // BEHEMOTH_TOOLS=0 turns tool calling off. Constrained answers start with an optional <think> block only for templates
 // that know <think> (ChatBackend::think). Message content may be text blocks (joined); other parts are rejected.
 #include "behemoth/protocol.hpp"
@@ -26,7 +31,25 @@ struct Tokenizer::Impl {
     int eos_id = -1;
     ToolFormat tools;
     bool template_source_has_tools = false;
-    explicit Impl(const std::filesystem::path &root, bool has_tools) : bpe(root), template_source_has_tools(has_tools) {
+    // Qwen (the template writes calls as <function=name>): <think> </think> <tool_call> </tool_call> <tool_response>
+    // </tool_response> are added tokens that are not special, which HF decodes as their text; so does piece() here
+    // (the reasoning split and the tool-call parser read them). GLM / Mistral: empty.
+    std::vector<std::pair<int, std::string>> text_tokens;
+    int think_open = -1, think_close = -1; // Qwen: the <think> / </think> ids
+    int text_token(const std::string &text) const {
+        for (const auto &[id, t] : text_tokens)
+            if (t == text)
+                return id;
+        return -1;
+    }
+    std::string piece(int token) const {
+        for (const auto &[id, t] : text_tokens)
+            if (id == token)
+                return t;
+        return bpe.decode({token}, false);
+    }
+    explicit Impl(const std::filesystem::path &root, bool has_tools, bool qwen)
+        : bpe(root), template_source_has_tools(has_tools) {
         auto token = [&](const char *key) -> std::string {
             const auto v = bpe.summary().value(key, nlohmann::json(nullptr));
             return v.is_string() ? v.get<std::string>() : v.is_object() ? v.value("content", "") : "";
@@ -34,9 +57,22 @@ struct Tokenizer::Impl {
         bos = token("bos_token");
         eos = token("eos_token");
         eos_id = control(eos);
+        if (qwen)
+            for (const char *t : {"<think>", "</think>", "<tool_call>", glm_call_end, "<tool_response>", "</tool_response>"})
+                if (const int id = control(t); id >= 0 && t != eos)
+                    text_tokens.push_back({id, t});
+        think_open = text_token("<think>");
+        think_close = text_token("</think>");
         const char *enabled = std::getenv("BEHEMOTH_TOOLS");
         if (enabled && std::atoi(enabled) == 0)
             return;
+        // Qwen3-Coder / Qwen3.5 (<tool_call> <function=name> <parameter=key> value ...; the template renders tools)
+        if (const int open = text_token("<tool_call>"); qwen && open >= 0) {
+            tools.calls = "<tool_call>";
+            tools.calls_token = open;
+            tools.qwen = true;
+            return;
+        }
         // GLM (<tool_call> ... </tool_call> with <arg_key> / <arg_value> control tokens; the template renders tools)
         if (const int open = control("<tool_call>"); open >= 0) {
             std::vector<std::pair<int, std::string>> markers;
@@ -110,7 +146,8 @@ static std::string template_source(const std::filesystem::path &root) {
     return std::string(std::istreambuf_iterator<char>(jinja), {});
 }
 Tokenizer::Tokenizer(const std::filesystem::path &root)
-    : impl_(std::make_unique<Impl>(root, template_source(root).find("tool_call") != std::string::npos)) {
+    : impl_(std::make_unique<Impl>(root, template_source(root).find("tool_call") != std::string::npos,
+                                   template_source(root).find("<function=") != std::string::npos)) {
     auto *impl = impl_.get();
     const char *name = std::getenv("BEHEMOTH_MODEL_NAME");
     ChatBackend backend{name ? name : root.filename().string(),
@@ -118,12 +155,19 @@ Tokenizer::Tokenizer(const std::filesystem::path &root)
     // Constrained answers may open with <think> only for templates that know it (reasoning models); others (Cydonia)
     // are constrained from the first token unless the request sets reasoning_effort.
     backend.think = template_source(root).find("<think>") != std::string::npos;
-    if (impl->tools.glm) {
+    // the generation prompt opens the think block itself (Qwen3.5: "<|im_start|>assistant\n<think>\n")
+    if (impl->think_open >= 0 && impl->think_close >= 0 &&
+        impl->bpe.chat(nlohmann::json::array({{{"role", "user"}, {"content", "x"}}}), true).ends_with("<think>\n")) {
+        backend.think_open = impl->think_open;
+        backend.think_close = impl->think_close;
+    }
+    if (impl->tools.glm || impl->tools.qwen) {
         backend.tools = impl->tools;
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
             return impl->bpe.chat_tools(messages, tools);
         };
-        std::cerr << "Tool calling: GLM format (<tool_call> " << impl->tools.calls_token << ", chat template renders tools)\n";
+        std::cerr << "Tool calling: " << (impl->tools.qwen ? "Qwen" : "GLM") << " format (<tool_call> " << impl->tools.calls_token
+                  << ", chat template renders tools" << (backend.think_open >= 0 ? "; the prompt opens <think>" : "") << ")\n";
     } else if (impl->tools.supported()) {
         backend.tools = impl->tools;
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
@@ -136,17 +180,17 @@ Tokenizer::Tokenizer(const std::filesystem::path &root)
 }
 Tokenizer::~Tokenizer() = default;
 std::vector<int> Tokenizer::encode(const std::string &rendered) const { return impl_->bpe.encode(rendered); }
-std::string Tokenizer::piece(int token, bool &) const { return impl_->bpe.decode({token}, false); }
+std::string Tokenizer::piece(int token, bool &) const { return impl_->piece(token); }
 std::string Tokenizer::decode(const std::vector<int> &ids) const { return impl_->bpe.decode(ids, false); }
 bool Tokenizer::is_special(int token) const {
-    return impl_->bpe.decode({token}, false).empty() && !impl_->bpe.decode({token}, true).empty();
+    return impl_->piece(token).empty() && !impl_->bpe.decode({token}, true).empty();
 }
 std::vector<Vocabulary::Token> vocabulary_pieces(const Tokenizer &tokenizer) {
     const auto &impl = *tokenizer.impl_;
     std::vector<Vocabulary::Token> tokens(impl.bpe.size());
     for (size_t id = 0; id < tokens.size(); ++id) {
         auto &t = tokens[id];
-        t.first = t.rest = impl.bpe.decode({int(id)}, false);
+        t.first = t.rest = impl.piece(int(id));
         t.special = t.rest.empty(); // control tokens and ids without a vocabulary entry
     }
     // the tool-call control tokens are text to the constraints: the server streams them as their marker text

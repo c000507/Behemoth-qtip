@@ -2,7 +2,8 @@
 // scheduler batches them, and prints every request's generated tokens as JSON.
 //   requests.json: [{"tokens":[...], "max_new":16, "temperature":0, "top_k":0, "top_p":1, "seed":0, "cancel_after":N?}]
 //   neuron_engine_cli MODEL_DIR requests.json [sequential]   (env BEHEMOTH_NEURON_NEFF_DIR=bucket dir)
-// `sequential` runs one request at a time (batch-invariance baseline).
+// `sequential` runs one request at a time (batch-invariance baseline). A request with "barrier": true starts a new wave: it is
+// submitted only after everything before it has finished (several stream counts in ONE engine process; stderr gets `wave-barrier i`).
 #include <cstdlib>
 #include "behemoth/engine.hpp"
 #include <chrono>
@@ -18,7 +19,7 @@ int main(int argc, char **argv) {
     if (argc < 3) { std::cerr << "usage: neuron_engine_cli MODEL_DIR requests.json\n"; return 2; }
     RuntimeOptions options;
     options.model = argv[1];
-    options.token_budget = 1024;
+    options.token_budget = std::getenv("BEHEMOTH_TOKEN_BUDGET") ? size_t(std::atoi(std::getenv("BEHEMOTH_TOKEN_BUDGET"))) : 1024; // >= the prefill chunk
     options.prefill_chunk = std::getenv("BEHEMOTH_PREFILL_CHUNK") ? size_t(std::atoi(std::getenv("BEHEMOTH_PREFILL_CHUNK"))) : 256; // 1: every prompt token is a single-row step
     std::ifstream f(argv[2]);
     const auto requests = nlohmann::json::parse(f);
@@ -33,11 +34,14 @@ int main(int argc, char **argv) {
     const auto start = std::chrono::steady_clock::now();
     const bool sequential = argc > 3 && std::string(argv[3]) == "sequential";
     for (size_t i = 0; i < requests.size(); ++i) {
-        if (sequential) { // wait for everything submitted so far
+        const auto &r = requests[i];
+        const bool barrier = r.value("barrier", false); // "barrier": true = a new wave: wait for everything submitted so far first
+        if (sequential || barrier) {
             std::unique_lock lock(mutex);
             cv.wait(lock, [&] { return open == requests.size() - i; });
         }
-        const auto &r = requests[i];
+        if (barrier || i == 0)
+            std::cerr << "wave-barrier " << i << std::endl;
         SamplingOptions s;
         s.temperature = r.value("temperature", 0.f);
         s.top_k = r.value("top_k", 0);
