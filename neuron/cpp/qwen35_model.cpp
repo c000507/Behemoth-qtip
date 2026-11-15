@@ -61,6 +61,21 @@ Dev alloc(int core, size_t bytes, const std::string &name) {
     return d;
 }
 void put(const Dev &d, const void *src, size_t bytes, size_t offset = 0) { check(nrt_tensor_write(d.t, src, offset, bytes), "write"); }
+// BEHEMOTH_NEURON_QWEN35_ASYNC=1 (docs/neuron-reap-launches.md): implicit async execution (nrt_execute queues the launch and returns);
+// every host read of a launch's output, and the end of every execute() / mtp_launch(), first drains the rank's queue, so host
+// writes (next step's inputs, state spill / restore, prefix-cache copies) only ever happen on an idle core.
+bool async_exec() {
+    static const bool on = std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC"));
+    return on;
+}
+int ltrace_every() {
+    static const int n = std::getenv("BEHEMOTH_NEURON_QWEN35_LTRACE") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_LTRACE")) : 0;
+    return n;
+}
+void drain(int core) {
+    if (async_exec())
+        check(nrt_async_drain_queued_execs(core), "drain");
+}
 void zero(const Dev &d) {
     std::vector<uint8_t> z(std::min<size_t>(d.bytes, 64u << 20), 0);
     for (size_t off = 0; off < d.bytes; off += z.size())
@@ -246,8 +261,8 @@ class Qwen35Model final : public Backend {
         // BEHEMOTH_NEURON_QWEN35_ASYNC=1: implicit async execution (launches return before the device finishes; the logits
         // read synchronises), hides launch gaps. Off by default: a GDN state spill / restore between two launches of one
         // step relies on the previous launch having finished.
-        if (const char *a = std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC"); a && std::atoi(a))
-            setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "8", 0);
+        if (async_exec()) // the queue depth: a whole decode step (<= 81 launches) may be in flight
+            setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC_DEPTH") ? std::getenv("BEHEMOTH_NEURON_QWEN35_ASYNC_DEPTH") : "128", 0);
         hold_cpu_latency();
         check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init");
         ranks.resize(size_t(tp));
@@ -359,7 +374,7 @@ class Qwen35Model final : public Backend {
             gr.has_gdn = gr.attn == "gdn" || std::find(gr.seg.begin(), gr.seg.end(), "gdn") != gr.seg.end();
             gr.inputs = m.at("inputs").get<std::vector<std::string>>();
             gr.verify = std::find(gr.inputs.begin(), gr.inputs.end(), "vslot") != gr.inputs.end();
-            gr.bound = m.value("gdn_slot", std::string()) == "bound";
+            gr.bound = gr.has_gdn && m.value("gdn_slot", std::string()) == "bound"; // (a gqa-only graph traced with GDN_SLOT=bound has no gdn state)
             gr.states = m.at("states").get<std::vector<std::string>>();
             if (gr.bound) {
                 gr.verify = m.value("verify", false);
@@ -505,10 +520,11 @@ class Qwen35Model final : public Backend {
                     throw std::runtime_error(gr.neff.string() + ": input " + t.name + " beyond meta inputs + states");
                 gr.input_bytes[index] = t.size;
             }
-            if (gr.bound && (gr.attn != "gdn" || !gr.seg.empty() || (gr.verify && gr.R != 1)))
-                throw std::runtime_error(gr.neff.string() + ": gdn_slot bound needs a gdn sub-block graph (verify: R = 1)");
+            if (gr.bound && ((gr.seg.empty() && gr.attn != "gdn") || (gr.verify && gr.R != 1)))
+                throw std::runtime_error(gr.neff.string() + ": gdn_slot bound needs a gdn sub-block graph or a segment (verify: R = 1)");
             for (size_t s = 0; s < gr.states.size(); ++s) // state_bytes: the whole layer state (all slots), also for bound graphs
-                gr.state_bytes.push_back(gr.input_bytes[gr.inputs.size() + s] * (gr.bound ? size_t(gr.slots) : 1)); // bound: row 0's kstate, cstate first
+                gr.state_bytes.push_back(gr.input_bytes[gr.inputs.size() + s] * (gr.bound && gr.seg.empty() ? size_t(gr.slots) : 1)); // bound: row 0's kstate, cstate first
+                // (segments: only the sub-block graphs size the layer states, a segment's state_bytes stay unused)
             if (gr.mtp) { // outputs: z [1, hidden] f32, logits [1, vocab shard] f32, then the aliased KV cache
                 std::map<std::string, size_t> out;
                 for (uint64_t i = 0; i < info->tensor_count; ++i)
@@ -841,16 +857,23 @@ class Qwen35Model final : public Backend {
             return it->second;
         };
         // bound graphs: "kstate" / "kstate_<i>" / "kstate@<i>" -> the slice of the layer's kstate at slot (*slots)[i]
+        // bound segments: "l<j>.kstate" / "l<j>.kstate_<i>" -> layer l + j; their gqa states ("l<j>.kv") bind whole
         auto bind_state = [&](const std::string &name) -> const Dev & {
             if (!g.bound)
                 return bind(name);
             const size_t cut = name.find_first_of("_@");
+            const std::string base = name.substr(0, cut);
+            const size_t dot = base.find('.');
+            const std::string leaf = dot == std::string::npos ? base : base.substr(dot + 1);
+            if (leaf != "kstate" && leaf != "cstate")
+                return bind(name);
             const int i = cut == std::string::npos ? 0 : std::stoi(name.substr(cut + 1));
-            const Dev &whole = bind(name.substr(0, cut));
+            const Dev &whole = bind(base);
             const int slot = int(slots->at(size_t(i)));
             if (slot < 0 || slot >= slots_total)
                 throw std::runtime_error("Qwen35: bound gdn graph: slot " + std::to_string(slot) + " out of range");
-            const std::string full = layer_prefix(l) + sub + name.substr(0, cut);
+            const int li = dot == std::string::npos ? l : l + std::stoi(base.substr(1, dot - 1));
+            const std::string full = layer_prefix(li) + "attn." + leaf;
             auto &sl = state_slices[{full, slot, r}];
             if (!sl.t) {
                 sl.bytes = whole.bytes / size_t(slots_total);
@@ -1173,6 +1196,18 @@ class Qwen35Model final : public Backend {
     }
     double layers_ms = 0, head_ms = 0, exec_ms = 0, plan_ms = 0; // exec: submit -> all ranks joined; plan: execute() before the submit
     std::vector<std::array<double, 7>> prof; // per rank, per forward(): see execute()
+    // BEHEMOTH_NEURON_QWEN35_LTRACE=N (docs/neuron-reap-launches.md): per (R, Q) bucket and rank, the host-side split of a
+    // launch() (execute() call): input writes, the nrt_execute call time per NEFF class, the gaps between consecutive calls,
+    // head execute, drain + logits read; one stderr line per bucket every N launches. Off (0) by default.
+    struct LTrace {
+        long steps = 0;
+        double wall = 0;                                        // execute(): submit -> all ranks joined
+        double join = 0;                                        // last rank's job done -> execute() sees all futures
+        std::array<std::array<double, 12>, 2> r{};               // [rank<2][put, gap, gdn, gqa, moe, seg, layer, head, read, n_gdn+gqa+moe, n_seg+layer, tail]
+    };
+    std::map<std::pair<int, int>, LTrace> ltrace;
+    std::array<double, 2> job_ms{};
+    std::mutex ltrace_mutex;
     int launches = 0;
     // BEHEMOTH_NEURON_QWEN35_NANSCAN=1 (debug, fault study): when a launch's logits contain a non-finite value, read back
     // every rank's residual buffers and every layer's state tensors and report, per layer / state / slot, the non-finite
@@ -1311,6 +1346,11 @@ class Qwen35Model final : public Backend {
                 static const int sync_bytes = std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_SYNC")) : 0;
                 static const int dump_x = std::getenv("NEURON_X_DUMP") ? std::atoi(std::getenv("NEURON_X_DUMP")) : 0; // 1: report non-finite layers, 2: every layer
                 std::vector<float> xr;
+                const int ltrace_n = ltrace_every();
+                std::array<double, 12> lt{};
+                auto lt_prev = Clock::now();
+                lt[0] = ms_since(t0);
+                lt[11] = std::chrono::duration<double, std::milli>(t0 - te0).count(); // dispatch: execute() submit -> this rank's job starts
                 for (const auto &[g, l] : plan) {
                     {
                         const auto ts = Clock::now();
@@ -1320,9 +1360,18 @@ class Qwen35Model final : public Backend {
                         const auto tx = Clock::now();
                         pr[0] += std::chrono::duration<double, std::milli>(te - ts).count();
                         pr[g->attn == "gdn" ? 1 : g->attn == "gqa" ? 2 : 3] += std::chrono::duration<double, std::milli>(tx - te).count();
+                        if (ltrace_n) {
+                            const int c = !g->seg.empty() ? 5 : !g->attn.empty() && !g->mlp.empty() ? 6 : g->attn == "gdn" ? 2 : g->attn == "gqa" ? 3 : 4;
+                            lt[1] += std::chrono::duration<double, std::milli>(te - lt_prev).count();
+                            lt[size_t(c)] += std::chrono::duration<double, std::milli>(tx - te).count();
+                            lt[c >= 5 ? 10 : 9] += 1;
+                            lt_prev = tx;
+                        }
                         parity ^= 1;
                         if (use_barrier)
                             barrier.wait();
+                        if (sync_bytes || dump_x)
+                            drain(r);
                         if (sync_bytes) { // BEHEMOTH_NEURON_QWEN35_SYNC=n: blocking read of n bytes of the new residual on EVERY rank
                             char probe[64]; // after every launch (the section-12 A/B: host-device synchronisation without the dump cost)
                             check(nrt_tensor_read(st.x[parity].t, probe, 0, size_t(std::min(sync_bytes, 64))), "sync read");
@@ -1348,6 +1397,7 @@ class Qwen35Model final : public Backend {
                 // the offline MTP acceptance study (tests/qwen35_mtp_study.py) reads it.
                 static const char *h_dump = std::getenv("NEURON_H_DUMP");
                 if (h_dump && r == 0) {
+                    drain(r);
                     xr.resize(L.x.size());
                     check(nrt_tensor_read(st.x[parity].t, xr.data(), 0, xr.size() * 4), "read x");
                     std::ofstream f(h_dump, std::ios::binary | std::ios::app);
@@ -1365,6 +1415,7 @@ class Qwen35Model final : public Backend {
                     auto [in, o] = head_set(*head, L.R, L.Q, r, parity);
                     const auto th = Clock::now();
                     check(nrt_execute(head->model[size_t(r)], in, o), "head execute");
+                    drain(r);
                     const auto tr = Clock::now();
                     // each rank reads its vocabulary shard of every sampled row straight into the row's place in the
                     // logits buffer (32 threads in parallel; no per-step shard vectors, no serial 1 MB-per-row copy)
@@ -1377,6 +1428,23 @@ class Qwen35Model final : public Backend {
                     }
                     pr[5] += std::chrono::duration<double, std::milli>(tr - th).count();
                     pr[6] += ms_since(tr);
+                    if (ltrace_n) {
+                        lt[1] += std::chrono::duration<double, std::milli>(th - lt_prev).count();
+                        lt[7] += std::chrono::duration<double, std::milli>(tr - th).count();
+                        lt[8] += ms_since(tr);
+                    }
+                } else {
+                    const auto td = Clock::now();
+                    drain(r);
+                    if (ltrace_n)
+                        lt[8] += ms_since(td);
+                }
+                if (ltrace_n && r < 2) {
+                    job_ms[size_t(r)] = ms_since(te0); // submit -> this rank's job done
+                    std::lock_guard lock(ltrace_mutex);
+                    auto &acc = ltrace[{L.R, L.Q}].r[size_t(r)];
+                    for (size_t i = 0; i < lt.size(); ++i)
+                        acc[i] += lt[i];
                 }
                 if (r == 0) {
                     t_layers = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1389,6 +1457,23 @@ class Qwen35Model final : public Backend {
             }));
         for (auto &j : jobs)
             j.get();
+        if (const int ltrace_n = ltrace_every()) {
+            std::lock_guard lock(ltrace_mutex);
+            auto &acc = ltrace[{L.R, L.Q}];
+            acc.wall += ms_since(te0);
+            acc.join += ms_since(te0) - std::max(job_ms[0], tp > 1 ? job_ms[1] : 0.0);
+            if (++acc.steps == ltrace_n) {
+                const double n = double(acc.steps);
+                char b[1024];
+                for (int r = 0; r < std::min(tp, 2); ++r) {
+                    const auto &a = acc.r[size_t(r)];
+                    std::snprintf(b, sizeof b, "LTRACE R=%d Q=%d rank=%d steps=%ld wall=%.3f dispatch=%.3f join=%.3f put=%.3f gap=%.3f gdn=%.3f gqa=%.3f moe=%.3f seg=%.3f layer=%.3f head=%.3f read=%.3f launches=%.1f+%.1f (ms per launch() call)\n",
+                                  L.R, L.Q, r, acc.steps, acc.wall / n, a[11] / n, acc.join / n, a[0] / n, a[1] / n, a[2] / n, a[3] / n, a[4] / n, a[5] / n, a[6] / n, a[7] / n, a[8] / n, a[9] / n, a[10] / n);
+                    std::cerr << b;
+                }
+                acc = {};
+            }
+        }
         static const bool nanscan = std::getenv("BEHEMOTH_NEURON_QWEN35_NANSCAN") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_NANSCAN"));
         if (nanscan && head)
             nan_scan(L, dest, int(plan.size() % 2));
@@ -1546,6 +1631,7 @@ class Qwen35Model final : public Backend {
                 }
                 auto [in, o] = mtp_set(g, first_pass, parity, r, xR, xrow);
                 check(nrt_execute(g.model[size_t(r)], in, o), "mtp execute");
+                drain(r);
                 if (g.chain) { // every rank holds the same drafts (all-reduced): rank 0's copy
                     if (r == 0)
                         check(nrt_tensor_read(mtp_chain.at(g.chain)[0].drafts.t, chain_out, 0, std::min(g.out0, size_t(256))), "read drafts");
@@ -1810,7 +1896,10 @@ class Qwen35Model final : public Backend {
                         widest = std::max(widest, g.P);
                 vpages = std::max(vpages, pin > 0 ? pin : widest);
             }
-            const auto [Q, P] = verify_bucket(count, vpages);
+            // BEHEMOTH_NEURON_QWEN35_STRICT_Q=q (strict mode): every launch in a verify bucket of at least q tokens, so streams with
+            // different draft counts run the same graph (Q buckets are separate compiles that may round differently)
+            static const int strict_q = std::getenv("BEHEMOTH_NEURON_QWEN35_STRICT_Q") ? std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_STRICT_Q")) : 0;
+            const auto [Q, P] = verify_bucket(strict_verify() ? std::max(count, strict_q) : count, vpages);
             if (!P)
                 throw std::runtime_error("Qwen35: no verify bucket for " + std::to_string(count) + " tokens with " + std::to_string(pages_needed(req)) + " pages");
             auto L = fresh(1, Q, P);

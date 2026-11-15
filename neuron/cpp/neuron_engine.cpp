@@ -641,8 +641,8 @@ struct Engine::Impl {
         return size_t(n - 2) < mtp_by_rows.size() ? std::min(spec_mtp, mtp_by_rows[size_t(n - 2)]) : 0;
     }
     int mtp_choose() {
-        if (!mtp_adapt || spec_mtp <= 1)
-            return spec_mtp;
+        if (!mtp_adapt || spec_mtp < 1) // (spec_mtp = 1 adapts too: k in {0, 1}, i.e. drafting switches off while the
+            return spec_mtp;            //  acceptance does not pay for the verify row; every 16th step probes k = 1)
         int best = 0;
         double best_rate = 0, tokens = 1;
         for (int k = 0; k <= spec_mtp; ++k) {

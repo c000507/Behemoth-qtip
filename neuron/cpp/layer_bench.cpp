@@ -112,6 +112,7 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
 
     // Collectives rendezvous across ranks, so every rank must execute the same number of times.
     for (int i = 0; i < 4; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute(warmup)", rank);
+    if (std::getenv("LB_ASYNC")) check(nrt_async_drain_queued_execs(rank), "async drain", rank);
     // drain target: the residual output (clock stops when the DEVICE finished, not the host submit)
     nrt_tensor_t* drain = nullptr;
     size_t drain_bytes = 0;
@@ -127,6 +128,7 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
         sync.arrive_and_wait();
         auto t1 = std::chrono::steady_clock::now();
         for (int i = 0; i < steps / BATCHES; ++i) check(nrt_execute(model, inputs, outputs), "nrt_execute", rank);
+        if (std::getenv("LB_ASYNC")) check(nrt_async_drain_queued_execs(rank), "async drain", rank);
         if (drain) check(nrt_tensor_read(drain, sink.data(), 0, drain_bytes), "drain read", rank);
         sync.arrive_and_wait();
         result.batch[b] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / (steps / BATCHES);
@@ -160,6 +162,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot read %s\n", argv[1]);
         return 1;
     }
+    // LB_ASYNC=1: implicit async execution (launches queue, the batch ends with a drain): the device-side time per launch
+    // without the synchronous completion round trip of every nrt_execute
+    if (std::getenv("LB_ASYNC")) setenv("NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS", "64", 0);
     check(nrt_init(NRT_FRAMEWORK_TYPE_NO_FW, "", ""), "nrt_init", -1);
 
     std::barrier<> sync(ranks);

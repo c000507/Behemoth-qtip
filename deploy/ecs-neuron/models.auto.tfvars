@@ -15,7 +15,7 @@ models = {
   ornith = {
     legacy_names       = true
     model_s3_prefix    = "models/ornith-reap20-v3-fp8"
-    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-bound"
+    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp" # = kv8-seg20 (kv8-bound + seg20_{1,2,4}_1_P) + MTP verify segments segv20_1_2_P + mtp_1_{1,2}_32 (docs/neuron-reap-mtp.md); needs the reap-mtp2 engine
     prepared_s3_prefix = "" # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
     model_ids          = ["ornith-1.5-35b-a3b-reap20-v3"]
     model_name         = "ornith-1.5-35b-a3b-reap20-v3"
@@ -34,6 +34,13 @@ models = {
       BEHEMOTH_NEURON_QWEN35_PREFIX_INTERVAL = "2048"
       BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB = "4"
       BEHEMOTH_NEURON_PREFIX_HOST_GB         = "4"
+      # idle OpenMP threads (sampling) must not spin: spinning ones delayed the rank workers by ~2.7 ms per step (docs/neuron-reap-launches.md)
+      OMP_WAIT_POLICY                        = "PASSIVE"
+      # MTP speculative decoding, 1 draft per step while ONE stream decodes (docs/neuron-reap-mtp.md): the head (mtp.json + r0/r1 mtp.bin)
+      # is pulled with the model dir (models/ornith-reap20-v3-fp8/mtp/); 2+ concurrent streams decode without drafts
+      BEHEMOTH_NEURON_MTP_DIR                = "/data/models/ornith-reap20-v3-fp8/mtp"
+      BEHEMOTH_NEURON_SPEC_MTP               = "1"
+      BEHEMOTH_NEURON_SPEC_MTP_ADAPT         = "1" # k in {0, 1} by measured acceptance and step times: no loss on low-acceptance text
     }
 
     use_spot      = false # spot disabled (spot placement score 1/10: launches fail); on-demand with a warm pool
