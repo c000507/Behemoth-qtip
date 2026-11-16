@@ -11,7 +11,15 @@
 #     --instance-market-options MarketType=capacity-block --capacity-reservation-specification \
 #     CapacityReservationTarget={CapacityReservationId=cr-...} --iam-instance-profile Name=<h3_instance_profile> \
 #     --security-group-ids <remote_security_groups[sa-east-1]> --subnet-id <a sa-east-1b subnet> \
-#     --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=1000,VolumeType=gp3,Throughput=1000,Iops=6000}
+#     --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+#     --user-data file://Minimax-neuron/tools/phase2/user_data.sh \
+#     --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=400,VolumeType=gp3,Throughput=625,Iops=16000,DeleteOnTermination=true}'
+# Storage facts (describe-instance-types, sa-east-1): trn2.3xlarge EBS tops out at 625 MB/s and 16,250 IOPS, so more
+# gp3 throughput buys nothing; the instance has one 470 GB NVMe instance store, which user_data.sh mounts at /data
+# for weights and scratch (ephemeral: the run book's persist stage copies results to the H3 bucket). The DLAMI root is
+# 100 GB by default, so the block-device mapping above is mandatory (400 GB is the fallback when the NVMe is missing).
+# Bucket policy: only the h3-neuron role (and var.h3_break_glass_principal_arns) may get or put objects. Applying it
+# locks out every other principal, the account root user included (root can still delete the bucket policy).
 locals {
   h3_enabled     = contains(var.remote_regions, "sa-east-1")
   h3_bucket_name = var.h3_bucket_name != "" ? var.h3_bucket_name : "${var.name}-h3-sa-east-1-${data.aws_caller_identity.current.account_id}"
@@ -84,6 +92,21 @@ data "aws_iam_policy_document" "h3_bucket" {
       values   = ["false"]
     }
   }
+  statement {
+    sid       = "DenyObjectAccessExceptH3Role"
+    effect    = "Deny"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.h3[0].arn}/*"]
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "ArnNotLike"
+      variable = "aws:PrincipalArn"
+      values   = concat([aws_iam_role.h3_neuron[0].arn], var.h3_break_glass_principal_arns)
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "h3" {
@@ -116,13 +139,13 @@ data "aws_iam_policy_document" "h3_neuron" {
   }
   statement {
     sid       = "H3BucketObjects" # prepared shards, NEFFs, goldens, outputs
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListBucketMultipartUploads"]
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"]
     resources = ["${aws_s3_bucket.h3[0].arn}/*"]
   }
   statement {
     sid       = "Logs"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
-    resources = ["*"]
+    resources = ["arn:${local.partition}:logs:sa-east-1:${data.aws_caller_identity.current.account_id}:*"]
   }
 }
 

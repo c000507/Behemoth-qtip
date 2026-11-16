@@ -541,6 +541,12 @@ variable "remote_regions" {
   }
 }
 
+variable "h3_break_glass_principal_arns" {
+  description = "IAM principal ARNs (besides the <name>-h3-neuron role) that the H3 bucket policy lets get and put objects, e.g. a named admin role for break-glass access from sa-east-1. Empty = the instance role only (the account root user is denied too). Wildcards allowed (ArnNotLike)."
+  type        = list(string)
+  default     = []
+}
+
 variable "h3_bucket_name" {
   description = "S3 bucket in sa-east-1 for MiniMax H3 (video model) weights, prepared shards, NEFFs and outputs. Empty = <name>-h3-sa-east-1-<account id>. Created only when sa-east-1 is in remote_regions. H3's licence excludes the US, EU, UK and South Korea, so nothing H3 may be stored in or copied to var.region buckets."
   type        = string
