@@ -17,7 +17,7 @@ variable "region" {
 variable "remote_regions" {
   description = "Regions where the stack's remote_regions.tf may manage security groups (keep in step with the stack's remote_regions)."
   type        = list(string)
-  default     = ["ap-southeast-2", "ap-south-1"]
+  default     = ["ap-southeast-2", "ap-south-1", "sa-east-1"]
 }
 
 variable "name" {
@@ -201,4 +201,10 @@ variable "execution_mode" {
   description = "Pipeline execution mode. SUPERSEDED: a newer run replaces one still waiting for approval, so a stale plan is never applied."
   type        = string
   default     = "SUPERSEDED"
+}
+
+variable "h3_bucket_name" {
+  description = "The main stack's h3_bucket_name (empty = <name>-h3-sa-east-1-<account id>); the apply role may create and configure this bucket."
+  type        = string
+  default     = ""
 }

@@ -267,3 +267,14 @@ If spot capacity is short in us-east-1f, the wait has no upper bound and the req
   defensively.
 * The ENI limit of trn1.2xlarge leaves room for the awsvpc task ENI (it should, at one task).
 * The current `cloudflared` ingress configuration of the existing tunnel.
+
+## H3 video host in sa-east-1
+
+`sa-east-1` is in `remote_regions` for MiniMax H3 (a trn2.3xlarge Capacity Block run by hand). `h3_sa_east_1.tf` adds a
+private bucket there (`h3_bucket` output) and the `<name>-h3-neuron` instance profile (`h3_instance_profile`): SSM plus
+read/write of that bucket only, no access to the models bucket in `var.region`, because H3's licence excludes the US,
+EU, UK and South Korea and its weights, graphs and outputs must stay in sa-east-1. `remote_security_groups` gains a
+`sa-east-1` entry (no ingress, all egress for Hugging Face and SSM). The pipeline stack needs the same
+`remote_regions` and its `h3_bucket_name` (empty = default), and applies first because it widens the apply role and the
+workload boundary. Launch example in the header of `h3_sa_east_1.tf`. Hugging Face weights are downloaded onto the
+instance (never locally or through the models bucket).

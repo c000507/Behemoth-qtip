@@ -21,6 +21,14 @@ provider "aws" {
   }
 }
 
+provider "aws" {
+  alias  = "sa_east_1"
+  region = "sa-east-1"
+  default_tags {
+    tags = local.remote_tags
+  }
+}
+
 module "remote_sg_ap_southeast_2" {
   source    = "./modules/remote_sg"
   count     = contains(var.remote_regions, "ap-southeast-2") ? 1 : 0
@@ -32,6 +40,13 @@ module "remote_sg_ap_south_1" {
   source    = "./modules/remote_sg"
   count     = contains(var.remote_regions, "ap-south-1") ? 1 : 0
   providers = { aws = aws.ap_south_1 }
+  name      = var.name
+}
+
+module "remote_sg_sa_east_1" {
+  source    = "./modules/remote_sg"
+  count     = contains(var.remote_regions, "sa-east-1") ? 1 : 0
+  providers = { aws = aws.sa_east_1 }
   name      = var.name
 }
 

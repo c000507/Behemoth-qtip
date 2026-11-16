@@ -5,6 +5,7 @@ locals {
 
   router_repo   = var.router_ecr_repository_name != "" ? var.router_ecr_repository_name : "${var.name}-router"
   models_bucket = var.models_bucket_name != "" ? var.models_bucket_name : "${var.name}-neuron-models-${var.account_id}"
+  h3_bucket     = var.h3_bucket_name != "" ? var.h3_bucket_name : "${var.name}-h3-sa-east-1-${var.account_id}"
 
   ecr_repo_arns = [
     "arn:${local.partition}:ecr:${var.region}:${local.acct}:repository/${var.backend_ecr_repository_name}",
@@ -12,7 +13,7 @@ locals {
   ]
 
   # the stack's own roles (deploy/ecs-neuron/iam.tf): the only roles the apply build may pass, all under the boundary
-  stack_role_arns = [for r in ["ecs-instance", "ecs-execution", "backend-task", "router-task", "remote-neuron"] :
+  stack_role_arns = [for r in ["ecs-instance", "ecs-execution", "backend-task", "router-task", "remote-neuron", "h3-neuron"] :
   "arn:${local.partition}:iam::${local.acct}:role/${local.p}-${r}"]
 
   state_bucket_arn    = aws_s3_bucket.this["state"].arn
@@ -370,7 +371,7 @@ data "aws_iam_policy_document" "apply_scoped" {
       "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketPublicAccessBlock", "s3:PutBucketOwnershipControls",
       "s3:PutBucketVersioning", "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration", "s3:PutBucketTagging",
     ]
-    resources = ["arn:${local.partition}:s3:::${local.models_bucket}"]
+    resources = ["arn:${local.partition}:s3:::${local.models_bucket}", "arn:${local.partition}:s3:::${local.h3_bucket}"]
   }
   statement {
     sid = "RouterRepo"
@@ -453,6 +454,14 @@ data "aws_iam_policy_document" "workload_boundary" {
     sid       = "ModelBucket"
     actions   = ["s3:ListBucket", "s3:GetObject"]
     resources = ["arn:${local.partition}:s3:::${local.models_bucket}", "arn:${local.partition}:s3:::${local.models_bucket}/*"]
+  }
+  statement {
+    sid = "H3Bucket" # the <name>-h3-neuron role (h3_sa_east_1.tf): its own policy limits it to this bucket; the boundary only has to allow it
+    actions = [
+      "s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject", "s3:PutObject",
+      "s3:AbortMultipartUpload", "s3:ListBucketMultipartUploads",
+    ]
+    resources = ["arn:${local.partition}:s3:::${local.h3_bucket}", "arn:${local.partition}:s3:::${local.h3_bucket}/*"]
   }
   statement {
     sid     = "StackSecrets" # the tunnel token / router key, named <name>/... or <name>-...

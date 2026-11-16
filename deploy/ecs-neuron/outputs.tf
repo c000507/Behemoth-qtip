@@ -79,5 +79,16 @@ output "remote_security_groups" {
   value = merge(
     { for m in module.remote_sg_ap_southeast_2 : "ap-southeast-2" => { security_group_id = m.security_group_id, vpc_id = m.vpc_id } },
     { for m in module.remote_sg_ap_south_1 : "ap-south-1" => { security_group_id = m.security_group_id, vpc_id = m.vpc_id } },
+    { for m in module.remote_sg_sa_east_1 : "sa-east-1" => { security_group_id = m.security_group_id, vpc_id = m.vpc_id } },
   )
+}
+
+output "h3_bucket" {
+  description = "sa-east-1 bucket for H3 weights, NEFFs and outputs (empty without sa-east-1 in remote_regions)."
+  value       = one(aws_s3_bucket.h3[*].bucket)
+}
+
+output "h3_instance_profile" {
+  description = "Instance profile for the H3 trn2 Capacity Block host in sa-east-1: SSM, read/write of the H3 bucket only (no access to the models bucket in the stack region)."
+  value       = one(aws_iam_instance_profile.h3_neuron[*].name)
 }

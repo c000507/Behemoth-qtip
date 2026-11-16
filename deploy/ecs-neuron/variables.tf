@@ -532,11 +532,17 @@ variable "container_insights" {
 }
 
 variable "remote_regions" {
-  description = "Regions outside var.region that get a no-ingress security group (default VPC) for hand-run Trainium hosts, e.g. Capacity Blocks; with any, the stack also creates the <name>-remote-neuron instance profile. Supported: ap-southeast-2, ap-south-1."
+  description = "Regions outside var.region that get a no-ingress security group (default VPC) for hand-run Trainium hosts, e.g. Capacity Blocks; with any, the stack also creates the <name>-remote-neuron instance profile. Supported: ap-southeast-2, ap-south-1, sa-east-1 (H3 video; see h3_sa_east_1.tf)."
   type        = list(string)
-  default     = ["ap-southeast-2", "ap-south-1"]
+  default     = ["ap-southeast-2", "ap-south-1", "sa-east-1"]
   validation {
-    condition     = alltrue([for r in var.remote_regions : contains(["ap-southeast-2", "ap-south-1"], r)])
-    error_message = "remote_regions supports ap-southeast-2 and ap-south-1 (each needs a provider alias in remote_regions.tf)."
+    condition     = alltrue([for r in var.remote_regions : contains(["ap-southeast-2", "ap-south-1", "sa-east-1"], r)])
+    error_message = "remote_regions supports ap-southeast-2, ap-south-1 and sa-east-1 (each needs a provider alias in remote_regions.tf)."
   }
+}
+
+variable "h3_bucket_name" {
+  description = "S3 bucket in sa-east-1 for MiniMax H3 (video model) weights, prepared shards, NEFFs and outputs. Empty = <name>-h3-sa-east-1-<account id>. Created only when sa-east-1 is in remote_regions. H3's licence excludes the US, EU, UK and South Korea, so nothing H3 may be stored in or copied to var.region buckets."
+  type        = string
+  default     = ""
 }
