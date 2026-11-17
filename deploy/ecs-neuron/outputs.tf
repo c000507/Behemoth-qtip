@@ -92,3 +92,8 @@ output "h3_instance_profile" {
   description = "Instance profile for the H3 trn2 Capacity Block host in sa-east-1: SSM, read/write of the H3 bucket only (no access to the models bucket in the stack region)."
   value       = one(aws_iam_instance_profile.h3_neuron[*].name)
 }
+
+output "h3_s3_endpoint_id" {
+  description = "S3 gateway endpoint of the sa-east-1 default VPC (empty without sa-east-1 in remote_regions)."
+  value       = one(aws_vpc_endpoint.h3_s3[*].id)
+}

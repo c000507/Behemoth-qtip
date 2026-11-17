@@ -138,3 +138,28 @@ resource "aws_iam_instance_profile" "h3_neuron" {
   name  = "${var.name}-h3-neuron"
   role  = aws_iam_role.h3_neuron[0].name
 }
+
+# S3 gateway endpoint for the default VPC of sa-east-1 (where the H3 host runs): keeps the host's S3 traffic (weights,
+# NEFFs, outputs, SSM-staged tarballs) on the AWS network instead of the internet gateway. Gateway endpoints are free
+# and add one prefix-list route to the VPC's main route table (the host's subnet has no explicit association, so it
+# uses the main table). The endpoint policy is the default (full access): the H3 bucket policy and the instance role
+# stay the access controls. The host keeps its public IP and internet route for Hugging Face downloads.
+data "aws_route_table" "h3_main" {
+  count    = local.h3_enabled ? 1 : 0
+  provider = aws.sa_east_1
+  vpc_id   = module.remote_sg_sa_east_1[0].vpc_id
+  filter {
+    name   = "association.main"
+    values = ["true"]
+  }
+}
+
+resource "aws_vpc_endpoint" "h3_s3" {
+  count             = local.h3_enabled ? 1 : 0
+  provider          = aws.sa_east_1
+  vpc_id            = module.remote_sg_sa_east_1[0].vpc_id
+  service_name      = "com.amazonaws.sa-east-1.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [data.aws_route_table.h3_main[0].id]
+  tags              = { Name = "${var.name}-h3-s3" }
+}
