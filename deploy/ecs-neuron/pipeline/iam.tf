@@ -251,6 +251,18 @@ data "aws_iam_policy_document" "apply_scoped" {
     }
   }
   statement {
+    sid = "RemoteVpcEndpoints" # h3_sa_east_1.tf: the S3 gateway endpoint of the sa-east-1 default VPC (only the remote regions)
+    actions = [
+      "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint", "ec2:DeleteVpcEndpoints",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.remote_regions
+    }
+  }
+  statement {
     sid = "AutoScaling"
     actions = [
       "autoscaling:CreateAutoScalingGroup", "autoscaling:UpdateAutoScalingGroup", "autoscaling:DeleteAutoScalingGroup",
