@@ -41,7 +41,8 @@ template <class T> struct Dev {
 
 struct Options {
     fs::path model, data, work, resume, export_dir, eval_data, trace_tokens, trace_out;
-    bool eval_only = false, export_only = false, no_quant = false, no_subln = false, attn_distill_rope = false;
+    bool eval_only = false, export_only = false, no_quant = false, no_subln = false, attn_distill_rope = false,
+         no_round = false;
     int rows = 1, accum = 1, loss_rows = 256, max_steps = 0, warmup = 20, checkpoint_every = 50, device = 0,
         attn_layer = -1, eval_rows = 0, log_every = 1, stop_after = 0, seed = 1;
     long max_tokens = 1'000'000;
@@ -77,6 +78,7 @@ class Model {
     bool quant;     // BitLinear (true) or dense bf16 operands
     bool subln;     // SubLN before o_proj / down_proj
     bool trainable; // latent fp32 weights in the flat parameter vector (student); teacher: operands only
+    bool round = true; // emulate the runtime's BF16 activation/residual boundaries (STE in backward)
     std::vector<LayerParams> layers;
     size_t final_norm = 0;
     size_t weight_params = 0, norm_params = 0, total_params = 0; // flat layout: [weights | norms]

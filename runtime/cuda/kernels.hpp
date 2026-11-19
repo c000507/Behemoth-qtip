@@ -29,7 +29,8 @@ void nvfp4_forward(const uint8_t *packed, const uint8_t *block_scales, float glo
 // BitNet b1.58 ternary projection: per-token int8 absmax activation quantisation (scratch holds
 // in int8 codes + 2 floats {scale, sum}), packed 2-bit weights (behemoth::ternary layout), int32
 // accumulation with dp4a, one scale multiply at the end. y = (sum(code * q) - sum(q)) * wscale * xscale.
-// `tokens` > 1 runs the same kernel per token on consecutive rows (x [tokens][in], y [tokens][out]).
+// `tokens` > 1 (x [tokens][in], y [tokens][out]) stages up to eight tokens per block so every packed
+// weight word is read once per eight tokens (the prefill path).
 size_t ternary_scratch_bytes(int in, int tokens);
 // `acc` (optional, [tokens][out]) receives the raw int32 dot products for exactness tests.
 void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, int in, int out,

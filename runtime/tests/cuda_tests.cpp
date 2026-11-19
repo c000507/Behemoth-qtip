@@ -363,7 +363,8 @@ int main(int argc, char **argv) {
                 linear_test(s, out, in, rz);
         fp8_test(s);
         for (auto [in, rows, tokens] : {std::tuple{16, 1, 1}, std::tuple{960, 2560, 1}, std::tuple{2560, 960, 3},
-                                        std::tuple{960, 320, 5}, std::tuple{12288, 28672, 1}})
+                                        std::tuple{960, 320, 5}, std::tuple{960, 2560, 8}, std::tuple{2560, 960, 13},
+                                        std::tuple{960, 961, 37}, std::tuple{12288, 28672, 1}})
             ternary_test(s, in, rows, tokens);
         nvfp4_test(s);
         fp8_test(s, 12288, 512);

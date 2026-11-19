@@ -307,11 +307,17 @@ void Trainer::forward_layer(Model &m, int l, const Batch &b, Workspace &w, bool 
     const int T = b.rows, qd = g.heads * g.dim, kd = g.kv * g.dim, group = g.heads / g.kv;
     const float *in = w.hin[l].p;
     auto &L = m.layers[l];
+    auto rnd = [&](float *x, size_t n) {
+        if (m.round)
+            gpu::round_bf16(x, n, s_);
+    };
     // attention
     gpu::rmsnorm_fwd(in, m.params.p + L.norm1, w.xn.p, nullptr, w.rstd1.p, T, g.n, g.eps, s_);
+    rnd(w.xn.p, size_t(T) * g.n);
     linear_forward(blas_, L.lin[0], m.quant, w.xn.p, w.xq.p, w.xs.p, w.q.p, T, s_);
     linear_forward(blas_, L.lin[1], m.quant, w.xn.p, w.xq.p, w.xs.p, w.k.p, T, s_, false);
     linear_forward(blas_, L.lin[2], m.quant, w.xn.p, w.xq.p, w.xs.p, w.v.p, T, s_, false);
+    rnd(w.q.p, size_t(T) * qd), rnd(w.k.p, size_t(T) * kd), rnd(w.v.p, size_t(T) * kd);
     if (keep_qkv && !opt_.attn_distill_rope) {
         check(cudaMemcpyAsync(w.tq.p, w.q.p, w.tq.bytes(), cudaMemcpyDeviceToDevice, s_), "copy");
         check(cudaMemcpyAsync(w.tk.p, w.k.p, w.tk.bytes(), cudaMemcpyDeviceToDevice, s_), "copy");
@@ -334,28 +340,38 @@ void Trainer::forward_layer(Model &m, int l, const Batch &b, Workspace &w, bool 
     for (int gi = 0; gi < g.kv; ++gi)
         gemm(blas_, false, false, T, g.dim, T, w.Pb.p + size_t(gi) * group * TT, T, w.vb.p + size_t(gi) * g.dim, kd,
              w.a.p + size_t(gi) * group * g.dim, qd, 1.f, 0.f, group, TT, 0, g.dim);
+    rnd(w.a.p, size_t(T) * qd);
     const float *o_in = w.a.p;
     if (m.subln) {
         gpu::rmsnorm_fwd(w.a.p, m.params.p + L.sub_attn, w.an.p, nullptr, w.rstda.p, T, qd, g.eps, s_);
+        rnd(w.an.p, size_t(T) * qd);
         o_in = w.an.p;
     }
     linear_forward(blas_, L.lin[3], m.quant, o_in, w.anq.p, w.as.p, w.o.p, T, s_);
+    rnd(w.o.p, size_t(T) * g.n);
     check(cudaMemcpyAsync(w.hmid.p, in, size_t(T) * g.n * 4, cudaMemcpyDeviceToDevice, s_), "copy");
     gpu::add(w.hmid.p, w.o.p, size_t(T) * g.n, s_);
+    rnd(w.hmid.p, size_t(T) * g.n);
     // mlp
     gpu::rmsnorm_fwd(w.hmid.p, m.params.p + L.norm2, w.xn2.p, nullptr, w.rstd2.p, T, g.n, g.eps, s_);
+    rnd(w.xn2.p, size_t(T) * g.n);
     linear_forward(blas_, L.lin[4], m.quant, w.xn2.p, w.xq2.p, w.xs2.p, w.gate.p, T, s_);
     linear_forward(blas_, L.lin[5], m.quant, w.xn2.p, w.xq2.p, w.xs2.p, w.up.p, T, s_, false);
+    rnd(w.gate.p, size_t(T) * g.inter), rnd(w.up.p, size_t(T) * g.inter);
     gpu::swiglu_fwd(w.gate.p, w.up.p, w.sact.p, size_t(T) * g.inter, s_);
+    rnd(w.sact.p, size_t(T) * g.inter);
     const float *d_in = w.sact.p;
     if (m.subln) {
         gpu::rmsnorm_fwd(w.sact.p, m.params.p + L.sub_ffn, w.sn.p, nullptr, w.rstdf.p, T, g.inter, g.eps, s_);
+        rnd(w.sn.p, size_t(T) * g.inter);
         d_in = w.sn.p;
     }
     linear_forward(blas_, L.lin[6], m.quant, d_in, w.snq.p, w.ss.p, w.d.p, T, s_);
+    rnd(w.d.p, size_t(T) * g.n);
     float *out = w.hin[l + 1].p;
     check(cudaMemcpyAsync(out, w.hmid.p, size_t(T) * g.n * 4, cudaMemcpyDeviceToDevice, s_), "copy");
     gpu::add(out, w.d.p, size_t(T) * g.n, s_);
+    rnd(out, size_t(T) * g.n);
 }
 void Trainer::relation_loss(const Batch &b, Workspace &w, int l) {
     // MiniLM-style self relations softmax(X X^T / sqrt(dim)) for X in {Q, K, V}, teacher vs student.
@@ -577,7 +593,7 @@ State load_checkpoint(const fs::path &dir, Model &m, cudaStream_t s) {
     auto meta = qat::read_json(dir / "metadata.json");
     require(meta.at("format") == "bitnet-trainer-v1", "unsupported checkpoint format");
     require(meta.at("layout") == m.layout(), "checkpoint layout mismatch");
-    qtip::SafeTensorsReader r(dir.string());
+    qtip::SafeTensorsReader r(dir.string(), "state.safetensors");
     auto p = to_float(r, "params", m.total_params);
     upload(m.params, p, s);
     if (m.trainable) {
@@ -600,11 +616,10 @@ void export_model(const fs::path &dest, const fs::path &source, const Model &m, 
     fs::create_directories(dest);
     qtip::SafeTensorsWriter w;
     auto params = download(m.params.p, m.total_params, cudaStreamPerThread);
+    // Norm gains are trained in FP32 and exported unchanged (F32) so that the runtime, which reads
+    // normalisation vectors as FP32, reproduces the trainer's forward exactly.
     auto add_norm = [&](const std::string &name, size_t off, int n) {
-        std::vector<uint16_t> b(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i)
-            b[size_t(i)] = behemoth::BFloat16(params[off + size_t(i)]).bits;
-        w.add(name, "BF16", {n}, b.data(), b.size() * 2);
+        w.add(name, "F32", {n}, params.data() + off, size_t(n) * 4);
     };
     for (int l = 0; l < g.layers; ++l) {
         const auto &L = m.layers[l];

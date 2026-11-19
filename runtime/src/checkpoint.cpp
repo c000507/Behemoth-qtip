@@ -292,6 +292,13 @@ SafeTensorFile::~SafeTensorFile() {
     if (fd_ >= 0)
         ::close(fd_);
 }
+std::vector<std::string> SafeTensorFile::names() const {
+    std::vector<std::string> out;
+    for (const auto &[key, value] : header_.items())
+        if (key != "__metadata__")
+            out.push_back(key);
+    return out;
+}
 std::vector<size_t> SafeTensorFile::shape(const std::string &name) const {
     return header_.at(name).at("shape").get<std::vector<size_t>>();
 }
@@ -341,9 +348,17 @@ uint16_t SafeTensorFile::code(const std::string &name, size_t i) const {
 }
 Checkpoint::Checkpoint(std::filesystem::path root)
     : root_(std::move(root)), config(ModelConfig::read(root_ / "config.json")) {
-    index_ = read_json(root_ / "model.safetensors.index.json")
-                 .at("weight_map")
-                 .get<std::map<std::string, std::string>>();
+    if (std::filesystem::exists(root_ / "model.safetensors.index.json"))
+        index_ = read_json(root_ / "model.safetensors.index.json")
+                     .at("weight_map")
+                     .get<std::map<std::string, std::string>>();
+    else {
+        // single-shard checkpoints (small HF models, bitnet_train exports) have no index
+        auto single = std::make_shared<SafeTensorFile>(root_ / "model.safetensors");
+        for (const auto &name : single->names())
+            index_[name] = "model.safetensors";
+        files_["model.safetensors"] = single;
+    }
     for (const auto &[key, file] : index_) {
         (void)key;
         if (std::filesystem::path(file).filename() != file)

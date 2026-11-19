@@ -22,6 +22,8 @@ void act_quant(const float *x, uint16_t *xq, float *scale, int rows, int n, bool
 // Absmean ternarisation of a flat weight: scale = mean|w| + eps, wq = bf16(clip(round(w/scale),-1,1)).
 // `scratch` is one float zeroed by the call.
 void ternarize(const float *w, size_t n, uint16_t *wq, float *scale, float *scratch, cudaStream_t);
+// In-place emulation of a BF16 activation boundary: x = float(bf16(x)).
+void round_bf16(float *x, size_t n, cudaStream_t);
 // Dense bf16 operand copy.
 void to_bf16(const float *x, uint16_t *y, size_t n, cudaStream_t);
 void to_f32(const uint16_t *x, float *y, size_t n, cudaStream_t);

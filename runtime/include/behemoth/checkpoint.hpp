@@ -56,6 +56,7 @@ class SafeTensorFile {
     std::vector<size_t> shape(const std::string &) const;
     std::string dtype(const std::string &) const;
     bool contains(const std::string &name) const { return header_.contains(name); }
+    std::vector<std::string> names() const;
     std::span<const std::byte> bytes(const std::string &) const;
     float value(const std::string &, size_t index) const;
     uint16_t code(const std::string &, size_t index) const;

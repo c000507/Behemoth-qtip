@@ -326,38 +326,58 @@ __global__ void ternary_quant_kernel(const B16 *x, int8_t *q, float *meta, int i
         meta[2 * t + 1] = float(ired[0]);
     }
 }
-// Four warps per block, one output row per warp, one token per blockIdx.y. Each lane handles
-// sixteen input channels per step: one packed word (byte-interleaved 2-bit codes) and four
-// int8x4 activation words, four dp4a products; sum(w x) = sum(code x) - sum(x).
+// Four warps per block, one output row per warp, TOK tokens per blockIdx.y (their int8 activations are
+// staged in shared memory). Each lane handles sixteen input channels per step: one packed word
+// (byte-interleaved 2-bit codes) and four int8x4 activation words per token, four dp4a products;
+// sum(w x) = sum(code x) - sum(x). Every packed weight word is read once for all TOK tokens, so the
+// multi-token prefill path reads the weights tokens/TOK times instead of once per token.
+template <int TOK>
 __global__ void ternary_gemv(const uint8_t *__restrict__ w, const int8_t *__restrict__ q,
                              const float *__restrict__ meta, float wscale, B16 *__restrict__ y, int in,
-                             int rows, int32_t *__restrict__ raw) {
-    extern __shared__ uint32_t xs[]; // in/4 words of int8 activations
-    const int t = blockIdx.y, words = in / 16;
-    const uint32_t *xq = reinterpret_cast<const uint32_t *>(q + size_t(t) * in);
-    for (int i = threadIdx.x; i < in / 4; i += blockDim.x)
-        xs[i] = xq[i];
+                             int rows, int tokens, int32_t *__restrict__ raw) {
+    extern __shared__ uint32_t xs[]; // TOK * in/4 words of int8 activations
+    const int t0 = blockIdx.y * TOK, words = in / 16, wrow = in / 4;
+    const int live = min(TOK, tokens - t0);
+    for (int i = threadIdx.x; i < live * wrow; i += blockDim.x)
+        xs[i] = reinterpret_cast<const uint32_t *>(q + size_t(t0) * in)[i];
     __syncthreads();
     const int r = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
-    int acc = 0;
+    int acc[TOK];
+#pragma unroll
+    for (int k = 0; k < TOK; ++k)
+        acc[k] = 0;
     if (r < rows) {
-        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * (size_t(in) / 4));
+        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * size_t(wrow));
         for (int c = lane; c < words; c += 32) {
             const uint32_t word = row[c];
-            const uint32_t *x4 = xs + c * 4;
+            uint32_t codes[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j)
-                acc = __dp4a(int((word >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+                codes[j] = (word >> (2 * j)) & 0x03030303u;
+#pragma unroll
+            for (int k = 0; k < TOK; ++k) {
+                if (k < live) {
+                    const uint32_t *x4 = xs + k * wrow + c * 4;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        acc[k] = __dp4a(int(codes[j]), int(x4[j]), acc[k]);
+                }
+            }
         }
     }
-    for (int o = 16; o; o >>= 1)
-        acc += __shfl_xor_sync(0xffffffffU, acc, o);
-    if (!lane && r < rows) {
-        const float scale = meta[2 * t], sum = meta[2 * t + 1];
-        const int32_t dot = acc - int32_t(sum);
-        if (raw)
-            raw[size_t(t) * rows + r] = dot;
-        y[size_t(t) * rows + r] = b16(float(dot) * wscale * scale);
+#pragma unroll
+    for (int k = 0; k < TOK; ++k) {
+        int a = acc[k];
+        for (int o = 16; o; o >>= 1)
+            a += __shfl_xor_sync(0xffffffffU, a, o);
+        if (!lane && r < rows && k < live) {
+            const int t = t0 + k;
+            const float scale = meta[2 * t], sum = meta[2 * t + 1];
+            const int32_t dot = a - int32_t(sum);
+            if (raw)
+                raw[size_t(t) * rows + r] = dot;
+            y[size_t(t) * rows + r] = b16(float(dot) * wscale * scale);
+        }
     }
 }
 __global__ void embed_kernel(const B16 *w, B16 *y, int token, int n) {
@@ -566,7 +586,15 @@ void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, 
     int8_t *q = reinterpret_cast<int8_t *>(scratch);
     float *meta = reinterpret_cast<float *>(scratch + size_t(tokens) * in);
     ternary_quant_kernel<<<tokens, 256, 0, s>>>(x, q, meta, in);
-    ternary_gemv<<<dim3((out + 3) / 4, tokens), 128, size_t(in), s>>>(packed, q, meta, wscale, y, in, out, acc);
+    if (tokens == 1)
+        ternary_gemv<1><<<dim3((out + 3) / 4, 1), 128, size_t(in), s>>>(packed, q, meta, wscale, y, in, out, tokens,
+                                                                        acc);
+    else if (tokens <= 4)
+        ternary_gemv<4><<<dim3((out + 3) / 4, (tokens + 3) / 4), 128, size_t(in) * 4, s>>>(
+            packed, q, meta, wscale, y, in, out, tokens, acc);
+    else
+        ternary_gemv<8><<<dim3((out + 3) / 4, (tokens + 7) / 8), 128, size_t(in) * 8, s>>>(
+            packed, q, meta, wscale, y, in, out, tokens, acc);
     launch_check();
 }
 void dense_forward(const B16 *w, const B16 *x, B16 *y, int in, int out, Stream s) {

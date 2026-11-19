@@ -45,18 +45,17 @@ inline void pack(std::span<const int8_t> q, size_t out, size_t in, std::span<uin
     const size_t rb = packed_bytes(in);
     if (q.size() != out * in || dst.size() != out * rb)
         throw std::invalid_argument("ternary pack size mismatch");
-    std::memset(dst.data(), 0, dst.size());
     for (size_t r = 0; r < out; ++r)
-        for (size_t i = 0; i < in; ++i) {
-            const int v = q[r * in + i];
-            if (v < -1 || v > 1)
-                throw std::invalid_argument("ternary value outside {-1,0,1}");
-            const unsigned sh = code_shift(unsigned(i % group));
-            uint32_t word;
-            uint8_t *p = dst.data() + r * rb + (i / group) * 4;
-            std::memcpy(&word, p, 4);
-            word |= uint32_t(v + 1) << sh;
-            std::memcpy(p, &word, 4);
+        for (size_t g = 0; g < in / group; ++g) {
+            uint32_t word = 0;
+            const int8_t *src = q.data() + r * in + g * group;
+            for (unsigned e = 0; e < group; ++e) {
+                const int v = src[e];
+                if (v < -1 || v > 1)
+                    throw std::invalid_argument("ternary value outside {-1,0,1}");
+                word |= uint32_t(v + 1) << code_shift(e);
+            }
+            std::memcpy(dst.data() + r * rb + g * 4, &word, 4);
         }
 }
 inline int8_t unpack_one(const uint8_t *row, size_t i) {

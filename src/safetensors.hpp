@@ -24,7 +24,8 @@ struct TensorInfo {
 
 class SafeTensorsReader {
  public:
-  explicit SafeTensorsReader(const std::string& model_dir);
+  // Reads the shards of model.safetensors.index.json, else `single_file` (default model.safetensors).
+  explicit SafeTensorsReader(const std::string& model_dir, const std::string& single_file = "model.safetensors");
   ~SafeTensorsReader();
   bool has(const std::string& name) const { return tensors_.count(name) != 0; }
   const TensorInfo& info(const std::string& name) const;

@@ -10,7 +10,7 @@ int main(int argc, char **argv) {
         std::map<std::string, std::string> a;
         for (int i = 1; i < argc; i += 2) {
             if (std::string(argv[i]) == "--help") {
-                std::cout << "behemoth_cuda --model DIR [--prompt TEXT | --messages CHAT.json | --tokens "
+                std::cout << "behemoth_cuda --model DIR [--prompt TEXT | --messages CHAT.json | --raw TEXT | --tokens "
                              "TOKENS.json] [--max-tokens 64] [--context 4096] [--device 0] [--tp 1|2] "
                              "[--trace TRACE.json]\n";
                 return 0;
@@ -20,8 +20,8 @@ int main(int argc, char **argv) {
         for (const auto &[k, v] : a) {
             (void)v;
             check(k == "--model" || k == "--prompt" || k == "--messages" || k == "--tokens" ||
-                      k == "--max-tokens" || k == "--context" || k == "--device" || k == "--trace" ||
-                      k == "--tp",
+                      k == "--raw" || k == "--max-tokens" || k == "--context" || k == "--device" ||
+                      k == "--trace" || k == "--tp",
                   "Unknown argument " + k);
         }
         auto number = [&](const char *key, int fallback) {
@@ -44,9 +44,17 @@ int main(int argc, char **argv) {
             check(bool(f), "Cannot read " + p);
             return json::parse(f);
         };
-        check(int(a.contains("--prompt")) + int(a.contains("--messages")) + int(a.contains("--tokens")) <= 1,
+        check(int(a.contains("--prompt")) + int(a.contains("--messages")) + int(a.contains("--tokens")) +
+                      int(a.contains("--raw")) <= 1,
               "Select one input format");
-        if (a.contains("--tokens")) {
+        if (a.contains("--raw")) {
+            // base models without a chat template: BOS (if configured) + the plain text
+            check(bool(tok), "Tokenizer assets missing; provide exact --tokens");
+            ids = tok->encode(a.at("--raw"));
+            const auto cfg = read(fs::path(a.at("--model")) / "config.json");
+            if (cfg.contains("bos_token_id") && cfg.at("bos_token_id").is_number())
+                ids.insert(ids.begin(), cfg.at("bos_token_id").get<int>());
+        } else if (a.contains("--tokens")) {
             auto j = read(a.at("--tokens"));
             ids = (j.is_array() ? j : j.at("tokens")).get<std::vector<int>>();
             if (j.is_object())

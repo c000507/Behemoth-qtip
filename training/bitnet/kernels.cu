@@ -135,6 +135,11 @@ __global__ void ternarize_kernel(const float *w, size_t n, uint16_t *wq, float *
         wq[i] = bf(fminf(fmaxf(q, -1.f), 1.f));
     }
 }
+__global__ void round_kernel(float *x, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n)
+        x[i] = fb(bf(x[i]));
+}
 __global__ void to_bf16_kernel(const float *x, uint16_t *y, size_t n) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n)
@@ -147,9 +152,9 @@ __global__ void to_f32_kernel(const uint16_t *x, float *y, size_t n) {
 }
 __global__ void scale_rows_kernel(const float *x, const float *s, float alpha, float *y, uint16_t *yb, int n) {
     const size_t off = size_t(blockIdx.x) * n;
-    const float f = alpha * s[blockIdx.x];
+    const float f = s[blockIdx.x];
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = x[off + i] * f;
+        const float v = (x[off + i] * alpha) * f; // (acc * wscale) * xscale, the runtime's order
         if (y)
             y[off + i] = v;
         if (yb)
@@ -385,6 +390,7 @@ void ternarize(const float *w, size_t n, uint16_t *wq, float *scale, float *scra
     abssum_kernel<<<b, threads, 0, s>>>(w, n, scratch);
     ternarize_kernel<<<b, threads, 0, s>>>(w, n, wq, scale, scratch);
 }
+void round_bf16(float *x, size_t n, cudaStream_t s) { round_kernel<<<blocks(n), threads, 0, s>>>(x, n); }
 void to_bf16(const float *x, uint16_t *y, size_t n, cudaStream_t s) {
     to_bf16_kernel<<<blocks(n), threads, 0, s>>>(x, y, n);
 }

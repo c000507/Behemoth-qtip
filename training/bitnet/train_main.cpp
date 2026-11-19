@@ -66,6 +66,7 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
   --attn-rope           Use post-RoPE Q/K for the relation loss (default pre-RoPE)
   --no-teacher          Continued training without a teacher (stage 2)
   --no-quant            Dense bf16 student (sanity check); --no-subln disables SubLN
+  --no-round            Keep activations FP32 instead of emulating the runtime's BF16 boundaries
   --checkpoint-every N  Checkpoint interval in steps (50); --stop-after-steps N
   --grad-dump FILE      One micro-batch (rows 0..) forward/backward; writes FILE (.f32 flat gradient)
                         and FILE.json with the losses, for reference cross-checks
@@ -83,7 +84,8 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
             };
             if (flag("--eval-only", o.eval_only) || flag("--export-only", o.export_only) ||
                 flag("--no-quant", o.no_quant) || flag("--no-subln", o.no_subln) ||
-                flag("--attn-rope", o.attn_distill_rope) || flag("--no-teacher", no_teacher))
+                flag("--attn-rope", o.attn_distill_rope) || flag("--no-teacher", no_teacher) ||
+                flag("--no-round", o.no_round))
                 continue;
             require(i + 1 < argc, "missing value for " + a);
             std::string v = argv[++i];
@@ -167,6 +169,7 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
         const Geometry geo = geometry(config);
         qtip::SafeTensorsReader reader(o.model.string());
         Model student(geo, !o.no_quant, !o.no_subln, true);
+        student.round = !o.no_round;
         State state;
         if (!o.resume.empty()) {
             fs::path dir = o.resume;
@@ -194,6 +197,7 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
         std::unique_ptr<Model> teacher;
         if (want_teacher) {
             teacher = std::make_unique<Model>(geo, false, false, false);
+            teacher->round = !o.no_round;
             teacher->load_hf(reader, s);
         }
         Trainer trainer(student, teacher.get(), o, s);

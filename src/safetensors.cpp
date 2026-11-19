@@ -15,7 +15,8 @@ namespace qtip {
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-SafeTensorsReader::SafeTensorsReader(const std::string& model_dir) : dir_(model_dir) {
+SafeTensorsReader::SafeTensorsReader(const std::string& model_dir, const std::string& single_file)
+    : dir_(model_dir) {
   fs::path idx = fs::path(model_dir) / "model.safetensors.index.json";
   if (fs::exists(idx)) {
     std::ifstream f(idx);
@@ -24,7 +25,7 @@ SafeTensorsReader::SafeTensorsReader(const std::string& model_dir) : dir_(model_
     for (auto& kv : j["weight_map"].items()) files[kv.value().get<std::string>()] = 1;
     for (auto& kv : files) parse_file(kv.first);
   } else {
-    parse_file("model.safetensors");
+    parse_file(single_file);
   }
 }
 SafeTensorsReader::~SafeTensorsReader() {

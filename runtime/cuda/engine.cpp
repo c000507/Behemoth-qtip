@@ -134,6 +134,19 @@ struct Linear {
         }
         checked(sync(s), "finish weight upload");
     }
+    bool batched() const { return ternary.p || dense.p; }
+    // x [tokens][in] -> y [tokens][out]; ternary runs the multi-token kernel, dense loops the gemv.
+    void forward_tokens(const B16 *x, B16 *y, Buffer<float> &scratch, int tokens, Stream s) const {
+        if (ternary.p) {
+            scratch.ensure((ternary_scratch_bytes(in, tokens) + 3) / 4, s);
+            ternary_forward(ternary, ternary_scale, x, y, in, out, reinterpret_cast<uint8_t *>(scratch.p), s,
+                            tokens);
+        } else {
+            check(dense.p, "batched prefill requires ternary or dense projections");
+            for (int t = 0; t < tokens; ++t)
+                dense_forward(dense, x + size_t(t) * in, y + size_t(t) * out, in, out, s);
+        }
+    }
     void forward(const Buffer<B16> &x, Buffer<B16> &y, Buffer<float> &scratch, Buffer<B16> &rotated,
                  Buffer<float> &z, bool rz, Stream s) const {
         y.ensure(out, s);
@@ -343,6 +356,91 @@ struct Model::Impl {
             (void)stream_destroy(stream);
         }
     }
+    bool batched_prefill() const { return layers.empty() || layers[0].linear[0].batched(); }
+    // Multi-token prefill for ternary/dense checkpoints: projections run on chunks of up to 32 tokens
+    // (ternary weights are read once per eight tokens); norms, RoPE and attention stay per token.
+    Vec prefill(const std::vector<int> &ids) {
+        check(!failed, "Reset the CUDA model after an inference failure");
+        check(!ids.empty() && position + int(ids.size()) <= context, "Prompt exceeds CUDA context");
+        for (int id : ids)
+            check(id >= 0 && id < vocab, "Token outside the vocabulary");
+        checked(set_device(device), "select CUDA device");
+        try {
+            constexpr int chunk = 32;
+            const int kv = kv_heads * head_dim, qd = q_heads * head_dim;
+            Buffer<B16> X, N, Q, K, V, A, P, G, U;
+            X.ensure(size_t(chunk) * hidden, stream);
+            N.ensure(size_t(chunk) * hidden, stream);
+            Q.ensure(size_t(chunk) * qd, stream);
+            K.ensure(size_t(chunk) * kv, stream);
+            V.ensure(size_t(chunk) * kv, stream);
+            A.ensure(size_t(chunk) * qd, stream);
+            P.ensure(size_t(chunk) * hidden, stream);
+            G.ensure(size_t(chunk) * inter, stream);
+            U.ensure(size_t(chunk) * inter, stream);
+            for (size_t p0 = 0; p0 < ids.size(); p0 += chunk) {
+                const int n = int(std::min<size_t>(chunk, ids.size() - p0));
+                for (int t = 0; t < n; ++t)
+                    embedding(embeddings, X.p + size_t(t) * hidden, ids[p0 + size_t(t)], hidden, stream);
+                for (auto &layer : layers) {
+                    for (int t = 0; t < n; ++t)
+                        norm(X.p + size_t(t) * hidden, layer.norm1, nullptr, N.p + size_t(t) * hidden, hidden, eps,
+                             false, stream);
+                    layer.linear[0].forward_tokens(N.p, Q.p, scratch, n, stream);
+                    layer.linear[1].forward_tokens(N.p, K.p, scratch, n, stream);
+                    layer.linear[2].forward_tokens(N.p, V.p, scratch, n, stream);
+                    for (int t = 0; t < n; ++t) {
+                        B16 *qt = Q.p + size_t(t) * qd, *kt = K.p + size_t(t) * kv;
+                        if (rope_freq.p)
+                            rope_scaled(qt, kt, position + t, q_heads, kv_heads, head_dim, rope_freq, stream);
+                        else
+                            rope(qt, kt, position + t, q_heads, kv_heads, head_dim, theta, stream);
+                    }
+                    checked(d2d(layer.keys.p + size_t(position) * kv, K.p, size_t(n) * kv * 2, stream),
+                            "append CUDA key cache");
+                    checked(d2d(layer.values.p + size_t(position) * kv, V.p, size_t(n) * kv * 2, stream),
+                            "append CUDA value cache");
+                    scores.ensure(size_t(q_heads) * (position + n), stream);
+                    for (int t = 0; t < n; ++t)
+                        gqa(Q.p + size_t(t) * qd, layer.keys, layer.values, A.p + size_t(t) * qd, scores,
+                            position + t + 1, q_heads, kv_heads, head_dim, stream);
+                    if (sub_norm)
+                        for (int t = 0; t < n; ++t)
+                            norm(A.p + size_t(t) * qd, layer.sub_attn, nullptr, A.p + size_t(t) * qd, qd, eps, false,
+                                 stream);
+                    layer.linear[3].forward_tokens(A.p, P.p, scratch, n, stream);
+                    residual(X, P, n * hidden, stream);
+                    for (int t = 0; t < n; ++t)
+                        norm(X.p + size_t(t) * hidden, layer.norm2, nullptr, N.p + size_t(t) * hidden, hidden, eps,
+                             false, stream);
+                    layer.linear[4].forward_tokens(N.p, G.p, scratch, n, stream);
+                    layer.linear[5].forward_tokens(N.p, U.p, scratch, n, stream);
+                    swiglu(G, U, n * inter, INFINITY, stream);
+                    if (sub_norm)
+                        for (int t = 0; t < n; ++t)
+                            norm(G.p + size_t(t) * inter, layer.sub_ffn, nullptr, G.p + size_t(t) * inter, inter, eps,
+                                 false, stream);
+                    layer.linear[6].forward_tokens(G.p, P.p, scratch, n, stream);
+                    residual(X, P, n * hidden, stream);
+                }
+                position += n;
+                if (p0 + size_t(n) == ids.size()) {
+                    norm(X.p + size_t(n - 1) * hidden, final_norm, nullptr, normed, hidden, eps, false, stream);
+                    gemv({tied ? embeddings.p : head.p, nullptr, nullptr, vocab, hidden, 4, false, 1}, normed,
+                         logits, true, stream);
+                }
+            }
+            checked(d2h(readback.p, logits, size_t(vocab) * 4, stream), "read CUDA logits");
+            checked(sync(stream), "finish CUDA prefill");
+            Vec out(readback.p, readback.p + vocab);
+            for (float a : out)
+                check(std::isfinite(a), "Nonfinite CUDA logits");
+            return out;
+        } catch (...) {
+            failed = true;
+            throw;
+        }
+    }
     Vec step(int token) {
         check(!failed, "Reset the CUDA model after an inference failure");
         check(token >= 0 && token < vocab && position < context,
@@ -464,6 +562,11 @@ std::vector<Vec> Model::prefill_batch(const std::vector<std::vector<int>> &token
 #endif
     check(tokens.size() == 1 && !tokens[0].empty(), "This backend requires a single prefill sequence");
     reset();
+    if (impl_ && impl_->batched_prefill()) {
+        auto out = impl_->prefill(tokens[0]);
+        position_ = int(tokens[0].size());
+        return {std::move(out)};
+    }
     Vec out;
     for (int id : tokens[0])
         out = step(id);
