@@ -380,6 +380,60 @@ __global__ void ternary_gemv(const uint8_t *__restrict__ w, const int8_t *__rest
         }
     }
 }
+// Decode (one token): the activation quantiser is fused into every block (the row is only `in` bf16
+// values, so recomputing absmax/sum per block is cheaper than a separate launch and a meta round trip).
+__global__ void ternary_gemv_fused(const uint8_t *__restrict__ w, const B16 *__restrict__ x, float wscale,
+                                   B16 *__restrict__ y, int in, int rows, int32_t *__restrict__ raw) {
+    extern __shared__ uint32_t xs[]; // in/4 words of int8 activations
+    __shared__ float red[4];
+    __shared__ int ired[4];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float m = 0;
+    for (int i = threadIdx.x; i < in; i += blockDim.x)
+        m = fmaxf(m, fabsf(f32(x[i])));
+    for (int o = 16; o; o >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffU, m, o));
+    if (!lane)
+        red[warp] = m;
+    __syncthreads();
+    m = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+    const float scale = (m > 0 ? m : 1e-5f) / 127.f;
+    int8_t *q = reinterpret_cast<int8_t *>(xs);
+    int sum = 0;
+    for (int i = threadIdx.x; i < in; i += blockDim.x) {
+        float v = rintf(f32(x[i]) / scale);
+        v = fminf(fmaxf(v, -127.f), 127.f);
+        const int c = int(v);
+        q[i] = int8_t(c);
+        sum += c;
+    }
+    for (int o = 16; o; o >>= 1)
+        sum += __shfl_xor_sync(0xffffffffU, sum, o);
+    if (!lane)
+        ired[warp] = sum;
+    __syncthreads();
+    sum = ired[0] + ired[1] + ired[2] + ired[3];
+    const int r = blockIdx.x * 4 + warp, words = in / 16;
+    int acc = 0;
+    if (r < rows) {
+        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * (size_t(in) / 4));
+        for (int c = lane; c < words; c += 32) {
+            const uint32_t word = row[c];
+            const uint32_t *x4 = xs + c * 4;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc = __dp4a(int((word >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+        }
+    }
+    for (int o = 16; o; o >>= 1)
+        acc += __shfl_xor_sync(0xffffffffU, acc, o);
+    if (!lane && r < rows) {
+        const int32_t dot = acc - sum;
+        if (raw)
+            raw[r] = dot;
+        y[r] = b16(float(dot) * wscale * scale);
+    }
+}
 __global__ void embed_kernel(const B16 *w, B16 *y, int token, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -583,13 +637,15 @@ void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, 
                      uint8_t *scratch, Stream s, int tokens, int32_t *acc) {
     if (in % 16 || tokens < 1)
         throw std::invalid_argument("ternary projection needs in % 16 == 0");
+    if (tokens == 1) {
+        ternary_gemv_fused<<<(out + 3) / 4, 128, size_t(in), s>>>(packed, x, wscale, y, in, out, acc);
+        launch_check();
+        return;
+    }
     int8_t *q = reinterpret_cast<int8_t *>(scratch);
     float *meta = reinterpret_cast<float *>(scratch + size_t(tokens) * in);
     ternary_quant_kernel<<<tokens, 256, 0, s>>>(x, q, meta, in);
-    if (tokens == 1)
-        ternary_gemv<1><<<dim3((out + 3) / 4, 1), 128, size_t(in), s>>>(packed, q, meta, wscale, y, in, out, tokens,
-                                                                        acc);
-    else if (tokens <= 4)
+    if (tokens <= 4)
         ternary_gemv<4><<<dim3((out + 3) / 4, (tokens + 3) / 4), 128, size_t(in) * 4, s>>>(
             packed, q, meta, wscale, y, in, out, tokens, acc);
     else
