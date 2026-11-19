@@ -469,6 +469,25 @@ struct Reference {
         return logits;
     }
 };
+// KL(softmax(b) || softmax(a)) in nats: the distribution-level distance between two logit vectors
+double kl_nats(const std::vector<float> &a, const std::vector<float> &b) {
+    auto logsoftmax = [](const std::vector<float> &z) {
+        double top = -INFINITY, sum = 0;
+        for (float v : z)
+            top = std::max(top, double(v));
+        for (float v : z)
+            sum += std::exp(double(v) - top);
+        std::vector<double> out(z.size());
+        for (size_t i = 0; i < z.size(); ++i)
+            out[i] = double(z[i]) - top - std::log(sum);
+        return out;
+    };
+    auto la = logsoftmax(a), lb = logsoftmax(b);
+    double kl = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        kl += std::exp(lb[i]) * (lb[i] - la[i]);
+    return kl;
+}
 double relative(const std::vector<float> &a, const std::vector<float> &b) {
     double e = 0, n = 0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -479,6 +498,7 @@ double relative(const std::vector<float> &a, const std::vector<float> &b) {
     return std::sqrt(e / std::max(n, 1e-30));
 }
 // returns {relative L2 of the scaled reference, of the unscaled reference} at the last token
+// tolerance < 0: real checkpoint diagnostics, judged by the mean KL (nats) instead of relative L2
 std::pair<double, double> compare(const fs::path &root, int tokens, const std::string &label,
                                   double tolerance = 0.02) {
     cu::Model model(root, 0, 128, 1, 1);
@@ -486,18 +506,32 @@ std::pair<double, double> compare(const fs::path &root, int tokens, const std::s
     const auto &c = scaled.c;
     require(model.config.vocab == c.vocab && model.config.eos == c.eos, "model config must follow config.json");
     std::mt19937 gen(77);
-    double worst = 0, plain_last = 0, scaled_last = 0;
+    double worst = 0, plain_last = 0, scaled_last = 0, kl_sum = 0;
+    int agree = 0;
+    std::vector<float> stepwise_last;
     for (int t = 0; t < tokens; ++t) {
         const int token = int(gen() % unsigned(c.vocab));
         auto actual = model.step(token);
+        stepwise_last = actual;
         auto expected = scaled.step(token);
         auto other = plain.step(token);
         scaled_last = relative(actual, expected);
         plain_last = relative(actual, other);
         worst = std::max(worst, scaled_last);
         require(actual.size() == size_t(c.vocab), "logit count");
-        std::cout << label << ": token " << t << " relative L2 " << scaled_last << '\n';
-        require(scaled_last < tolerance, label + ": CUDA/CPU logits mismatch");
+        if (tolerance < 0) {
+            const double kl = kl_nats(actual, expected);
+            kl_sum += kl;
+            agree += std::max_element(actual.begin(), actual.end()) - actual.begin() ==
+                     std::max_element(expected.begin(), expected.end()) - expected.begin();
+            std::cout << label << ": token " << t << " relative L2 " << scaled_last << " KL " << kl << " nats\n";
+        } else
+            require(scaled_last < tolerance, label + ": CUDA/CPU logits mismatch");
+    }
+    if (tolerance < 0) {
+        std::cout << label << ": mean KL " << kl_sum / tokens << " nats, argmax agreement " << agree << '/' << tokens
+                  << '\n';
+        require(kl_sum / tokens < 0.05, label + ": CUDA/CPU distributions differ (mean KL >= 0.05 nats)");
     }
     // prefill must reproduce the last stepwise logits
     std::mt19937 again(77);
@@ -509,7 +543,13 @@ std::pair<double, double> compare(const fs::path &root, int tokens, const std::s
     std::vector<float> last;
     for (int id : ids)
         last = check.step(id);
-    require(relative(prefilled, last) < tolerance, label + ": prefill mismatch");
+    // The batched prefill (ternary/dense) runs the same exact-integer kernels as the stepwise path, so
+    // it must reproduce the stepwise CUDA logits (not just the reference) almost bit for bit.
+    const double prefill_vs_step = relative(prefilled, stepwise_last);
+    std::cout << label << ": prefill vs stepwise CUDA relative L2 " << prefill_vs_step << '\n';
+    require(prefill_vs_step < 1e-3, label + ": prefill differs from the stepwise CUDA logits");
+    if (tolerance >= 0)
+        require(relative(prefilled, last) < tolerance, label + ": prefill mismatch");
     std::cout << label << ": layers " << c.layers << " hidden " << c.hidden << " ffn " << c.intermediate << " heads "
               << c.q_heads << '/' << c.kv_heads << " hd " << c.dim << " vocab " << c.vocab << " rope "
               << (c.rope_llama3 ? "llama3" : "plain") << ": worst relative L2 " << worst << " (unscaled-rope reference "
@@ -773,10 +813,11 @@ int main(int argc, char **argv) {
         bitnet.tied = true;
         compare(write_checkpoint(tmp / "llama_dense", bitnet, 8), 12, "synthetic dense BF16 llama (ternary baseline)");
         // Real checkpoints: deep ternary models amplify summation-order differences through the int8
-        // activation rounding, so the CPU reference agrees only approximately (see docs/BITNET.md).
+        // activation rounding (random-token prompts are the worst case), so the CPU reference is compared
+        // at the distribution level (mean KL < 0.05 nats) and the per-token numbers are printed.
         for (int i = 1; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--checkpoint")
-                compare(argv[i + 1], 12, std::string("checkpoint ") + argv[i + 1], 0.25);
+                compare(argv[i + 1], 12, std::string("checkpoint ") + argv[i + 1], -1);
         for (int i = 1; i + 2 < argc; ++i)
             if (std::string(argv[i]) == "--fidelity") // --fidelity CHECKPOINT SOURCE LIMIT
                 fidelity(argv[i + 1], argv[i + 2], std::stod(argv[i + 3]));

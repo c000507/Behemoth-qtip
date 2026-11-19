@@ -154,10 +154,12 @@ product used by the CPU references of both the trainer and the runtime.
 - `engine.cpp` (`Model::Impl`): `Linear::forward` dispatches to `ternary_forward` or
   `dense_forward`; SubLN norms run in place before `o_proj` and `down_proj`; the tied head reuses
   the embedding matrix.
-- Decode kernel `ternary_gemv_fused`: one block of four warps per four output rows; each block
-  quantises the bf16 input row to int8 in shared memory (absmax, sum), then each lane consumes one
-  packed word (16 weights) and four int8x4 activation words per step with four `__dp4a` into an
-  int32 accumulator; warp reduction; `y = bf16((acc - sum) * s * xs)`.
+- Decode kernel `ternary_gemv_fused`: one block of four warps, each warp owning 1-8 consecutive
+  output rows (more rows for wide matrices so the staged activations are amortised); each block
+  quantises the bf16 input row to int8 in shared memory (absmax, sum), then each lane consumes four
+  packed words (64 weights, one 16-byte load) and four 16-byte int8 activation vectors per step
+  with sixteen `__dp4a` into an int32 accumulator (`in % 64 != 0` falls back to one word per
+  step); warp reduction; `y = bf16((acc - sum) * s * xs)`.
 - Prefill: `ternary_gemv<TOK>` stages up to eight tokens' int8 activations per block so every packed
   word is read once per eight tokens; `Impl::prefill` runs the seven projections of 32-token chunks
   through it (norms, RoPE and attention remain per-token kernels, as in the stepwise engine). The
@@ -220,9 +222,9 @@ and test splits held out). Hardware: one RTX A4000 (16 GB, sm_86), CUDA 12.0.
   output equals the exact int32 reference (max relative error 0.0). Backward: `dX` and `dW` (STE)
   match a double-precision reference to `< 1e-5` relative L2.
 - Whole tiny model (2 layers, packed two-document batch) through the HF loader: dense and
-  ternary+SubLN forward match a double-precision CPU reference with relative L2 `0.0` (identical
-  rounding), cross-entropy identical; the packed second document equals an isolated reference run
-  (mask/positions).
+  ternary+SubLN forward, each with and without the BF16 boundary emulation, match a
+  double-precision CPU reference with relative L2 `0.0` (identical rounding), cross-entropy
+  identical; the packed second document equals an isolated reference run (mask/positions).
 - Runtime kernel: raw int32 dot products equal the CPU reference for all tested shapes/tokens
   (16x1, 2560x960, 960x2560 x3 tokens, 320x960 x5, 2560x960 x8, 960x2560 x13, 961x960 x37,
   28672x12288) and the scaled bf16 outputs are bit-exact.
@@ -250,17 +252,96 @@ within that sensitivity.
 
 ### Distillation run
 
-RESULTS_PLACEHOLDER
+Stage 2 (CE only, no teacher, lr 3e-4 cosine to 0.3, 1000 steps x 2048 tokens = 2.0 M tokens,
+8 min) took the converted model from CE 13.9 (perplexity 1.1 M on 16 validation rows) to a
+validation perplexity of **279.5** (64 rows, 65 k tokens). Stage 3 (`--init` from stage 2, CE +
+KL at T = 2 + Q/K/V relation at layer 24, lr 3e-4 warmup 100 cosine to 3e-5, 10,000 steps x 2048
+tokens = 20.5 M tokens, 1 h 50 min at 3.0-3.4 k tokens/s) then reached:
+
+| stage 3 step | CE | T^2 KL | relation | lr |
+|---|---|---|---|---|
+| 1000 | 5.66 | 4.34 | 1.25 | 2.9e-4 |
+| 2000 | 5.11 | 3.75 | 1.06 | 2.8e-4 |
+| 4000 | 4.55 | 2.93 | 0.87 | 2.1e-4 |
+| 6000 | 4.04 | 2.46 | 0.79 | 1.2e-4 |
+| 8000 | 3.71 | 1.99 | 0.72 | 5.6e-5 |
+| 10000 | 3.61 | 1.84 | 0.68 | 3.0e-5 |
+
+(means over the previous 500 steps, training rows). Held-out perplexity, same block-causal
+1024-token packing, teacher and student evaluated by the same trainer code:
+
+| model | validation (64 rows, 65,452 tokens) | test (all 294 rows, 300,702 tokens) |
+|---|---|---|
+| teacher SmolLM2-360M (BF16) | CE 2.522, ppl **12.45** | CE 2.574, ppl **13.12** |
+| ternary student after stage 2 | CE 5.633, ppl 279.5 | - |
+| ternary student after stage 3 | CE 3.373, ppl **29.16** | CE 3.526, ppl **34.00** |
+
+The student is 2.6x the teacher's perplexity after 22 M tokens; the loss was still falling at
+the end of the cosine schedule (the stage-2 checkpoint was lost to an external `/tmp` cleanup
+after its export, so its test perplexity was not measured). Greedy continuations of the exported
+model through the CUDA engine are fluent but repetitive and factually wrong, as expected at
+this perplexity, e.g. `The Battle of Hastings took place in` -> ` 1914 , and the Battle of
+Hastings was the first battle of the war between the British and the British .`
+The run itself was interrupted once (a checkpoint write hit a full disk at step 4000) and
+resumed from step 3500 with `--resume`; `--keep-checkpoints` now bounds the disk use.
 
 ### Runtime parity and speed
 
-PARITY_PLACEHOLDER
+**Load and parity.** The exported model (173 MB) loads in `behemoth_cuda`/`behemoth_cuda_server`
+(detected from `quantization_config.quant_method`), and the OpenAI-compatible chat endpoint
+answers (the base model has no chat template; a one-line `chat_template.jinja` was added to the
+export directory for the server test). On the first 64 test tokens, trainer forward (`--trace-tokens`)
+vs runtime (`--trace`): per-position logit relative L2 mean 3.8%, max 9.9%, argmax agreement
+95.3%, mean KL(trainer || runtime) **0.0042 nats**. The runtime vs the double-precision CPU
+reference of the same math on 12 random tokens (`behemoth_cuda_llama_tests --checkpoint`):
+mean KL 0.039 nats, argmax 12/12, relative L2 3.5-40% per token. These few-percent L2 gaps are
+the reduction-order sensitivity of a 32-layer int8/ternary network (3-layer synthetic models agree
+to 1e-7 and the trainer's own backward is equally sensitive, see above); the distribution-level
+distance is small. The batched prefill reproduces the stepwise CUDA logits exactly (relative L2
+0) on the real model.
+
+**Speed (idle RTX A4000, CUDA 12.0, single sequence, `behemoth_cuda`, greedy 128 tokens after a
+9-token prompt; median of 3):**
+
+| checkpoint | weights read per token | decode | 512-token prefill |
+|---|---|---|---|
+| SmolLM2-360M BF16 (`Quantization::Dense`) | 630 MB blocks + 94 MB head | 145-150 tok/s | 2.47 s (one token at a time) |
+| SmolLM2-360M ternary export | 79 MB blocks + 94 MB head | **259-263 tok/s** (1.76x) | **0.65 s** (batched, 3.8x) |
+
+Projection kernels (`behemoth_cuda_ternary_bench`, GPU event time, median of 5 x 100 calls):
+
+| shape (out x in) | tokens | ternary µs/call | ternary weight GB/s | bf16 µs/call | bf16 weight GB/s | speedup |
+|---|---|---|---|---|---|---|
+| 2560x960 (gate/up) | 1 | 7.0 | 88 | 30.1 | 163 | 4.3x |
+| 2560x960 | 8 | 23.3 (2.9/token) | 26 | 233 (29.1/token) | 169 | 10.0x |
+| 960x2560 (down) | 1 | 8.8 | 70 | 36.2 | 136 | 4.1x |
+| 960x2560 | 8 | 30.5 (3.8/token) | 20 | 290 (36.3/token) | 135 | 9.5x |
+| 960x960 (q/o) | 1 | 4.9 | 47 | 8.0 | 231 | 1.6x |
+| 320x960 (k/v) | 1 | 4.4 | 18 | 7.6 | 81 | 1.7x |
+| 12288x12288 (Behemoth q/o size) | 1 | 211 | 179 | - | - | - |
+| 28672x12288 (Behemoth gate/up size) | 1 | 383 | 230 | 3050 | 231 | 8.0x |
+| 28672x12288 | 8 | 1932 (241/token) | 46 | - | - | - |
+
+Reading: the bf16 gemv runs at 140-240 GB/s (about half of the A4000's 448 GB/s) and is
+bandwidth-bound; the ternary kernel moves 8x fewer bytes but at the SmolLM2 shapes its calls are
+4-9 µs, i.e. launch and latency bound (0.1-0.6 MB matrices). At Behemoth-sized shapes the
+single-token ternary kernel reaches 230 GB/s, the same bandwidth as the bf16 kernel, so the
+8x byte reduction becomes an 8x time reduction (0.38 ms vs 3.05 ms per gate/up projection).
+Per token the whole ternary SmolLM2 model needs 3.8 ms of which the unquantised 94 MB bf16 head
+alone costs ~0.5 ms; the bf16 model needs 6.7 ms. Effective end-to-end weight bandwidth is
+therefore 46 GB/s (ternary) vs 108 GB/s (bf16): both runs are dominated by ~400 kernel launches
+and a host sync per token, which CUDA graphs would remove (see *Limitations*). The multi-token
+kernel reads each packed word once per eight tokens and gives a 10x per-token advantage over the
+per-token bf16 gemv at small shapes; at large shapes it is `dp4a`-throughput bound (241 µs/token
+for 28672x12288 at 8 tokens vs 383 µs for one), which is where an int8 tensor-core GEMM would be
+needed.
 
 ## Limitations and open questions
 
 - **Scale of the run.** BitDistill uses billions of tokens; this run used about 22 M tokens on one
-  A4000 in under two hours. The student is far from the teacher (numbers above are honest).
-  Longer stage 2/3 runs, a larger `--rows`, and lower temperature/KL weights were not explored.
+  A4000 in about two hours. The student (ppl 34 vs 13) is far from the teacher and the loss was
+  still falling. Longer stage 2/3 runs, larger `--rows`, other temperatures/KL weights and the
+  choice of the relation layer were not explored.
 - **Trainer throughput** (~3.4-4.3 k tokens/s at `T = 1024`) is bounded by the materialised
   attention (memory-bound softmax over `[heads, T, T]`) and many small element-wise passes. A
   fused flash-style attention and fused scale/round kernels would help; neither was needed to

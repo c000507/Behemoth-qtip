@@ -175,8 +175,13 @@ void bitlinear_test(std::mt19937 &rng) {
 // CPU double-precision reference of the Llama forward with optional BitLinear/SubLN.
 struct Ref {
     Geometry g;
-    bool quant, subln;
+    bool quant, subln, round = false; // round: BF16 boundaries like the trainer's default / the runtime
     std::map<std::string, std::vector<float>> w;
+    void rnd(std::vector<double> &x) const {
+        if (round)
+            for (auto &v : x)
+                v = bf16_round(float(v));
+    }
     std::vector<double> linear(const std::string &name, const std::vector<double> &x, int T, int in, int out) {
         const auto &W = w.at(name);
         std::vector<double> y(size_t(T) * out);
@@ -231,9 +236,11 @@ struct Ref {
         for (int l = 0; l < g.layers; ++l) {
             const std::string p = "model.layers." + std::to_string(l) + ".";
             auto xn = rms(h, w.at(p + "input_layernorm.weight"), T, n);
+            rnd(xn);
             auto q = linear(p + "self_attn.q_proj.weight", xn, T, n, qd);
             auto k = linear(p + "self_attn.k_proj.weight", xn, T, n, kd);
             auto v = linear(p + "self_attn.v_proj.weight", xn, T, n, kd);
+            rnd(q), rnd(k), rnd(v);
             auto rope = [&](std::vector<double> &x, int heads) {
                 for (int t = 0; t < T; ++t)
                     for (int hh = 0; hh < heads; ++hh)
@@ -274,22 +281,34 @@ struct Ref {
                     }
                 }
             }
-            if (subln)
+            rnd(att);
+            if (subln) {
                 att = rms(att, w.at(p + "self_attn.attn_sub_norm.weight"), T, qd);
+                rnd(att);
+            }
             auto o = linear(p + "self_attn.o_proj.weight", att, T, qd, n);
+            rnd(o);
             for (size_t i = 0; i < h.size(); ++i)
                 h[i] += o[i];
+            rnd(h);
             auto xn2 = rms(h, w.at(p + "post_attention_layernorm.weight"), T, n);
+            rnd(xn2);
             auto gate = linear(p + "mlp.gate_proj.weight", xn2, T, n, g.inter);
             auto up = linear(p + "mlp.up_proj.weight", xn2, T, n, g.inter);
+            rnd(gate), rnd(up);
             std::vector<double> sact(gate.size());
             for (size_t i = 0; i < gate.size(); ++i)
                 sact[i] = gate[i] / (1 + std::exp(-gate[i])) * up[i];
-            if (subln)
+            rnd(sact);
+            if (subln) {
                 sact = rms(sact, w.at(p + "mlp.ffn_sub_norm.weight"), T, g.inter);
+                rnd(sact);
+            }
             auto d = linear(p + "mlp.down_proj.weight", sact, T, g.inter, n);
+            rnd(d);
             for (size_t i = 0; i < h.size(); ++i)
                 h[i] += d[i];
+            rnd(h);
         }
         auto xf = rms(h, w.at("model.norm.weight"), T, n);
         std::vector<double> out(size_t(T) * g.vocab);
@@ -377,9 +396,10 @@ void model_test(std::mt19937 &rng) {
     // reference positions restart at segment boundaries: emulate by rotating with the actual positions
     Options o;
     o.loss_rows = 8;
-    for (int variant = 0; variant < 2; ++variant) {
-        const bool quant = variant == 1;
+    for (int variant = 0; variant < 4; ++variant) {
+        const bool quant = variant % 2 == 1, round = variant >= 2;
         Model m(g, quant, quant, quant);
+        m.round = round;
         m.load_hf(reader, s);
         gpu::check(cudaStreamSynchronize(s), "sync");
         Trainer tr(m, nullptr, o, s);
@@ -387,7 +407,7 @@ void model_test(std::mt19937 &rng) {
         std::vector<float> logits;
         auto rep = tr.evaluate(m, db, nullptr, &logits);
         gpu::check(cudaStreamSynchronize(s), "sync");
-        Ref ref{g, quant, quant, w};
+        Ref ref{g, quant, quant, round, w};
         // The reference rotates with angle t. Rows 0..9 are the first document (positions == t);
         // the second document restarts positions, so it is compared against an isolated reference run,
         // which also checks that the packed attention mask isolates the documents.
@@ -396,15 +416,13 @@ void model_test(std::mt19937 &rng) {
         std::vector<float> got(logits.begin(), logits.begin() + 10 * g.vocab);
         std::vector<double> ref10(want.begin(), want.begin() + 10 * g.vocab);
         const double err = rel_l2(got, ref10);
-        expect(err < (quant ? 2e-3 : 2e-3),
-               std::string(quant ? "ternary SubLN" : "dense") + " forward matches CPU reference (rel L2 " +
-                   std::to_string(err) + ")");
+        const std::string what = std::string(quant ? "ternary SubLN" : "dense") + (round ? " (bf16 boundaries)" : "");
+        expect(err < 2e-3, what + " forward matches CPU reference (rel L2 " + std::to_string(err) + ")");
         std::vector<int32_t> t2(b.tokens.begin() + 10, b.tokens.end()), s2(size_t(T - 10), 0);
         auto want2 = ref.logits(t2, s2);
         std::vector<float> got2(logits.begin() + 10 * g.vocab, logits.end());
         const double err2 = rel_l2(got2, want2);
-        expect(err2 < 2e-3, std::string(quant ? "ternary" : "dense") +
-                                " packed second document matches isolated reference (rel L2 " +
+        expect(err2 < 2e-3, what + " packed second document matches isolated reference (rel L2 " +
                                 std::to_string(err2) + ")");
         // CE consistency: mean CE from the kernel equals the reference's CE on supervised rows
         double ce = 0;

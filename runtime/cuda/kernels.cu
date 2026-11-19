@@ -326,6 +326,41 @@ __global__ void ternary_quant_kernel(const B16 *x, int8_t *q, float *meta, int i
         meta[2 * t + 1] = float(ired[0]);
     }
 }
+// Warp-level packed-row dot product against int8 activations in shared memory. With in % 64 == 0
+// every lane consumes four packed words (64 weights, one 16-byte load) and four 16-byte activation
+// loads per step (conflict-free), otherwise one word per step.
+__device__ __forceinline__ int ternary_row_dot(const uint8_t *__restrict__ wrow, const uint32_t *__restrict__ xs,
+                                               int in, int lane) {
+    int acc = 0;
+    if (in % 64 == 0) {
+        const uint4 *row4 = reinterpret_cast<const uint4 *>(wrow);
+        const uint4 *xs4 = reinterpret_cast<const uint4 *>(xs);
+        const int quads = in / 64;
+        for (int c = lane; c < quads; c += 32) {
+            const uint4 wv = row4[c];
+            const uint32_t words[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint4 xv = xs4[c * 4 + k];
+                const uint32_t x4[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    acc = __dp4a(int((words[k] >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+            }
+        }
+        return acc;
+    }
+    const uint32_t *row = reinterpret_cast<const uint32_t *>(wrow);
+    const int words = in / 16;
+    for (int c = lane; c < words; c += 32) {
+        const uint32_t word = row[c];
+        const uint32_t *x4 = xs + c * 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            acc = __dp4a(int((word >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+    }
+    return acc;
+}
 // Four warps per block, one output row per warp, TOK tokens per blockIdx.y (their int8 activations are
 // staged in shared memory). Each lane handles sixteen input channels per step: one packed word
 // (byte-interleaved 2-bit codes) and four int8x4 activation words per token, four dp4a products;
@@ -334,33 +369,66 @@ __global__ void ternary_quant_kernel(const B16 *x, int8_t *q, float *meta, int i
 template <int TOK>
 __global__ void ternary_gemv(const uint8_t *__restrict__ w, const int8_t *__restrict__ q,
                              const float *__restrict__ meta, float wscale, B16 *__restrict__ y, int in,
-                             int rows, int tokens, int32_t *__restrict__ raw) {
+                             int rows, int tokens, int rows_per_warp, int32_t *__restrict__ raw) {
     extern __shared__ uint32_t xs[]; // TOK * in/4 words of int8 activations
     const int t0 = blockIdx.y * TOK, words = in / 16, wrow = in / 4;
     const int live = min(TOK, tokens - t0);
     for (int i = threadIdx.x; i < live * wrow; i += blockDim.x)
         xs[i] = reinterpret_cast<const uint32_t *>(q + size_t(t0) * in)[i];
     __syncthreads();
-    const int r = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int lane = threadIdx.x & 31;
+    // each warp owns rows_per_warp consecutive rows and reuses the staged activations for all of them
+    for (int rr = 0; rr < rows_per_warp; ++rr) {
+    const int r = (blockIdx.x * 4 + threadIdx.x / 32) * rows_per_warp + rr;
     int acc[TOK];
 #pragma unroll
     for (int k = 0; k < TOK; ++k)
         acc[k] = 0;
     if (r < rows) {
-        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * size_t(wrow));
-        for (int c = lane; c < words; c += 32) {
-            const uint32_t word = row[c];
-            uint32_t codes[4];
+        const uint8_t *wrow_p = w + size_t(r) * size_t(wrow);
+        if (in % 64 == 0) {
+            const uint4 *row4 = reinterpret_cast<const uint4 *>(wrow_p);
+            const int quads = in / 64;
+            for (int c = lane; c < quads; c += 32) {
+                const uint4 wv = row4[c];
+                const uint32_t wds[4] = {wv.x, wv.y, wv.z, wv.w};
+                uint32_t codes[4][4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                codes[j] = (word >> (2 * j)) & 0x03030303u;
-#pragma unroll
-            for (int k = 0; k < TOK; ++k) {
-                if (k < live) {
-                    const uint32_t *x4 = xs + k * wrow + c * 4;
+                for (int k = 0; k < 4; ++k)
 #pragma unroll
                     for (int j = 0; j < 4; ++j)
-                        acc[k] = __dp4a(int(codes[j]), int(x4[j]), acc[k]);
+                        codes[k][j] = (wds[k] >> (2 * j)) & 0x03030303u;
+#pragma unroll
+                for (int t = 0; t < TOK; ++t) {
+                    if (t < live) {
+                        const uint4 *xs4 = reinterpret_cast<const uint4 *>(xs + t * wrow) + c * 4;
+#pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            const uint4 xv = xs4[k];
+                            const uint32_t x4[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+                            for (int j = 0; j < 4; ++j)
+                                acc[t] = __dp4a(int(codes[k][j]), int(x4[j]), acc[t]);
+                        }
+                    }
+                }
+            }
+        } else {
+            const uint32_t *row = reinterpret_cast<const uint32_t *>(wrow_p);
+            for (int c = lane; c < words; c += 32) {
+                const uint32_t word = row[c];
+                uint32_t codes[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    codes[j] = (word >> (2 * j)) & 0x03030303u;
+#pragma unroll
+                for (int k = 0; k < TOK; ++k) {
+                    if (k < live) {
+                        const uint32_t *x4 = xs + k * wrow + c * 4;
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            acc[k] = __dp4a(int(codes[j]), int(x4[j]), acc[k]);
+                    }
                 }
             }
         }
@@ -379,11 +447,13 @@ __global__ void ternary_gemv(const uint8_t *__restrict__ w, const int8_t *__rest
             y[size_t(t) * rows + r] = b16(float(dot) * wscale * scale);
         }
     }
+    }
 }
 // Decode (one token): the activation quantiser is fused into every block (the row is only `in` bf16
 // values, so recomputing absmax/sum per block is cheaper than a separate launch and a meta round trip).
 __global__ void ternary_gemv_fused(const uint8_t *__restrict__ w, const B16 *__restrict__ x, float wscale,
-                                   B16 *__restrict__ y, int in, int rows, int32_t *__restrict__ raw) {
+                                   B16 *__restrict__ y, int in, int rows, int rows_per_warp,
+                                   int32_t *__restrict__ raw) {
     extern __shared__ uint32_t xs[]; // in/4 words of int8 activations
     __shared__ float red[4];
     __shared__ int ired[4];
@@ -413,25 +483,19 @@ __global__ void ternary_gemv_fused(const uint8_t *__restrict__ w, const B16 *__r
         ired[warp] = sum;
     __syncthreads();
     sum = ired[0] + ired[1] + ired[2] + ired[3];
-    const int r = blockIdx.x * 4 + warp, words = in / 16;
-    int acc = 0;
-    if (r < rows) {
-        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * (size_t(in) / 4));
-        for (int c = lane; c < words; c += 32) {
-            const uint32_t word = row[c];
-            const uint32_t *x4 = xs + c * 4;
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                acc = __dp4a(int((word >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+    for (int rr = 0; rr < rows_per_warp; ++rr) {
+        const int r = (blockIdx.x * 4 + warp) * rows_per_warp + rr;
+        int acc = 0;
+        if (r < rows)
+            acc = ternary_row_dot(w + size_t(r) * (size_t(in) / 4), xs, in, lane);
+        for (int o = 16; o; o >>= 1)
+            acc += __shfl_xor_sync(0xffffffffU, acc, o);
+        if (!lane && r < rows) {
+            const int32_t dot = acc - sum;
+            if (raw)
+                raw[r] = dot;
+            y[r] = b16(float(dot) * wscale * scale);
         }
-    }
-    for (int o = 16; o; o >>= 1)
-        acc += __shfl_xor_sync(0xffffffffU, acc, o);
-    if (!lane && r < rows) {
-        const int32_t dot = acc - sum;
-        if (raw)
-            raw[r] = dot;
-        y[r] = b16(float(dot) * wscale * scale);
     }
 }
 __global__ void embed_kernel(const B16 *w, B16 *y, int token, int n) {
@@ -637,20 +701,32 @@ void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, 
                      uint8_t *scratch, Stream s, int tokens, int32_t *acc) {
     if (in % 16 || tokens < 1)
         throw std::invalid_argument("ternary projection needs in % 16 == 0");
+    // Rows per warp: amortise the staged activations over several rows for wide matrices while keeping
+    // at least ~768 warps (48 SMs x 16) busy for the small ones.
+    const int rpw = std::clamp(out / 768, 1, 8);
+    const unsigned blocks_x = unsigned((out + 4 * rpw - 1) / (4 * rpw));
     if (tokens == 1) {
-        ternary_gemv_fused<<<(out + 3) / 4, 128, size_t(in), s>>>(packed, x, wscale, y, in, out, acc);
+        ternary_gemv_fused<<<blocks_x, 128, size_t(in), s>>>(packed, x, wscale, y, in, out, rpw, acc);
         launch_check();
         return;
     }
     int8_t *q = reinterpret_cast<int8_t *>(scratch);
     float *meta = reinterpret_cast<float *>(scratch + size_t(tokens) * in);
     ternary_quant_kernel<<<tokens, 256, 0, s>>>(x, q, meta, in);
-    if (tokens <= 4)
-        ternary_gemv<4><<<dim3((out + 3) / 4, (tokens + 3) / 4), 128, size_t(in) * 4, s>>>(
-            packed, q, meta, wscale, y, in, out, tokens, acc);
-    else
-        ternary_gemv<8><<<dim3((out + 3) / 4, (tokens + 7) / 8), 128, size_t(in) * 8, s>>>(
-            packed, q, meta, wscale, y, in, out, tokens, acc);
+    // tokens staged per block, bounded by the 48 KB default dynamic shared memory
+    constexpr size_t smem_limit = 47 * 1024;
+    if (tokens >= 5 && size_t(in) * 8 <= smem_limit)
+        ternary_gemv<8><<<dim3(blocks_x, (tokens + 7) / 8), 128, size_t(in) * 8, s>>>(
+            packed, q, meta, wscale, y, in, out, tokens, rpw, acc);
+    else if (tokens >= 2 && size_t(in) * 4 <= smem_limit)
+        ternary_gemv<4><<<dim3(blocks_x, (tokens + 3) / 4), 128, size_t(in) * 4, s>>>(
+            packed, q, meta, wscale, y, in, out, tokens, rpw, acc);
+    else {
+        if (size_t(in) > smem_limit)
+            throw std::invalid_argument("ternary projection input too wide for shared memory staging");
+        ternary_gemv<1><<<dim3(blocks_x, tokens), 128, size_t(in), s>>>(packed, q, meta, wscale, y, in, out,
+                                                                      tokens, rpw, acc);
+    }
     launch_check();
 }
 void dense_forward(const B16 *w, const B16 *x, B16 *y, int in, int out, Stream s) {
