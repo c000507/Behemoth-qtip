@@ -14,9 +14,11 @@ struct FloatTensorView {
     }
     float operator[](size_t i) const;
 };
-// Weight format of the checkpoint: AQLM 1x16 (the original runtime format) or QTIP 2-bit HYB
-// (qtip_quant output, QTIP-hfized llama layout with config.quip_params; see qtip.hpp).
-enum class Quantization { Aqlm, Qtip };
+// Weight format of the checkpoint: AQLM 1x16 (the original runtime format), QTIP 2-bit HYB
+// (qtip_quant output, QTIP-hfized llama layout with config.quip_params; see qtip.hpp), BitNet b1.58
+// ternary (bitnet_train export, config.quantization_config.quant_method == "bitnet"; see ternary.hpp)
+// or a plain BF16 llama checkpoint (the dense baseline of a ternary model).
+enum class Quantization { Aqlm, Qtip, Ternary, Dense };
 // llama3 RoPE frequency scaling (HF rope_scaling type "llama3", e.g. Llama 3.3 70B).
 struct RopeScalingLlama3 {
     double factor = 0, low_freq_factor = 0, high_freq_factor = 0;
@@ -25,6 +27,8 @@ struct RopeScalingLlama3 {
 struct ModelConfig {
     Quantization quantization = Quantization::Aqlm;
     bool fp8_kv = false; // Mixed QTIP checkpoint: original E4M3 K/V projections.
+    bool tied_embeddings = false; // lm_head.weight aliases model.embed_tokens.weight (Ternary/Dense only)
+    bool sub_norm = false;        // BitNet SubLN: RMSNorm before o_proj and down_proj (Ternary only)
     int layers = 88, hidden = 12288, intermediate = 28672, q_heads = 96, kv_heads = 8, dim = 128,
         vocab = 32768;
     int max_context = 131072;

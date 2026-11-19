@@ -116,23 +116,45 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
     // Mistral-Large layout, Llama 3.3 or other supported llama shapes): model_type llama +
     // quip_params, no quantization_config. Dimensions are derived from the config; the AQLM
     // path below still requires the exact original Behemoth geometry.
+    // BitNet b1.58 ternary exports (bitnet_train --export) and plain BF16 llama checkpoints (the dense
+    // baseline) share the llama-layout branch; they have no Hadamard geometry constraint and may tie
+    // the embeddings. A plain checkpoint is model_type llama without any quantization marker.
     const bool qtip = j.contains("quip_params");
-    if (qtip) {
+    const bool bitnet = !qtip && j.contains("quantization_config") && j.at("quantization_config").is_object() &&
+                        j.at("quantization_config").value("quant_method", std::string()) == "bitnet";
+    const bool dense = !qtip && !bitnet && j.value("model_type", std::string()) == "llama" &&
+                       !j.contains("quantization_config");
+    if (qtip || bitnet || dense) {
         if (j.at("model_type") != "llama")
             throw std::invalid_argument("QTIP checkpoint must use model_type llama");
-        auto q = j.at("quip_params");
-        if (q.at("codebook") != "bitshift" || q.at("L") != 16 || q.at("K") != 2 || q.at("V") != 2 ||
-            q.at("tlut_bits") != 9 || q.at("decode_mode") != "quantlut_sym" || q.at("td_x") != 16 ||
-            q.at("td_y") != 16 || (q.contains("split_for_tp") && q.at("split_for_tp") != false) ||
-            (q.contains("skip_list") && !q.at("skip_list").is_null()) ||
-            j.contains("quantization_config"))
-            throw std::invalid_argument("Unsupported QTIP format (needs HYB L16 K2 V2 tlut_bits 9 "
-                                        "quantlut_sym 16x16, no TP split, no skip list)");
-        c.quantization = Quantization::Qtip;
-        const auto format = j.value("qtip_quant", nlohmann::json::object()).value("kv_format", std::string("qtip"));
-        if (format != "qtip" && format != "fp8")
-            throw std::invalid_argument("qtip_quant.kv_format must be qtip or fp8");
-        c.fp8_kv = format == "fp8";
+        if (qtip) {
+            auto q = j.at("quip_params");
+            if (q.at("codebook") != "bitshift" || q.at("L") != 16 || q.at("K") != 2 || q.at("V") != 2 ||
+                q.at("tlut_bits") != 9 || q.at("decode_mode") != "quantlut_sym" || q.at("td_x") != 16 ||
+                q.at("td_y") != 16 || (q.contains("split_for_tp") && q.at("split_for_tp") != false) ||
+                (q.contains("skip_list") && !q.at("skip_list").is_null()) ||
+                j.contains("quantization_config"))
+                throw std::invalid_argument("Unsupported QTIP format (needs HYB L16 K2 V2 tlut_bits 9 "
+                                            "quantlut_sym 16x16, no TP split, no skip list)");
+            c.quantization = Quantization::Qtip;
+            const auto format =
+                j.value("qtip_quant", nlohmann::json::object()).value("kv_format", std::string("qtip"));
+            if (format != "qtip" && format != "fp8")
+                throw std::invalid_argument("qtip_quant.kv_format must be qtip or fp8");
+            c.fp8_kv = format == "fp8";
+        } else if (bitnet) {
+            const auto &q = j.at("quantization_config");
+            if (q.value("activation_bits", 0) != 8 || q.value("packing", std::string()) != "u32x16_2bit_byte_interleaved" ||
+                q.value("weight_scale", std::string()) != "absmean_per_tensor")
+                throw std::invalid_argument("Unsupported bitnet quantization_config (expected 8-bit activations, "
+                                            "absmean_per_tensor scale, u32x16_2bit_byte_interleaved packing)");
+            c.quantization = Quantization::Ternary;
+            c.sub_norm = q.value("sub_norm", false);
+        } else
+            c.quantization = Quantization::Dense;
+        if ((j.contains("attention_bias") && j.at("attention_bias") == true) ||
+            (j.contains("mlp_bias") && j.at("mlp_bias") == true))
+            throw std::invalid_argument("Projection biases are not supported");
         c.hidden = j.at("hidden_size").get<int>();
         c.intermediate = j.at("intermediate_size").get<int>();
         c.layers = j.at("num_hidden_layers").get<int>();
@@ -142,7 +164,8 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
                     ? j.at("head_dim").get<int>()
                     : c.hidden / c.q_heads;
         c.vocab = j.at("vocab_size").get<int>();
-        if (j.at("hidden_act") != "silu" || j.at("tie_word_embeddings") != false ||
+        c.tied_embeddings = j.value("tie_word_embeddings", false) == true;
+        if (j.at("hidden_act") != "silu" || (qtip && c.tied_embeddings) ||
             (j.contains("sliding_window") && !j.at("sliding_window").is_null()))
             throw std::invalid_argument("QTIP checkpoint requires bias-free SiLU llama layers with "
                                         "untied embeddings and no sliding window");
@@ -150,10 +173,13 @@ ModelConfig ModelConfig::read(const std::filesystem::path &path) {
             c.q_heads <= 0 || c.kv_heads <= 0 || c.q_heads % c.kv_heads != 0 ||
             c.dim <= 0 || c.dim > 256 || c.dim % 2 != 0)
             throw std::invalid_argument("Invalid attention/vocabulary geometry in config.json");
-        for (int n : {c.hidden, c.intermediate, c.q_heads * c.dim, c.kv_heads * c.dim})
-            if (n % 32 != 0 || hadamard_pow2_part(n) == 0 || hadamard_pow2_part(n) > 8192)
+        for (int n : {c.hidden, c.intermediate, c.q_heads * c.dim, c.kv_heads * c.dim}) {
+            if (qtip && (n % 32 != 0 || hadamard_pow2_part(n) == 0 || hadamard_pow2_part(n) > 8192))
                 throw std::invalid_argument("Unsupported projection dimension " + std::to_string(n) +
                                             " (need 2^p / 12*2^p / 28*2^p, multiple of 32, pow2 part <= 8192)");
+            if (!qtip && n % 16 != 0)
+                throw std::invalid_argument("Projection dimension " + std::to_string(n) + " must be a multiple of 16");
+        }
         c.max_context = j.at("max_position_embeddings").get<int>();
         c.epsilon = j.at("rms_norm_eps").get<float>();
         c.theta = j.at("rope_theta").get<float>();

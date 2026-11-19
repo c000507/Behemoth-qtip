@@ -1,5 +1,6 @@
 #include "behemoth/qtip.hpp"
 #include "behemoth/numeric.hpp"
+#include "behemoth/ternary.hpp"
 #include "kernels.hpp"
 #include "safetensors.hpp"
 #include <algorithm>
@@ -136,6 +137,66 @@ void fp8_test(cg::Stream s, int in = 96, int rows = 64) {
     cg::checked(cg::d2h(host.p, result, size_t(rows) * 4, s), "read FP8");
     cg::checked(cg::sync(s), "finish FP8 test");
     error({host.p, host.p + rows}, expected, "FP8 output-channel scaling");
+}
+// BitNet b1.58: int8 activation quantisation + packed ternary dp4a GEMV. The raw int32 dot products must
+// equal the CPU reference exactly; the scaled bf16 outputs must equal reference_forward bit for bit.
+void ternary_test(cg::Stream s, int in, int rows, int tokens) {
+    behemoth::qtip::HostLinear h;
+    h.in = in;
+    h.out = rows;
+    std::mt19937 gen(unsigned(in * 131 + rows));
+    std::vector<int8_t> q(size_t(rows) * in);
+    for (auto &v : q) {
+        const unsigned r = gen() % 10;
+        v = int8_t(r < 4 ? 0 : r < 7 ? 1 : -1);
+    }
+    h.ternary_packed.resize(size_t(rows) * behemoth::ternary::packed_bytes(size_t(in)));
+    behemoth::ternary::pack(q, size_t(rows), size_t(in), h.ternary_packed);
+    h.ternary_scale = 0.0173f;
+    std::normal_distribution<float> normal(0, 1);
+    std::vector<float> x(size_t(tokens) * in);
+    for (auto &v : x)
+        v = float(BFloat16(normal(gen) * 3));
+    x[7] = 40; // one outlier so that most codes are small
+    auto expected = behemoth::qtip::reference_forward(h, x, true);
+    for (auto &v : expected)
+        v = float(BFloat16(v));
+    std::vector<int32_t> dots(size_t(tokens) * rows);
+    std::vector<int8_t> xq(static_cast<size_t>(in));
+    for (int t = 0; t < tokens; ++t) {
+        behemoth::ternary::quantize_activation(std::span<const float>(x).subspan(size_t(t) * in, size_t(in)), xq);
+        for (int r = 0; r < rows; ++r)
+            dots[size_t(t) * rows + r] =
+                behemoth::ternary::dot_row(h.ternary_packed.data() + size_t(r) * in / 4, xq.data(), size_t(in));
+    }
+    cg::Buffer<uint8_t> w, scratch;
+    cg::Buffer<uint16_t> input, out;
+    cg::Buffer<float> result;
+    cg::Buffer<int32_t> raw;
+    put(w, h.ternary_packed, s);
+    put(input, bits(x), s);
+    out.ensure(size_t(tokens) * rows, s);
+    result.ensure(size_t(tokens) * rows, s);
+    raw.ensure(size_t(tokens) * rows, s);
+    scratch.ensure(cu::ternary_scratch_bytes(in, tokens), s);
+    cu::ternary_forward(w, h.ternary_scale, input, out, in, rows, scratch, s, tokens, raw);
+    cg::to_float(out, result, tokens * rows, s);
+    cg::Pinned<float> host;
+    host.ensure(size_t(tokens) * rows);
+    cg::Pinned<int32_t> hraw;
+    hraw.ensure(size_t(tokens) * rows);
+    cg::checked(cg::d2h(host.p, result, size_t(tokens) * rows * 4, s), "read ternary");
+    cg::checked(cg::d2h(hraw.p, raw, size_t(tokens) * rows * 4, s), "read ternary dots");
+    cg::checked(cg::sync(s), "finish ternary test");
+    size_t exact = 0, bitexact = 0;
+    for (size_t i = 0; i < dots.size(); ++i) {
+        exact += hraw.p[i] == dots[i];
+        bitexact += host.p[i] == expected[i];
+    }
+    std::cout << "ternary " << rows << "x" << in << " tokens " << tokens << ": int32 exact " << exact << "/"
+              << dots.size() << ", bf16 bit-exact " << bitexact << "/" << dots.size() << '\n';
+    require(exact == dots.size(), "ternary int32 accumulation differs from the CPU reference");
+    require(bitexact == dots.size(), "ternary scaled output differs from the CPU reference");
 }
 void nvfp4_test(cg::Stream s) {
     // Adaptive mixed-format checkpoints: NVFP4 projection (E2M1 pairs, E4M3 block scales over 16
@@ -301,11 +362,14 @@ int main(int argc, char **argv) {
             for (bool rz : {false, true})
                 linear_test(s, out, in, rz);
         fp8_test(s);
+        for (auto [in, rows, tokens] : {std::tuple{16, 1, 1}, std::tuple{960, 2560, 1}, std::tuple{2560, 960, 3},
+                                        std::tuple{960, 320, 5}, std::tuple{12288, 28672, 1}})
+            ternary_test(s, in, rows, tokens);
         nvfp4_test(s);
         fp8_test(s, 12288, 512);
         attention_test(s);
         cg::checked(cg::stream_destroy(s), "test stream shutdown");
-        std::cout << "PASS native CUDA QTIP, Hadamard orientations, FP8 scales, NVFP4 and causal GQA\n";
+        std::cout << "PASS native CUDA QTIP, Hadamard orientations, FP8 scales, ternary, NVFP4 and causal GQA\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';
         if (s)

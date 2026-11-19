@@ -92,6 +92,9 @@ struct Linear {
     Buffer<uint8_t> fp8;
     Buffer<uint8_t> nv_packed, nv_scales;
     float nv_global = 0;
+    Buffer<uint8_t> ternary; // BitNet b1.58 packed 2-bit codes [out][in/4]
+    float ternary_scale = 0;
+    Buffer<B16> dense;       // plain BF16 [out][in]
     PeerContext *parallel = nullptr;
     std::unique_ptr<PeerWeights> peer;
     void load(const Checkpoint &cp, int layer, const std::string &name, Stream s, int requested_splits,
@@ -101,7 +104,12 @@ struct Linear {
         in = h.in;
         out = h.out;
         splits = std::min(requested_splits, in / 32);
-        if (h.is_fp8()) {
+        if (h.is_ternary()) {
+            ternary_scale = h.ternary_scale;
+            upload(ternary, h.ternary_packed.data(), h.ternary_packed.size(), s);
+        } else if (h.is_dense()) {
+            upload(dense, h.bf16.data(), h.bf16.size(), s);
+        } else if (h.is_fp8()) {
             upload(fp8, h.fp8.data(), h.fp8.size(), s);
             upload(scales, h.fp8_scale.data(), h.fp8_scale.size(), s);
         } else if (h.is_nvfp4()) {
@@ -129,7 +137,12 @@ struct Linear {
     void forward(const Buffer<B16> &x, Buffer<B16> &y, Buffer<float> &scratch, Buffer<B16> &rotated,
                  Buffer<float> &z, bool rz, Stream s) const {
         y.ensure(out, s);
-        if (fp8.p)
+        if (ternary.p) {
+            scratch.ensure((ternary_scratch_bytes(in, 1) + 3) / 4, s);
+            ternary_forward(ternary, ternary_scale, x, y, in, out, reinterpret_cast<uint8_t *>(scratch.p), s);
+        } else if (dense.p)
+            dense_forward(dense, x, y, in, out, s);
+        else if (fp8.p)
             fp8_forward(fp8, scales, x, y, in, out, s);
         else if (nv_packed.p)
             nvfp4_forward(nv_packed, nv_scales, nv_global, x, y, in, out, s);
@@ -200,16 +213,17 @@ struct Model::Impl {
     std::vector<float> inv_freq; // llama3 rope_scaling table (empty for plain RoPE)
     struct Layer {
         std::array<Linear, 7> linear;
-        Buffer<float> norm1, norm2;
+        Buffer<float> norm1, norm2, sub_attn, sub_ffn; // sub_* : BitNet SubLN gains (optional)
         Buffer<B16> keys, values;
     };
+    bool sub_norm = false, tied = false;
     std::vector<Layer> layers;
     Buffer<B16> embeddings, head, x, normed, q, k, v, attended, projected, gate, up, rotated;
     Buffer<float> final_norm, scratch, z, scores, logits, rope_freq;
     Pinned<float> readback;
-    void vector(const std::string &name, Buffer<float> &out) {
+    void vector(const std::string &name, Buffer<float> &out, int expected = 0) {
         auto view = checkpoint.tensor(name).floats(name);
-        check(view.size() == size_t(hidden), "Invalid normalization shape: " + name);
+        check(view.size() == size_t(expected ? expected : hidden), "Invalid normalization shape: " + name);
         Vec data(view.size());
         for (size_t i = 0; i < data.size(); ++i) {
             data[i] = view[i];
@@ -249,7 +263,13 @@ struct Model::Impl {
             inv_freq = llama3_inv_freq(head_dim, theta, cfg.rope);
         int splits = qtip_splits(tp);
         check(tp == 1 || tp == 2, "CUDA tensor parallel degree must be 1 or 2");
-        check(checkpoint.config.quantization == Quantization::Qtip, "CUDA runner requires a QTIP checkpoint");
+        check(checkpoint.config.quantization == Quantization::Qtip ||
+                  checkpoint.config.quantization == Quantization::Ternary ||
+                  checkpoint.config.quantization == Quantization::Dense,
+              "CUDA runner requires a QTIP, BitNet ternary or BF16 llama checkpoint");
+        sub_norm = checkpoint.config.sub_norm;
+        tied = checkpoint.config.tied_embeddings;
+        check(tp == 1 || checkpoint.config.quantization == Quantization::Qtip, "TP=2 requires a QTIP checkpoint");
         check(ctx > 0 && ctx <= checkpoint.config.max_context, "Invalid CUDA context limit");
         checked(set_device(d), "select CUDA device");
         checked(stream_create(&stream), "create CUDA stream");
@@ -262,7 +282,8 @@ struct Model::Impl {
             }
             initialize_tables();
             dense("model.embed_tokens.weight", embeddings);
-            dense("lm_head.weight", head);
+            if (!tied)
+                dense("lm_head.weight", head);
             vector("model.norm.weight", final_norm);
             if (!inv_freq.empty()) {
                 rope_freq.ensure(inv_freq.size(), stream);
@@ -278,6 +299,10 @@ struct Model::Impl {
                 auto prefix = "model.layers." + std::to_string(l) + ".";
                 vector(prefix + "input_layernorm.weight", p.norm1);
                 vector(prefix + "post_attention_layernorm.weight", p.norm2);
+                if (sub_norm) {
+                    vector(prefix + "self_attn.attn_sub_norm.weight", p.sub_attn, q_heads * head_dim);
+                    vector(prefix + "mlp.ffn_sub_norm.weight", p.sub_ffn, inter);
+                }
                 for (int i = 0; i < 7; ++i)
                     p.linear[i].load(checkpoint, l, names[i], stream, splits, peer.get());
                 p.keys.ensure(size_t(ctx) * kv, stream);
@@ -285,8 +310,8 @@ struct Model::Impl {
                 std::cerr << "Loaded CUDA QTIP layer " << l + 1 << '/' << layers.size() << '\n';
             }
             x.ensure(hidden, stream);
-            normed.ensure(hidden, stream);
-            attended.ensure(hidden, stream);
+            normed.ensure(std::max(hidden, inter), stream);
+            attended.ensure(q_heads * head_dim, stream);
             logits.ensure(vocab, stream);
             // Scores are scratch, so reserve them once instead of cudaMalloc/free
             // at every new sequence length (cudaFree synchronizes the device).
@@ -342,17 +367,23 @@ struct Model::Impl {
                 scores.ensure(size_t(q_heads) * (position + 1), stream);
                 gqa(q, layer.keys, layer.values, attended, scores, position + 1, q_heads, kv_heads,
                     head_dim, stream);
+                if (sub_norm) {
+                    norm(attended, layer.sub_attn, nullptr, attended, q_heads * head_dim, eps, false, stream);
+                }
                 layer.linear[3].forward(attended, projected, scratch, rotated, z, false, stream);
                 residual(x, projected, hidden, stream);
                 norm(x, layer.norm2, nullptr, normed, hidden, eps, false, stream);
                 layer.linear[4].forward(normed, gate, scratch, rotated, z, true, stream);
                 layer.linear[5].forward(normed, up, scratch, rotated, z, true, stream);
                 swiglu(gate, up, inter, INFINITY, stream);
+                if (sub_norm)
+                    norm(gate, layer.sub_ffn, nullptr, gate, inter, eps, false, stream);
                 layer.linear[6].forward(gate, projected, scratch, rotated, z, false, stream);
                 residual(x, projected, hidden, stream);
             }
             norm(x, final_norm, nullptr, normed, hidden, eps, false, stream);
-            gemv({head, nullptr, nullptr, vocab, hidden, 4, false, 1}, normed, logits, true, stream);
+            gemv({tied ? embeddings.p : head.p, nullptr, nullptr, vocab, hidden, 4, false, 1}, normed, logits, true,
+                 stream);
             checked(d2h(readback.p, logits, size_t(vocab) * 4, stream), "read CUDA logits");
             checked(sync(stream), "finish CUDA token");
             Vec out(readback.p, readback.p + vocab);

@@ -58,6 +58,14 @@ struct HostLinear {
     std::vector<uint8_t> nvfp4_scales;   // [out][in/16] E4M3
     float nvfp4_global = 0;
     bool is_nvfp4() const { return !nvfp4_packed.empty(); }
+    // BitNet b1.58 ternary projection (bitnet_train export): packed 2-bit codes [out][in/4] in the
+    // behemoth::ternary layout plus one absmean scale; activations are quantised per token to int8.
+    std::vector<uint8_t> ternary_packed;
+    float ternary_scale = 0;
+    bool is_ternary() const { return !ternary_packed.empty(); }
+    // Dense BF16 projection [out][in] (plain llama checkpoint, the baseline of a ternary export).
+    std::vector<uint16_t> bf16;
+    bool is_dense() const { return !bf16.empty(); }
     // Kernel-layout word c (0..31) of tile (tile_row, tile_col):
     // trellis[(((i0*(in/32) + j0)*32 + c)*2 + j1)*2 + i1], tile_row = 2*i0+i1, tile_col = 2*j0+j1.
     uint16_t word(int tile_row, int tile_col, int c) const {
@@ -86,6 +94,9 @@ std::vector<float> reference_forward(const HostLinear &, std::span<const float> 
                                      bool device_rounding = false, bool round_z_bf16 = false);
 // Linear `name` (e.g. "self_attn.q_proj") of a layer of a QTIP checkpoint, full matrix.
 HostLinear load_linear(const Checkpoint &, int layer, const std::string &name);
+// Ternary / dense BF16 projections (Quantization::Ternary / Dense checkpoints).
+HostLinear load_ternary_linear(const SafeTensorFile &, int layer, const std::string &name, const ModelConfig &);
+HostLinear load_dense_linear(const SafeTensorFile &, int layer, const std::string &name, const ModelConfig &);
 // The same from one layer file (model-layer-XXXXX.safetensors) without an assembled checkpoint.
 HostLinear load_linear(const SafeTensorFile &, int layer, const std::string &name,
                        const ModelConfig *config = nullptr);

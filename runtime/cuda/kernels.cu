@@ -287,6 +287,79 @@ __global__ void fp8_gemv(const uint8_t *w, const float *scales, const B16 *x, B1
     if (!lane && r < rows)
         y[r] = b16(sum * scales[r]);
 }
+// --- BitNet b1.58 ternary GEMV ---
+// One block per token: int8 absmax quantisation of a bf16 row, meta = {scale, sum of codes}.
+__global__ void ternary_quant_kernel(const B16 *x, int8_t *q, float *meta, int in) {
+    __shared__ float red[256];
+    __shared__ int ired[256];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const B16 *row = x + size_t(t) * in;
+    float m = 0;
+    for (int i = tid; i < in; i += 256)
+        m = fmaxf(m, fabsf(f32(row[i])));
+    red[tid] = m;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            red[tid] = fmaxf(red[tid], red[tid + d]);
+        __syncthreads();
+    }
+    m = red[0];
+    const float scale = (m > 0 ? m : 1e-5f) / 127.f;
+    int sum = 0;
+    for (int i = tid; i < in; i += 256) {
+        float v = rintf(f32(row[i]) / scale);
+        v = fminf(fmaxf(v, -127.f), 127.f);
+        const int c = int(v);
+        q[size_t(t) * in + i] = int8_t(c);
+        sum += c;
+    }
+    ired[tid] = sum;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (tid < d)
+            ired[tid] += ired[tid + d];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        meta[2 * t] = scale;
+        meta[2 * t + 1] = float(ired[0]);
+    }
+}
+// Four warps per block, one output row per warp, one token per blockIdx.y. Each lane handles
+// sixteen input channels per step: one packed word (byte-interleaved 2-bit codes) and four
+// int8x4 activation words, four dp4a products; sum(w x) = sum(code x) - sum(x).
+__global__ void ternary_gemv(const uint8_t *__restrict__ w, const int8_t *__restrict__ q,
+                             const float *__restrict__ meta, float wscale, B16 *__restrict__ y, int in,
+                             int rows, int32_t *__restrict__ raw) {
+    extern __shared__ uint32_t xs[]; // in/4 words of int8 activations
+    const int t = blockIdx.y, words = in / 16;
+    const uint32_t *xq = reinterpret_cast<const uint32_t *>(q + size_t(t) * in);
+    for (int i = threadIdx.x; i < in / 4; i += blockDim.x)
+        xs[i] = xq[i];
+    __syncthreads();
+    const int r = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    int acc = 0;
+    if (r < rows) {
+        const uint32_t *row = reinterpret_cast<const uint32_t *>(w + size_t(r) * (size_t(in) / 4));
+        for (int c = lane; c < words; c += 32) {
+            const uint32_t word = row[c];
+            const uint32_t *x4 = xs + c * 4;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc = __dp4a(int((word >> (2 * j)) & 0x03030303u), int(x4[j]), acc);
+        }
+    }
+    for (int o = 16; o; o >>= 1)
+        acc += __shfl_xor_sync(0xffffffffU, acc, o);
+    if (!lane && r < rows) {
+        const float scale = meta[2 * t], sum = meta[2 * t + 1];
+        const int32_t dot = acc - int32_t(sum);
+        if (raw)
+            raw[size_t(t) * rows + r] = dot;
+        y[size_t(t) * rows + r] = b16(float(dot) * wscale * scale);
+    }
+}
 __global__ void embed_kernel(const B16 *w, B16 *y, int token, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -484,6 +557,22 @@ void nvfp4_forward(const uint8_t *packed, const uint8_t *block_scales, float glo
     glm53::gpu::Matrix m{packed, nullptr, block_scales, out, in, 2, false, global};
     glm53::gpu::gemv(m, x, y, false, s);
     glm53::gpu::checked(cudaGetLastError(), "Behemoth CUDA NVFP4 gemv");
+}
+size_t ternary_scratch_bytes(int in, int tokens) { return size_t(tokens) * (size_t(in) + 8); }
+void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, int in, int out,
+                     uint8_t *scratch, Stream s, int tokens, int32_t *acc) {
+    if (in % 16 || tokens < 1)
+        throw std::invalid_argument("ternary projection needs in % 16 == 0");
+    int8_t *q = reinterpret_cast<int8_t *>(scratch);
+    float *meta = reinterpret_cast<float *>(scratch + size_t(tokens) * in);
+    ternary_quant_kernel<<<tokens, 256, 0, s>>>(x, q, meta, in);
+    ternary_gemv<<<dim3((out + 3) / 4, tokens), 128, size_t(in), s>>>(packed, q, meta, wscale, y, in, out, acc);
+    launch_check();
+}
+void dense_forward(const B16 *w, const B16 *x, B16 *y, int in, int out, Stream s) {
+    glm53::gpu::Matrix m{w, nullptr, nullptr, out, in, 4, false, 1};
+    glm53::gpu::gemv(m, x, y, false, s);
+    glm53::gpu::checked(cudaGetLastError(), "Behemoth CUDA dense gemv");
 }
 void embedding(const B16 *w, B16 *y, int t, int h, Stream s) {
     embed_kernel<<<(h + 255) / 256, 256, 0, s>>>(w, y, t, h);

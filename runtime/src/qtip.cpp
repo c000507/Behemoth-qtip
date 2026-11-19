@@ -1,4 +1,5 @@
 #include "behemoth/qtip.hpp"
+#include "behemoth/ternary.hpp"
 #include "behemoth/attention.hpp"
 #include "qtip_tables.hpp"
 #include <cmath>
@@ -131,6 +132,41 @@ std::vector<float> reference_forward(const HostLinear &l, std::span<const float>
     if (x.size() % size_t(l.in))
         throw std::invalid_argument("QTIP reference input shape");
     const size_t rows = x.size() / size_t(l.in);
+    if (l.is_ternary()) {
+        // exact int32 products of per-token int8 activations and ternary codes, scaled at the end
+        std::vector<float> y(rows * size_t(l.out));
+        std::vector<int8_t> q(size_t(l.in));
+        std::vector<float> xr(size_t(l.in));
+        const size_t rb = ternary::packed_bytes(size_t(l.in));
+        for (size_t r = 0; r < rows; ++r) {
+            for (int i = 0; i < l.in; ++i) {
+                float v = x[r * size_t(l.in) + size_t(i)];
+                xr[size_t(i)] = device_rounding ? float(BFloat16(v)) : v;
+            }
+            const float xs = ternary::quantize_activation(xr, q);
+            for (int o = 0; o < l.out; ++o) {
+                const int32_t acc = ternary::dot_row(l.ternary_packed.data() + size_t(o) * rb, q.data(), l.in);
+                y[r * size_t(l.out) + size_t(o)] = float(acc) * l.ternary_scale * xs;
+            }
+        }
+        return y;
+    }
+    if (l.is_dense()) {
+        std::vector<float> y(rows * size_t(l.out));
+        for (size_t r = 0; r < rows; ++r)
+            for (int o = 0; o < l.out; ++o) {
+                double sum = 0;
+                for (int i = 0; i < l.in; ++i) {
+                    float v = x[r * size_t(l.in) + size_t(i)];
+                    if (device_rounding) v = float(BFloat16(v));
+                    BFloat16 w;
+                    w.bits = l.bf16[size_t(o) * size_t(l.in) + size_t(i)];
+                    sum += double(v) * double(float(w));
+                }
+                y[r * size_t(l.out) + size_t(o)] = float(sum);
+            }
+        return y;
+    }
     if (l.is_fp8()) {
         if (l.fp8.size() != size_t(l.in) * size_t(l.out) || l.fp8_scale.size() != size_t(l.out))
             throw std::invalid_argument("Invalid FP8 reference weight");
@@ -193,9 +229,11 @@ std::vector<float> reference_forward(const HostLinear &l, std::span<const float>
 namespace {
 // expected (in, out) of a llama-layout projection from the checkpoint configuration
 std::pair<int, int> projection_geometry(const ModelConfig &c, const std::string &name) {
-    const int kv = c.kv_heads * c.dim;
-    if (name == "self_attn.q_proj" || name == "self_attn.o_proj")
-        return {c.hidden, c.hidden};
+    const int kv = c.kv_heads * c.dim, q = c.q_heads * c.dim;
+    if (name == "self_attn.q_proj")
+        return {c.hidden, q};
+    if (name == "self_attn.o_proj")
+        return {q, c.hidden};
     if (name == "self_attn.k_proj" || name == "self_attn.v_proj")
         return {c.hidden, kv};
     if (name == "mlp.gate_proj" || name == "mlp.up_proj")
@@ -205,10 +243,55 @@ std::pair<int, int> projection_geometry(const ModelConfig &c, const std::string 
     throw std::invalid_argument("Unknown projection " + name);
 }
 } // namespace
+HostLinear load_ternary_linear(const SafeTensorFile &file, int layer, const std::string &name,
+                               const ModelConfig &config) {
+    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    auto [in, out] = projection_geometry(config, name);
+    if (file.dtype(base + "weight") != "U8" ||
+        file.shape(base + "weight") != std::vector<size_t>{size_t(out), ternary::packed_bytes(size_t(in))})
+        throw std::invalid_argument("Invalid ternary weight for " + base);
+    if (file.dtype(base + "weight_scale") != "F32" || file.shape(base + "weight_scale") != std::vector<size_t>{1})
+        throw std::invalid_argument("Invalid ternary weight_scale for " + base);
+    HostLinear l;
+    l.in = in;
+    l.out = out;
+    auto raw = file.bytes(base + "weight");
+    l.ternary_packed.resize(raw.size());
+    std::memcpy(l.ternary_packed.data(), raw.data(), raw.size());
+    for (size_t i = 0; i < raw.size(); i += 4) {
+        uint32_t word;
+        std::memcpy(&word, raw.data() + i, 4);
+        // code 3 is invalid in every 2-bit field: both bits set
+        if ((word & (word >> 1) & 0x55555555u) != 0)
+            throw std::invalid_argument("Invalid ternary code in " + base);
+    }
+    l.ternary_scale = file.value(base + "weight_scale", 0);
+    if (!(l.ternary_scale > 0) || !std::isfinite(l.ternary_scale))
+        throw std::invalid_argument("Invalid ternary scale for " + base);
+    return l;
+}
+HostLinear load_dense_linear(const SafeTensorFile &file, int layer, const std::string &name,
+                             const ModelConfig &config) {
+    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    auto [in, out] = projection_geometry(config, name);
+    if (file.dtype(base + "weight") != "BF16" || file.shape(base + "weight") != std::vector<size_t>{size_t(out), size_t(in)})
+        throw std::invalid_argument("Invalid BF16 weight for " + base);
+    HostLinear l;
+    l.in = in;
+    l.out = out;
+    auto raw = file.bytes(base + "weight");
+    l.bf16.resize(raw.size() / 2);
+    std::memcpy(l.bf16.data(), raw.data(), raw.size());
+    return l;
+}
 HostLinear load_linear(const Checkpoint &checkpoint, int layer, const std::string &name) {
     if (layer < 0 || layer >= checkpoint.config.layers)
         throw std::invalid_argument("Invalid QTIP layer");
     const auto base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    if (checkpoint.config.quantization == Quantization::Ternary)
+        return load_ternary_linear(checkpoint.tensor(base + "weight"), layer, name, checkpoint.config);
+    if (checkpoint.config.quantization == Quantization::Dense)
+        return load_dense_linear(checkpoint.tensor(base + "weight"), layer, name, checkpoint.config);
     if (checkpoint.has_tensor(base + "weight_packed"))
         return load_nvfp4_linear(checkpoint.tensor(base + "weight_packed"), layer, name);
     const bool fp8 = checkpoint.config.fp8_kv && (name == "self_attn.k_proj" || name == "self_attn.v_proj");

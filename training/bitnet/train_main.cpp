@@ -35,7 +35,8 @@ int main(int argc, char **argv) {
     try {
         Options o;
         bool no_teacher = false;
-        fs::path grad_dump;
+        fs::path grad_dump, init;
+        long start_row = 0;
         std::set<std::string> seen;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
@@ -45,6 +46,8 @@ int main(int argc, char **argv) {
 bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
   --work DIR            Checkpoint directory (ckpt-N/, latest.json)
   --resume DIR          Resume from a checkpoint directory (or its latest.json)
+  --init DIR            Initialise latent weights/norms from a checkpoint (fresh optimizer, new stage)
+  --start-row N         First dataset row of a new run (0)
   --export DIR          Export the packed ternary checkpoint at the end
   --export-only         Only export (--resume required)
   --eval-only           Evaluate teacher (unless --no-teacher) and student on --eval-data/--data
@@ -94,6 +97,10 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
                 o.work = v;
             else if (a == "--resume")
                 o.resume = v;
+            else if (a == "--init")
+                init = v;
+            else if (a == "--start-row")
+                start_row = num();
             else if (a == "--export")
                 o.export_dir = v;
             else if (a == "--eval-data")
@@ -169,8 +176,19 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
             student.load_hf(reader, s);
             state = load_checkpoint(dir, student, s);
             std::cerr << json({{"resumed", dir.string()}, {"step", state.step}, {"tokens", state.tokens}}) << "\n";
-        } else
+        } else {
             student.load_hf(reader, s);
+            if (!init.empty()) {
+                fs::path dir = init;
+                if (dir.filename() == "latest.json")
+                    dir = dir.parent_path() / qat::read_json(dir).at("checkpoint").get<std::string>();
+                State prev = load_checkpoint(dir, student, s);
+                gpu::check(cudaMemset(student.m.p, 0, student.m.bytes()), "memset");
+                gpu::check(cudaMemset(student.v.p, 0, student.v.bytes()), "memset");
+                std::cerr << json({{"initialised_from", dir.string()}, {"step", prev.step}}) << "\n";
+            }
+            state.position = size_t(start_row);
+        }
         const bool want_teacher = !no_teacher && !o.export_only && (o.kl_w > 0 || o.attn_w > 0 || o.eval_only ||
                                                                      !o.trace_tokens.empty());
         std::unique_ptr<Model> teacher;

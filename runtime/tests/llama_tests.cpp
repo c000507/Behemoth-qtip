@@ -5,6 +5,7 @@
 // reference of the whole model. usage: behemoth_cuda_llama_tests [--checkpoint DIR]...
 // Real checkpoints given with --checkpoint (e.g. qtip_quant output) get the same CPU comparison.
 #include "behemoth/checkpoint.hpp"
+#include "behemoth/ternary.hpp"
 #include "behemoth/cuda.hpp"
 #include "behemoth/numeric.hpp"
 #include "behemoth/qtip.hpp"
@@ -133,6 +134,9 @@ struct Geometry {
     bool tokenizer = true;
     bool fp8_kv = false;       // K/V as FP8-Dynamic (E4M3 weight + bf16 per-channel weight_scale), as written by
                                // qtip_quant --kv-format fp8 from a BF16 source
+    enum Kind { qtip, ternary, dense } kind = qtip; // ternary: BitNet b1.58 export; dense: plain BF16 llama
+    bool tied = false;         // tie_word_embeddings (ternary/dense only)
+    bool sub_norm = true;      // SubLN gains in a ternary checkpoint
 };
 std::pair<int, int> shape_of(const Geometry &g, const std::string &name) {
     if (name == "self_attn.q_proj" || name == "self_attn.o_proj")
@@ -221,6 +225,28 @@ void add_fp8_dynamic(::qtip::SafeTensorsWriter &w, const std::string &base, int 
     w.add(base + "weight", "F8_E4M3", {out, in}, codes.data(), codes.size());
     w.add(base + "weight_scale", "BF16", {out}, scales.data(), scales.size() * 2);
 }
+// BitNet b1.58: random ternary codes packed in the behemoth::ternary layout with one absmean scale.
+void add_ternary(::qtip::SafeTensorsWriter &w, const std::string &base, int in, int out, std::mt19937 &gen,
+                 float gain) {
+    std::vector<int8_t> q(size_t(out) * in);
+    for (auto &v : q) {
+        const unsigned r = gen() % 10;
+        v = int8_t(r < 4 ? 0 : r < 7 ? 1 : -1);
+    }
+    std::vector<uint8_t> packed(size_t(out) * behemoth::ternary::packed_bytes(size_t(in)));
+    behemoth::ternary::pack(q, size_t(out), size_t(in), packed);
+    const float scale = gain * 1.3f / std::sqrt(float(in));
+    w.add(base + "weight", "U8", {out, in / 4}, packed.data(), packed.size());
+    w.add(base + "weight_scale", "F32", {1}, &scale, 4);
+}
+void add_dense(::qtip::SafeTensorsWriter &w, const std::string &base, int in, int out, std::mt19937 &gen,
+               float gain) {
+    std::normal_distribution<float> normal(0, gain / std::sqrt(float(in)));
+    std::vector<uint16_t> bits(size_t(out) * in);
+    for (auto &b : bits)
+        b = BFloat16(normal(gen)).bits;
+    w.add(base + "weight", "BF16", {out, in}, bits.data(), bits.size() * 2);
+}
 void add_bf16(::qtip::SafeTensorsWriter &w, const std::string &name, std::vector<int64_t> shape, size_t n,
               std::mt19937 &gen, float mean, float sd) {
     std::normal_distribution<float> normal(mean, sd);
@@ -235,15 +261,21 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
     fs::create_directories(root);
     std::mt19937 gen(seed);
     ::qtip::SafeTensorsWriter w;
-    add_bf16(w, "model.embed_tokens.weight", {g.vocab, g.hidden}, size_t(g.vocab) * g.hidden, gen, 0, 1);
-    add_bf16(w, "lm_head.weight", {g.vocab, g.hidden}, size_t(g.vocab) * g.hidden, gen, 0,
-             1.f / std::sqrt(float(g.hidden)));
+    add_bf16(w, "model.embed_tokens.weight", {g.vocab, g.hidden}, size_t(g.vocab) * g.hidden, gen, 0,
+             g.tied ? 1.f / std::sqrt(float(g.hidden)) : 1.f);
+    if (!g.tied)
+        add_bf16(w, "lm_head.weight", {g.vocab, g.hidden}, size_t(g.vocab) * g.hidden, gen, 0,
+                 1.f / std::sqrt(float(g.hidden)));
     add_bf16(w, "model.norm.weight", {g.hidden}, size_t(g.hidden), gen, 1, .1f);
     json layer_formats = json::array();
     for (int l = 0; l < g.layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
         add_bf16(w, p + "input_layernorm.weight", {g.hidden}, size_t(g.hidden), gen, 1, .1f);
         add_bf16(w, p + "post_attention_layernorm.weight", {g.hidden}, size_t(g.hidden), gen, 1, .1f);
+        if (g.kind == Geometry::ternary && g.sub_norm) {
+            add_bf16(w, p + "self_attn.attn_sub_norm.weight", {g.nq * g.hd}, size_t(g.nq * g.hd), gen, 1, .1f);
+            add_bf16(w, p + "mlp.ffn_sub_norm.weight", {g.inter}, size_t(g.inter), gen, 1, .1f);
+        }
         const bool fp4 = g.nvfp4_layer1 && l == 1;
         layer_formats.push_back(fp4 ? "nvfp4" : "qtip");
         int linear_index = 0;
@@ -255,7 +287,11 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
             // large q/k and o gains make attention (and therefore RoPE) dominate the logits
             const std::string n = name;
             const float gain = n == "self_attn.q_proj" || n == "self_attn.k_proj" ? 8.f : n == "self_attn.o_proj" ? 4.f : 1.f;
-            if (g.fp8_kv && (n == "self_attn.k_proj" || n == "self_attn.v_proj"))
+            if (g.kind == Geometry::ternary)
+                add_ternary(w, p + name + ".", in, out, gen, gain);
+            else if (g.kind == Geometry::dense)
+                add_dense(w, p + name + ".", in, out, gen, gain);
+            else if (g.fp8_kv && (n == "self_attn.k_proj" || n == "self_attn.v_proj"))
                 add_fp8_dynamic(w, p + name + ".", in, out, gen, gain);
             else
                 (fp4_here ? add_nvfp4 : add_qtip)(w, p + name + ".", in, out, gen, gain);
@@ -269,13 +305,18 @@ fs::path write_checkpoint(const fs::path &root, const Geometry &g, unsigned seed
     json c = {{"architectures", {"LlamaForCausalLM"}}, {"model_type", "llama"}, {"hidden_size", g.hidden},
               {"intermediate_size", g.inter}, {"num_hidden_layers", g.layers},
               {"num_attention_heads", g.nq}, {"num_key_value_heads", g.nkv}, {"head_dim", g.hd},
-              {"vocab_size", g.vocab}, {"hidden_act", "silu"}, {"tie_word_embeddings", false},
+              {"vocab_size", g.vocab}, {"hidden_act", "silu"}, {"tie_word_embeddings", g.tied},
               {"rms_norm_eps", 1e-5}, {"rope_theta", g.theta}, {"max_position_embeddings", 131072},
-              {"bos_token_id", 260}, {"eos_token_id", g.eos[0]}, {"attention_bias", false}, {"mlp_bias", false},
-              {"quip_params", {{"codebook", "bitshift"}, {"codebook_version", 0}, {"L", 16}, {"K", 2}, {"V", 2},
-                               {"tlut_bits", 9}, {"decode_mode", "quantlut_sym"}, {"td_x", 16}, {"td_y", 16},
-                               {"split_for_tp", false}, {"skip_list", nullptr}}},
-              {"qtip_quant", {{"kv_format", g.fp8_kv ? "fp8" : "qtip"}, {"layer_formats", layer_formats}}}};
+              {"bos_token_id", 260}, {"eos_token_id", g.eos[0]}, {"attention_bias", false}, {"mlp_bias", false}};
+    if (g.kind == Geometry::qtip) {
+        c["quip_params"] = {{"codebook", "bitshift"}, {"codebook_version", 0}, {"L", 16}, {"K", 2}, {"V", 2},
+                            {"tlut_bits", 9}, {"decode_mode", "quantlut_sym"}, {"td_x", 16}, {"td_y", 16},
+                            {"split_for_tp", false}, {"skip_list", nullptr}};
+        c["qtip_quant"] = {{"kv_format", g.fp8_kv ? "fp8" : "qtip"}, {"layer_formats", layer_formats}};
+    } else if (g.kind == Geometry::ternary)
+        c["quantization_config"] = {{"quant_method", "bitnet"}, {"bits", 1.58}, {"weight_scale", "absmean_per_tensor"},
+                                    {"activation_bits", 8}, {"activation_scale", "absmax_per_token"},
+                                    {"packing", "u32x16_2bit_byte_interleaved"}, {"sub_norm", g.sub_norm}};
     if (g.llama3)
         // Llama 3.3 factors; original_max_position_embeddings scaled with the toy head_dim so that
         // the scaled, interpolated and untouched frequency bands are all hit by short test sequences.
@@ -400,6 +441,8 @@ struct Reference {
                     attended[size_t(head * c.dim + d)] = bf(s);
                 }
             }
+            if (c.sub_norm)
+                attended = norm(attended, p + "self_attn.attn_sub_norm.weight");
             auto o = project(lin[3], attended, false);
             for (size_t i = 0; i < x.size(); ++i)
                 x[i] = bf(x[i] + o[i]);
@@ -407,12 +450,14 @@ struct Reference {
             auto gate = project(lin[4], h, true), up = project(lin[5], h, true);
             for (size_t i = 0; i < gate.size(); ++i)
                 gate[i] = bf(gate[i] / (1 + std::exp(-gate[i])) * up[i]);
+            if (c.sub_norm)
+                gate = norm(gate, p + "mlp.ffn_sub_norm.weight");
             auto down = project(lin[6], gate, false);
             for (size_t i = 0; i < x.size(); ++i)
                 x[i] = bf(x[i] + down[i]);
         }
         auto normed = norm(x, "model.norm.weight");
-        auto head = cp.bf16("lm_head.weight");
+        auto head = cp.bf16(c.tied_embeddings ? "model.embed_tokens.weight" : "lm_head.weight");
         std::vector<float> logits(static_cast<size_t>(c.vocab));
         for (int v = 0; v < c.vocab; ++v) {
             double s = 0;
@@ -706,6 +751,25 @@ int main(int argc, char **argv) {
         plain.eos = {2};
         plain.tokenizer = false;
         compare(write_checkpoint(tmp / "llama_plain", plain, 3), 16, "synthetic plain-RoPE llama geometry");
+        // BitNet b1.58 ternary export (int8 activations, packed 2-bit weights, SubLN, tied embeddings) and the
+        // dense BF16 baseline of the same layout (SmolLM2-like: hidden not a Hadamard size)
+        Geometry bitnet;
+        bitnet.kind = Geometry::ternary;
+        bitnet.tied = true;
+        bitnet.llama3 = false;
+        bitnet.theta = 100000;
+        bitnet.hidden = 240, bitnet.inter = 400, bitnet.nq = 5, bitnet.nkv = 1, bitnet.hd = 48, bitnet.layers = 3;
+        bitnet.eos = {2};
+        bitnet.tokenizer = false;
+        compare(write_checkpoint(tmp / "llama_bitnet", bitnet, 6), 16,
+                "synthetic BitNet b1.58 ternary llama (SubLN, tied embeddings)");
+        bitnet.sub_norm = false;
+        bitnet.tied = false;
+        compare(write_checkpoint(tmp / "llama_bitnet_plain", bitnet, 7), 12,
+                "synthetic BitNet b1.58 ternary llama without SubLN, untied head");
+        bitnet.kind = Geometry::dense;
+        bitnet.tied = true;
+        compare(write_checkpoint(tmp / "llama_dense", bitnet, 8), 12, "synthetic dense BF16 llama (ternary baseline)");
         for (int i = 1; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--checkpoint")
                 compare(argv[i + 1], 12, std::string("checkpoint ") + argv[i + 1]);
