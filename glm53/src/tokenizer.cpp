@@ -102,9 +102,17 @@ Tokenizer::Tokenizer(const fs::path &path) {
         int code = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174) ? b : next++;
         byte_map_[b] = utf8(code);
         inverse_[byte_map_[b]] = uint8_t(b);
-        check(vocab_.contains(byte_map_[b]), "missing byte token in BPE vocabulary");
+        // Some vocabularies (e.g. SmolLM2) drop byte tokens that never occur in training;
+        // such bytes map to the unknown token at encode time (HF tokenizers behave the same).
+        if (!vocab_.contains(byte_map_[b]))
+            missing_bytes_ = true;
     }
-    bool bytelevel = false;
+    if (missing_bytes_) {
+        const auto &unk = m.value("unk_token", json());
+        if (unk.is_string() && vocab_.contains(unk.get<std::string>()))
+            unk_ = vocab_.at(unk.get<std::string>());
+    }
+    bool bytelevel = false, digits_split = false;
     std::function<void(const json &)> pre = [&](const json &p) {
         std::string type = p.at("type");
         if (type == "Sequence") {
@@ -115,11 +123,17 @@ Tokenizer::Tokenizer(const fs::path &path) {
                       p.at("pattern").contains("Regex"),
                   "unsupported BPE split behavior");
             patterns_.push_back(p["pattern"]["Regex"]);
+        } else if (type == "Digits") {
+            // HF Digits pre-tokenizer: isolate runs of ASCII digits (or every digit); the ByteLevel
+            // regex that follows is applied to each piece, as in the HF Sequence. Checked against
+            // HF tokenizers: non-ASCII numerals (Burmese, Arabic-Indic, vulgar fractions) are not split.
+            patterns_.push_back(p.value("individual_digits", false) ? "[0-9]" : "[0-9]+");
+            digits_split = true;
         } else if (type == "ByteLevel") {
             bytelevel = true;
             prefix_space_ = p.value("add_prefix_space", false);
             if (p.value("use_regex", true)) {
-                check(patterns_.empty(), "ByteLevel regex after custom Split unsupported");
+                check(patterns_.empty() || digits_split, "ByteLevel regex after custom Split unsupported");
                 patterns_.push_back(
                     "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+");
             }
@@ -160,8 +174,11 @@ void Tokenizer::bpe(std::string_view word, std::vector<int> &out) const {
         symbols[at] += symbols[at + 1];
         symbols.erase(symbols.begin() + at + 1);
     }
-    for (const auto &s : symbols)
-        out.push_back(vocab_.at(s));
+    for (const auto &s : symbols) {
+        auto it = vocab_.find(s);
+        check(it != vocab_.end() || unk_ >= 0, "byte sequence without BPE vocabulary entry or unk token");
+        out.push_back(it != vocab_.end() ? it->second : unk_);
+    }
 }
 std::vector<int> Tokenizer::encode(const std::string &text) const {
     std::vector<int> out;

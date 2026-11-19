@@ -27,7 +27,8 @@ class Tokenizer {
     std::vector<std::string> patterns_;
     std::string byte_map_[256];
     std::map<std::string, unsigned char> inverse_;
-    bool prefix_space_ = false, ignore_merges_ = false;
+    bool prefix_space_ = false, ignore_merges_ = false, missing_bytes_ = false;
+    int unk_ = -1;
     void bpe(std::string_view, std::vector<int> &) const;
 
   public:
