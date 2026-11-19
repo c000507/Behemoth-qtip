@@ -12,7 +12,9 @@ Code: the paper's 2-bit HYB code. Bitshift trellis L=16, K=2 bits/weight, V=2, `
 2^9-entry tunable LUT, 16x16 tiles (one tail-biting trellis of 256 weights per tile), kernel (`for_kernel`) layout.
 The quantizer gives each layer one LDLQ/Viterbi pass. A standalone C++20/HIP streaming QAT
 trainer tunes continuous signs/scales and norms without LoRA, with no Python dependency; see
-[fine-tuning instructions and verification status](docs/FINE_TUNING.md).
+[fine-tuning instructions and verification status](docs/FINE_TUNING.md). BitNet b1.58
+distillation, the packed ternary format and ternary inference are described in
+[docs/BITNET.md](docs/BITNET.md).
 
 Pipeline:
 

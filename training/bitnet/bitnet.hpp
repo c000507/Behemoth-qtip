@@ -44,7 +44,7 @@ struct Options {
     bool eval_only = false, export_only = false, no_quant = false, no_subln = false, attn_distill_rope = false,
          no_round = false;
     int rows = 1, accum = 1, loss_rows = 256, max_steps = 0, warmup = 20, checkpoint_every = 50, device = 0,
-        attn_layer = -1, eval_rows = 0, log_every = 1, stop_after = 0, seed = 1;
+        attn_layer = -1, eval_rows = 0, log_every = 1, stop_after = 0, seed = 1, keep_checkpoints = 2;
     long max_tokens = 1'000'000;
     float lr = 1e-4f, norm_lr = 1e-4f, decay = 0.f, clip = 1.f, temperature = 2.f, ce_w = 1.f, kl_w = 1.f,
           attn_w = 0.f, min_lr_ratio = 0.1f, beta1 = 0.9f, beta2 = 0.95f, eps = 1e-8f;

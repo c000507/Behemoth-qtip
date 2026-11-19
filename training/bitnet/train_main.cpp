@@ -1,5 +1,6 @@
 #include "bitnet.hpp"
 #include "safetensors.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -68,6 +69,7 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
   --no-quant            Dense bf16 student (sanity check); --no-subln disables SubLN
   --no-round            Keep activations FP32 instead of emulating the runtime's BF16 boundaries
   --checkpoint-every N  Checkpoint interval in steps (50); --stop-after-steps N
+  --keep-checkpoints N  Delete older checkpoints beyond the newest N (2)
   --grad-dump FILE      One micro-batch (rows 0..) forward/backward; writes FILE (.f32 flat gradient)
                         and FILE.json with the losses, for reference cross-checks
   --trace-tokens FILE   JSON {"tokens": [...]} forward trace -> --trace-out FILE (.f32 [T, vocab])
@@ -143,6 +145,8 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
                 o.attn_layer = int(num());
             else if (a == "--checkpoint-every")
                 o.checkpoint_every = int(num());
+            else if (a == "--keep-checkpoints")
+                o.keep_checkpoints = int(num());
             else if (a == "--stop-after-steps")
                 o.stop_after = int(num());
             else if (a == "--grad-dump")
@@ -284,6 +288,16 @@ bitnet_train --model HF_BF16_MODEL --data PACKED [--work DIR] [options]
             const std::string name = "ckpt-" + std::to_string(state.step);
             save_checkpoint(o.work / name, student, state, o, info);
             qat::durable_json(o.work / "latest.json", {{"checkpoint", name}, {"step", state.step}});
+            // keep the newest --keep-checkpoints complete checkpoints (each holds parameters + Adam moments)
+            std::vector<std::pair<int, fs::path>> old;
+            for (const auto &e : fs::directory_iterator(o.work))
+                if (e.is_directory() && e.path().filename().string().starts_with("ckpt-"))
+                    old.emplace_back(std::stoi(e.path().filename().string().substr(5)), e.path());
+            std::sort(old.begin(), old.end());
+            while (int(old.size()) > o.keep_checkpoints && old.front().first != state.step) {
+                fs::remove_all(old.front().second);
+                old.erase(old.begin());
+            }
         };
         int step = state.step;
         while (step < total_steps && state.position + size_t(o.rows) <= ds.count) {
