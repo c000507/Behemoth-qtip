@@ -163,7 +163,6 @@ struct PrefillOps::Impl {
     Buffer<int8_t> weights, codes;  // unpacked ternary matrix, quantised activations
     Buffer<float> meta, scores, grouped;
     Buffer<B16> probabilities;
-    const B16 *input = nullptr;
     size_t budget = size_t(32) << 20; // fp32 score cells per attention pass
     int strided = -1; // strided-batched bf16 GEMM availability (probed on first use)
     explicit Impl(Stream s) : stream(s) {
@@ -204,8 +203,9 @@ void PrefillOps::norm(const B16 *x, const float *gain, B16 *y, int rows, int wid
     launched();
 }
 void PrefillOps::quantize(const B16 *x, int rows, int in) {
-    (void)rows, (void)in;
-    impl->input = x;
+    impl->codes.ensure(size_t(rows) * in, impl->stream);
+    impl->meta.ensure(size_t(rows) * 2, impl->stream);
+    ternary_quantize(x, impl->codes, impl->meta, in, rows, impl->stream);
 }
 Product PrefillOps::dense(const B16 *weight, const B16 *x, int in, int out, int rows, int slot) {
     auto &z = impl->z.at(size_t(slot));
@@ -222,16 +222,18 @@ Product PrefillOps::ternary(const uint8_t *packed, float wscale, int in, int out
         throw std::invalid_argument("ternary projection needs in % 16 == 0");
     auto &z = impl->z.at(size_t(slot));
     z.ensure(size_t(rows) * out, impl->stream);
-    // dp4a multi-token kernel; its raw int32 dot products are the product (meta lives in its scratch)
-    impl->codes.ensure(ternary_scratch_bytes(in, rows), impl->stream);
-    impl->weights.ensure(size_t(rows) * out * 2, impl->stream);
-    ternary_forward(packed, wscale, impl->input, reinterpret_cast<B16 *>(impl->weights.p), in, out,
-                    reinterpret_cast<uint8_t *>(impl->codes.p), impl->stream, rows,
-                    reinterpret_cast<int32_t *>(z.p));
-    float *meta = reinterpret_cast<float *>(impl->codes.p + size_t(rows) * in);
-    if (rows == 1) // the single-token kernel quantises internally and leaves no metadata
-        ternary_quantize(impl->input, impl->codes.p, meta, in, 1, impl->stream);
-    return {z.p, meta, wscale, out};
+    const size_t words = size_t(out) * in / 16;
+    impl->weights.ensure(words * 16, impl->stream);
+    unpack_ternary<<<blocks(words), 256, 0, impl->stream>>>(reinterpret_cast<const uint32_t *>(packed),
+                                                           reinterpret_cast<uint4 *>(impl->weights.p), words);
+    launched();
+    // exact: |sum| <= in * 127 fits int32 and the tensor cores accumulate int8 products in int32
+    const int one = 1, zero = 0;
+    blas(cublasGemmEx(impl->handle, CUBLAS_OP_T, CUBLAS_OP_N, out, rows, in, &one, impl->weights.p, CUDA_R_8I, in,
+                      impl->codes.p, CUDA_R_8I, in, &zero, z.p, CUDA_R_32I, out, CUBLAS_COMPUTE_32I,
+                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+         "ternary prefill GEMM");
+    return {z.p, impl->meta.p, wscale, out};
 }
 void PrefillOps::store(Product p, B16 *y, int rows) {
     const size_t n = size_t(rows) * p.width;
