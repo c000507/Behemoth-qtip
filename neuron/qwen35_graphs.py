@@ -116,7 +116,7 @@ ATT_QBLOCK = int(os.environ.get('ATT_QBLOCK', '0'))  # KV8 attention of wide pre
 WT = os.environ.get('WT', '0') == '1'   # dense projections, router, head and the experts' gate|up stored TRANSPOSED [in, out] (contraction axis first):
                                          # the M = 1 matmul then needs no on-chip transpose of the weight tiles (decode lever, docs/neuron-reap-decode-profile.md)
 GDN_RSPLIT = int(os.environ.get('GDN_RSPLIT', '0'))   # decode (Q = 1): the gdn state contractions in row groups of this many (R = 8 -> 2 x 4)
-WT_MOE = os.environ.get('WT_MOE', '')   # WT experts' gate|up: '' (decode: one matmul over the gathered slices relaid [H, E_ 2EIl]; MOE=all: stack) | stack | cat
+WT_MOE = os.environ.get('WT_MOE', '')   # WT experts' gate|up: '' (one matmul over the slices relaid [H, E_ 2EIl]) | stack (a matmul per expert). Neither is good for MOE=all prefill (open)
 PROF_NOAR = os.environ.get('PROF_NOAR', '0') == '1'   # timing probes only (WRONG output): the in-graph all-reduces are replaced by the identity
 PROF_FIXED = os.environ.get('PROF_FIXED', '0') == '1'   # timing probes only (WRONG output): gathered decode MoE uses experts 0..8T-1 by a static slice (no expert gather)
 VERIFY = os.environ.get('VERIFY', '0') == '1'   # speculative verify buckets (R = 1, Q = 1 + drafts tokens of one request): the gdn state after
@@ -1231,7 +1231,7 @@ def moe_routed(n, comb, t, g, mode):
         return None, comb
     if MOE_DEBUG == 'shared':
         return None, None
-    if WT and gus is not None and not EXACT and (WT_MOE == 'stack' or (WT_MOE == '' and mode == 'all')):
+    if WT and gus is not None and not EXACT and WT_MOE == 'stack':
         # one [T, H] x [H, 2 EIl] matmul per expert (no relayout of the expert tensor; the same products as lin)
         a, h8 = quant8(n)
         hgu = torch.stack([G.mm8(h8, gu[e]).float() for e in range(E_)], dim=1) * a.reshape(T, 1, 1) * gus.reshape(1, E_, 2 * EIl)
