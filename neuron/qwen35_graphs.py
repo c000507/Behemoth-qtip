@@ -652,6 +652,11 @@ def moe_block(n, t, g, allreduce, mode='all', ar_route=None):
         alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm', 'rcols')) * 0.0
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     if mode == 'group':
+        # padding tokens (position -1) take no expert: their residual is whatever the attention made of an all-masked row
+        # (it reads the scratch page, whose content is not reproducible), and in the grouped form a routed padding token
+        # would occupy slots and move the hot / cold split of the REAL tokens, i.e. their fp8 rounding path. Without
+        # them a real token's output depends on real tokens only, as with MOE=all.
+        comb = comb * (t['pos'] >= 0).float().reshape(T, 1)
         routed, ovf = moe_grouped(n, comb, t, g)
         return allreduce(shared + routed), {'ovf': ovf}
     groups = MOE_SPLIT if (mode == 'gather' and MOE_SPLIT and T > MOE_SPLIT and T % MOE_SPLIT == 0 and not MOE_DEBUG) else T
@@ -1197,7 +1202,7 @@ def state_shapes(kind, g, pages, slots):
 def step_shapes(kind, R, Q, P, g):
     T = R * Q
     s = {'x': ((T, g.H), torch.float32)}
-    if kind in ('gdn', 'gqa'):
+    if kind in ('gdn', 'gqa') or (kind == 'moe' and os.environ.get('MOE') == 'group'):   # the grouped MoE masks padding tokens (pos -1)
         s['pos'] = ((T,), torch.int64)
     if kind == 'gdn' and GDN_SLOT != 'bound':
         s['slot'] = ((R,), torch.int64)
