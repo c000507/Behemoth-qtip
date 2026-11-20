@@ -71,7 +71,7 @@ def check(d, meta, kind, parts, g, shards, neff_io):
     pos = torch.tensor([start + (i % Q_) if R_ == 1 else start + i for i in range(T)], dtype=torch.int64)
     table = torch.stack([torch.arange(P_, dtype=torch.int64) + r * P_ for r in range(R_)])
     table = table.clamp(max=meta['pages'] - 2)
-    wslot = torch.stack([table[i // Q_, int(pos[i]) // 16] * 16 + pos[i] % 16 for i in range(T)])
+    wslot = torch.stack([table[i // Q_, min(int(pos[i]) // 16, P_ - 1)] * 16 + pos[i] % 16 for i in range(T)])   # (clamped: a wide gdn / moe graph has a nominal P)
     step = {'x': x, 'pos': pos, 'wslot': wslot, 'table': table, 'slot': torch.arange(R_, dtype=torch.int64),
             'cos_sin': Q.cos_sin_rows(pos, g.rot, g.theta)}
     states = {}

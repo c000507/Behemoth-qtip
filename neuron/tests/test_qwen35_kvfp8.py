@@ -28,14 +28,13 @@ def main():
     table = torch.randperm(pages - 1)[:P].reshape(1, P)
     ar = lambda v: v
     state = {}
-    for mode in ('f32', 'fp8', 'fp8b'):
-        Q.ATT_BLOCK = 4 if mode == 'fp8b' else 0
+    for mode in ('f32', 'fp8', 'fp8b', 'fp8q'):
         if mode == 'f32':
             state[mode] = {'kv': torch.zeros(pages, 2, kvl, Q.PAGE, D)}
         else:
             state[mode] = {'kv': torch.zeros(pages, 2, kvl, Q.PAGE, D, dtype=torch.int8 if Q.KV_CODE == 'int8' else Q.F8), 'kvs': torch.zeros(pages, 2, kvl, Q.PAGE)}
     steps = [(0, 64), (64, 64), (128, 50)] + [(178 + i, 1) for i in range(20)]
-    worst = {'fp8': 0.0, 'fp8b': 0.0, 'blk': 0.0}
+    worst = {'fp8': 0.0, 'fp8b': 0.0, 'blk': 0.0, 'qblk': 0.0}
     for p0, n in steps:
         x = torch.randn(n, H)
         pos = torch.arange(p0, p0 + n)
@@ -44,8 +43,9 @@ def main():
         cs = torch.cat((torch.cat((ang.cos(), ang.cos()), -1), torch.cat((ang.sin(), ang.sin()), -1)), -1)
         wslot = table[0, pos // Q.PAGE] * Q.PAGE + pos % Q.PAGE
         out = {}
-        for mode in ('f32', 'fp8', 'fp8b'):
-            Q.ATT_BLOCK = 4 if mode == 'fp8b' else 0
+        for mode in ('f32', 'fp8', 'fp8b', 'fp8q'):   # fp8q: key blocks x query blocks (ATT_QBLOCK, wide prefill chunks)
+            Q.ATT_BLOCK = 4 if mode in ('fp8b', 'fp8q') else 0
+            Q.ATT_QBLOCK = 16 if mode == 'fp8q' else 0
             t = {**w, **state[mode], 'cos_sin': cs, 'wslot': wslot, 'table': table, 'pos': pos}
             y, st = Q.gqa_block(x, t, g, 1, n, P, ar)
             state[mode].update(st)
@@ -54,9 +54,12 @@ def main():
         worst['fp8'] = max(worst['fp8'], rel(out['fp8'], out['f32']))
         worst['fp8b'] = max(worst['fp8b'], rel(out['fp8b'], out['f32']))
         worst['blk'] = max(worst['blk'], rel(out['fp8b'], out['fp8']))
+        worst['qblk'] = max(worst['qblk'], rel(out['fp8q'], out['fp8b']))
     print(Q.KV_CODE, 'max relative error over %d calls: fp8 vs f32 %.3e, fp8 blocked vs f32 %.3e, blocked vs unblocked %.3e' %
           (len(steps), worst['fp8'], worst['fp8b'], worst['blk']))
     assert worst['blk'] < 1e-5, worst
+    assert worst['qblk'] < 1e-5, worst
+    print('query blocks vs key blocks only: %.3e' % worst['qblk'])
     assert worst['fp8'] < 5e-2, worst
     print('OK')
 
