@@ -15,23 +15,26 @@ models = {
   ornith = {
     legacy_names       = true
     model_s3_prefix    = "models/ornith-reap20-v3-fp8"
-    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp-pf" # = kv8-seg20-mtp + the faster prefill set (docs/neuron-qwen35-moe.md section 13: chunked GDN, blocked GQA, grouped MoE moeg_1_256_32 with moe_1_256_32 as overflow fallback); needs the ornith-prefill engine (BEHEMOTH_NEURON_QWEN35_MOE_GROUP=0 disables the grouped MoE)
+    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp-pf1024" # = -pf (docs/neuron-qwen35-moe.md section 13: chunked GDN, blocked GQA, grouped MoE with dense fallback) + the 9 Q=1024 prefill NEFFs of section 14 (pfbuild_wide.sh 1024); needs the ornith-chunk4096 engine. Rollback: the -pf prefix with --prefill-chunk 256 and no --token-budget
     prepared_s3_prefix = "" # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
     model_ids          = ["ornith-1.5-35b-a3b-reap20-v3"]
     model_name         = "ornith-1.5-35b-a3b-reap20-v3"
     shm_size_mib       = 6144 # as served so far (backend_shm_size_mib of terraform.tfvars)
 
     # --prefix-cache-gb 4: host K/V tier of the prefix cache (int8 KV, 162.5 KiB per 16-token page, ~385k tokens).
-    extra_server_args = "--prefill-chunk 256 --max-batch-requests 8 --prefix-cache-gb 4"
+    # --prefill-chunk 1024 --token-budget 1032: 1024-token prefill chunks (section 14: ~+37 % prefill on long cold prompts;
+    # decode streams advance one token per chunk while a prompt prefills, median gap 711 ms vs 277 ms at 256).
+    extra_server_args = "--prefill-chunk 1024 --token-budget 1032 --max-batch-requests 8 --prefix-cache-gb 4"
     # STREAM_LOAD=0: the prepared dir has no model-layer-*.bin files to stream (no Devstral-style staging vars).
     # gdn_{1,2,4}_1_32 are GDN_SLOT=bound NEFFs (docs/neuron-reap-nonfinite.md). Prefix cache with recurrent-state
-    # snapshots (docs/neuron-reap-prefix-cache.md): 62.8 MiB per snapshot every 2048 tokens on the 256-token chunk grid,
+    # snapshots (docs/neuron-reap-prefix-cache.md): 62.8 MiB per snapshot every 2048 tokens on the 1024-token chunk grid,
     # <= 4 GB of snapshots + <= 4 GB of K/V host pages.
     extra_env = {
       STREAM_LOAD                            = "0"
       BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE    = "1"
       BEHEMOTH_NEURON_QWEN35_PREFIX_ALIGN    = "1"
       BEHEMOTH_NEURON_QWEN35_PREFIX_INTERVAL = "2048"
+      BEHEMOTH_NEURON_QWEN35_BUCKET_FIT      = "1" # short prompts / tails use the Q=64 / Q=256 buckets instead of a padded Q=1024 chunk
       BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB = "4"
       BEHEMOTH_NEURON_PREFIX_HOST_GB         = "4"
       # idle OpenMP threads (sampling) must not spin: spinning ones delayed the rank workers by ~2.7 ms per step (docs/neuron-reap-launches.md)
