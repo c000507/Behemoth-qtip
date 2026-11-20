@@ -216,6 +216,118 @@ class Ref:
         return (logits, h) if return_hidden else logits
 
 
+class Mtp:
+    """The checkpoint's multi-token-prediction head (`mtp.*`; transformers ignores these tensors, the semantics are those of
+    vLLM's Qwen3_5MultiTokenPredictor and llama.cpp's qwen35moe graph_mtp, which agree):
+
+        z = fc(cat(rms(embed(x[p+1]), pre_fc_norm_embedding), rms(h[p], pre_fc_norm_hidden)))     (embedding FIRST)
+        z = z + full_attention(rms(z, input_layernorm))          own KV cache, RoPE position p, causal over the MTP entries
+        z = z + moe(rms(z, post_attention_layernorm))
+        o = rms(z, mtp.norm);   logits = lm_head(o)  -> the draft for x[p+2]
+
+    h[p] is the main model's hidden state of position p AFTER its final norm (what its lm_head reads); embed and lm_head
+    are the main model's (mtp_use_dedicated_embeddings false). Drafting further tokens chains the same layer on its own
+    output: h <- o, x <- the draft, position + 1 (the chained entries enter the MTP KV cache and are overwritten by the true
+    (h, x) pairs once the main model has produced them). The MTP layer may have another expert count than the main layers
+    (a pruned checkpoint keeps the original head): geometry from the tensors.
+
+    weights: 'mtp.*' HF names -> tensors (experts per expert `experts.<e>.{gate,up,down}_proj.weight` or fused)."""
+
+    def __init__(self, cfg, weights):
+        g = Cfg(cfg) if not isinstance(cfg, Cfg) else cfg
+        w = {k: v.float() for k, v in weights.items() if k.startswith('mtp.')}
+        lp = 'mtp.layers.0.'
+        inner = {'model.' + k[len('mtp.'):]: v for k, v in w.items() if '.mlp.experts.' not in k}
+        if lp + 'mlp.experts.gate_up_proj' in w:
+            inner['model.layers.0.mlp.experts.gate_up_proj'] = w[lp + 'mlp.experts.gate_up_proj']
+            inner['model.layers.0.mlp.experts.down_proj'] = w[lp + 'mlp.experts.down_proj']
+        else:
+            E = w[lp + 'mlp.gate.weight'].shape[0]
+            ex = lambda e, n: w[f'{lp}mlp.experts.{e}.{n}_proj.weight']
+            inner['model.layers.0.mlp.experts.gate_up_proj'] = torch.stack([torch.cat((ex(e, 'gate'), ex(e, 'up'))) for e in range(E)])
+            inner['model.layers.0.mlp.experts.down_proj'] = torch.stack([ex(e, 'down') for e in range(E)])
+        raw = dict(g.raw)
+        raw.update(num_hidden_layers=1, layer_types=['full_attention'], num_experts=inner['model.layers.0.mlp.gate.weight'].shape[0])
+        self.ref = Ref(raw, inner)
+        self.g = self.ref.g
+        self.w = inner
+
+    def init_state(self):
+        return {'k': torch.zeros(0, self.g.kvh, self.g.D), 'v': torch.zeros(0, self.g.kvh, self.g.D)}
+
+    def step(self, h, emb, pos, st, moe=None):
+        """h [T, H] (main post-norm hidden, or the previous step's output), emb [T, H] embeddings of the NEXT tokens, pos [T]
+        consecutive positions continuing st (all earlier MTP keys) -> o [T, H] (post mtp.norm; logits = o @ lm_head.T)."""
+        g, t = self.g, self.ref.t
+        cat = torch.cat((rms(emb, t('pre_fc_norm_embedding.weight'), g.eps), rms(h, t('pre_fc_norm_hidden.weight'), g.eps)), dim=-1)
+        z = cat @ t('fc.weight').T
+        z = z + self.ref.full_attn(0, rms(z, t('layers.0.input_layernorm.weight'), g.eps), torch.as_tensor(pos, dtype=torch.int64), st)
+        z = z + (moe or self.ref.moe)(0, rms(z, t('layers.0.post_attention_layernorm.weight'), g.eps))
+        return rms(z, t('norm.weight'), g.eps)
+
+
+    def chains(self, o, pos, K, V, embed, head, steps):
+        """Batched greedy draft chains (the offline acceptance study): row m continues from the true entry at position pos[m]
+        whose output is o[m]; it sees the true MTP entries K / V [N, kvh, D] of positions <= pos[m] plus its own chained
+        entries. -> drafts [M, steps + 1] (column 0 = argmax head(o): the draft for token pos + 2, column j for pos + 2 + j).
+        Equal to step() on a copy of the state truncated after pos[m] (tests/test_qwen35_mtp_ref.py)."""
+        g, t = self.g, self.ref.t
+        a = 'layers.0.self_attn.'
+        M_, N = o.shape[0], K.shape[0]
+        rep = g.heads // g.kvh
+        Kr, Vr = K.repeat_interleave(rep, dim=1), V.repeat_interleave(rep, dim=1)
+        pos = torch.as_tensor(pos, dtype=torch.int64)
+        vis = (torch.arange(N).reshape(1, 1, N) <= pos.reshape(M_, 1, 1))
+        drafts = [(o @ head.T).argmax(-1)]
+        h, cK, cV = o, [], []
+        for j in range(1, steps + 1):
+            cat = torch.cat((rms(embed[drafts[-1]].float(), t('pre_fc_norm_embedding.weight'), g.eps), rms(h, t('pre_fc_norm_hidden.weight'), g.eps)), dim=-1)
+            z = cat @ t('fc.weight').T
+            n = rms(z, t('layers.0.input_layernorm.weight'), g.eps)
+            qg = (n @ t(a + 'q_proj.weight').T).reshape(M_, g.heads, 2 * g.D)
+            q, gate = qg[..., :g.D], qg[..., g.D:]
+            k = (n @ t(a + 'k_proj.weight').T).reshape(M_, g.kvh, g.D)
+            v = (n @ t(a + 'v_proj.weight').T).reshape(M_, g.kvh, g.D)
+            cos, sin = rope_cos_sin(pos + j, g.rot, g.theta)
+            q = apply_rope(rms(q, t(a + 'q_norm.weight'), g.eps), cos, sin)
+            k = apply_rope(rms(k, t(a + 'k_norm.weight'), g.eps), cos, sin)
+            cK.append(k.repeat_interleave(rep, dim=1))
+            cV.append(v.repeat_interleave(rep, dim=1))
+            ck, cv = torch.stack(cK, dim=1), torch.stack(cV, dim=1)                       # [M, j, heads, D]
+            s_true = torch.einsum('mhd,nhd->mhn', q, Kr) / math.sqrt(g.D)
+            s_true = torch.where(vis, s_true, torch.full_like(s_true, -float('inf')))
+            s_ch = torch.einsum('mhd,mjhd->mhj', q, ck) / math.sqrt(g.D)
+            pr = torch.softmax(torch.cat((s_true, s_ch), dim=-1), dim=-1)
+            att = torch.einsum('mhn,nhd->mhd', pr[..., :N], Vr) + torch.einsum('mhj,mjhd->mhd', pr[..., N:], cv)
+            z = z + (att * torch.sigmoid(gate)).reshape(M_, g.heads * g.D) @ t(a + 'o_proj.weight').T
+            z = z + self.ref.moe(0, rms(z, t('layers.0.post_attention_layernorm.weight'), g.eps))
+            h = rms(z, t('norm.weight'), g.eps)
+            drafts.append((h @ head.T).argmax(-1))
+        return torch.stack(drafts, dim=1)
+
+
+def random_mtp_weights(cfg, seed=7, scale=0.02, experts=None, fused=False):
+    """Random `mtp.*` weights of the checkpoint's shapes (per-expert tensors unless fused)."""
+    raw = dict(cfg.get('text_config', cfg))
+    raw.update(num_hidden_layers=1, layer_types=['full_attention'])
+    if experts:
+        raw['num_experts'] = experts
+    g = Cfg(raw)
+    base = random_weights(raw, seed=seed, scale=scale, prefix='mtp.')
+    gen = torch.Generator().manual_seed(seed + 1)
+    w = {k: v for k, v in base.items() if k.startswith('mtp.layers.') or k == 'mtp.norm.weight'}
+    w['mtp.fc.weight'] = torch.randn(g.H, 2 * g.H, generator=gen) * (2 * g.H) ** -0.5
+    w['mtp.pre_fc_norm_embedding.weight'] = torch.randn(g.H, generator=gen) * scale
+    w['mtp.pre_fc_norm_hidden.weight'] = torch.randn(g.H, generator=gen) * scale
+    if not fused:
+        gu, dn = w.pop('mtp.layers.0.mlp.experts.gate_up_proj'), w.pop('mtp.layers.0.mlp.experts.down_proj')
+        for e in range(g.E):
+            w[f'mtp.layers.0.mlp.experts.{e}.gate_proj.weight'] = gu[e, :g.I].clone()
+            w[f'mtp.layers.0.mlp.experts.{e}.up_proj.weight'] = gu[e, g.I:].clone()
+            w[f'mtp.layers.0.mlp.experts.{e}.down_proj.weight'] = dn[e].clone()
+    return w
+
+
 def random_weights(cfg, seed=0, scale=0.02, prefix='model.language_model.'):
     """Random f32 weights of the real HF shapes (expert tensors fused, norms zero-centred)."""
     g = Cfg(cfg)

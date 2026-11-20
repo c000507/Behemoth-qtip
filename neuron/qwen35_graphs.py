@@ -22,7 +22,8 @@ Weights: WEIGHTS=fp8 (default) row-scaled E4M3 x E4M3-activation matmuls as glm_
 input channel so the gathered experts fold into one contraction), WEIGHTS=bf16 for exactness checks. Norm weights are
 stored as (1 + w) by the prepare step (Qwen's zero-centred RMSNorm), so the graphs multiply by them directly.
 
-usage: qwen35_graphs.py WORKDIR {gdn|gqa|moe|layer_gdn_moe|layer_gqa_moe} R Q P | head T S
+usage: qwen35_graphs.py WORKDIR {gdn|gqa|moe|layer_gdn_moe|layer_gqa_moe|seg_<kinds>|mtp} R Q P | head T S
+       VERIFY=1 seg_... 1 Q P: speculative verify bucket (per-position gdn states); mtp 1 Q P: the MTP head (MTP_EXPERTS)
   env: MODEL (dir with config.json) or CONFIG, TP, PAGES (incl. one scratch page), SLOTS (incl. one scratch slot),
        WEIGHTS=fp8|bf16, MOE=all|gather, NCC_FLAGS
 """
@@ -42,10 +43,17 @@ PAGE = G.PAGE
 F8 = G.F8
 MOE_DEBUG = os.environ.get('MOE_DEBUG', '')         # device bisection only: the MoE block returns an intermediate (comb|hgu|act|routed|shared)
 ATT_BF16 = os.environ.get('ATT_BF16', '0') == '1'   # gqa: scores / values contracted in bf16 straight from the paged cache (long-context decode lever)
+KV8 = os.environ.get('KV8', '0') == '1'      # gqa KV cache as fp8 e4m3 codes + per-token f32 scales (long-context pool: half the bytes)
+KV_CODE = os.environ.get('KV_CODE', 'int8')        # KV8 codes: int8 (round(x / amax * 127): 8 bits uniform, ~10x less error than e4m3) | e4m3
+ATT_BLOCK = int(os.environ.get('ATT_BLOCK', '0'))  # KV8 attention: key blocks of this many pages, online softmax (0: one block)
 ATT_GATHER = os.environ.get('ATT_GATHER', 'index')   # gqa page gather: index (cache[table]) | flat (index_select over the flattened table)
 GDN_GATHER = os.environ.get('GDN_GATHER', 'index')   # gdn state read: index (state[slot]) | flat (index_select)
 GDN_EINSUM = os.environ.get('GDN_EINSUM', 'mm')       # decode recurrence contractions: mm (einsum -> batched matmul) | elem (multiply + sum)
 GDN_CHUNK = int(os.environ.get('GDN_CHUNK', '0'))     # prefill: chunk size (power of two) of the matmul-form recurrence; 0 = token loop
+GDN_INV = os.environ.get('GDN_INV', 'rec')            # GDN_CHUNK inverse: rec (per-block recursion, unit_lower_inverse) | diag (block-diagonal
+                                                      # doubling with full [C, C] matmuls, every chunk in one batch: gdn_chunks2, docs/neuron-qwen397-prefill.md)
+GDN_LOOP = os.environ.get('GDN_LOOP', '')             # prefill token loop: fused = one state contraction with (k | q) per token, no where() (padding: beta = 0, decay = 1)
+RLOGIT = os.environ.get('RLOGIT', 'f32')              # router logits matmul: f32 | bf16 (explicit bf16 operands, f32 accumulate)
 AR_BF16 = os.environ.get('AR_BF16', '0')           # 1: all-reduce the partial sums in bf16 (halves the collective bytes; prefill lever), moe: MoE only
 ROUTE = os.environ.get('ROUTE', 'topk')          # router top-k: topk (torch.topk + one-hot) | rank | rank2 | tour (no topk op: topk_mask)
 TOUR_GROUPS = int(os.environ.get('TOUR_GROUPS', '8'))
@@ -57,8 +65,37 @@ ROUTER = os.environ.get('ROUTER', 'full')        # full: replicated f32 router [
 #                                                  router columns of its hidden slice ('rws' [E, H / TP], 'rcols' [H / TP]) and the logits are all-reduced
 GDN_DEC = os.environ.get('GDN_DEC', '0') == '1'    # decode (Q = 1): conv state = the last K-1 inputs by a static slice (no gather by the valid count)
 GDN_FORM = os.environ.get('GDN_FORM', '')          # fused: decode recurrence with one state contraction (see gdn_block)
+GDN_SLOT = os.environ.get('GDN_SLOT', '')          # bound: the gdn graph takes each row's state as its own [1, ...] tensor (R = 1: kstate / cstate,
+#                                                  R > 1: kstate_<r> / cstate_<r>; no slot / vslot input) and the engine binds the slot's slice
+#                                                  of the layer state, so the graph has no dynamic (runtime-indexed) state DMA. Verify buckets
+#                                                  (R = 1) also return the states after positions 1..Q-1 as outputs kstate@<i> / cstate@<i>,
+#                                                  which the engine binds to the slices of vslot[i] (docs/neuron-reap-nonfinite.md: the
+#                                                  dynamic state gather / scatter races on trn1)
 ROW_FORM = os.environ.get('ROW_FORM', '')         # probes of MOE_SLOTS=row: full | sort | launder | topk (see moe_routed)
 LIN_CSE = os.environ.get('LIN_CSE', '0') == '1'  # share the fp8 activation scaling (amax, divide, cast) between the projections of one input
+MOE_KERNEL = os.environ.get('MOE_KERNEL', '')     # dyn: gathered decode MoE through nki_moe_dyn.moe_dyn9 (loop over the DISTINCT experts)
+if MOE_KERNEL:
+    os.environ.setdefault('UNSAFE_FP8FNCAST', '1')   # torch float8_e4m3fn -> NKI float8_e4m3 (the HLO is retargeted the same way)
+EGU_T_FORM = os.environ.get('EGU_T_FORM', 'permute')   # prefill (MOE=all) with EGU_T: permute (back to [E, 64, H]) | einsum
+MOE_KM = int(os.environ.get('MOE_KM', '0'))          # kernel slot capacity override (default 10 T)
+MOE_KPRE = os.environ.get('MOE_KPRE', '0') == '1'   # prefill MoE (MOE=all) through the kernel too (row chunks of 128)
+MOE_KCH = int(os.environ.get('MOE_KCH', '32'))      # prefill row chunk (the kernel is validated on the device to 32 rows)
+MOE_KUP = int(os.environ.get('MOE_KUP', '4'))       # super-iteration size for chunks wider than 32 rows (SBUF)
+MOE_KU, MOE_KV = int(os.environ.get('MOE_KU', '8')), int(os.environ.get('MOE_KV', '2'))
+MOE_KMEM = int(os.environ.get('MOE_KMEM', '160'))   # row kernel: up to this many slots the activations stay in SBUF between the phases
+MOE_KSKIP = os.environ.get('MOE_KSKIP', '0') == '1'   # row kernel: padding slots (10 T not a multiple of 8) are not streamed
+MOE_KFAST = int(os.environ.get('MOE_KFAST', '0'))   # row kernel: 1 = fewer vector instructions per group (one gate x up multiply, one amax per call)
+MOE_KDENSE = int(os.environ.get('MOE_KDENSE', '0'))  # prefill with MOE_KERNEL=row MOE_KPRE=1: 1 = nki_moe_dyn.moe_dense9 (ONE pass over the experts for all the rows, per-super-iteration activation scale); 2: the same with two instructions for the scaled accumulate
+MOE_KYD = int(os.environ.get('MOE_KYD', '0'))   # row kernel: y = accd * a2 straight from PSUM (one phase-3 call), no memset of the accumulator
+MOE_KSTAT = int(os.environ.get('MOE_KSTAT', '0'))   # rows <= MOE_KSTAT: the kernel with static trip counts (all 10 T slots streamed, no device loop)
+EGU_T = os.environ.get('EGU_T', '1' if MOE_KERNEL else '0') == '1'   # egu stored as egu_t [E * 128, 2048] (kernel layout, nki_moe.relayout_egu)
+MTP_ARGMAX = os.environ.get('MTP_ARGMAX', 'eq')   # mtpc (draft chain in one launch): eq (no argmax op) | max (torch.max indices: aborts in the XLA trace)
+MTP_CHAIN_DBG = os.environ.get('MTP_CHAIN_DBG', '0') == '1'
+MTP_WIN = os.environ.get('MTP_WIN', 'arith')     # mtpc winner rank: arith (clamp arithmetic) | cmp (>= and a count)
+GDN_VPUT = os.environ.get('GDN_VPUT', 'stack')   # verify state writes: stack (one scatter of R * Q states) | seq (one scatter of R rows per token:
+#                                                  probe for the R > 1, Q = 2 buckets, whose gdn block costs 6.2 ms instead of 0.36 on the device)
+VERIFY = os.environ.get('VERIFY', '0') == '1'   # speculative verify buckets (R = 1, Q = 1 + drafts tokens of one request): the gdn state after
+#                                                  EVERY position goes to its own slot (step input 'vslot' [Q]); docs/neuron-qwen397-mtp.md
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
 
 
@@ -190,20 +227,36 @@ def gdn_block(n, t, g, R, Q, allreduce):
     order). State slot per row t['slot'] [R]; a row whose first token is at position 0 starts from zero state. Padding
     tokens of a short prefill chunk have position -1 and leave the state untouched (same contract as glm_graphs.kda_block)."""
     T, hl, hk, Dk, Dv, W, K = R * Q, g.hl, g.hk, g.Dk, g.Dv, g.W3, g.K
-    slot = t['slot']
+    slot = t.get('slot')
     keep = (t['pos'].reshape(R, Q)[:, 0] != 0).float()
     proj = lin(n, t, 'qkv').reshape(R, Q, W)                                           # [R, Q, W]
-    cs = (torch.index_select(t['cstate'], 0, slot) if GDN_GATHER == 'flat' else t['cstate'][slot]) * keep.reshape(R, 1, 1)                                     # [R, W, K-1], oldest first
+    bound = GDN_SLOT == 'bound'
+    verify = VERIFY and Q > 1 if bound else 'vslot' in t
+    if bound:
+        assert R == 1 or not verify, 'GDN_SLOT=bound verify buckets: one row'
+        rowst = lambda n: t[n] if R == 1 else torch.cat([t[f'{n}_{r}'] for r in range(R)], dim=0)
+    cs = (rowst('cstate') if bound else torch.index_select(t['cstate'], 0, slot) if GDN_GATHER == 'flat' else t['cstate'][slot]) * keep.reshape(R, 1, 1)                                     # [R, W, K-1], oldest first
     seq = torch.cat((cs.permute(0, 2, 1), proj), dim=1)                                # [R, K-1+Q, W]
     cw = t['conv']                                                                     # [W, K] f32
     conv = sum(seq[:, j:j + Q] * cw[:, j].reshape(1, 1, W) for j in range(K))          # [R, Q, W]
     valid = t['pos'].reshape(R, Q) >= 0
-    if K > 1 and Q == 1 and GDN_DEC:                                                   # decode rows are never padding: the new state is the last K-1 inputs
-        cstate = t['cstate'].index_put((slot,), seq[:, 1:].permute(0, 2, 1))
+    vs = t['vslot'].reshape(R, Q) if verify and not bound else None                    # the state after token i of row r -> slot vslot[r * Q + i]
+    if bound and verify:                                                               # per-position conv states (states dict below)
+        cstate = [seq[:, i + 1:i + K].permute(0, 2, 1) for i in range(Q)] if K > 1 else [t['cstate']] * Q
+    elif verify and K > 1 and GDN_VPUT == 'seq':                                         # one scatter of R rows per token (see GDN_VPUT)
+        cstate = t['cstate']
+        for i in range(Q):
+            cstate = cstate.index_put((vs[:, i],), seq[:, i + 1:i + K].permute(0, 2, 1))
+    elif verify and K > 1:                                                             # (padding only at a row's end, its vslot = the scratch slot)
+        cstate = t['cstate'].index_put((t['vslot'],), torch.stack([seq[:, i + 1:i + K] for i in range(Q)], dim=1).reshape(R * Q, K - 1, W).permute(0, 2, 1))
+    elif K > 1 and Q == 1 and GDN_DEC:                                                 # decode rows are never padding: the new state is the last K-1 inputs
+        cstate = seq[:, 1:].permute(0, 2, 1) if bound else t['cstate'].index_put((slot,), seq[:, 1:].permute(0, 2, 1))
     elif K > 1:                                                                        # state = the K-1 inputs before the first padding token
         nvalid = valid.long().sum(dim=1)
         idx = (nvalid.reshape(R, 1) + torch.arange(K - 1, device=n.device).reshape(1, K - 1)).reshape(R, K - 1, 1).expand(R, K - 1, W)
-        cstate = t['cstate'].index_put((slot,), torch.gather(seq, 1, idx).permute(0, 2, 1))
+        cstate = torch.gather(seq, 1, idx).permute(0, 2, 1)
+        if not bound:
+            cstate = t['cstate'].index_put((slot,), cstate)
     else:
         cstate = t['cstate']
     act = bf(conv * torch.sigmoid(conv))
@@ -221,7 +274,7 @@ def gdn_block(n, t, g, R, Q, allreduce):
     a = lin(n, t, 'a').reshape(R, Q, hl)
     gg = -torch.exp(t['alog']).reshape(1, 1, hl) * torch.nn.functional.softplus(a + t['dt'].reshape(1, 1, hl))
     decay = torch.exp(gg)                                                              # [R, Q, hl]
-    st = (torch.index_select(t['kstate'], 0, slot) if GDN_GATHER == 'flat' else t['kstate'][slot]) * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
+    st = (rowst('kstate') if bound else torch.index_select(t['kstate'], 0, slot) if GDN_GATHER == 'flat' else t['kstate'][slot]) * keep.reshape(R, 1, 1, 1)                                 # [R, hl, Dk, Dv]
     C = GDN_CHUNK
     if Q == 1 and GDN_FORM == 'fused':
         # one contraction of the stored state with (k | q) instead of two contractions of two materialised states:
@@ -231,10 +284,24 @@ def gdn_block(n, t, g, R, Q, allreduce):
         delta = (v[:, 0] - d * c[:, :, 0]) * beta[:, 0].unsqueeze(-1)
         y = (d * c[:, :, 1] + (kn[:, 0] * qn[:, 0]).sum(dim=-1, keepdim=True) * delta).unsqueeze(1)
         st = st * d.unsqueeze(-1) + kn[:, 0].unsqueeze(-1) * delta.unsqueeze(-2)
-    elif Q > 1 and C > 1 and Q % C == 0:
-        st, y = gdn_chunks(st, qn, kn, v, beta, gg, valid, C)
-    else:
+    elif Q > 1 and C > 1 and Q % C == 0 and not verify:
+        st, y = (gdn_chunks2 if GDN_INV == 'diag' else gdn_chunks)(st, qn, kn, v, beta, gg, valid, C)
+    elif Q > 1 and GDN_LOOP == 'fused' and not verify:
+        # the Q = 1 fused form per token; padding tokens (only at a row's end) get beta = 0 and decay = 1: the state stays
+        vf = valid.reshape(R, Q, 1).float()
+        bm, dm = beta * vf, torch.exp(gg * vf)
+        kq = (kn * qn).sum(dim=-1, keepdim=True)                                       # [R, Q, hl, 1]
+        kqs = torch.stack((kn, qn), dim=-1)                                            # [R, Q, hl, Dk, 2]
         outs = []
+        for i in range(Q):
+            d = dm[:, i].reshape(R, hl, 1)
+            c = torch.einsum('rhkd,rhkc->rhcd', st, kqs[:, i])                         # [R, hl, 2, Dv]
+            delta = (v[:, i] - d * c[:, :, 0]) * bm[:, i].unsqueeze(-1)
+            outs.append(d * c[:, :, 1] + kq[:, i] * delta)
+            st = st * d.unsqueeze(-1) + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+        y = torch.stack(outs, dim=1)
+    else:
+        outs, sts = [], []
         elem = GDN_EINSUM == 'elem' and Q == 1
         contract = (lambda m, x: (m * x.unsqueeze(-1)).sum(dim=-2)) if elem else (lambda m, x: torch.einsum('rhkd,rhk->rhd', m, x))
         for i in range(Q):                                                             # the recurrence, token by token
@@ -243,12 +310,27 @@ def gdn_block(n, t, g, R, Q, allreduce):
             delta = (v[:, i] - mem) * beta[:, i].unsqueeze(-1)
             nst = nst + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
             outs.append(contract(nst, qn[:, i]))
-            st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 else nst
+            st = torch.where(valid[:, i].reshape(R, 1, 1, 1), nst, st) if Q > 1 and not verify else nst
+            sts.append(nst)
         y = torch.stack(outs, dim=1)                                                   # [R, Q, hl, Dv]
-    kstate = t['kstate'].index_put((slot,), st)
+    if bound and verify:
+        kstate = sts
+    elif verify and GDN_VPUT == 'seq':
+        kstate = t['kstate']
+        for i in range(Q):
+            kstate = kstate.index_put((vs[:, i],), sts[i])
+    else:
+        kstate = t['kstate'].index_put((t['vslot'],), torch.stack(sts, dim=1).reshape(R * Q, hl, Dk, Dv)) if verify else st if bound else t['kstate'].index_put((slot,), st)
     z = lin(n, t, 'z').reshape(R, Q, hl, Dv)
     y = y * torch.rsqrt(torch.mean(y * y, dim=-1, keepdim=True) + g.eps) * t['onorm'] * (z * torch.sigmoid(z))
     out = allreduce(lin_partial(bf(y).reshape(T, g.Wv), t, 'o'))
+    if bound and verify:      # position 0 -> the row's own slot (aliased state), positions i >= 1 -> extra outputs bound to vslot[i]
+        sd = {'kstate': kstate[0], 'cstate': cstate[0]}
+        for i in range(1, Q):
+            sd[f'kstate@{i}'], sd[f'cstate@{i}'] = kstate[i], cstate[i]
+        return out, sd
+    if bound and R > 1:
+        return out, {f'{n}_{r}': v[r:r + 1] for r in range(R) for n, v in (('kstate', kstate), ('cstate', cstate))}
     return out, {'kstate': kstate, 'cstate': cstate}
 
 
@@ -303,6 +385,51 @@ def gdn_chunks(st, qn, kn, v, beta, gg, valid, C):
     return st, torch.cat(ys, dim=2).permute(0, 2, 1, 3)
 
 
+def gdn_chunks2(st, qn, kn, v, beta, gg, valid, C):
+    """gdn_chunks (same algebra, same contract) arranged for the tensor engine: every matrix is [C, C] / [C, Dk] / [C, Dv] with
+    C = 128 = one PE tile, everything that does not depend on the carried state (Gram matrices, the decay ratios, the inverse)
+    is computed for ALL chunks in one batch [R, hl, Q / C], and (I + M)^-1 is built by block-diagonal doubling with full
+    matmuls: with X_s = the block-diagonal matrix of the inverses of the s-blocks of I + M and L_s = M restricted to the
+    (odd s-block, preceding even s-block) cells, X_2s = X_s - X_s L_s X_s (the exact 2 x 2 block inverse; log2(C) levels,
+    2 batched matmuls each, no per-block slicing). The sequential part is 5 matmuls per chunk."""
+    R, Q, hl, Dk = kn.shape
+    Dv, nc, dev = v.shape[-1], Q // C, st.device
+    vf = valid.reshape(R, Q, 1).float()
+    beta, gg = beta * vf, gg * vf
+    K = kn.permute(0, 2, 1, 3).reshape(R, hl, nc, C, Dk)
+    Qm = qn.permute(0, 2, 1, 3).reshape(R, hl, nc, C, Dk)
+    V = v.permute(0, 2, 1, 3).reshape(R, hl, nc, C, Dv)
+    b = beta.permute(0, 2, 1).reshape(R, hl, nc, C, 1)
+    gl = gg.permute(0, 2, 1).reshape(R, hl, nc, 1, C)
+    incl = torch.tril(torch.ones(C, C, device=dev))
+    low = torch.tril(torch.ones(C, C, device=dev), diagonal=-1)
+    Gc = (gl * incl).sum(dim=-1)                                                       # cumulative log decay [R, hl, nc, C] (<= 0)
+    ratio = torch.exp((Gc.unsqueeze(-1) - Gc.unsqueeze(-2)) * incl)                    # e^(G_t - G_j), j <= t (masked below)
+    KT = K.transpose(-1, -2)
+    M = b * ratio * torch.matmul(K, KT) * low
+    N = ratio * torch.matmul(Qm, KT) * incl
+    blk = torch.arange(C, device=dev)
+    inv = None
+    s = 1
+    while s < C:
+        bi = torch.div(blk, s, rounding_mode='floor')
+        cell = ((bi.reshape(C, 1) % 2 == 1) & (bi.reshape(1, C) == bi.reshape(C, 1) - 1)).float()
+        L = M * cell
+        inv = (torch.eye(C, device=dev) - L) if inv is None else inv - torch.matmul(torch.matmul(inv, L), inv)
+        s *= 2
+    eG = torch.exp(Gc).unsqueeze(-1)                                                   # [R, hl, nc, C, 1]
+    last = Gc[..., -1:]                                                                # [R, hl, nc, 1]
+    eL = torch.exp(last).unsqueeze(-1)                                                 # [R, hl, nc, 1, 1]
+    Kd = (torch.exp(last - Gc).unsqueeze(-1) * K).transpose(-1, -2)                    # [R, hl, nc, Dk, C]
+    bV, beK, eQ = b * V, b * eG * K, eG * Qm
+    ys = []
+    for c in range(nc):
+        U = torch.matmul(inv[:, :, c], bV[:, :, c] - torch.matmul(beK[:, :, c], st))   # [R, hl, C, Dv]
+        ys.append(torch.matmul(eQ[:, :, c], st) + torch.matmul(N[:, :, c], U))
+        st = eL[:, :, c] * st + torch.matmul(Kd[:, :, c], U)
+    return st, torch.cat(ys, dim=2).permute(0, 2, 1, 3)
+
+
 def gqa_block(n, t, g, R, Q, P, allreduce):
     """GQA attention with per-head q/k RMSNorm, partial RoPE and the sigmoid output gate over the request's paged keys.
     t['cos_sin'] [T, 2 rot] host rows; t['wslot'] [T] flat write slots (page * 16 + offset); t['table'] [R, P]."""
@@ -331,6 +458,8 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
     off = torch.bitwise_and(t['wslot'], PAGE - 1)
     at = (page[:, None, None], torch.arange(2, dtype=torch.int64, device=n.device)[None, :, None],
           torch.arange(kvl, dtype=torch.int64, device=n.device)[None, None, :], off[:, None, None])
+    if 'kvs' in t:                                                                     # KV8: fp8 codes + one f32 scale per (token, K|V, head)
+        return gqa_fp8(n, t, g, R, Q, P, allreduce, q, gate, k, bf(v), cache, at)
     cache = cache.index_put(at, torch.stack((k, bf(v)), dim=1).to(cache.dtype))         # [T, 2, kvl, D]
     table = t['table']                                                                 # [R, P]
     keys = P * PAGE
@@ -347,6 +476,8 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
     s = torch.einsum('rqhgd,rhkd->rqhgk', qh.to(kk.dtype), kk).float() / math.sqrt(D)
     kpos = torch.arange(keys, dtype=torch.int64, device=n.device).reshape(1, 1, 1, 1, keys)
     visible = kpos <= t['pos'].reshape(R, Q, 1, 1, 1)
+    if 'lo' in t:                                                                      # MTP cache: entries exist from key t['lo'] [R] of the table on
+        visible = visible & (kpos >= t['lo'].reshape(R, 1, 1, 1, 1))
     s = torch.where(visible, s, torch.full_like(s, -3e38))
     p = bf(torch.softmax(s, dim=-1))
     o = torch.einsum('rqhgk,rhkd->rqhgd', p.to(vv.dtype), vv).float().reshape(T, hq, D)
@@ -354,6 +485,63 @@ def gqa_block(n, t, g, R, Q, P, allreduce):
         o = o * torch.sigmoid(gate)
     out = allreduce(lin_partial(bf(o).reshape(T, hq * D), t, 'o'))
     return out, {'kv': cache}
+
+
+def gqa_fp8(n, t, g, R, Q, P, allreduce, q, gate, k, v, cache, at):
+    """KV8 (long context): the cache holds fp8 e4m3 codes [pages, 2, kvl, 16, D] (half the bf16 bytes) and t['kvs'] one f32 scale
+    per (page, K|V, head, offset) = amax over D / 224, the activation recipe of quant8. The scales are folded into the scores (keys)
+    and the probabilities (values), so no dequantised copy of the keys exists. ATT_BLOCK = pages per key block: the keys are
+    visited in blocks with a running max / sum (online softmax), which bounds the scratch of the 8192 / 16384-page buckets."""
+    T, hq, kvl, D = R * Q, g.hq, g.kvl, g.D
+    kv = torch.stack((k, v), dim=1).float()                                            # [T, 2, kvl, D]
+    if cache.dtype == torch.int8:
+        a = torch.amax(torch.abs(kv), dim=-1).clamp(min=1e-20) / 127.0                # [T, 2, kvl]
+        cache = cache.index_put(at, torch.round(kv / a.unsqueeze(-1)).to(torch.int8))
+    else:
+        a = torch.amax(torch.abs(kv), dim=-1).clamp(min=1e-20) / 224.0
+        cache = cache.index_put(at, (kv / a.unsqueeze(-1)).to(cache.dtype))
+    scales = t['kvs'].index_put(at, a)                                 # [pages, 2, kvl, 16]
+    table = t['table']
+    rep = hq // kvl
+    qh = q.reshape(R, Q, kvl, rep, D)
+    dt = torch.float32 if EXACT else torch.bfloat16                                    # int8 / e4m3 codes are exact in bf16
+    qd = qh.to(dt)
+    pos = t['pos'].reshape(R, Q, 1, 1, 1)
+    blk = ATT_BLOCK if ATT_BLOCK and P > ATT_BLOCK and P % ATT_BLOCK == 0 else P
+    m = l = acc = None
+    for b0 in range(0, P, blk):
+        tb = table[:, b0:b0 + blk] if blk < P else table
+        if ATT_GATHER == 'flat':
+            kb = torch.index_select(cache, 0, tb.reshape(R * blk)).reshape(R, blk, 2, kvl, PAGE, D)
+        else:
+            kb = cache[tb]
+        sb = scales[tb]                                                                # [R, blk, 2, kvl, 16]
+        keys = blk * PAGE
+        kk = kb[:, :, 0].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D).to(dt)
+        vv = kb[:, :, 1].permute(0, 2, 1, 3, 4).reshape(R, kvl, keys, D).to(dt)
+        ks = sb[:, :, 0].permute(0, 2, 1, 3).reshape(R, 1, kvl, 1, keys)
+        vs = sb[:, :, 1].permute(0, 2, 1, 3).reshape(R, 1, kvl, 1, keys)
+        s = torch.einsum('rqhgd,rhkd->rqhgk', qd, kk).float() * (ks / math.sqrt(D))
+        kpos = torch.arange(b0 * PAGE, b0 * PAGE + keys, dtype=torch.int64, device=n.device).reshape(1, 1, 1, 1, keys)
+        s = torch.where(kpos <= pos, s, torch.full_like(s, -3e38))
+        mb = torch.amax(s, dim=-1)
+        if m is None:   # block 0 holds key 0, visible to every real row: m is finite from here on
+            m = mb
+            p = torch.exp(s - m.unsqueeze(-1))
+            l = p.sum(-1)
+            acc = torch.einsum('rqhgk,rhkd->rqhgd', bf(p * vs).to(dt), vv).float()
+        else:
+            mn = torch.maximum(m, mb)
+            c = torch.exp(m - mn)
+            p = torch.exp(s - mn.unsqueeze(-1))
+            l = l * c + p.sum(-1)
+            acc = acc * c.unsqueeze(-1) + torch.einsum('rqhgk,rhkd->rqhgd', bf(p * vs).to(dt), vv).float()
+            m = mn
+    o = (acc / l.unsqueeze(-1)).reshape(T, hq, D)
+    if gate is not None:
+        o = o * torch.sigmoid(gate)
+    out = allreduce(lin_partial(bf(o).reshape(T, hq * D), t, 'o'))
+    return out, {'kv': cache, 'kvs': scales}
 
 
 def topk_mask(probs, k, form):
@@ -402,10 +590,18 @@ def route(n, t, g, allreduce=None, want_top=False):
     same bits, so every rank selects the same experts)."""
     if 'rws' in t:
         logits = allreduce(torch.matmul(torch.index_select(n, 1, t['rcols']).float(), t['rws'].T))
+    elif RLOGIT == 'bf16' and not EXACT:
+        logits = torch.matmul(n.to(torch.bfloat16), t['rw'].to(torch.bfloat16).T).float()
     else:
         logits = torch.matmul(n.float(), t['rw'].T)
     probs = torch.softmax(logits, dim=-1)                                              # [T, E] f32
     T = n.shape[0]
+    if ROUTE == 'thr' and not want_top:
+        # top-k by threshold: the k-th largest probability of the row (torch.topk VALUES; no index tensor, no one-hot, no
+        # einsum). Equal to ROUTE=topk unless two probabilities tie exactly at the k-th place (then both are kept).
+        thr = torch.topk(probs, g.topk, dim=-1)[0][:, g.topk - 1:g.topk]
+        w = probs * (probs >= thr).float()
+        return w / w.sum(dim=-1, keepdim=True)
     if want_top:
         N = int(ROUTE[3:]) if ROUTE.startswith('pad') else T
         padded = torch.cat((probs, torch.zeros(N - T, g.E, device=n.device) + probs[:1] * 0.0), dim=0) if T < N else probs
@@ -468,6 +664,101 @@ def moe_routed(n, comb, t, g, mode):
     the MOE_DEBUG stage tensor or None)."""
     T, E, EIl = n.shape[0], g.E, g.EIl
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')                 # [E, 2EIl, H], [E, EIl, H]
+    if MOE_KERNEL in ('row', 'dyn') and isinstance(comb, tuple) and n.device.type != 'cpu' and not MOE_DEBUG:
+        # MOE_SLOTS=row with a kernel: the static row-slot kernel (10 T slots, no selection logic; nki_moe_dyn.moe_row9)
+        import nki_moe_dyn as D
+        top, w = comb
+        n8, a = D.graph_inputs9(n)
+        idx, idxf, cs = D.row_inputs9(top, w, T, g.topk)
+        routed = D.moe_row9(n8, a, idx, idxf, cs, gus, dc, gu if gu.dim() == 2 else gu.reshape(E * 128, -1), dw.reshape(E * EIl, g.H),
+                            U=min(MOE_KU, idx.shape[0] // 8), mem=1 if idx.shape[0] <= MOE_KMEM else 0,
+                            NR=T * g.topk if MOE_KSKIP else 1000000, fast=MOE_KFAST, yd=MOE_KYD)
+        return routed, routed
+    if MOE_KERNEL == 'row' and mode == 'all' and MOE_KPRE and not isinstance(comb, tuple) and n.device.type != 'cpu' and not MOE_DEBUG:
+        # prefill through the static kernel, DENSE: every expert is a slot (idx = arange(E)), rows in chunks of MOE_KCH (<= 128:
+        # the stationary operand); every chunk streams all the experts once
+        import nki_moe_dyn as D
+        if MOE_KDENSE and T % min(MOE_KCH, T) == 0:
+            tc = min(MOE_KCH, T)
+            NH = T // tc
+            n8, a = D.graph_inputs9(n)
+            outs = []
+            for h0 in range(0, NH, 4):   # at most 4 row blocks per kernel call (SBUF: x^T, x and y of every block stay resident)
+                nh = min(4, NH - h0)
+                r0, r1 = h0 * tc, (h0 + nh) * tc
+                cs = comb[r0:r1].reshape(nh, tc, E).permute(0, 2, 1).reshape(nh * E, tc).contiguous()
+                outs.append(D.moe_dense9(n8[r0:r1], a[r0:r1], cs, gus, dc, gu if gu.dim() == 2 else gu.reshape(E * 128, -1), dw.reshape(E * EIl, g.H),
+                                         NH=nh, U=MOE_KUP, stt=1 if MOE_KDENSE == 1 else 0))
+            routed = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+            return routed, routed
+        idxf = torch.arange(E, device=n.device).float().reshape(E, 1)
+        idx = idxf.to(torch.int32)
+        outs = []
+        for r0 in range(0, T, MOE_KCH):
+            tc = min(MOE_KCH, T - r0)
+            n8, a = D.graph_inputs9(n[r0:r0 + tc])
+            outs.append(D.moe_row9(n8, a, idx, idxf, comb[r0:r0 + tc].T.contiguous(), gus, dc, gu if gu.dim() == 2 else gu.reshape(E * 128, -1),
+                                   dw.reshape(E * EIl, g.H), U=MOE_KUP if tc > 32 else MOE_KU, mem=0, fast=MOE_KFAST))
+        routed = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+        return routed, routed
+    if MOE_KERNEL == 'dyn' and (mode == 'gather' or MOE_KPRE) and not isinstance(comb, tuple) and n.device.type != 'cpu' and not MOE_DEBUG:
+        # the distinct-expert kernel; prefill (mode all, MOE_KPRE=1): row chunks of <= 128 (every chunk streams the experts its rows use)
+        import nki_moe_dyn as D
+        outs = []
+        for r0 in range(0, T, MOE_KCH):
+            tc = min(MOE_KCH, T - r0)
+            km = min(E, max(-(-g.topk * tc // 8) * 8, MOE_KM))
+            n8, a = D.graph_inputs9(n[r0:r0 + tc])
+            u = MOE_KU if tc <= 32 else MOE_KUP
+            outs.append(D.moe_dyn9(n8, a, comb[r0:r0 + tc], gus, dc, gu if gu.dim() == 2 else gu.reshape(E * 128, -1), dw.reshape(E * EIl, g.H),
+                                   KM=km, U=min(u, km // 8) if tc <= MOE_KSTAT else u, V=MOE_KV, stat=1 if tc <= MOE_KSTAT else 0))
+        routed = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+        return routed, routed
+    if gu.dim() == 2 and mode == 'all' and EGU_T_FORM == 'bmm' and gus is not None and not EXACT and not isinstance(comb, tuple):
+        # EGU_T layout, every expert, no relayout of the weights: egu_t viewed as E matrices [4096 (p, kt), 64] (contraction-major,
+        # like ed) and a batched matmul over the experts with the activations permuted to the (p, kt) order
+        a, n8 = quant8(n)
+        KTn = g.H // 128
+        n8p = n8.reshape(T, KTn, 128).transpose(1, 2).reshape(1, T, g.H)
+        w3 = gu.reshape(E, g.H, 2 * EIl)
+        if n.device.type == 'cpu':
+            hgu = torch.matmul(n8p.float(), w3.float())                                # [E, T, 2 EIl]
+        else:
+            hgu = torch.matmul(n8p.expand(E, T, g.H), w3)
+        hgu = G.bf(hgu.float() * a.reshape(1, T, 1) * gus.reshape(E, 1, 2 * EIl)).reshape(E, T, 2, EIl)
+        act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * comb.T.unsqueeze(-1)           # [E, T, EIl]
+        if dc is not None:
+            act = act * dc.reshape(E, 1, EIl)
+        a2 = act.permute(1, 0, 2).reshape(T, E * EIl)
+        a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        routed = G.mm8((a2 / a).to(F8), dw.reshape(E * EIl, g.H)).float() * a
+        return routed, routed
+    if gu.dim() == 2 and mode == 'all' and EGU_T_FORM == 'einsum' and gus is not None and not EXACT and not isinstance(comb, tuple):
+        # EGU_T layout, every expert: hgu[t, e, o] = sum_{kt, p} n8[t, kt, p] egu_t[e, p, kt, o] (no relayout of the weights)
+        a, n8 = quant8(n)
+        w4 = gu.reshape(E, 128, g.H // 128, 2 * EIl)
+        if n.device.type == 'cpu':
+            hgu = torch.einsum('tkp,epko->teo', n8.float().reshape(T, g.H // 128, 128), w4.float())
+        else:
+            hgu = torch.einsum('tkp,epko->teo', n8.reshape(T, g.H // 128, 128), w4)
+        hgu = G.bf(hgu.float() * a.reshape(T, 1, 1) * gus.reshape(1, E, 2 * EIl)).reshape(T, E, 2, EIl)
+        act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * comb.unsqueeze(-1)
+        if dc is not None:
+            act = act * dc.reshape(1, E, EIl)
+        a2 = act.reshape(T, E * EIl)
+        a = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        routed = G.mm8((a2 / a).to(F8), dw.reshape(E * EIl, g.H)).float() * a
+        return routed, routed
+    egut = gu.dim() == 2
+    if egut:   # EGU_T layout [E * 128, 2048] (egu_t[e * 128 + p, kt * 64 + o] = egu[e, o, kt * 128 + p])
+        gu = gu.reshape(E, 128, g.H // 128 * 2 * EIl)
+        if mode == 'all' or not (isinstance(comb, tuple) or g.topk * T < E):   # every expert: back to [E, 2EIl, H] (a full relayout)
+            if EGU_T_FORM == 'u8' and gu.device.type != 'cpu':   # transpose the raw bytes (int8), bitcast back to fp8
+                gu = gu.view(torch.int8).reshape(E, 128, g.H // 128, 2 * EIl).permute(0, 3, 2, 1).reshape(E, 2 * EIl, g.H).view(F8)
+            else:
+                gu = gu.reshape(E, 128, g.H // 128, 2 * EIl).permute(0, 3, 2, 1).reshape(E, 2 * EIl, g.H)
+            egut = False
+    untile = lambda w: w.reshape(-1, 128, g.H // 128, 2 * EIl).permute(0, 3, 2, 1).reshape(-1, 2 * EIl, g.H) if egut else w   # gathered slices only
     if isinstance(comb, tuple):
         # MOE_SLOTS=row: slot r * K + j holds the j-th expert of row r (the router's topk indices, no union over the rows, no
         # top-k over the experts, no [T, E] combine matrix). An expert selected by two rows is read twice; the union form
@@ -483,7 +774,7 @@ def moe_routed(n, comb, t, g, mode):
         elif ROW_FORM == 'topk':    # probe: the indices re-derived by a [1, T K] topk (ascending expert order, duplicates kept)
             order = torch.topk(-(idx.float() + torch.arange(T * K, device=n.device).float() / (2 * T * K)).reshape(1, T * K), T * K, dim=-1)[1].reshape(T * K)
             idx, perm = torch.index_select(idx, 0, order), order
-        gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
+        gu, dw = untile(torch.index_select(gu, 0, idx)), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
         if perm is not None:
@@ -520,7 +811,7 @@ def moe_routed(n, comb, t, g, mode):
             rank = used - ar * (0.5 / E)
             idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                     # (2-D topk: a 1-D one crashed the XLA trace)
             comb = torch.index_select(comb, 1, idx)
-        gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
+        gu, dw = untile(torch.index_select(gu, 0, idx)), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_ = gu.shape[0]
@@ -620,6 +911,108 @@ def sequence(kinds, t, g, R, Q, P, allreduce, moe_mode='all'):
     return x, states
 
 
+def mtp_block(t, g, gm, Q, P, allreduce):
+    """The MTP head on Q entries of one request (qwen35_moe_ref.Mtp): entry i pairs the hidden state of position p_i with the
+    embedding t['e'][i] of the NEXT token. t['x'] [Q, H] is a residual BEFORE its norm t['hnorm']: the main model's final
+    residual with the final norm (the first pass after a decode / verify step; the engine binds that step's buffer), or
+    the previous pass's own output row with mtp.norm (chained drafts): one NEFF serves both by the tensor bound to hnorm.
+    fc is column-parallel (this rank's 2H / TP columns of cat(embedding, hidden), t['fcols']) + all-reduce; the layer is
+    a gqa + moe pair with weights a.* / m.* of geometry gm (the MTP layer's own expert count) and its own paged KV cache
+    t['kv']; t['pos'] / t['lo'] are relative to the first key of t['table'] (a window of the request's pages; RoPE rows
+    use the absolute position). -> (z[sel] [1, H] pre-norm, this rank's logits shard of row sel [1, V / TP], {'kv'})."""
+    h = rms(t['x'], t['hnorm'], g.eps)
+    cat = torch.cat((rms(t['e'], t['en'], g.eps), rms(h, t['hn'], g.eps)), dim=-1)
+    z = allreduce(lin_partial(bf(torch.index_select(cat, 1, t['fcols'])), t, 'fc'))
+    common = {k: t[k] for k in ('pos', 'cos_sin', 'wslot', 'table', 'lo')}
+    sub = lambda pre: {k[len(pre):]: v for k, v in t.items() if k.startswith(pre)}
+    z, st = sublayer('gqa', {**common, **sub('a.'), 'kv': t['kv'], 'x': z}, gm, 1, Q, P, allreduce)
+    z, _ = sublayer('moe', {**sub('m.'), 'x': z}, gm, 1, Q, P, allreduce, 'gather')
+    logits = head({'x': z, 'norm': t['mnorm'], 'w': t['w'], **({'w_s': t['w_s']} if 'w_s' in t else {})}, g, t['sel'])
+    return torch.index_select(z, 0, t['sel']), logits, st
+
+
+def cross_rank_argmax(logits, t, g, allreduce):
+    """In-graph greedy pick over the vocabulary-sharded logits (the draft chain in one launch): this rank's shard row
+    logits [1, V / TP] -> (embedding row [1, H] f32 of the global argmax, its token id [1, 1] f32) on EVERY rank, by two
+    small all-reduces: the ranks' local maxima ([TP], one-hot by rank t['rhot']), then the winner's (embedding row | id)
+    ([H + 1]; the other ranks add zeros). t['vbias'] [V / TP] masks the padded vocabulary rows, t['emb'] [V / TP, H] is
+    this rank's slice of the embedding table, t['rbase'] [1] its first token id. An exact tie between two ranks adds two
+    rows (an invalid id, the host drops such a draft): these are drafts, the verify step decides."""
+    l = torch.where(t['vbias'].reshape(1, -1) < 0, t['vbias'].reshape(1, -1), logits)   # not logits + bias: a padded row may hold anything
+    if MTP_ARGMAX == 'eq':                                                             # no argmax op: the last index reaching the maximum
+        m = torch.amax(l, dim=-1)
+        a = torch.amax(torch.where(l >= m.reshape(1, 1), torch.arange(l.shape[1], dtype=torch.float32, device=l.device).reshape(1, -1),
+                                   torch.zeros_like(l)), dim=-1).long()
+    else:
+        m, a = torch.max(l, dim=-1)
+    M = allreduce(t['rhot'] * m)
+    # this rank wins when its maximum reaches every rank's. On the device `M >= amax(M)` came out true on EVERY rank (the
+    # drafts were the sum of all ranks' picks), so no full reduce-max and, by default, no comparison: clamp arithmetic
+    if MTP_WIN == 'cmp':
+        win = (torch.sum((m.reshape(1) >= M).float()) >= g.TP - 0.5).float().reshape(1, 1)
+    else:
+        win = torch.clamp(torch.sum(torch.clamp((m.reshape(1) - M) * 1e30 + 1.0, 0.0, 1.0)) - (g.TP - 1), 0.0, 1.0).reshape(1, 1)
+    row = torch.index_select(t['emb'], 0, a).float()
+    out = allreduce(torch.cat((row, (a.float() + t['rbase']).reshape(1, 1)), dim=-1) * win)
+    if MTP_CHAIN_DBG:                                                                  # device bisection: the ranks' maxima and this rank's (win, m, a)
+        return out[:, :g.H], torch.cat((out[:, g.H:], M.reshape(1, -1), win, m.reshape(1, 1), a.float().reshape(1, 1)), dim=-1)
+    return out[:, :g.H], out[:, g.H:]
+
+
+def mtp_chain_block(t, g, gm, Q, P, D, allreduce):
+    """D drafts in ONE launch: the first pass of mtp_block over Q entries, then D - 1 chained passes of the same layer on its
+    own output (x <- z[sel] with mtp.norm, e <- the embedding of the previous draft picked in the graph), each writing its
+    entry t['cpos'|'ccos'|'cwslot'][j] into the head's KV cache. -> (drafts [1, D] f32 token ids, {'kv'})."""
+    z, logits, st = mtp_block(t, g, gm, Q, P, allreduce)
+    toks = []
+    zero = torch.zeros(1, dtype=torch.int64, device=z.device)
+    for j in range(D):
+        e, tok = cross_rank_argmax(logits, t, g, allreduce)
+        toks.append(tok if j == 0 or not MTP_CHAIN_DBG else tok[:, :1])
+        if j == D - 1:
+            break
+        tj = dict(t)
+        tj.update(x=z, hnorm=t['mnorm'], e=e, pos=t['cpos'][j:j + 1], cos_sin=t['ccos'][j:j + 1], wslot=t['cwslot'][j:j + 1], sel=zero, kv=st['kv'])
+        z, logits, st = mtp_block(tj, g, gm, 1, P, allreduce)
+    if MTP_CHAIN_DBG:                                                                  # drafts first, then the first pick's debug values
+        return torch.cat([tk[:, :1] for tk in toks] + [toks[0][:, 1:]], dim=-1), st
+    return torch.cat(toks, dim=-1), st
+
+
+def mtp_chain_shapes(g, gm, Q, P, D, fp8=True):
+    step, w = mtp_shapes(g, gm, Q, P, fp8)
+    if D > 1:
+        step.update(cpos=((D - 1,), torch.int64), ccos=((D - 1, 2 * g.rot), torch.float32), cwslot=((D - 1,), torch.int64))
+    VS = g.VP // g.TP
+    w.update(vbias=((VS,), torch.float32), rhot=((g.TP,), torch.float32), rbase=((1,), torch.float32), emb=((VS, g.H), torch.bfloat16))
+    return step, w
+
+
+def mtp_geo(g, experts=None):
+    """Geometry of the MTP layer: the main text geometry with one full-attention layer and the head's own expert count."""
+    raw = dict(g.raw)
+    raw.update(num_hidden_layers=1, layer_types=['full_attention'], num_experts=experts or int(os.environ.get('MTP_EXPERTS', g.E)))
+    return Geo(raw, g.TP)
+
+
+def mtp_shapes(g, gm, Q, P, fp8=True):
+    """(step, weights) name -> (shape, dtype) of the mtp graph for one rank, in input order."""
+    H, f32, i64 = g.H, torch.float32, torch.int64
+    step = {'x': ((Q, H), f32), 'e': ((Q, H), f32), 'pos': ((Q,), i64), 'cos_sin': ((Q, 2 * g.rot), f32), 'wslot': ((Q,), i64),
+            'table': ((1, P), i64), 'lo': ((1,), i64), 'sel': ((1,), i64)}
+    wt = F8 if fp8 else torch.bfloat16
+    w = {'hnorm': ((H,), f32), 'en': ((H,), f32), 'hn': ((H,), f32), 'fcols': ((2 * H // g.TP,), i64), 'fc': ((H, 2 * H // g.TP), wt)}
+    if fp8:
+        w['fc_s'] = ((H,), f32)
+    w.update({'a.' + k: v for k, v in weight_shapes('gqa', gm, fp8).items()})
+    w.update({'m.' + k: v for k, v in weight_shapes('moe', gm, fp8).items()})
+    w['mnorm'] = ((H,), f32)
+    w['w'] = ((g.VP // g.TP, H), wt)
+    if fp8:
+        w['w_s'] = ((g.VP // g.TP,), f32)
+    return step, w
+
+
 def head(t, g, rows):
     x = torch.index_select(t['x'], 0, rows)
     h = bf(rms(x, t['norm'], g.eps))
@@ -655,7 +1048,8 @@ def weight_shapes(kind, g, fp8=True):
             s['rws'] = ((g.E, H // g.TP), f32); s['rcols'] = ((H // g.TP,), torch.int64)
         else:
             s['rw'] = ((g.E, H), f32)
-        s['egu'] = ((g.E, 2 * g.EIl, H), wt); s['ed'] = ((g.E, g.EIl, H), wt)
+        s['egu'] = ((g.E * 128, 2 * g.EIl * H // 128), wt) if EGU_T else ((g.E, 2 * g.EIl, H), wt)
+        s['ed'] = ((g.E, g.EIl, H), wt)
         if fp8:
             s['egu_s'] = ((g.E, 2 * g.EIl), f32); s['ed_c'] = ((g.E, g.EIl), f32)
     return s
@@ -663,8 +1057,11 @@ def weight_shapes(kind, g, fp8=True):
 
 def state_shapes(kind, g, pages, slots):
     if kind == 'gdn':
+        slots = 1 if GDN_SLOT == 'bound' else slots
         return {'kstate': ((slots, g.hl, g.Dk, g.Dv), torch.float32), 'cstate': ((slots, g.W3, g.K - 1), torch.float32)}
     if kind == 'gqa':
+        if KV8:   # fp8 codes + per-(token, K|V, head) f32 scales: 8.25 KiB per page per layer and core instead of 16
+            return {'kv': ((pages, 2, g.kvl, PAGE, g.D), torch.int8 if KV_CODE == 'int8' else F8), 'kvs': ((pages, 2, g.kvl, PAGE), torch.float32)}
         return {'kv': ((pages, 2, g.kvl, PAGE, g.D), torch.float32 if EXACT else torch.bfloat16)}
     return {}
 
@@ -674,8 +1071,11 @@ def step_shapes(kind, R, Q, P, g):
     s = {'x': ((T, g.H), torch.float32)}
     if kind in ('gdn', 'gqa'):
         s['pos'] = ((T,), torch.int64)
-    if kind == 'gdn':
+    if kind == 'gdn' and GDN_SLOT != 'bound':
         s['slot'] = ((R,), torch.int64)
+    if kind == 'gdn' and GDN_SLOT != 'bound':
+        if VERIFY and Q > 1:                                                           # R streams x Q tokens each (R > 1: bench only so far)
+            s['vslot'] = ((R * Q,), torch.int64)
     if kind == 'gqa':
         s['cos_sin'] = ((T, 2 * g.rot), torch.float32); s['wslot'] = ((T,), torch.int64); s['table'] = ((R, P), torch.int64)
     return s
@@ -705,6 +1105,35 @@ def main():
         fn = lambda *a: head(dict(zip(names, a)), g, a[1])
         meta = {'kind': 'qwen35_head', 'T': T, 'S': S, 'inputs': names, 'states': [], 'fp8': fp8}
         kwargs = {}
+    elif kind in ('mtp', 'mtpc'):                                                      # mtpc 1 Q P with MTP_CHAIN=D: D drafts in one launch
+        R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+        D = int(os.environ.get('MTP_CHAIN', '2')) if kind == 'mtpc' else 0
+        gm = mtp_geo(g)
+        step, wsh = mtp_chain_shapes(g, gm, Q, P, D, fp8) if D else mtp_shapes(g, gm, Q, P, fp8)
+        ssh = state_shapes('gqa', gm, pages, slots)
+        names, snames = list(step) + list(wsh), list(ssh)
+        inputs = [zeros(*step[n]) for n in step] + [torch.ones(*wsh[n][0]) if n.endswith('_s') or n.endswith('_c') else zeros(*wsh[n]) for n in wsh]
+
+        class MtpBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer('kv', zeros(*ssh['kv']))
+
+            def forward(self, *a):
+                t = dict(zip(names, a))
+                t['kv'] = self.kv
+                if D:
+                    toks, st = mtp_chain_block(t, g, gm, Q, P, D, allreduce)
+                    self.kv = st['kv']
+                    return toks
+                z, logits, st = mtp_block(t, g, gm, Q, P, allreduce)
+                self.kv = st['kv']
+                return z, logits
+        fn = MtpBlock()
+        kwargs = {'enable_aliasing': True}
+        meta = {'kind': 'qwen35_' + kind, 'seg': [], 'R': 1, 'Q': Q, 'P': P, 'D': D, 'pages': pages, 'slots': slots, 'inputs': names, 'states': snames, 'fp8': fp8,
+                'outputs': ['drafts'] if D else ['z', 'logits'], 'mtp_experts': gm.E, 'moe_slots': MOE_SLOTS, 'router': ROUTER, 'route': ROUTE, 'row_form': ROW_FORM,
+                'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'lin_cse': LIN_CSE}
     else:
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
         seg = kind.split('_')[1:] if kind.startswith('seg_') else None       # seg_gdn_gdn_gdn_gqa: consecutive whole layers in one NEFF
@@ -721,13 +1150,25 @@ def main():
                 step.update(step_shapes(a_kind, R, Q, P, g))
                 wsh.update({f'l{i}.a.{k}': v for k, v in weight_shapes(a_kind, g, fp8).items()})
                 wsh.update({f'l{i}.m.{k}': v for k, v in weight_shapes('moe', g, fp8).items()})
-                ssh.update({f'l{i}.{k}': v for k, v in state_shapes(a_kind, g, pages, slots).items()})
+                if a_kind == 'gdn' and GDN_SLOT == 'bound' and R > 1:   # one state pair per row, as in the bound gdn sub-block
+                    ssh.update({f'l{i}.{k}_{r}': v for r in range(R) for k, v in state_shapes(a_kind, g, pages, slots).items()})
+                else:
+                    ssh.update({f'l{i}.{k}': v for k, v in state_shapes(a_kind, g, pages, slots).items()})
         else:
             for i, part in enumerate(parts):
                 step.update(step_shapes(part, R, Q, P, g))
                 pre = ('a.', 'm.')[i] if len(parts) > 1 else ''
                 wsh.update({pre + k: v for k, v in weight_shapes(part, g, fp8).items()})
             ssh = state_shapes(parts[0], g, pages, slots)
+        xnames = []   # GDN_SLOT=bound verify: extra (non-aliased) state outputs after x
+        if kind == 'gdn' and GDN_SLOT == 'bound':
+            if R > 1:
+                ssh = {f'{k}_{r}': v for r in range(R) for k, v in ssh.items()}
+            if VERIFY and Q > 1:
+                xnames = [f'{k}@{i}' for i in range(1, Q) for k in ('kstate', 'cstate')]
+        elif seg and GDN_SLOT == 'bound' and VERIFY and Q > 1:   # bound verify segment (R = 1): per-position states of every gdn layer
+            assert R == 1, 'GDN_SLOT=bound verify segments: one row'
+            xnames = [f'l{j}.{k}@{i}' for j, a_kind in enumerate(seg) if a_kind == 'gdn' for i in range(1, Q) for k in ('kstate', 'cstate')]
         names = list(step) + list(wsh)
         snames = list(ssh)
         inputs = [zeros(*step[n]) for n in step] + [zeros(*wsh[n]) for n in wsh]
@@ -758,11 +1199,12 @@ def main():
                     x, _ = sublayer(parts[1], {**common, **sub('m.'), 'x': x}, g, R, Q, P, allreduce, moe_mode)
                 for n_ in snames:
                     setattr(self, n_.replace('.', '_'), st[n_])   # mutated buffers: aliased input -> output (in place on the device)
-                return x
+                return (x, *[st[n_] for n_ in xnames]) if xnames else x
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'gdn_form': GDN_FORM, 'row_form': ROW_FORM, 'moe_split': MOE_SPLIT, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'att_bf16': ATT_BF16, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'gdn_form': GDN_FORM, 'row_form': ROW_FORM, 'moe_split': MOE_SPLIT, 'moe_kernel': MOE_KERNEL, 'moe_kstat': MOE_KSTAT, 'moe_kskip': MOE_KSKIP, 'moe_kyd': MOE_KYD, 'moe_kdense': MOE_KDENSE, 'moe_kfast': MOE_KFAST, 'moe_kpre': MOE_KPRE, 'egu_t': EGU_T, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'gdn_inv': GDN_INV, 'gdn_loop': GDN_LOOP, 'rlogit': RLOGIT, 'att_bf16': ATT_BF16, 'kv8': KV8, 'kv_code': KV_CODE, 'att_block': ATT_BLOCK, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM, 'gdn_slot': GDN_SLOT, 'extra_outputs': xnames,
+                'verify': bool(VERIFY and Q > 1)}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

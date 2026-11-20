@@ -115,6 +115,81 @@ def shard_head(get, rank, g, fp8=True):
     return out
 
 
+class MtpGetter:
+    """Getter over the `mtp.*` tensors (a glm_repack.Checkpoint or a dict): the MTP layer appears as layer 0 of a one-layer
+    full-attention model, its per-expert tensors (experts.<e>.{gate,up,down}_proj.weight) as the fused expert tensors."""
+
+    def __init__(self, source):
+        self.src, self.cache = source, None
+        self.E = self('layers.0.mlp.gate.weight').shape[0]
+
+    def one(self, full):
+        if isinstance(self.src, dict):
+            return self.src[full].float()
+        if full.endswith('.weight') and self.src.has(full[:-7] + '.weight_scale_inv'):  # HF block-fp8 (Ornith v3 head)
+            return self.src.linear(full[:-7])
+        return self.src.tensor(full)
+
+    def __call__(self, name):
+        if self.cache is not None and name in self.cache:
+            return self.cache[name]
+        if name.endswith('experts.gate_up_proj') or name.endswith('experts.down_proj'):
+            t = self.chunk(name, 0, self.E)
+        else:
+            t = self.one('mtp.' + name)
+        if self.cache is not None:
+            self.cache[name] = t
+        return t
+
+    def chunk(self, name, e0, e1):
+        base = 'mtp.' + name[:name.rindex('.')]
+        has = (base + '.gate_up_proj') in self.src if isinstance(self.src, dict) else self.src.has(base + '.gate_up_proj')
+        if has:
+            return self.one('mtp.' + name)[e0:e1]
+        if name.endswith('gate_up_proj'):
+            return torch.stack([torch.cat((self.one(f'{base}.{e}.gate_proj.weight'), self.one(f'{base}.{e}.up_proj.weight'))) for e in range(e0, e1)])
+        return torch.stack([self.one(f'{base}.{e}.down_proj.weight') for e in range(e0, e1)])
+
+
+def pack_mtp(get, g, fp8=True):
+    """-> (gm, [rank] dicts) of the MTP head: attn.* / mlp.* of its layer (shard_layer's names; pack_layer quantises the
+    experts once), fc [H, 2H / TP] column-parallel with a per-output-row scale + this rank's columns fcols, the pre-fc
+    norms en / hn and the head norm `norm`, all (1 + w). Names / shapes = qwen35_graphs.mtp_shapes."""
+    gm = Q.mtp_geo(g, get.E)
+    ranks = pack_layer(get, 0, gm, fp8)
+    fc = get('fc.weight').float()                                                       # [H, 2H]
+    if fp8:
+        codes, scale = RP.to_fp8_rows(fc)
+    n = 2 * g.H // g.TP
+    for r in range(g.TP):
+        t = ranks[r]
+        if fp8:
+            t['fc'], t['fc_s'] = codes[:, r * n:(r + 1) * n].contiguous(), scale
+        else:
+            t['fc'] = store(fc[:, r * n:(r + 1) * n].contiguous())
+        t['fcols'] = torch.arange(r * n, (r + 1) * n, dtype=torch.int64)
+        t['en'] = 1.0 + get('pre_fc_norm_embedding.weight').float()
+        t['hn'] = 1.0 + get('pre_fc_norm_hidden.weight').float()
+        t['norm'] = 1.0 + get('norm.weight').float()
+    return gm, ranks
+
+
+def main_mtp(a):
+    """qwen35_prepare.py MTP_SOURCE OUT --mtp --tp N: OUT/mtp.json + OUT/r<rank>/mtp.bin (a namespace of its own: the main
+    prepared set is not touched; the engine loads it from BEHEMOTH_NEURON_MTP_DIR)."""
+    cfg = json.loads((Path(a.model) / 'config.json').read_text())
+    g = Q.Geo(cfg, a.tp)
+    get = MtpGetter(RP.Checkpoint(a.model))
+    t0 = time.time()
+    gm, ranks = pack_mtp(get, g, a.weights == 'fp8')
+    out = Path(a.out)
+    files = {f'r{r}/mtp.bin': RP.write_file(out / f'r{r}/mtp.bin', t) for r, t in enumerate(ranks)}
+    man = {'format': 'qwen35-mtp-neuron-prepared', 'version': 1, 'geometry': gm.meta(), 'main_experts': g.E, 'weights': a.weights, 'files': files,
+           'source': str(Path(a.model).resolve())}
+    (out / 'mtp.json').write_text(json.dumps(man))
+    print(f'wrote {out}: MTP layer with {gm.E} experts, TP {a.tp}, {sum(e["bytes"] for e in files["r0/mtp.bin"]) / 2**20:.1f} MiB per rank, {time.time() - t0:.0f}s')
+
+
 class Getter:
     """HF name (without the model prefix; 'lm_head.weight' as is) -> f32 tensor, from a glm_repack.Checkpoint or a dict."""
 
@@ -131,16 +206,27 @@ class Getter:
         if self.cache is not None and name in self.cache:
             return self.cache[name]
         full = name if name.startswith('lm_head') else self.prefix + name
-        t = self.src[full].float() if isinstance(self.src, dict) else self.src.tensor(full)
+        t = self.src[full].float() if isinstance(self.src, dict) else self.dense(full)
         if self.cache is not None:
             self.cache[name] = t
         return t
+
+    def dense(self, full):
+        """f32 of a stored tensor; an HF block-fp8 weight (`.weight` + `.weight_scale_inv`) is dequantised first."""
+        if full.endswith('.weight') and self.src.has(full[:-7] + '.weight_scale_inv'):
+            return self.src.linear(full[:-7])
+        return self.src.tensor(full)
 
     def chunk(self, name, e0, e1):
         """f32 [e1 - e0, ...] of a 3-D expert tensor without materialising the whole tensor (13 GB bf16 per layer at E = 512)."""
         full = self.prefix + name
         if isinstance(self.src, dict):
             return self.src[full][e0:e1].float()
+        if not self.src.has(full):                                                     # per-expert checkpoint (experts.<e>.{gate,up,down}_proj.weight, maybe block-fp8)
+            base = full[:full.rindex('.')]
+            if name.endswith('gate_up_proj'):
+                return torch.stack([torch.cat((self.dense(f'{base}.{e}.gate_proj.weight'), self.dense(f'{base}.{e}.up_proj.weight'))) for e in range(e0, e1)])
+            return torch.stack([self.dense(f'{base}.{e}.down_proj.weight') for e in range(e0, e1)])
         dtype, shape, arr = self.src.raw(full)
         per = 1
         for d in shape[1:]:
@@ -236,7 +322,10 @@ def main():
     ap.add_argument('--threads', type=int, default=8, help='torch threads per worker')
     ap.add_argument('--only', default='', help='comma-separated layers (partial run for validation; no prepared.json)')
     ap.add_argument('--layers', type=int, default=None, help='keep only the first N layers (reduced-size validation)')
+    ap.add_argument('--mtp', action='store_true', help='MODEL holds the mtp.* tensors (qwen35_fetch_mtp.py output or a full checkpoint): write the MTP head set')
     a = ap.parse_args()
+    if a.mtp:
+        return main_mtp(a)
     cfg = json.loads((Path(a.model) / 'config.json').read_text())
     if a.layers:
         cfg = truncate_config(cfg, a.layers)
