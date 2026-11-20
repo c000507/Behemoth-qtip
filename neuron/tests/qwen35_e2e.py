@@ -6,7 +6,8 @@ writes run_<i>.json ({"prompt": ids, "generated": ids}) for test_qwen35_oracle.p
 usage: BEHEMOTH_NEURON_NEFF_DIR=GRAPHS python neuron/tests/qwen35_e2e.py PREPARED_DIR CLI_BINARY OUT_DIR [max_new] [prompt...]
   env: CONCURRENT=n (the same prompt n times in one submission; SEQUENTIAL=1: one after the other in the same engine
        process - the run-to-run reproducibility test without reloading the weights), THINK=0 (template with enable_thinking=false), FILL=n
-       (prepend ~n tokens of filler text to the prompt: long-context timing)
+       (prepend ~n tokens of filler text to the prompt: long-context timing), NEEDLE=sentence NEEDLE_AT=f (bury the sentence at
+       fraction f of the filler: retrieval check)
 """
 import json
 import os
@@ -66,7 +67,13 @@ def main():
         if fill:
             words = ('The history of computing spans mechanical calculators, electromechanical relays, vacuum tubes, transistors and integrated circuits. ' * (fill // 20 + 1))
             fill_ids = tok.encode(words, add_special_tokens=False)[:fill]
-            p = tok.decode(fill_ids) + '\n\nAfter that long preamble, here is the question: ' + p
+            needle = os.environ.get('NEEDLE', '')   # long-context retrieval: this sentence buried at fraction NEEDLE_AT of the filler
+            if needle:
+                cut = tok.decode(fill_ids[:int(len(fill_ids) * float(os.environ.get('NEEDLE_AT', '0.1')))])
+                cut = cut[:cut.rfind('. ') + 2] if '. ' in cut else cut
+                p = cut + needle + ' ' + tok.decode(fill_ids)[len(cut):] + '\n\nAfter that long preamble, here is the question: ' + p
+            else:
+                p = tok.decode(fill_ids) + '\n\nAfter that long preamble, here is the question: ' + p
         text = tok.apply_chat_template([{'role': 'user', 'content': p}], tokenize=False, add_generation_prompt=True, enable_thinking=think)
         ids = tok.encode(text, add_special_tokens=False)
         for _ in range(conc):

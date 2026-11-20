@@ -92,6 +92,10 @@ def check(d, meta, kind, parts, g, shards, neff_io):
             for k in [k for k in w if k == 'rw' or k.endswith('.rw')]:
                 rw = w.pop(k)
                 w[k + 's'], w[k[:-2] + 'rcols'] = rw[:, cols].contiguous(), cols
+        if meta.get('egu_t'):   # EGU_T graphs: the engine re-lays the experts out at load (nki_moe.relayout_egu)
+            import nki_moe
+            for k in [k for k in w if k == 'egu' or k.endswith('.egu')]:
+                w[k] = torch.from_numpy(nki_moe.relayout_egu(w[k].view(torch.uint8).numpy())).view(w[k].dtype)
         per_rank.append({**step, **w, **{k: v.clone() for k, v in states.items()}})
     ar, ref = ThreadAllReduce(g.TP), [None] * g.TP
     moe_mode = meta.get('moe', 'all')
