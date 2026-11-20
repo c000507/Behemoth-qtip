@@ -160,11 +160,20 @@ product used by the CPU references of both the trainer and the runtime.
   packed words (64 weights, one 16-byte load) and four 16-byte int8 activation vectors per step
   with sixteen `__dp4a` into an int32 accumulator (`in % 64 != 0` falls back to one word per
   step); warp reduction; `y = bf16((acc - sum) * s * xs)`.
-- Prefill: `ternary_gemv<TOK>` stages up to eight tokens' int8 activations per block so every packed
-  word is read once per eight tokens; `Impl::prefill` runs the seven projections of 32-token chunks
-  through it (norms, RoPE and attention remain per-token kernels, as in the stepwise engine). The
-  QTIP path keeps the one-token-at-a-time prefill. A native int8 tensor-core GEMM is not
-  implemented (see *Limitations*).
+- Prefill (`runtime/cuda/prefill.{hpp,cu}`, `Impl::prefill`): ternary and dense checkpoints run
+  whole 512-token chunks (`BEHEMOTH_CUDA_PREFILL_CHUNK`, `0` = token by token). Per layer and
+  chunk: row-batched RMSNorm/SubLN; the seven projections as tensor-core GEMMs over all rows
+  (cuBLAS `int8 x int8 -> int32` for ternary - the packed matrix is unpacked to int8 `{-1,0,1}` by
+  one launch into a scratch buffer, the activations are quantised once per distinct input - and
+  `bf16 x bf16 -> fp32` for dense); the unrounded products are consumed by fused BF16-round +
+  RoPE / residual / SwiGLU / KV-cache-write kernels; causal attention is a scores GEMM
+  (`K^T Q` per KV head, strided batched, queries regrouped by KV head), a masked softmax that
+  rounds the probabilities to BF16, and a values GEMM. All rounding points of `step()` are kept
+  and the integer ternary products are bit-identical to the `dp4a` kernel; only the fp32 summation
+  order of the dense and attention GEMMs differs. The `dp4a` kernels (`ternary_gemv_fused`, and the
+  multi-token `ternary_gemv<TOK>` that stages up to eight tokens per block) remain the decode
+  path. A throwaway chunk at load time pulls in the lazily loaded cuBLAS kernels. GPUs without
+  cuBLAS bf16/int8 GEMMs (probed at load) and the QTIP path prefill one token at a time.
 - The OpenAI-compatible server (`behemoth_cuda_server`) and CLI (`behemoth_cuda`, new `--raw TEXT`
   for base models without a chat template) select the format from `config.json` automatically.
 
@@ -230,7 +239,12 @@ and test splits held out). Hardware: one RTX A4000 (16 GB, sm_86), CUDA 12.0.
   28672x12288) and the scaled bf16 outputs are bit-exact.
 - Runtime end to end: synthetic 3-layer ternary checkpoints (SubLN + tied head; no SubLN + untied
   head) and a dense BF16 checkpoint vs the CPU reference: worst relative L2 `6.9e-8`; batched
-  prefill reproduces the stepwise logits.
+  prefill reproduces the stepwise logits, also when split into 5-token and 1-token chunks.
+- Prefill operators (`behemoth_cuda_tests`): the int8 GEMM products equal the CPU reference
+  exactly and the scaled BF16 outputs bit for bit (shapes up to 2560x960 x300 tokens and
+  1024x8192); row-batched norm and RoPE (plain and llama3 table) equal the stepwise kernels bit
+  for bit; the dense GEMM and the causal attention (cache rows before the chunk, several
+  score passes) agree with the stepwise kernels to BF16 rounding (relative L2 `<= 3e-6`).
 
 ### Trainer forward vs HF transformers
 
@@ -297,16 +311,67 @@ reference of the same math on 12 random tokens (`behemoth_cuda_llama_tests --che
 mean KL 0.039 nats, argmax 12/12, relative L2 3.5-40% per token. These few-percent L2 gaps are
 the reduction-order sensitivity of a 32-layer int8/ternary network (3-layer synthetic models agree
 to 1e-7 and the trainer's own backward is equally sensitive, see above); the distribution-level
-distance is small. The batched prefill reproduces the stepwise CUDA logits exactly (relative L2
-0) on the real model.
+distance is small.
+
+**Batched prefill vs stepwise** (`behemoth_cuda_prefill_bench`, wikitext test tokens, logits of
+the last prompt token, then 16 greedy decode steps on the cache written by the prefill):
+
+| checkpoint | tokens | relative L2 | KL(stepwise \|\| prefill) | argmax | following 16 steps: worst rel. L2 / worst KL / argmax |
+|---|---|---|---|---|---|
+| BF16 | 8 | 1.1% | 4.8e-4 | equal | 2.9% / 6.5e-4 / 15 of 16 |
+| BF16 | 64 | 1.9% | 2.0e-5 | equal | 3.3% / 8.2e-3 / 16 of 16 |
+| BF16 | 512 | 0.71% | 3.1e-4 | equal | 2.0% / 1.7e-3 / 16 of 16 |
+| BF16 | 2048 | 0.75% | 3.8e-4 | equal | 2.7% / 7.1e-4 / 16 of 16 |
+| ternary | 8 | 0 | 0 | equal | 0 / 0 / 16 of 16 |
+| ternary | 64 | 2.2% | 4.3e-3 | equal | 4.8% / 1.1e-2 / 16 of 16 |
+| ternary | 512 | 1.9% | 3.3e-3 | equal | 6.2% / 1.0e-2 / 14 of 16 |
+| ternary | 2048 | 2.6% | 1.3e-2 | equal | 8.7% / 1.1e-2 / 15 of 16 |
+
+The prefill is not bit-identical to the stepwise path once the fp32 summation order matters: the
+dense GEMM and, for longer contexts, the attention GEMMs occasionally round an output to the
+neighbouring BF16 value (operator-level unit tests: relative L2 0 to 3e-6), and 32 layers amplify that to
+the same few-percent level as every other reduction-order change measured above (trainer vs
+runtime 3.8% / 0.0042 nats; stepwise vs CPU reference 0.039 nats). Short ternary prompts are
+bit-identical because all their sums are exact. Against the double-precision CPU reference the
+prefill is as close as the stepwise path (BF16, 12 random tokens: KL 2.4e-4 vs 2.5e-4 nats). A few
+of the following greedy steps pick a different token (4 of 128 above); those positions were not
+examined further.
 
 **Speed (idle RTX A4000, CUDA 12.0, single sequence, `behemoth_cuda`, greedy 128 tokens after a
 9-token prompt; median of 3):**
 
-| checkpoint | weights read per token | decode | 512-token prefill |
-|---|---|---|---|
-| SmolLM2-360M BF16 (`Quantization::Dense`) | 630 MB blocks + 94 MB head | 145-150 tok/s | 2.47 s (one token at a time) |
-| SmolLM2-360M ternary export | 79 MB blocks + 94 MB head | **259-263 tok/s** (1.76x) | **0.65 s** (batched, 3.8x) |
+| checkpoint | weights read per token | decode | 512-token prefill | 2048-token prefill |
+|---|---|---|---|---|
+| SmolLM2-360M BF16 (`Quantization::Dense`) | 630 MB blocks + 94 MB head | 150 tok/s | **17.5 ms** (29 k tok/s; was 2.44 s) | **93 ms** (22 k tok/s; was 11.2 s) |
+| SmolLM2-360M ternary export | 79 MB blocks + 94 MB head | **267-275 tok/s** (1.8x) | **17.9 ms** (was 0.64 s) | **95 ms** (was 4.1 s) |
+
+Decode is unchanged by the prefill work (BF16 150 -> 151 tok/s, ternary 267 -> 275 tok/s after a
+9-token prompt; 135 -> 134 and 225 -> 222 tok/s at 512 tokens of context, 99 -> 98 and 140 -> 139
+at 2048).
+
+**Where the old prefill time went** (512 tokens, `nsys --trace=cuda`; `ncu` counters are not
+accessible without root on this machine, bandwidth and FLOP/s are derived from kernel durations):
+
+| | BF16, 2.44 s | ternary, 0.64 s |
+|---|---|---|
+| kernel launches | 215 042 | 140 290 |
+| projections | 2013 ms (81%): 114 689 per-token GEMVs re-reading all 627 MB of weights for every token, 321 GB at 160 GB/s, 0.18 TFLOP/s | 121 ms (17%) + 11 ms quantiser: 32-token `dp4a` chunks, ~3 TFLOP/s equivalent |
+| attention (scores, softmax, values per token) | 216 ms (9%) | 218 ms (31%) |
+| RMSNorm/SubLN (one 256-thread block per token) | 90 ms (4%) | 223 ms (32%) |
+| RoPE, residual, SwiGLU, embedding | 29 ms | 29 ms |
+| GPU idle between launches | ~150 ms (6%) | ~100 ms (14%) |
+
+The host was never the bottleneck: one sync and one 196 KB read-back per prefill, and
+`cudaLaunchKernel` blocked on a full launch queue (5-12 ms from launch to start). The GPU spent
+the whole time in ~10^5 tiny kernels, none of which used tensor cores.
+
+**Where the new prefill time goes** (512 tokens, 17.6 ms of kernel time, ~4.9 k launches for BF16):
+projection GEMMs 8.4 ms (0.37 TFLOP at ~44 TFLOP/s; cuBLAS reaches 46-51 TFLOP/s on the gate/up
+shape and 30 on 960x960), attention 6 ms (scores GEMM 1.4, softmax 3.4, values GEMM 1.0), fused
+element-wise kernels and norms 3.5 ms. The ternary path replaces the bf16 GEMMs by int8 GEMMs of the same
+cost plus 1 ms of unpacking and 1.4 ms of activation quantisation. At 2048 tokens (92 ms)
+projections take 35 ms and attention 42 ms (softmax 20, scores 14, values 8): the materialised
+`[heads, queries, keys]` scores are memory-bound.
 
 Projection kernels (`behemoth_cuda_ternary_bench`, GPU event time, median of 5 x 100 calls):
 
@@ -333,8 +398,8 @@ therefore 46 GB/s (ternary) vs 108 GB/s (bf16): both runs are dominated by ~400 
 and a host sync per token, which CUDA graphs would remove (see *Limitations*). The multi-token
 kernel reads each packed word once per eight tokens and gives a 10x per-token advantage over the
 per-token bf16 gemv at small shapes; at large shapes it is `dp4a`-throughput bound (241 µs/token
-for 28672x12288 at 8 tokens vs 383 µs for one), which is where an int8 tensor-core GEMM would be
-needed.
+for 28672x12288 at 8 tokens vs 383 µs for one), which is where an int8 tensor-core GEMM is
+needed (the prefill now uses one, see above).
 
 ## Limitations and open questions
 
@@ -351,9 +416,15 @@ needed.
   reference both differ by a few percent relative L2 on the real 32-layer model while
   3-layer synthetic models agree to `1e-7`. Argmax agreement is what to look at for greedy
   decoding; a bit-exact chain would require identical reduction orders in both implementations.
-- **Prefill GEMM.** The multi-token kernel reuses each weight word for eight tokens but is still a
-  `dp4a` GEMV family, not an int8 tensor-core GEMM (`mma.sync.m16n8k32.s8`), which would be the
-  right kernel for long prompts. Norms, RoPE and attention stay per token in the stepwise engine.
+- **Prefill.** The whole-chunk prefill uses cuBLAS for every GEMM. Remaining costs: attention
+  materialises fp32 scores and BF16 probabilities per chunk (memory-bound, the largest item at
+  2048 tokens; a flash-style kernel that keeps the softmax in registers would remove it), the
+  ternary matrices are unpacked to int8 for every chunk (1 ms of 18; a kernel that unpacks tiles in
+  shared memory in front of `mma.sync.m16n8k32.s8` would avoid the scratch matrix, which is
+  `in * out` bytes and matters at Behemoth sizes), and cuBLAS picks a slower generic kernel for
+  the 960x960 shapes. The prefill is single-sequence; batching across sequences is only
+  implemented in the QTIP fast path. The QTIP path itself still prefills one token at a time
+  without `BEHEMOTH_CUDA_FAST`.
 - **Decode of a 360 M model is launch-bound**, not bandwidth-bound: the packed matrices are
   0.2-0.6 MB each, so per-kernel latency (~5-10 µs) dominates and the ternary kernel's measured
   bandwidth is far below the A4000's 448 GB/s. CUDA graphs (as in the Behemoth fast path) would

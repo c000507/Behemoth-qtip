@@ -9,7 +9,7 @@ checkpoint's `config.json`:
 | Behemoth adaptive mixed-format (`qtip_quant --mode adaptive`) | same geometry; per-layer QTIP or NVFP4 (E2M1 + E4M3 block scales) projections, selected per linear from the checkpoint tensors |
 | Llama 3.3 70B Instruct QTIP (`qtip_quant` output) | 80 layers, hidden 8192, GQA 64/8, `head_dim` 128, FFN 28672, vocab 128256, rope_theta 5e5 with `llama3` rope_scaling, byte-level BPE tokenizer, stop on the `generation_config.json` eos list (`<|end_of_text|>`, `<|eot_id|>`, ...); single sequence, one GPU (no TP2/batching) |
 | `glm5_next` / `glm5_next_text` | Original 320B MoE or custom dense config, KDA, NoPE sparse MLA, mHC, FP8/BF16 and NVFP4 MLPs |
-| BitNet b1.58 ternary llama (`bitnet_train --export`, `quantization_config.quant_method == "bitnet"`) and plain BF16 llama checkpoints | any llama-layout geometry with dimensions divisible by 16, tied or untied head, SubLN; packed 2-bit weights with int8 activations (dp4a GEMV) or dense bf16 projections; single sequence, one GPU. See [docs/BITNET.md](../../docs/BITNET.md) |
+| BitNet b1.58 ternary llama (`bitnet_train --export`, `quantization_config.quant_method == "bitnet"`) and plain BF16 llama checkpoints | any llama-layout geometry with dimensions divisible by 16, tied or untied head, SubLN; packed 2-bit weights with int8 activations (dp4a GEMV for decode, int8 tensor-core GEMM for prefill) or dense bf16 projections (bf16 GEMM prefill); single sequence, one GPU. See [docs/BITNET.md](../../docs/BITNET.md) |
 
 The Llama/Mistral QTIP profile reads its geometry from `config.json` (Behemoth, Llama 3.3 70B or any
 llama-layout shape whose dimensions are `2^p`, `12*2^p` or `28*2^p` multiples of 32 with `2^p <= 8192`),
@@ -45,6 +45,17 @@ Use architecture `75` for RTX 2080 Ti / Turing. CUDA 12.4 was used for the A100
 execution checks. CUDA 12.9 also compiles the QTIP kernels for sm_75. The kernels
 use integer BF16 storage and FP32 arithmetic, without requiring BF16 or FP8
 tensor-core instructions. Configure ROCm and CUDA in separate build directories.
+
+cuBLAS (part of the CUDA toolkit) is linked by the base build: ternary and dense BF16
+llama checkpoints prefill whole 512-token chunks through bf16/int8 tensor-core GEMMs
+(`cuda/prefill.cu`). On an RTX A4000 a 512-token prompt of SmolLM2-360M takes 17.5 ms
+(BF16; 2.44 s token by token) and 17.9 ms (ternary; 0.64 s before), 2048 tokens 93 / 95 ms;
+logits agree with the stepwise path to BF16 rounding noise (KL 3e-4 nats BF16, 3e-3 to
+1.3e-2 nats ternary, same argmax). `BEHEMOTH_CUDA_PREFILL_CHUNK` sets the chunk size
+(`0` replays tokens through the decode path); GPUs whose cuBLAS lacks the bf16 or int8
+GEMM fall back to that automatically. `behemoth_cuda_prefill_bench --model DIR --tokens
+TOKENS.json --lengths 512,2048` times the prefill and compares it with the stepwise path.
+Details and the profile are in [docs/BITNET.md](../../docs/BITNET.md).
 
 The optional Ampere fast backend adds NCCL TP2, batched decode, cuBLAS prefill,
 and cuDNN causal GQA. For two RTX A6000s, configure with:

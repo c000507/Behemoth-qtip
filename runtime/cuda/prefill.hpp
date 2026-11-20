@@ -25,6 +25,9 @@ class PrefillOps {
     };
     explicit PrefillOps(Stream); // the stream's device must be current
     ~PrefillOps();
+    // Whether cuBLAS on this device runs the bf16 -> fp32 and int8 -> int32 GEMMs (probed once with
+    // tiny operands; BF16 tensor cores need sm_80+). Callers fall back to the stepwise path otherwise.
+    bool supported() const;
     // RMSNorm of every row (the arithmetic of glm53::gpu::norm); in place is allowed.
     void norm(const B16 *x, const float *gain, B16 *y, int rows, int width, float epsilon);
     // Per-row int8 absmax quantisation of the input of the following ternary() calls.

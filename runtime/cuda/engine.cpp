@@ -215,7 +215,7 @@ int qtip_splits(int tp) {
 struct Model::Impl {
     Checkpoint checkpoint;
     int device, context, position = 0;
-    int prefill_chunk = 512; // tokens per batched prefill pass (BEHEMOTH_CUDA_PREFILL_CHUNK)
+    int prefill_chunk = 512; // tokens per batched prefill pass (BEHEMOTH_CUDA_PREFILL_CHUNK, 0 = stepwise)
     Stream stream{};
     std::unique_ptr<PeerContext> peer;
     bool failed = false;
@@ -296,11 +296,17 @@ struct Model::Impl {
             initialize_tables();
             if (checkpoint.config.quantization != Quantization::Qtip) {
                 ops = std::make_unique<PrefillOps>(stream);
+                if (!ops->supported()) {
+                    std::cerr << "cuBLAS bf16/int8 GEMM unavailable on this GPU: prefill runs token by token\n";
+                    ops.reset();
+                }
                 if (const char *value = std::getenv("BEHEMOTH_CUDA_PREFILL_CHUNK")) {
                     const char *end = value + std::char_traits<char>::length(value);
                     auto result = std::from_chars(value, end, prefill_chunk);
-                    check(result.ec == std::errc{} && result.ptr == end && prefill_chunk >= 1,
-                          "BEHEMOTH_CUDA_PREFILL_CHUNK must be a positive integer");
+                    check(result.ec == std::errc{} && result.ptr == end && prefill_chunk >= 0,
+                          "BEHEMOTH_CUDA_PREFILL_CHUNK must be a nonnegative integer");
+                    if (!prefill_chunk) // 0: token-by-token prefill through step()
+                        ops.reset();
                 }
             }
             dense("model.embed_tokens.weight", embeddings);
@@ -339,6 +345,19 @@ struct Model::Impl {
             // at every new sequence length (cudaFree synchronizes the device).
             scores.ensure(size_t(q_heads) * ctx, stream);
             readback.ensure(vocab);
+            if (ops) {
+                // One throwaway chunk: loads the cuBLAS/prefill kernels (CUDA loads modules lazily, ~50 ms
+                // on the first prompt otherwise) and sizes the chunk buffers. The cache rows it writes
+                // are overwritten by the first real sequence.
+                try {
+                    (void)prefill(std::vector<int>(size_t(std::min(prefill_chunk, ctx)), 0));
+                } catch (const std::exception &e) {
+                    std::cerr << "CUDA prefill warm-up failed: " << e.what() << '\n';
+                }
+                checked(sync(stream), "finish CUDA prefill warm-up");
+                position = 0;
+                failed = false;
+            }
             size_t free = 0, total = 0;
             checked(cudaMemGetInfo(&free, &total), "CUDA memory info");
             std::cerr << "CUDA QTIP ready: " << double(total - free) / (1ull << 30) << " GiB used, context "
@@ -367,7 +386,7 @@ struct Model::Impl {
             (void)stream_destroy(stream);
         }
     }
-    bool batched_prefill() const { return layers.empty() || layers[0].linear[0].batched(); }
+    bool batched_prefill() const { return ops && (layers.empty() || layers[0].linear[0].batched()); }
     // Whole-chunk prefill for ternary/dense checkpoints (see prefill.hpp): per layer and chunk seven
     // tensor-core GEMMs, one causal attention pass and a handful of elementwise launches, independent
     // of the token count. Rounding points are those of step(); fp32 summation order differs.

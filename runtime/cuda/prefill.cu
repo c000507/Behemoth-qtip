@@ -14,7 +14,11 @@ __device__ __forceinline__ B16 b16(float x) {
     unsigned u = __float_as_uint(x);
     return B16((u + 0x7fffU + ((u >> 16) & 1)) >> 16);
 }
-__device__ __forceinline__ float sigmoid(float x) { return x >= 0 ? 1 / (1 + expf(-x)) : expf(x) / (1 + expf(x)); }
+// glm53 sigmoid (x >= 0 ? 1 / (1 + exp(-x)) : exp(x) / (1 + exp(x))) with its one distinct exponential
+__device__ __forceinline__ float sigmoid(float x) {
+    const float e = expf(-fabsf(x));
+    return x >= 0 ? 1 / (1 + e) : e / (1 + e);
+}
 // the projection output as the stepwise path sees it: rounded to BF16
 __device__ __forceinline__ float value(const Product &p, int row, size_t i) {
     if (p.meta)
@@ -102,19 +106,33 @@ __global__ void rope_product(Product p, B16 *out, int rows, int position, int he
     out[dst + half] = b16(b * c + a * s);
 }
 // One block per (kv head, query, group member) row of fp32 scores [columns]; the query at cache row
-// first + q sees keys 0..first + q. Same arithmetic as the stepwise softmax; probabilities are
-// rounded to BF16 and the masked tail is zero.
+// first + q sees keys 0..first + q. Same arithmetic and reduction order as the stepwise softmax;
+// probabilities are rounded to BF16 and the masked tail is zero. Each thread keeps its (at most
+// Slots) scores in registers, so the scores are read once and only the probabilities are written;
+// Slots == 0 is the unbounded variant that exponentiates in place.
+template <int Slots>
 __global__ void causal_softmax(float *scores, B16 *probabilities, int columns, int queries, int group, int first,
                                float scale) {
     __shared__ float red[256];
     const int tid = threadIdx.x, n = first + int(blockIdx.x / group % queries) + 1;
     float *x = scores + size_t(blockIdx.x) * columns;
     B16 *p = probabilities + size_t(blockIdx.x) * columns;
+    float held[Slots ? Slots : 1];
     float top = -INFINITY;
-    for (int i = tid; i < n; i += 256) {
-        x[i] *= scale;
-        top = fmaxf(top, x[i]);
-    }
+    if (Slots) {
+#pragma unroll
+        for (int j = 0; j < Slots; ++j) {
+            const int i = tid + j * 256;
+            if (i < n) {
+                held[j] = x[i] * scale;
+                top = fmaxf(top, held[j]);
+            }
+        }
+    } else
+        for (int i = tid; i < n; i += 256) {
+            x[i] *= scale;
+            top = fmaxf(top, x[i]);
+        }
     red[tid] = top;
     __syncthreads();
     for (int d = 128; d; d /= 2) {
@@ -125,11 +143,19 @@ __global__ void causal_softmax(float *scores, B16 *probabilities, int columns, i
     top = red[0];
     __syncthreads();
     float sum = 0;
-    for (int i = tid; i < n; i += 256) {
-        const float a = expf(x[i] - top);
-        x[i] = a;
-        sum += a;
-    }
+    if (Slots) {
+#pragma unroll
+        for (int j = 0; j < Slots; ++j)
+            if (tid + j * 256 < n) {
+                held[j] = expf(held[j] - top);
+                sum += held[j];
+            }
+    } else
+        for (int i = tid; i < n; i += 256) {
+            const float a = expf(x[i] - top);
+            x[i] = a;
+            sum += a;
+        }
     red[tid] = sum;
     __syncthreads();
     for (int d = 128; d; d /= 2) {
@@ -138,8 +164,16 @@ __global__ void causal_softmax(float *scores, B16 *probabilities, int columns, i
         __syncthreads();
     }
     sum = red[0];
-    for (int i = tid; i < columns; i += 256)
-        p[i] = i < n ? b16(x[i] / sum) : B16(0);
+    if (Slots) {
+#pragma unroll
+        for (int j = 0; j < Slots; ++j) {
+            const int i = tid + j * 256;
+            if (i < columns)
+                p[i] = i < n ? b16(held[j] / sum) : B16(0);
+        }
+    } else
+        for (int i = tid; i < columns; i += 256)
+            p[i] = i < n ? b16(x[i] / sum) : B16(0);
 }
 // fp32 [kvheads][queries][group][dim] -> bf16 [queries][kvheads * group][dim]
 __global__ void attention_output(const float *grouped, B16 *out, int queries, int kvheads, int group, int dim) {
@@ -164,10 +198,27 @@ struct PrefillOps::Impl {
     Buffer<float> meta, scores, grouped;
     Buffer<B16> probabilities;
     size_t budget = size_t(32) << 20; // fp32 score cells per attention pass
+    bool usable = false;
     int strided = -1; // strided-batched bf16 GEMM availability (probed on first use)
     explicit Impl(Stream s) : stream(s) {
         blas(cublasCreate(&handle), "create cuBLAS handle");
         blas(cublasSetStream(handle, s), "set cuBLAS stream");
+        // probe both operand types on 16 x 16 zero matrices
+        z[0].ensure(256, s);
+        weights.ensure(512, s);
+        glm53::gpu::checked(cudaMemsetAsync(weights.p, 0, 512, s), "clear cuBLAS probe operands");
+        const float one = 1, zero = 0;
+        const int ione = 1, izero = 0;
+        const B16 *half = reinterpret_cast<const B16 *>(weights.p);
+        usable = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &one, half, CUDA_R_16BF, 16, half,
+                              CUDA_R_16BF, 16, &zero, z[0].p, CUDA_R_32F, 16, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS &&
+                 cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &ione, weights.p, CUDA_R_8I, 16,
+                              weights.p, CUDA_R_8I, 16, &izero, z[0].p, CUDA_R_32I, 16, CUBLAS_COMPUTE_32I,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS &&
+                 cudaStreamSynchronize(s) == cudaSuccess;
+        if (!usable)
+            (void)cudaGetLastError();
     }
     ~Impl() {
         (void)cudaStreamSynchronize(stream);
@@ -198,6 +249,7 @@ struct PrefillOps::Impl {
 };
 PrefillOps::PrefillOps(Stream s) : impl(std::make_unique<Impl>(s)) {}
 PrefillOps::~PrefillOps() = default;
+bool PrefillOps::supported() const { return impl->usable; }
 void PrefillOps::norm(const B16 *x, const float *gain, B16 *y, int rows, int width, float epsilon) {
     norm_rows<<<rows, 256, 0, impl->stream>>>(x, gain, y, width, epsilon);
     launched();
@@ -270,17 +322,36 @@ void PrefillOps::attention(const B16 *queries, const B16 *keys, const B16 *value
     // bound the materialised scores
     const int step =
         int(std::clamp<size_t>(impl->budget / (size_t(qheads) * (position + rows)), 1, size_t(rows)));
+    // sized once for the widest pass: growing a buffer frees the old one, which synchronises the device
+    const size_t most = size_t(qheads) * step * (position + rows);
+    impl->scores.ensure(most, s);
+    impl->probabilities.ensure(most, s);
+    impl->grouped.ensure(size_t(qheads) * step * dim, s);
     for (int a = 0; a < rows; a += step) {
         const int nq = std::min(step, rows - a), columns = position + a + nq, wide = nq * group;
-        const size_t cells = size_t(kvheads) * wide * columns;
-        impl->scores.ensure(cells, s);
-        impl->probabilities.ensure(cells, s);
-        impl->grouped.ensure(size_t(kvheads) * wide * dim, s);
         // scores[kh] (columns x wide) = K[kh]^T (columns x dim) Q[kh] (dim x wide)
         impl->gemm_batch(CUBLAS_OP_T, columns, wide, dim, keys, kv, dim, queries + size_t(a) * group * dim, dim,
                          (long long)rows * group * dim, impl->scores, columns, (long long)wide * columns, kvheads);
-        causal_softmax<<<kvheads * wide, 256, 0, s>>>(impl->scores, impl->probabilities, columns, nq, group,
-                                                     position + a, rsqrtf(float(dim)));
+        const float scale = rsqrtf(float(dim));
+        const int first = position + a, slots = (columns + 255) / 256;
+#define BEHEMOTH_SOFTMAX(SLOTS)                                                                                       \
+    causal_softmax<SLOTS><<<kvheads * wide, 256, 0, s>>>(impl->scores, impl->probabilities, columns, nq, group,      \
+                                                         first, scale)
+        if (slots <= 1)
+            BEHEMOTH_SOFTMAX(1);
+        else if (slots <= 2)
+            BEHEMOTH_SOFTMAX(2);
+        else if (slots <= 4)
+            BEHEMOTH_SOFTMAX(4);
+        else if (slots <= 8)
+            BEHEMOTH_SOFTMAX(8);
+        else if (slots <= 16)
+            BEHEMOTH_SOFTMAX(16);
+        else if (slots <= 32)
+            BEHEMOTH_SOFTMAX(32);
+        else
+            BEHEMOTH_SOFTMAX(0);
+#undef BEHEMOTH_SOFTMAX
         launched();
         // out[kh] (dim x wide) = V[kh] (dim x columns) P[kh] (columns x wide)
         impl->gemm_batch(CUBLAS_OP_N, dim, wide, columns, values, kv, dim, impl->probabilities, columns,
