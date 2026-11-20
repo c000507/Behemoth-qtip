@@ -34,6 +34,9 @@ class Mirror:
         get = P.Getter(weights)
         self.layers = [[P.shard_layer(get, l, r, g, FP8) for l in range(g.L)] for r in range(tp)]
         self.heads = [P.shard_head(get, r, g, FP8) for r in range(tp)]
+        if Q.WT:   # WT=1: the transposed layout (qwen35_graphs.to_wt), as an engine / prepare step would store it
+            self.layers = [[{k: Q.to_wt(k.split('.', 1)[1], v) for k, v in lr.items()} for lr in rl] for rl in self.layers]
+            self.heads = [{k: Q.to_wt(k, v) for k, v in h.items()} for h in self.heads]
         self.embed = get('embed_tokens.weight')
         self.pages, self.slots = pages, slots
         self.group_launches, self.group_overflows = [0] * tp, [0] * tp

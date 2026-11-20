@@ -113,6 +113,12 @@ MOE_GSLOTS = int(os.environ.get('MOE_GSLOTS', '3072'))   # MOE_GF=idx: slots per
 MOE_GSTAGE = os.environ.get('MOE_GSTAGE', '')        # bench only (MOE_GF=idx): stop after book | gather | gu | down (the result is NOT the MoE)
 MOE_TSUB = int(os.environ.get('MOE_TSUB', '0'))    # wide prefill chunks: MOE=all and the hot tier of MOE_GF=idx in token sub-blocks of this many rows
 ATT_QBLOCK = int(os.environ.get('ATT_QBLOCK', '0'))  # KV8 attention of wide prefill chunks: queries in blocks of this many tokens (x ATT_BLOCK key blocks)
+WT = os.environ.get('WT', '0') == '1'   # dense projections, router, head and the experts' gate|up stored TRANSPOSED [in, out] (contraction axis first):
+                                         # the M = 1 matmul then needs no on-chip transpose of the weight tiles (decode lever, docs/neuron-reap-decode-profile.md)
+GDN_RSPLIT = int(os.environ.get('GDN_RSPLIT', '0'))   # decode (Q = 1): the gdn state contractions in row groups of this many (R = 8 -> 2 x 4)
+WT_MOE = os.environ.get('WT_MOE', '')   # WT experts' gate|up: '' (decode: one matmul over the gathered slices relaid [H, E_ 2EIl]; MOE=all: stack) | stack | cat
+PROF_NOAR = os.environ.get('PROF_NOAR', '0') == '1'   # timing probes only (WRONG output): the in-graph all-reduces are replaced by the identity
+PROF_FIXED = os.environ.get('PROF_FIXED', '0') == '1'   # timing probes only (WRONG output): gathered decode MoE uses experts 0..8T-1 by a static slice (no expert gather)
 VERIFY = os.environ.get('VERIFY', '0') == '1'   # speculative verify buckets (R = 1, Q = 1 + drafts tokens of one request): the gdn state after
 #                                                  EVERY position goes to its own slot (step input 'vslot' [Q]); docs/neuron-qwen397-mtp.md
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
@@ -212,7 +218,37 @@ def quant8(h2):
     return a, h8
 
 
+def wmat(t, name):
+    """the [in, out] weight of a projection (WT: as stored; else the transpose view of the stored [out, in])."""
+    return t[name] if WT else t[name].T
+
+
+WT_PROJ = {'qkv', 'z', 'b', 'a', 'o', 'q', 'k', 'v', 'sg', 'su', 'sd', 'fc'}
+
+
+def to_wt(name, w):
+    """A prepared tensor (the [out, in] layout of qwen35_prepare) -> its WT=1 layout: projections and the router [in, out],
+    the experts' gate|up [E, H, 2 EIl], the head [H, V / TP]. Scales and every other tensor are unchanged (ed is already
+    [E, EIl, H] = [in, out] per expert)."""
+    if name in WT_PROJ or name == 'rw' or (name == 'w' and w.dim() == 2):
+        return w.T.contiguous()
+    if name == 'egu' and w.dim() == 3:
+        return w.permute(0, 2, 1).contiguous()
+    return w
+
+
 def lin(h, t, name):
+    if WT:
+        w = t[name]
+        h2 = h.reshape(-1, h.shape[-1])
+        if EXACT:
+            return torch.matmul(h2, w.float()).reshape(*h.shape[:-1], w.shape[1])
+        if name + '_s' in t:
+            a, h8 = quant8(h2)
+            y = G.mm8(h8, w).float() * a * t[name + '_s'].reshape(1, -1)
+        else:
+            y = torch.matmul(h2.to(torch.bfloat16), w.to(torch.bfloat16)).float()
+        return G.bf(y).reshape(*h.shape[:-1], w.shape[1])
     if EXACT:
         return torch.matmul(h.reshape(-1, h.shape[-1]), t[name].float().T).reshape(*h.shape[:-1], t[name].shape[0])
     if LIN_CSE and name + '_s' in t and h.dim() == 2:
@@ -222,6 +258,14 @@ def lin(h, t, name):
 
 
 def lin_partial(h, t, name):
+    if WT:
+        w = t[name]
+        if EXACT:
+            return torch.matmul(h, w.float())
+        if name + '_s' in t:
+            a = torch.amax(torch.abs(h.float()), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+            return G.mm8((h.float() / a).to(F8), w).float() * a * t[name + '_s'].reshape(1, -1)
+        return torch.matmul(h.to(torch.bfloat16), w.to(torch.bfloat16)).float()
     if EXACT:
         return torch.matmul(h, t[name].float().T)
     return G.lin_partial(h, t, name)
@@ -319,6 +363,20 @@ def gdn_block(n, t, g, R, Q, allreduce):
             outs.append(d * c[:, :, 1] + kq[:, i] * delta)
             st = st * d.unsqueeze(-1) + kn[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
         y = torch.stack(outs, dim=1)
+    elif Q == 1 and GDN_RSPLIT and R > GDN_RSPLIT and R % GDN_RSPLIT == 0 and not verify:
+        # decode rows in groups of GDN_RSPLIT for the state contractions (R = 8 compiles into tiny f32 tiles; R = 4 does not)
+        ys, nsts = [], []
+        for r0 in range(0, R, GDN_RSPLIT):
+            sl = slice(r0, r0 + GDN_RSPLIT)
+            nst = st[sl] * decay[sl, 0].reshape(GDN_RSPLIT, hl, 1, 1)
+            mem = torch.einsum('rhkd,rhk->rhd', nst, kn[sl, 0])
+            delta = (v[sl, 0] - mem) * beta[sl, 0].unsqueeze(-1)
+            nst = nst + kn[sl, 0].unsqueeze(-1) * delta.unsqueeze(-2)
+            ys.append(torch.einsum('rhkd,rhk->rhd', nst, qn[sl, 0]))
+            nsts.append(nst)
+        st = torch.cat(nsts, dim=0)
+        sts = [st]
+        y = torch.cat(ys, dim=0).unsqueeze(1)                                          # [R, 1, hl, Dv]
     else:
         outs, sts = [], []
         elem = GDN_EINSUM == 'elem' and Q == 1
@@ -618,9 +676,9 @@ def route(n, t, g, allreduce=None, want_top=False):
     if 'rws' in t:
         logits = allreduce(torch.matmul(torch.index_select(n, 1, t['rcols']).float(), t['rws'].T))
     elif RLOGIT == 'bf16' and not EXACT:
-        logits = torch.matmul(n.to(torch.bfloat16), t['rw'].to(torch.bfloat16).T).float()
+        logits = torch.matmul(n.to(torch.bfloat16), wmat(t, 'rw').to(torch.bfloat16)).float()
     else:
-        logits = torch.matmul(n.float(), t['rw'].T)
+        logits = torch.matmul(n.float(), wmat(t, 'rw'))
     probs = torch.softmax(logits, dim=-1)                                              # [T, E] f32
     T = n.shape[0]
     if ROUTE == 'thr' and not want_top:
@@ -1154,22 +1212,35 @@ def moe_routed(n, comb, t, g, mode):
             sel = ((order == torch.arange(slots, device=n.device).float().reshape(slots, 1)) & (used > 0)).float()   # [slots, E]
             idx = (sel * ar).sum(dim=-1).round().long()                                 # [slots]
             comb = (comb.unsqueeze(1) * sel.unsqueeze(0)).sum(dim=-1)                   # [T, slots], 0 for empty slots
+        elif PROF_FIXED:   # timing probe: the first `slots` experts by a static slice (no dynamic gather); comb keeps its routing cost
+            comb = comb[:, :slots] + 0.0 * comb.sum(dim=-1, keepdim=True)
         else:
             rank = used - ar * (0.5 / E)
             idx = torch.topk(rank, slots, dim=-1)[1].reshape(slots)                     # (2-D topk: a 1-D one crashed the XLA trace)
             comb = torch.index_select(comb, 1, idx)
-        gu, dw = untile(torch.index_select(gu, 0, idx)), torch.index_select(dw, 0, idx)
-        gus = torch.index_select(gus, 0, idx) if gus is not None else None
-        dc = torch.index_select(dc, 0, idx) if dc is not None else None
+        if PROF_FIXED and MOE_SLOTS != 'onehot':
+            gu, dw = untile(gu[:slots]), dw[:slots]
+            gus = gus[:slots] if gus is not None else None
+            dc = dc[:slots] if dc is not None else None
+        else:
+            gu, dw = untile(torch.index_select(gu, 0, idx)), torch.index_select(dw, 0, idx)
+            gus = torch.index_select(gus, 0, idx) if gus is not None else None
+            dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_ = gu.shape[0]
     if MOE_DEBUG == 'comb':
         return None, comb
     if MOE_DEBUG == 'shared':
         return None, None
-    tt = {'w': gu.reshape(E_ * 2 * EIl, g.H)}
-    if gus is not None:
-        tt['w_s'] = gus.reshape(-1)
-    hgu = lin(n, tt, 'w').reshape(T, E_, 2, EIl)
+    if WT and gus is not None and not EXACT and (WT_MOE == 'stack' or (WT_MOE == '' and mode == 'all')):
+        # one [T, H] x [H, 2 EIl] matmul per expert (no relayout of the expert tensor; the same products as lin)
+        a, h8 = quant8(n)
+        hgu = torch.stack([G.mm8(h8, gu[e]).float() for e in range(E_)], dim=1) * a.reshape(T, 1, 1) * gus.reshape(1, E_, 2 * EIl)
+        hgu = G.bf(hgu).reshape(T, E_, 2, EIl)
+    else:
+        tt = {'w': gu.permute(1, 0, 2).reshape(g.H, E_ * 2 * EIl) if WT else gu.reshape(E_ * 2 * EIl, g.H)}   # WT: gu [E_, H, 2 EIl]
+        if gus is not None:
+            tt['w_s'] = gus.reshape(-1)
+        hgu = lin(n, tt, 'w').reshape(T, E_, 2, EIl)
     if MOE_DEBUG == 'hgu':
         return None, hgu
     act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * comb.unsqueeze(-1)
@@ -1365,10 +1436,10 @@ def head(t, g, rows):
     h = bf(rms(x, t['norm'], g.eps))
     if 'w_s' in t:
         a = torch.amax(torch.abs(h), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
-        return G.mm8((h / a).to(F8), t['w'].T).float() * a * t['w_s'].reshape(1, -1)
+        return G.mm8((h / a).to(F8), wmat(t, 'w')).float() * a * t['w_s'].reshape(1, -1)
     if EXACT:
-        return torch.matmul(h, t['w'].float().T)
-    return torch.matmul(h.to(torch.bfloat16), t['w'].T).float()
+        return torch.matmul(h, wmat(t, 'w').float())
+    return torch.matmul(h.to(torch.bfloat16), wmat(t, 'w')).float()
 
 
 # ---------------------------------------------------------------------------------------------------------------- shapes
@@ -1379,7 +1450,7 @@ def weight_shapes(kind, g, fp8=True):
     s = {'norm': ((H,), f32)}
 
     def proj(name, out, inp):
-        s[name] = ((out, inp), wt)
+        s[name] = ((inp, out) if WT else (out, inp), wt)
         if fp8:
             s[name + '_s'] = ((out,), f32)
     if kind == 'gdn':
@@ -1394,8 +1465,8 @@ def weight_shapes(kind, g, fp8=True):
         if ROUTER == 'shard':
             s['rws'] = ((g.E, H // g.TP), f32); s['rcols'] = ((H // g.TP,), torch.int64)
         else:
-            s['rw'] = ((g.E, H), f32)
-        s['egu'] = ((g.E * 128, 2 * g.EIl * H // 128), wt) if EGU_T else ((g.E, 2 * g.EIl, H), wt)
+            s['rw'] = ((H, g.E) if WT else (g.E, H), f32)
+        s['egu'] = ((g.E * 128, 2 * g.EIl * H // 128), wt) if EGU_T else ((g.E, H, 2 * g.EIl) if WT else (g.E, 2 * g.EIl, H), wt)
         s['ed'] = ((g.E, g.EIl, H), wt)
         if fp8:
             s['egu_s'] = ((g.E, 2 * g.EIl), f32); s['ed_c'] = ((g.E, g.EIl), f32)
@@ -1442,15 +1513,15 @@ def main():
     import torch_xla.core.xla_model as xm
     os.environ.setdefault('XLA_ALWAYS_ALLREDUCE', '1')
     groups = [list(range(g.TP))]
-    allreduce = (lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=groups)) if g.TP > 1 else (lambda v: v)
+    allreduce = (lambda v: xm.all_reduce(xm.REDUCE_SUM, v, groups=groups)) if g.TP > 1 and not PROF_NOAR else (lambda v: v)
     if kind == 'head':
         T, S = int(sys.argv[3]), int(sys.argv[4])
         names = ['x', 'rows', 'norm', 'w'] + (['w_s'] if fp8 else [])
         shp = {'x': ((T, g.H), torch.float32), 'rows': ((S,), torch.int64), 'norm': ((g.H,), torch.float32),
-               'w': ((g.VP // g.TP, g.H), F8 if fp8 else torch.bfloat16), 'w_s': ((g.VP // g.TP,), torch.float32)}
+               'w': (((g.H, g.VP // g.TP) if WT else (g.VP // g.TP, g.H)), F8 if fp8 else torch.bfloat16), 'w_s': ((g.VP // g.TP,), torch.float32)}
         inputs = [zeros(*shp[n]) for n in names]
         fn = lambda *a: head(dict(zip(names, a)), g, a[1])
-        meta = {'kind': 'qwen35_head', 'T': T, 'S': S, 'inputs': names, 'states': [], 'fp8': fp8}
+        meta = {'kind': 'qwen35_head', 'T': T, 'S': S, 'inputs': names, 'states': [], 'fp8': fp8, 'wt': WT}
         kwargs = {}
     elif kind in ('mtp', 'mtpc'):                                                      # mtpc 1 Q P with MTP_CHAIN=D: D drafts in one launch
         R, Q, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
@@ -1554,7 +1625,7 @@ def main():
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
                 'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'gdn_form': GDN_FORM, 'row_form': ROW_FORM, 'moe_split': MOE_SPLIT, 'moe_kernel': MOE_KERNEL, 'moe_kstat': MOE_KSTAT, 'moe_kskip': MOE_KSKIP, 'moe_kyd': MOE_KYD, 'moe_kdense': MOE_KDENSE, 'moe_kfast': MOE_KFAST, 'moe_kpre': MOE_KPRE, 'egu_t': EGU_T, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'gdn_inv': GDN_INV, 'gdn_loop': GDN_LOOP, 'rlogit': RLOGIT, 'att_bf16': ATT_BF16, 'kv8': KV8, 'kv_code': KV_CODE, 'att_block': ATT_BLOCK, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM, 'gdn_slot': GDN_SLOT, 'extra_outputs': xnames,
                 'moe_cap': MOE_CAP if moe_mode == 'group' and kind == 'moe' else 0, 'moe_hot': MOE_HOT, 'moe_gg': MOE_GG, 'moe_ge': MOE_GE, 'moe_stat': (MOE_GSTAT if MOE_GSTAT >= 0 else g.E) if moe_mode == 'group' and kind == 'moe' else 0, 'moe_gd': MOE_GD, 'moe_gf': MOE_GF, 'moe_gb': MOE_GB, 'moe_tiers': MOE_TIERS, 'moe_tail': MOE_TAIL, 'moe_gslots': MOE_GSLOTS, 'moe_gblk': MOE_GBLK, 'moe_tsub': MOE_TSUB, 'att_qblock': ATT_QBLOCK,
-                'verify': bool(VERIFY and Q > 1)}
+                'verify': bool(VERIFY and Q > 1), 'wt': WT, 'wt_moe': WT_MOE, 'gdn_rsplit': GDN_RSPLIT, 'prof_noar': PROF_NOAR, 'prof_fixed': PROF_FIXED}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
