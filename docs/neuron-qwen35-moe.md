@@ -444,7 +444,8 @@ one 2-D fp8 matmul per expert for gate|up and for down, the slot outputs added b
 with the slot's fp8 scale folded in). The graph also returns the largest cold-expert load; the engine (kind `moeg`) reads it
 after the launch (4 bytes) and, when it exceeds `MOE_CAP`, reruns the layer's MoE with the bucket's `MOE=all` NEFF from the
 untouched input residual - the result is always the exact routed sum. All ranks exchange their verdict first, so they cannot
-disagree on a launch whose collectives need them all.
+disagree on a launch whose collectives need them all. Padding tokens of a short chunk (position -1; the graph takes `pos`)
+are routed to no expert: see 13.5 for why that matters.
 
 Fallback rate P(load of the (S+1)-th expert > C), code / prose prompts, %: (S=16, C=32) 24 / 31; (16, 40) 0.9 / 1.7;
 (16, 48) 0 / 0; (24, 28) 1.1 / 3.4; **(24, 32) 0.00 / 0.14**; (24, 36) 0 / 0; (32, 24) 0.03 / 0.31.
@@ -457,8 +458,8 @@ Fallback rate P(load of the (S+1)-th expert > C), code / prose prompts, %: (S=16
 | group, `MOE_GE=69` experts per pass: (C, S) = (32, 24) / (40, 24) / (48, 16) | **4.41** / 4.74 / 5.26 |
 | group, `MOE_GE` = 41 / 16 / 8 at (32, 24) | 5.00 / 6.89 / 9.65 (0.25 ms per pass) |
 
-Chosen `MOE_CAP=32 MOE_HOT=24 MOE_GE=69`: 4.41 ms, 4.7 ms per launch in the engine (incl. the load read), 267 -> 189 ms per
-chunk; fallbacks in the full prompt matrix: 8 of 22 520 launches (0.04 %), none in the parity and cache runs (7 600 launches). Device vs mirror 3.48e-2 (MOE=all 3.50e-2). It is still
+Chosen `MOE_CAP=32 MOE_HOT=24 MOE_GE=69`: 4.4 ms, 4.7 ms per launch in the engine (incl. the load read), 267 -> 188 ms per
+chunk; fallbacks in the full prompt matrix: 5 of 22 560 launches (0.02 %), none in the parity and cache runs (8 720 launches). Device vs mirror 3.48e-2 (MOE=all 3.50e-2). It is still
 2.4x above the routed roof (1.8 ms): the router, the shared expert and the hot tier, the gathers, the one-hot scatter and
 the per-pass overhead cost as much as the expert matmuls themselves.
 Two neuronx-cc traps found on the way: a batched matmul over the 205 experts is slow AND non-finite; an fp8 x fp8 matmul
@@ -469,29 +470,31 @@ E4M3 and returns NaN) - `bmm8g()` documents both.
 a chunk); prefill segments (`seg_gdn_gdn_gdn_gqa` at Q=256, 10 launches) would recover most of it but cannot hold the grouped
 MoE (its rerun must restart from the MoE's own input, and a segment has already advanced the gdn / KV state).
 
-### 13.4 Before / after (same box, same session, same prompts, production env; engine `34c68eb` + production graphs vs
-engine of this branch + the new prefill set)
+### 13.4 Before / after
 
-Per 256-token chunk (rank 0, ms in `nrt_execute`): gdn 246 -> **39**, moe 267 -> **189**, gqa (P=128 .. 4096) 11 .. 255 ->
+Same box, same session, same prompts, production env; engine `34c68eb` + production graphs vs the engine of this branch +
+the new prefill set (final build, 13.7).
+
+Per 256-token chunk (rank 0, ms in `nrt_execute`): gdn 246 -> **39**, moe 267 -> **188**, gqa (P=128 .. 4096) 11 .. 255 ->
 11 .. 106, total at short context 541 -> **248** (1030 tok/s).
 
 | prompt (tokens) | TTFT before | TTFT after | prefill tok/s before -> after |
 |---|---|---|---|
-| 82 | 0.67 s | 0.39 s | (one padded chunk) |
-| 501 | 1.16 s | 0.59 s | 461 -> 969 |
+| 82 | 0.67 s | 0.38 s | (one padded chunk) |
+| 501 | 1.16 s | 0.59 s | 461 -> 971 |
 | 3029 | 6.54 s | 3.08 s | 469 -> 1009 |
-| 6715 | 14.42 s | 6.81 s | 469 -> 999 |
-| 23763 | 54.30 s | 25.00 s | 439 -> 956 |
-| 50111 | 129.26 s | 58.25 s | 388 -> 863 |
+| 6715 | 14.42 s | 6.80 s | 469 -> 1001 |
+| 23763 | 54.30 s | 25.01 s | 439 -> 956 |
+| 50111 | 129.26 s | 58.26 s | 388 -> 863 |
 | 4 concurrent x ~7k (28392 in all): first token of the first / last stream | 52.5 / 61.5 s | 24.3 / 28.8 s | 462 -> 986 aggregate |
-| 8 concurrent x ~3.8k (30293 in all) | 28.7 / 68.6 s | 13.6 / 33.5 s | 442 -> 905 aggregate |
-| 4 concurrent x ~60 | 1.58 s | 0.92 s | |
+| 8 concurrent x ~3.8k (30293 in all) | 28.7 / 68.6 s | 13.4 / 33.6 s | 442 -> 903 aggregate |
+| 4 concurrent x ~60 | 1.58 s | 0.90 s | |
 
 (tok/s = the server's `request_metrics.prefill_tokens_per_s`; TTFT = first streamed token at the client.)
 
 Decode is untouched (same decode NEFFs; engine step log, ms per step, before -> after): 1 stream with one MTP draft 25.4 ->
-25.3 (15.5-16.5 ms per token at the client in both), 1 stream no draft 18.3 -> 18.1, 4 rows 34.4 -> 34.5, 8 rows 106.4 ->
-106.2. HBM: the set loads next to the weights as before (81 NEFFs, 13.32 GiB weights + 0.66 GiB state + 0.38 GiB MTP per
+25.3 (15.5-17.5 ms per token at the client in both), 1 stream no draft 18.3 -> 18.0, 4 rows 34.4 -> 34.3, 8 rows 106.4 ->
+106.1. HBM: the set loads next to the weights as before (81 NEFFs, 13.32 GiB weights + 0.66 GiB state + 0.38 GiB MTP per
 core) and ran the 50k-token prompt through the P=4096 buckets.
 
 ### 13.5 Parity
@@ -500,30 +503,43 @@ core) and ran the 50k-token prompt through the P=4096 buckets.
   the overflow rerun path (`MOE_CAP=1`) reproduces MOE=all exactly; `test_qwen35_gdn_chunk2.py` <= 2.5e-6.
 * Device vs CPU mirror per NEFF (random real-shape weights, `test_qwen35_device.py`): all new NEFFs 3.5-4.2e-2, equal to the
   production NEFF of the same block; both ranks bit-identical.
-* End to end, `NEURON_LOGITS_DUMP`, MTP off, 7 prompts (82 .. 23763 tokens) x 8 greedy steps. Production vs production
-  (two server starts): bit-identical. New set vs production: **prefill-end top-1 7 / 7**, logits rel L2 0.091-0.110, KL
-  0.0005-0.0052; over the following greedy steps 32 / 36 compared steps agree, the 4 flips at production margins
-  0.00 / 0.00 / 0.31 / 0.34. 0 non-finite logits in every run (parity, matrix, cache tests: ~1200 prefill chunks).
-  The set rebuilt from the committed `pfbuild.sh` (the one uploaded, 13.7): same layer_bench times (1.13 / 0.54 / 1.68 /
-  2.91 / 5.42 / 10.46 / 4.39 ms), prefill-end top-1 7 / 7, rel L2 0.083-0.159, KL 0.0005-0.0045, 32 / 36 steps, vs the
-  reference 0.073 / 0.114. (Two compiles of the same graph are not bit-identical to each other: the first and the rebuilt
-  set agree bit for bit on 3 of the 7 prompts and differ by 0.03 mean rel L2 over all.)
-* New engine + production graphs: all 56 logits records bit-identical to the production engine.
+* End to end, `NEURON_LOGITS_DUMP`, MTP off, 7 prompts (82 .. 23763 tokens) x 8 greedy steps, final set vs production:
+  **prefill-end top-1 7 / 7**, logits rel L2 0.092-0.168, KL 0.0005-0.0058; over the following greedy steps 32 / 36 compared
+  steps agree, the 4 flips at production margins 0.00 / 0.01 / 0.05 / 0.34. 0 non-finite logits in every run of the session
+  (parity, matrix, cache tests: ~2500 prefill chunks on the new graphs).
 * Is 0.1 rel L2 "the same"? `tests/qwen35_prepared_ref.py` (new): the graph functions in EXACT mode over the DEQUANTISED
   prepared weights, the whole prompt as one chunk = an f32 reference that isolates what the device adds (fp8 activations, bf16,
-  int8 KV, block form). Prefill-end logits vs that reference (82-token / 501-token prompt): production 0.083 / 0.092, GDN
-  change only 0.075 / 0.095, GDN + grouped MoE (40, 16) 0.083 / 0.081, final set 0.073 / 0.114; KL 0.001-0.006, top-1 equal in
-  all. Production itself sits 8-9 % from the f32 result, the new forms sit at the same distance, and two builds differ from
-  each other like two independent draws of that fp8 noise (0.09-0.11). (Only two reference prompts: the reference costs
-  17 CPU minutes for 501 tokens on the box.)
+  int8 KV, block form). Prefill-end logits vs that reference, rel L2 (KL) for the 82-token / 501-token prompt:
+
+  | build | 82 tokens | 501 tokens |
+  |---|---|---|
+  | production | 0.083 (0.0013) | 0.092 (0.0011) |
+  | GDN change only | 0.075 (0.0059) | 0.095 (0.0032) |
+  | GDN + grouped MoE (C=40, S=16) | 0.083 (0.0011) | 0.081 (0.0030) |
+  | **final set** (GDN + blocked attention + grouped MoE C=32, S=24) | 0.077 (0.0013) | 0.117 (0.0017) |
+
+  top-1 equal to the reference in all. Production itself sits 8-9 % from the f32 result; the new forms are at the same level
+  (0.075-0.117 over the variants), and two builds differ from each other like two draws of that fp8 noise. Only two reference
+  prompts (the reference costs 17 CPU minutes for 501 tokens on the box): this bounds the error class, it is not a statistic.
+* **Run-to-run reproducibility.** Production prefill is bit-reproducible (two server starts: 56 / 56 logits records
+  identical), and the prefix cache relies on it. The GDN / attention changes keep that (two starts bit-identical). The first
+  grouped-MoE build did NOT: prompts whose last chunk was a padded 256-token chunk differed by 0.04-0.09 rel L2 between two
+  starts. Cause: a padding row's residual is not reproducible (its all-masked attention row reads the scratch page, which
+  the padding tokens of a launch overwrite in arbitrary order); MOE=all keeps rows independent, but in the grouped form a
+  routed padding row occupied slots and moved the hot / cold split - i.e. the fp8 rounding path - of the real tokens. Fixed
+  in the graph (padding tokens take no expert, commit `76b905a`): two server starts of the final set are bit-identical on
+  all 56 records, also across a cold second server in the cache test.
+* New engine + production graphs: all 56 logits records bit-identical to the production engine.
+* Device vs CPU mirror of the final `moeg_1_256_32`: 3.48e-2; layer_bench of the final set 1.13 / 0.54 (gdn 256 / 64),
+  1.68 / 2.91 / 5.42 / 10.46 (gqa P=512 .. 4096), 4.38 ms (moeg).
 
 ### 13.6 Prefix cache
 
 The state snapshots are the same tensors (bound NEFFs read / write the request's slice of the layer state), so the cache
-needs nothing new. `PREFIX_ALIGN=1` exactness holds for the new set as for production (logits dump, MTP off): a repeated
-6715-token prompt (6656 cached tokens) and the same prompt with 487 more tokens (6656 cached, 546 prefilled after the restore)
-return logits **bit-identical** to a cold server for all 8 compared steps, in both builds. TTFT of that extended turn:
-1.43 -> 0.79 s; of the full hit 0.26 -> 0.21 s.
+needs nothing new. `PREFIX_ALIGN=1` exactness holds for the new set as for production (logits dump, MTP off, 8 steps each):
+a repeated 6715-token prompt (6656 cached tokens), the same prompt with 487 more tokens (6656 cached, 546 prefilled after
+the restore), and the same pair for a 5251-token prompt whose tail is a padded 256-token chunk (5120 cached) all return
+logits **bit-identical** to a cold server. TTFT of the extended 7202-token turn: 1.43 -> 0.79 s; of the full hit 0.26 -> 0.21 s.
 
 ### 13.7 Building the set, and what a deployment needs (nothing was pushed or deployed)
 
@@ -537,8 +553,9 @@ Graphs (7 NEFFs, ~4 min with 7 parallel compiles on the box; needs the prepared 
     #   moeg_1_256_32  MOE=group MOE_CAP=32 MOE_HOT=24 MOE_GE=69      moe 1 256 32
     # common: TP=2 PAGES=4097 SLOTS=9 WEIGHTS=fp8 (KV_CODE int8 is the default)
 
-The NEFFs built by that script in this session are in `s3://behemoth-neuron-models-912935854432/tmp/ornith-prefill/graphs-pf/`
-(scratch prefix; 7 directories with `graph.neff` + `meta.json`, `MANIFEST.md5`); logs and per-request JSON of every run under
+The NEFFs built by that script in this session - the exact files of the final measurements - are in
+`s3://behemoth-neuron-models-912935854432/tmp/ornith-prefill/graphs-pf/` (scratch prefix; 7 directories with `graph.neff` +
+`meta.json`, `MANIFEST.md5`); logs and per-request JSON of every run under
 `.../tmp/ornith-prefill/{run,log}/`. Engine: `neuron/cpp/build.sh OUT srv` from this branch. The measurement drivers are
 in `deploy/neuron-reap/prefill/` (`matrix.sh` prompt matrix, `par.sh` + `cmp.py` logits parity, `cache.sh` prefix-cache
 exactness, `ref.sh` + `cmpref.py` prepared-weights reference, `loads.py` expert-load table, `lb.sh` / `devtest.sh` per-NEFF
@@ -575,7 +592,7 @@ To deploy (for the user):
 * Short prompts: a 65..255-token prompt still pays one padded 256-token chunk (0.39 s for 82 tokens; 0.67 s before).
 * The Q=64 buckets keep MOE=all and the one-block attention (used for <= 64-token prompts and for nothing else on the grid).
 * GDN prefill is at 1.1 ms vs ~0.25 ms roof: the projections + conv over 256 tokens and the bf16 all-reduce are what is left.
-* Parity against the HF-checkpoint oracle (`test_qwen35_oracle.py`) was not rerun (the raw checkpoint is not in the account's
-  buckets); the prepared-weights reference of 13.5 replaces it, on two prompts.
+* Parity against the HF-checkpoint oracle (`test_qwen35_oracle.py`) was not rerun (no raw checkpoint in the two buckets used
+  here, and nothing was fetched from outside the account); the prepared-weights reference of 13.5 replaces it, on two prompts.
 * Decode at long context (29-31 ms per token at 50k) still uses the one-block attention; `ATT_BLOCK` for the decode / segment
   buckets is the same switch but was out of scope (decode numbers had to stay unchanged).
