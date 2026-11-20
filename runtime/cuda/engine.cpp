@@ -1,6 +1,7 @@
 #include "behemoth/cuda.hpp"
 #include "behemoth/qtip.hpp"
 #include "glm53.hpp"
+#include "batch_kernels.hpp"
 #include "kernels.hpp"
 #include "prefill.hpp"
 #if defined(BEHEMOTH_CUDA_FAST)
@@ -136,16 +137,13 @@ struct Linear {
         checked(sync(s), "finish weight upload");
     }
     bool batched() const { return ternary.p || dense.p; }
-    // x [tokens][in] -> y [tokens][out]; ternary runs the multi-token kernel, dense one bf16 GEMM.
-    void forward_tokens(const B16 *x, B16 *y, Buffer<float> &scratch, int tokens, Stream s, PrefillOps &ops) const {
-        if (ternary.p) {
-            scratch.ensure((ternary_scratch_bytes(in, tokens) + 3) / 4, s);
-            ternary_forward(ternary, ternary_scale, x, y, in, out, reinterpret_cast<uint8_t *>(scratch.p), s,
-                            tokens);
-        } else {
-            check(dense.p, "batched prefill requires ternary or dense projections");
-            ops.store(ops.dense(dense, x, in, out, tokens), y, tokens);
-        }
+    // Unrounded [tokens][out] product of the whole chunk. Ternary inputs must have been quantised by
+    // ops.quantize (shared by the projections that read the same activations).
+    PrefillOps::Product product(const B16 *x, int tokens, PrefillOps &ops, int slot = 0) const {
+        if (ternary.p)
+            return ops.ternary(ternary, ternary_scale, in, out, tokens, slot);
+        check(dense.p, "batched prefill requires ternary or dense projections");
+        return ops.dense(dense, x, in, out, tokens, slot);
     }
     void forward(const Buffer<B16> &x, Buffer<B16> &y, Buffer<float> &scratch, Buffer<B16> &rotated,
                  Buffer<float> &z, bool rz, Stream s) const {
@@ -217,6 +215,7 @@ int qtip_splits(int tp) {
 struct Model::Impl {
     Checkpoint checkpoint;
     int device, context, position = 0;
+    int prefill_chunk = 512; // tokens per batched prefill pass (BEHEMOTH_CUDA_PREFILL_CHUNK)
     Stream stream{};
     std::unique_ptr<PeerContext> peer;
     bool failed = false;
@@ -295,8 +294,15 @@ struct Model::Impl {
                 peer = std::make_unique<PeerContext>(d, d + 1);
             }
             initialize_tables();
-            if (checkpoint.config.quantization != Quantization::Qtip)
+            if (checkpoint.config.quantization != Quantization::Qtip) {
                 ops = std::make_unique<PrefillOps>(stream);
+                if (const char *value = std::getenv("BEHEMOTH_CUDA_PREFILL_CHUNK")) {
+                    const char *end = value + std::char_traits<char>::length(value);
+                    auto result = std::from_chars(value, end, prefill_chunk);
+                    check(result.ec == std::errc{} && result.ptr == end && prefill_chunk >= 1,
+                          "BEHEMOTH_CUDA_PREFILL_CHUNK must be a positive integer");
+                }
+            }
             dense("model.embed_tokens.weight", embeddings);
             if (!tied)
                 dense("lm_head.weight", head);
@@ -351,6 +357,7 @@ struct Model::Impl {
     ~Impl() {
         (void)set_device(device);
         ops.reset();
+        work = {};
         if (peer) {
             DeviceGuard guard(peer->device);
             (void)sync(peer->stream);
@@ -361,8 +368,13 @@ struct Model::Impl {
         }
     }
     bool batched_prefill() const { return layers.empty() || layers[0].linear[0].batched(); }
-    // Multi-token prefill for ternary/dense checkpoints: projections run on chunks of up to 32 tokens
-    // (ternary weights are read once per eight tokens); norms, RoPE and attention stay per token.
+    // Whole-chunk prefill for ternary/dense checkpoints (see prefill.hpp): per layer and chunk seven
+    // tensor-core GEMMs, one causal attention pass and a handful of elementwise launches, independent
+    // of the token count. Rounding points are those of step(); fp32 summation order differs.
+    struct Work {
+        Buffer<int> ids;
+        Buffer<B16> x, normed, queries, attended, gate;
+    } work;
     Vec prefill(const std::vector<int> &ids) {
         check(!failed, "Reset the CUDA model after an inference failure");
         check(!ids.empty() && position + int(ids.size()) <= context, "Prompt exceeds CUDA context");
@@ -370,62 +382,49 @@ struct Model::Impl {
             check(id >= 0 && id < vocab, "Token outside the vocabulary");
         checked(set_device(device), "select CUDA device");
         try {
-            const int chunk = layers[0].linear[0].dense.p ? 512 : 32;
+            const int chunk = int(std::min<size_t>(ids.size(), size_t(prefill_chunk)));
             const int kv = kv_heads * head_dim, qd = q_heads * head_dim;
-            Buffer<B16> X, N, Q, K, V, A, P, G, U;
+            auto &[tokens, X, N, Q, A, G] = work;
+            tokens.ensure(ids.size(), stream);
+            checked(h2d(tokens, ids.data(), ids.size() * sizeof(int), stream), "upload prompt tokens");
             X.ensure(size_t(chunk) * hidden, stream);
             N.ensure(size_t(chunk) * hidden, stream);
             Q.ensure(size_t(chunk) * qd, stream);
-            K.ensure(size_t(chunk) * kv, stream);
-            V.ensure(size_t(chunk) * kv, stream);
             A.ensure(size_t(chunk) * qd, stream);
-            P.ensure(size_t(chunk) * hidden, stream);
             G.ensure(size_t(chunk) * inter, stream);
-            U.ensure(size_t(chunk) * inter, stream);
-            for (size_t p0 = 0; p0 < ids.size(); p0 += chunk) {
-                const int n = int(std::min<size_t>(chunk, ids.size() - p0));
-                for (int t = 0; t < n; ++t)
-                    embedding(embeddings, X.p + size_t(t) * hidden, ids[p0 + size_t(t)], hidden, stream);
+            const float *freq = rope_freq.p;
+            for (size_t p0 = 0; p0 < ids.size(); p0 += size_t(chunk)) {
+                const int n = int(std::min<size_t>(size_t(chunk), ids.size() - p0));
+                embedding_batch(embeddings, X, tokens.p + p0, n, hidden, stream);
                 for (auto &layer : layers) {
-                    for (int t = 0; t < n; ++t)
-                        norm(X.p + size_t(t) * hidden, layer.norm1, nullptr, N.p + size_t(t) * hidden, hidden, eps,
-                             false, stream);
-                    layer.linear[0].forward_tokens(N.p, Q.p, scratch, n, stream, *ops);
-                    layer.linear[1].forward_tokens(N.p, K.p, scratch, n, stream, *ops);
-                    layer.linear[2].forward_tokens(N.p, V.p, scratch, n, stream, *ops);
-                    for (int t = 0; t < n; ++t) {
-                        B16 *qt = Q.p + size_t(t) * qd, *kt = K.p + size_t(t) * kv;
-                        if (rope_freq.p)
-                            rope_scaled(qt, kt, position + t, q_heads, kv_heads, head_dim, rope_freq, stream);
-                        else
-                            rope(qt, kt, position + t, q_heads, kv_heads, head_dim, theta, stream);
-                    }
-                    checked(d2d(layer.keys.p + size_t(position) * kv, K.p, size_t(n) * kv * 2, stream),
-                            "append CUDA key cache");
-                    checked(d2d(layer.values.p + size_t(position) * kv, V.p, size_t(n) * kv * 2, stream),
-                            "append CUDA value cache");
-                    scores.ensure(size_t(q_heads) * (position + n), stream);
-                    for (int t = 0; t < n; ++t)
-                        gqa(Q.p + size_t(t) * qd, layer.keys, layer.values, A.p + size_t(t) * qd, scores,
-                            position + t + 1, q_heads, kv_heads, head_dim, stream);
+                    auto &w = layer.linear;
+                    // quantise once per distinct ternary input
+                    auto input = [&](const B16 *x, std::initializer_list<int> consumers) {
+                        for (int i : consumers)
+                            if (w[size_t(i)].ternary.p) {
+                                ops->quantize(x, n, w[size_t(i)].in);
+                                return;
+                            }
+                    };
+                    ops->norm(X, layer.norm1, N, n, hidden, eps);
+                    input(N, {0, 1, 2});
+                    ops->rope_queries(w[0].product(N, n, *ops), Q, n, position, q_heads, kv_heads, head_dim, theta,
+                                      freq);
+                    ops->rope_keys(w[1].product(N, n, *ops), layer.keys.p + size_t(position) * kv, n, position,
+                                   kv_heads, head_dim, theta, freq);
+                    ops->store(w[2].product(N, n, *ops), layer.values.p + size_t(position) * kv, n);
+                    ops->attention(Q, layer.keys, layer.values, A, position, n, q_heads, kv_heads, head_dim);
                     if (sub_norm)
-                        for (int t = 0; t < n; ++t)
-                            norm(A.p + size_t(t) * qd, layer.sub_attn, nullptr, A.p + size_t(t) * qd, qd, eps, false,
-                                 stream);
-                    layer.linear[3].forward_tokens(A.p, P.p, scratch, n, stream, *ops);
-                    residual(X, P, n * hidden, stream);
-                    for (int t = 0; t < n; ++t)
-                        norm(X.p + size_t(t) * hidden, layer.norm2, nullptr, N.p + size_t(t) * hidden, hidden, eps,
-                             false, stream);
-                    layer.linear[4].forward_tokens(N.p, G.p, scratch, n, stream, *ops);
-                    layer.linear[5].forward_tokens(N.p, U.p, scratch, n, stream, *ops);
-                    swiglu(G, U, n * inter, INFINITY, stream);
+                        ops->norm(A, layer.sub_attn, A, n, qd, eps);
+                    input(A, {3});
+                    ops->add(w[3].product(A, n, *ops), X, n);
+                    ops->norm(X, layer.norm2, N, n, hidden, eps);
+                    input(N, {4, 5});
+                    ops->swiglu(w[4].product(N, n, *ops, 0), w[5].product(N, n, *ops, 1), G, n);
                     if (sub_norm)
-                        for (int t = 0; t < n; ++t)
-                            norm(G.p + size_t(t) * inter, layer.sub_ffn, nullptr, G.p + size_t(t) * inter, inter, eps,
-                                 false, stream);
-                    layer.linear[6].forward_tokens(G.p, P.p, scratch, n, stream, *ops);
-                    residual(X, P, n * hidden, stream);
+                        ops->norm(G, layer.sub_ffn, G, n, inter, eps);
+                    input(G, {6});
+                    ops->add(w[6].product(G, n, *ops), X, n);
                 }
                 position += n;
                 if (p0 + size_t(n) == ids.size()) {

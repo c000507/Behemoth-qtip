@@ -2,6 +2,7 @@
 #include "behemoth/numeric.hpp"
 #include "behemoth/ternary.hpp"
 #include "kernels.hpp"
+#include "prefill.hpp"
 #include "safetensors.hpp"
 #include <algorithm>
 #include <cmath>
@@ -140,7 +141,8 @@ void fp8_test(cg::Stream s, int in = 96, int rows = 64) {
 }
 // BitNet b1.58: int8 activation quantisation + packed ternary dp4a GEMV. The raw int32 dot products must
 // equal the CPU reference exactly; the scaled bf16 outputs must equal reference_forward bit for bit.
-void ternary_test(cg::Stream s, int in, int rows, int tokens) {
+// With `ops` the same products come from the whole-chunk prefill operators (PrefillOps::ternary).
+void ternary_test(cg::Stream s, int in, int rows, int tokens, cu::PrefillOps *ops = nullptr) {
     behemoth::qtip::HostLinear h;
     h.in = in;
     h.out = rows;
@@ -179,7 +181,13 @@ void ternary_test(cg::Stream s, int in, int rows, int tokens) {
     result.ensure(size_t(tokens) * rows, s);
     raw.ensure(size_t(tokens) * rows, s);
     scratch.ensure(cu::ternary_scratch_bytes(in, tokens), s);
-    cu::ternary_forward(w, h.ternary_scale, input, out, in, rows, scratch, s, tokens, raw);
+    if (ops) {
+        ops->quantize(input, tokens, in);
+        auto product = ops->ternary(w, h.ternary_scale, in, rows, tokens);
+        ops->store(product, out, tokens);
+        cg::checked(cg::d2d(raw, product.z, size_t(tokens) * rows * 4, s), "copy ternary products");
+    } else
+        cu::ternary_forward(w, h.ternary_scale, input, out, in, rows, scratch, s, tokens, raw);
     cg::to_float(out, result, tokens * rows, s);
     cg::Pinned<float> host;
     host.ensure(size_t(tokens) * rows);
@@ -193,7 +201,7 @@ void ternary_test(cg::Stream s, int in, int rows, int tokens) {
         exact += hraw.p[i] == dots[i];
         bitexact += host.p[i] == expected[i];
     }
-    std::cout << "ternary " << rows << "x" << in << " tokens " << tokens << ": int32 exact " << exact << "/"
+    std::cout << (ops ? "prefill ternary " : "ternary ") << rows << "x" << in << " tokens " << tokens << ": int32 exact " << exact << "/"
               << dots.size() << ", bf16 bit-exact " << bitexact << "/" << dots.size() << '\n';
     require(exact == dots.size(), "ternary int32 accumulation differs from the CPU reference");
     require(bitexact == dots.size(), "ternary scaled output differs from the CPU reference");
@@ -342,6 +350,120 @@ void attention_test(cg::Stream s) {
         error({host.p, host.p + heads * dim}, expected, "GQA causal prefix/group mapping");
     }
 }
+// Whole-chunk prefill operators against the stepwise kernels: norm and RoPE bit for bit, the dense
+// GEMM and the causal attention (other fp32 summation order) within BF16 rounding.
+std::vector<float> download(const uint16_t *device, size_t n, cg::Stream s) {
+    cg::Buffer<float> wide;
+    wide.ensure(n, s);
+    cg::to_float(device, wide, int(n), s);
+    std::vector<float> host(n);
+    cg::checked(cg::d2h(host.data(), wide, n * 4, s), "read prefill result");
+    cg::checked(cg::sync(s), "finish prefill read");
+    return host;
+}
+void close(const std::vector<float> &actual, const std::vector<float> &expected, double limit, const std::string &name) {
+    double e = 0, r = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(std::isfinite(actual[i]), "Nonfinite CUDA prefill result");
+        e += std::pow(double(actual[i]) - expected[i], 2);
+        r += double(expected[i]) * expected[i];
+    }
+    const double relative = std::sqrt(e / std::max(r, 1e-30));
+    std::cout << "prefill " << name << " vs stepwise relative L2 " << relative << '\n';
+    require(relative <= limit, "prefill operator differs from the stepwise kernel");
+}
+void prefill_ops_test(cg::Stream s, cu::PrefillOps &ops, int qheads, int kvheads, int dim, int position, int rows,
+                      float theta, bool llama3) {
+    const int qd = qheads * dim, kv = kvheads * dim, group = qheads / kvheads, hidden = 208, total = position + rows;
+    std::mt19937 gen(unsigned(qheads * 7 + rows));
+    std::normal_distribution<float> normal(0, .25f);
+    auto random = [&](size_t n, float scale = 1) {
+        std::vector<float> x(n);
+        for (auto &v : x)
+            v = float(BFloat16(normal(gen) * scale));
+        return x;
+    };
+    const std::string tag = std::to_string(qheads) + "/" + std::to_string(kvheads) + "x" + std::to_string(dim) + " rows " +
+                            std::to_string(rows) + "@" + std::to_string(position);
+    // RMSNorm
+    auto x = random(size_t(rows) * hidden, 4);
+    std::vector<float> gain(static_cast<size_t>(hidden));
+    for (auto &v : gain)
+        v = 1 + normal(gen);
+    cg::Buffer<uint16_t> dx, normed, single;
+    cg::Buffer<float> dgain;
+    put(dx, bits(x), s);
+    put(dgain, gain, s);
+    normed.ensure(x.size(), s);
+    single.ensure(x.size(), s);
+    ops.norm(dx, dgain, normed, rows, hidden, 1e-5f);
+    for (int t = 0; t < rows; ++t)
+        cg::norm(dx.p + size_t(t) * hidden, dgain, nullptr, single.p + size_t(t) * hidden, hidden, 1e-5f, false, s);
+    close(download(normed, x.size(), s), download(single, x.size(), s), 0, "norm " + tag);
+    // dense projection of the normed rows
+    auto w = random(size_t(qd) * hidden, .2f);
+    cg::Buffer<uint16_t> dw, projected, expected;
+    put(dw, bits(w), s);
+    projected.ensure(size_t(rows) * qd, s);
+    expected.ensure(size_t(rows) * qd, s);
+    ops.store(ops.dense(dw, normed, hidden, qd, rows), projected, rows);
+    for (int t = 0; t < rows; ++t)
+        cu::dense_forward(dw, normed.p + size_t(t) * hidden, expected.p + size_t(t) * qd, hidden, qd, s);
+    close(download(projected, size_t(rows) * qd, s), download(expected, size_t(rows) * qd, s), 4e-3, "dense GEMM " + tag);
+    // RoPE of fp32 products (BF16-exact values), queries regrouped by KV head
+    auto q = random(size_t(rows) * qd), k = random(size_t(total) * kv), v = random(size_t(total) * kv);
+    std::vector<float> inv(static_cast<size_t>(dim / 2));
+    for (int d = 0; d < dim / 2; ++d)
+        inv[size_t(d)] = std::pow(theta, -float(2 * d) / dim) * (d % 3 ? 1.f : .25f);
+    cg::Buffer<float> fq, fk, dinv;
+    cg::Buffer<uint16_t> grouped, keys, values, sq, sk, out, sout;
+    put(fq, q, s);
+    put(fk, k, s);
+    put(dinv, inv, s);
+    put(sq, bits(q), s);
+    put(sk, bits(k), s);
+    put(values, bits(v), s);
+    grouped.ensure(q.size(), s);
+    keys.ensure(k.size(), s);
+    const float *table = llama3 ? dinv.p : nullptr;
+    // earlier cache rows, then the chunk at `position`
+    if (position)
+        ops.rope_keys({fk.p, nullptr, 1, kv}, keys, position, 0, kvheads, dim, theta, table);
+    ops.rope_queries({fq.p, nullptr, 1, qd}, grouped, rows, position, qheads, kvheads, dim, theta, table);
+    ops.rope_keys({fk.p + size_t(position) * kv, nullptr, 1, kv}, keys.p + size_t(position) * kv, rows, position,
+                  kvheads, dim, theta, table);
+    for (int t = 0; t < total; ++t) {
+        uint16_t *qt = sq.p + size_t(std::max(0, t - position)) * qd, *kt = sk.p + size_t(t) * kv;
+        // rotate the keys of every row and the queries of the chunk rows (qheads = 0 skips the queries)
+        if (llama3)
+            cu::rope_scaled(qt, kt, t, t < position ? 0 : qheads, kvheads, dim, dinv, s);
+        else
+            cu::rope(qt, kt, t, t < position ? 0 : qheads, kvheads, dim, theta, s);
+    }
+    close(download(keys, k.size(), s), download(sk, k.size(), s), 0, "key RoPE " + tag);
+    auto rotated = download(grouped, q.size(), s), stepwise = download(sq, q.size(), s);
+    std::vector<float> regrouped(q.size());
+    for (int t = 0; t < rows; ++t)
+        for (int h = 0; h < qheads; ++h)
+            for (int d = 0; d < dim; ++d)
+                regrouped[(size_t(t) * qheads + h) * dim + d] =
+                    rotated[((size_t(h / group) * rows + t) * group + h % group) * dim + d];
+    close(regrouped, stepwise, 0, "query RoPE " + tag);
+    // causal attention over the cache, in passes of a few queries
+    out.ensure(q.size(), s);
+    sout.ensure(q.size(), s);
+    cg::Buffer<float> scores;
+    scores.ensure(size_t(qheads) * total, s);
+    for (size_t budget : {size_t(32) << 20, size_t(qheads) * total * 7}) {
+        ops.score_budget(budget);
+        ops.attention(grouped, keys, values, out, position, rows, qheads, kvheads, dim);
+        for (int t = 0; t < rows; ++t)
+            cu::gqa(sq.p + size_t(t) * qd, keys, values, sout.p + size_t(t) * qd, scores, position + t + 1, qheads,
+                    kvheads, dim, s);
+        close(download(out, q.size(), s), download(sout, q.size(), s), 4e-3, "causal attention " + tag);
+    }
+    ops.score_budget(size_t(32) << 20);
+}
 int main(int argc, char **argv) {
     int count = 0;
     auto status = cg::device_count(&count);
@@ -366,6 +488,16 @@ int main(int argc, char **argv) {
                                         std::tuple{960, 320, 5}, std::tuple{960, 2560, 8}, std::tuple{2560, 960, 13},
                                         std::tuple{960, 961, 37}, std::tuple{12288, 28672, 1}})
             ternary_test(s, in, rows, tokens);
+        {
+            cu::PrefillOps ops(s);
+            for (auto [in, rows, tokens] :
+                 {std::tuple{16, 1, 1}, std::tuple{960, 2560, 2}, std::tuple{2560, 960, 13}, std::tuple{960, 320, 64},
+                  std::tuple{960, 961, 37}, std::tuple{2560, 960, 300}, std::tuple{8192, 1024, 17}})
+                ternary_test(s, in, rows, tokens, &ops);
+            prefill_ops_test(s, ops, 6, 2, 64, 0, 45, 10000.f, false);
+            prefill_ops_test(s, ops, 15, 5, 64, 19, 70, 100000.f, false);
+            prefill_ops_test(s, ops, 8, 1, 128, 5, 33, 500000.f, true);
+        }
         nvfp4_test(s);
         fp8_test(s, 12288, 512);
         attention_test(s);

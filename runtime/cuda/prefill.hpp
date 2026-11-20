@@ -42,6 +42,8 @@ class PrefillOps {
                    const float *inv_freq);
     // Causal GQA for rows new tokens at cache rows position..position+rows-1 (keys/values already
     // appended): out [rows][qheads][dim].
+    // Scores are materialised for at most `floats` fp32 cells per pass (default 32M = 128 MB).
+    void score_budget(size_t floats);
     void attention(const B16 *grouped_queries, const B16 *keys, const B16 *values, B16 *out, int position, int rows,
                    int qheads, int kvheads, int dim);
 };

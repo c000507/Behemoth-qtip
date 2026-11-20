@@ -5,6 +5,7 @@
 // reference of the whole model. usage: behemoth_cuda_llama_tests [--checkpoint DIR]...
 // Real checkpoints given with --checkpoint (e.g. qtip_quant output) get the same CPU comparison.
 #include "behemoth/checkpoint.hpp"
+#include <cstdlib>
 #include "behemoth/ternary.hpp"
 #include "behemoth/cuda.hpp"
 #include "behemoth/numeric.hpp"
@@ -543,11 +544,21 @@ std::pair<double, double> compare(const fs::path &root, int tokens, const std::s
     std::vector<float> last;
     for (int id : ids)
         last = check.step(id);
-    // The batched prefill (ternary/dense) runs the same exact-integer kernels as the stepwise path, so
-    // it must reproduce the stepwise CUDA logits (not just the reference) almost bit for bit.
+    // The batched prefill (ternary/dense) keeps the rounding points of the stepwise path but sums in a
+    // different order (tensor-core GEMMs). The small synthetic models reproduce the stepwise logits;
+    // deep real checkpoints amplify BF16 rounding flips, so they are judged like the stepwise path: by
+    // the KL divergence from the CPU reference, and from the stepwise CUDA distribution.
     const double prefill_vs_step = relative(prefilled, stepwise_last);
     std::cout << label << ": prefill vs stepwise CUDA relative L2 " << prefill_vs_step << '\n';
-    require(prefill_vs_step < 1e-3, label + ": prefill differs from the stepwise CUDA logits");
+    if (tolerance < 0) {
+        const double step_kl = kl_nats(stepwise_last, last), prefill_kl = kl_nats(prefilled, last),
+                     between = kl_nats(prefilled, stepwise_last);
+        std::cout << label << ": last token KL from the CPU reference: stepwise " << step_kl << ", prefill "
+                  << prefill_kl << " nats; prefill vs stepwise " << between << " nats\n";
+        require(prefill_kl < std::max(0.05, 2 * step_kl), label + ": prefill distribution differs from the reference");
+        require(between < 0.05, label + ": prefill distribution differs from the stepwise CUDA path");
+    } else
+        require(prefill_vs_step < 1e-3, label + ": prefill differs from the stepwise CUDA logits");
     if (tolerance >= 0)
         require(relative(prefilled, last) < tolerance, label + ": prefill mismatch");
     std::cout << label << ": layers " << c.layers << " hidden " << c.hidden << " ffn " << c.intermediate << " heads "
@@ -812,6 +823,14 @@ int main(int argc, char **argv) {
         bitnet.kind = Geometry::dense;
         bitnet.tied = true;
         compare(write_checkpoint(tmp / "llama_dense", bitnet, 8), 12, "synthetic dense BF16 llama (ternary baseline)");
+        // the same two layouts with the batched prefill split into several chunks (cache rows > 0, a
+        // short last chunk) and a single-row chunk
+        for (const char *chunk : {"5", "1"}) {
+            setenv("BEHEMOTH_CUDA_PREFILL_CHUNK", chunk, 1);
+            compare(tmp / "llama_dense", 12, std::string("synthetic dense BF16 llama, prefill chunk ") + chunk);
+            compare(tmp / "llama_bitnet", 16, std::string("synthetic BitNet ternary llama, prefill chunk ") + chunk);
+        }
+        unsetenv("BEHEMOTH_CUDA_PREFILL_CHUNK");
         // Real checkpoints: deep ternary models amplify summation-order differences through the int8
         // activation rounding (random-token prompts are the worst case), so the CPU reference is compared
         // at the distribution level (mean KL < 0.05 nats) and the per-token numbers are printed.
