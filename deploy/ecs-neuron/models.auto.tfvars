@@ -15,7 +15,7 @@ models = {
   ornith = {
     legacy_names       = true
     model_s3_prefix    = "models/ornith-reap20-v3-fp8"
-    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp" # = kv8-seg20 (kv8-bound + seg20_{1,2,4}_1_P) + MTP verify segments segv20_1_2_P + mtp_1_{1,2}_32 (docs/neuron-reap-mtp.md); needs the reap-mtp2 engine
+    graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp-pf" # = kv8-seg20-mtp + the faster prefill set (docs/neuron-qwen35-moe.md section 13: chunked GDN, blocked GQA, grouped MoE moeg_1_256_32 with moe_1_256_32 as overflow fallback); needs the ornith-prefill engine (BEHEMOTH_NEURON_QWEN35_MOE_GROUP=0 disables the grouped MoE)
     prepared_s3_prefix = "" # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
     model_ids          = ["ornith-1.5-35b-a3b-reap20-v3"]
     model_name         = "ornith-1.5-35b-a3b-reap20-v3"
