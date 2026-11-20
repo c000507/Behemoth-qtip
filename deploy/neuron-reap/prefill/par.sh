@@ -8,6 +8,6 @@ cd $S; for e in "$@"; do export "$e"; done
 python3 /root/op/pf.py run/$TAG short:40:1:8 p1k:1000:1:8 q2k:2000:1:8 p4k:4000:1:8 q6k:6000:1:8 p8k:8000:1:8 p32k:32000:1:8 > run/$TAG/par.txt 2>&1
 pkill -f neuron_server; sleep 2
 grep -c -i nonfinite run/$TAG/server.log >> run/$TAG/par.txt
-python3 /root/op/steps.py run/$TAG/server.log | grep "tokens=256 " >> run/$TAG/par.txt
+python3 /root/op/steps.py run/$TAG/server.log | grep "^prefill" >> run/$TAG/par.txt
 grep -o '"moe_fallbacks":[0-9]*' run/$TAG/server.log | sort | uniq -c >> run/$TAG/par.txt
 ls -la run/$TAG/logits.bin >> run/$TAG/par.txt; echo PAR_DONE >> run/$TAG/par.txt

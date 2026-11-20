@@ -8,4 +8,4 @@ python3 /root/op/pf.py run/$TAG short:40:1:200 p1k:1000 p4k:4000 p8k:8000 p32k:3
 python3 /root/op/steps.py run/$TAG/server.log > run/$TAG/steps.txt 2>&1
 echo "nonfinite: $(grep -c -i nonfinite run/$TAG/server.log)" >> run/$TAG/matrix.txt; grep -E 'Qwen35: 40 layers|MTP: ready' run/$TAG/server.log >> run/$TAG/matrix.txt; grep request_metrics run/$TAG/server.log | python3 -c 'import sys,json; [print("metrics", {k: d.get(k) for k in ("prompt_tokens","cached_tokens","prefill_ms","prefill_tokens_per_s","decode_tokens_per_s","ttft_ms","active_start")}) for d in (json.loads(l.split(" ",1)[1]) for l in sys.stdin)]' >> run/$TAG/matrix.txt
 echo MATRIX_DONE >> run/$TAG/matrix.txt
-aws s3 sync --only-show-errors --exclude '*' --include '*.txt' --include '*.json' run/$TAG s3://behemoth-neuron-models-912935854432/tmp/ornith-prefill/run/$TAG
+aws s3 sync --only-show-errors --exclude '*' --include '*.txt' --include '*.json' run/$TAG s3://behemoth-neuron-models-912935854432/tmp/ornith-chunk4096/run/$TAG

@@ -2,7 +2,7 @@
 # setup.sh: instance store, src, prod model + graphs, engine build. Idempotent; log in /mnt/scratch/log/setup.log
 set -o pipefail
 B=s3://behemoth-neuron-models-912935854432
-T=$B/tmp/ornith-prefill
+T=$B/tmp/ornith-chunk4096
 S=/mnt/scratch
 export PATH=/usr/local/bin:/opt/aws/neuron/bin:$PATH
 if ! mountpoint -q $S; then
@@ -16,11 +16,15 @@ exec >> log/setup.log 2>&1
 echo "== setup $(date -u +%T)"
 aws s3 cp --only-show-errors $T/src.tgz src.tgz && mkdir -p src && tar -xzf src.tgz -C src && echo "src ok"
 ( aws s3 sync --only-show-errors $B/models/ornith-reap20-v3-fp8 model && echo "model ok $(du -sh model | cut -f1)" ) &
-aws s3 sync --only-show-errors $B/graphs/ornith-reap20-v3-kv8-seg20-mtp gprod && echo "graphs ok $(ls gprod | wc -l)"
+aws s3 sync --only-show-errors $B/graphs/ornith-reap20-v3-kv8-seg20-mtp-pf gprod && echo "graphs ok $(ls gprod | wc -l)"
 which g++-12 >/dev/null || (apt-get update -qq && apt-get install -y -qq g++-12 libboost-dev libpcre2-dev) > log/apt.log 2>&1
 dpkg -l libboost-dev libpcre2-dev >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq libboost-dev libpcre2-dev) >> log/apt.log 2>&1
 mkdir -p shim && ln -sf $(which g++-12) shim/g++
 (cd src && PATH=$S/shim:$PATH bash neuron/cpp/build.sh $S/BUILD srv) > log/build.log 2>&1; tail -2 log/build.log
 $S/shim/g++ -std=c++20 -O2 -pthread -I/opt/aws/neuron/include src/neuron/cpp/layer_bench.cpp -L/opt/aws/neuron/lib -lnrt -Wl,-rpath,/opt/aws/neuron/lib -o BUILD/layer_bench && echo "layer_bench ok"
+for c in corpus corpus2; do aws s3 cp --only-show-errors $B/tmp/ornith-prefill/$c.tgz $c.tgz; done
+mkdir -p corpus corpus2 ref && tar -xzf corpus.tgz -C corpus && tar -xzf corpus2.tgz -C corpus2; ls corpus corpus2 | head
+aws s3 sync --only-show-errors $B/tmp/ornith-prefill/ref ref
+$S/shim/g++ -std=c++20 -O2 -pthread -I/opt/aws/neuron/include src/neuron/cpp/neff_io.cpp -L/opt/aws/neuron/lib -lnrt -Wl,-rpath,/opt/aws/neuron/lib -o BUILD/neff_io && echo "neff_io ok"
 wait
 echo "SETUP_DONE $(date -u +%T)"

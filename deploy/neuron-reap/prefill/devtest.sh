@@ -12,7 +12,7 @@ m = json.load(open(sys.argv[1]))
 e = {'MOE': m.get('moe', 'all'), 'MOE_CAP': m.get('moe_cap') or 32, 'MOE_HOT': m.get('moe_hot', 16), 'MOE_GG': m.get('moe_gg', 'idx'), 'MOE_GD': m.get('moe_gd', 'slot2'),
      'MOE_GE': m.get('moe_ge', 0), 'GDN_CHUNK': m.get('gdn_chunk', 0), 'GDN_INV': m.get('gdn_inv', 'rec'),
      'GDN_SLOT': m.get('gdn_slot', ''), 'KV8': 1 if m.get('kv8') else 0, 'KV_CODE': m.get('kv_code', 'int8'), 'ATT_BLOCK': m.get('att_block', 0), 'ROUTE': m.get('route', 'topk'),
-     'MOE_GF': m.get('moe_gf', 'onehot'), 'MOE_GB': m.get('moe_gb', 'sc1'), 'MOE_TIERS': m.get('moe_tiers', '') or "''", 'MOE_TAIL': m.get('moe_tail', 'nat'), 'MOE_GSLOTS': m.get('moe_gslots', 3072), 'MOE_GBLK': m.get('moe_gblk', 0), 'MOE_TSUB': m.get('moe_tsub', 0), 'ATT_QBLOCK': m.get('att_qblock', 0),
+     'MOE_GF': m.get('moe_gf', 'onehot'), 'MOE_GB': m.get('moe_gb', 'sc1'), 'MOE_TIERS': m.get('moe_tiers', '').replace(',', '+'), 'MOE_TAIL': m.get('moe_tail', 'nat'), 'MOE_GSLOTS': m.get('moe_gslots', 3072), 'MOE_GBLK': m.get('moe_gblk', 0), 'MOE_TSUB': m.get('moe_tsub', 0), 'ATT_QBLOCK': m.get('att_qblock', 0),
      'ATT_SPLIT': m.get('att_split', 0), 'ATT_FOLD': m.get('att_fold', 0), 'TP': m['geometry']['tp'], 'PAGES': m['pages'], 'SLOTS': m['slots']}
 print(' '.join(f'{k}={v}' for k, v in e.items()))
 P
