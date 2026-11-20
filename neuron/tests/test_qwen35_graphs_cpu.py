@@ -6,6 +6,7 @@ padding), then decode steps (R rows: the same sequence plus a second one), state
   WEIGHTS=bf16 python neuron/tests/test_qwen35_graphs_cpu.py       # bf16 rounding as the device graphs
   WEIGHTS=fp8 python neuron/tests/test_qwen35_graphs_cpu.py        # fp8 weights + activations (exact E4M3 mirror)
   MOE=gather ...                                                   # decode steps through the gathered-expert path
+  PREFILL_MOE=group MOE_CAP=4 MOE_HOT=2 ...                        # the prefill chunk through the grouped MoE (+ MOE_GG / MOE_GD forms)
 """
 import os
 import sys
@@ -22,6 +23,7 @@ from glm_runner import ThreadAllReduce  # noqa: E402
 
 FP8 = os.environ.get('WEIGHTS', 'bf16') == 'fp8'
 MOE_DEC = os.environ.get('MOE', 'all')
+PREFILL_MOE = os.environ.get('PREFILL_MOE', 'all')   # group: the prefill chunk through moe_grouped (MOE_CAP / MOE_HOT)
 
 
 class Mirror:
@@ -34,6 +36,7 @@ class Mirror:
         self.heads = [P.shard_head(get, r, g, FP8) for r in range(tp)]
         self.embed = get('embed_tokens.weight')
         self.pages, self.slots = pages, slots
+        self.group_launches, self.group_overflows = [0] * tp, [0] * tp
         self.state = [[{k: Q.zeros(*v) for k, v in Q.state_shapes(g.kind(l), g, pages, slots).items()} for l in range(g.L)] for r in range(tp)]
 
     def launch(self, tokens, pos, slot, table, moe_mode):
@@ -59,7 +62,13 @@ class Mirror:
                 if Q.ROUTER == 'shard':   # the engine derives the rank's router slice from the replicated router at load
                     cols = torch.arange(g.H // g.TP) + r * (g.H // g.TP)
                     t['rws'], t['rcols'] = t.pop('rw')[:, cols].contiguous(), cols
-                xr, _ = Q.sublayer('moe', t, g, R_, Q_, table.shape[1], ar(r), moe_mode)
+                x_in = xr
+                xr, st = Q.sublayer('moe', t, g, R_, Q_, table.shape[1], ar(r), moe_mode)
+                if moe_mode == 'group':   # the engine's rule: a cold expert with more tokens than its slots -> rerun with MOE=all
+                    self.group_launches[r] += 1
+                    if float(st['ovf'][0]) > Q.MOE_CAP:
+                        self.group_overflows[r] += 1
+                        xr, _ = Q.sublayer('moe', {**t, 'x': x_in}, g, R_, Q_, table.shape[1], ar(r), 'all')
             rows = torch.arange(R_) * Q_ + (pos >= 0).long().sum(dim=1) - 1
             out[r] = (xr, Q.head({'x': xr, **self.heads[r]}, g, rows))
         th = [threading.Thread(target=run, args=(r,)) for r in range(g.TP)]
@@ -89,7 +98,9 @@ def main():
     lg_ref, h_ref = ref.forward(toksA, stA, return_hidden=True)
     tokens = torch.cat((toksA, torch.zeros(2, dtype=torch.int64))).reshape(1, 8)
     pos = torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]])
-    h, lg = mir.launch(tokens, pos, torch.tensor([0]), torch.tensor([[0, 1]]), 'all')
+    h, lg = mir.launch(tokens, pos, torch.tensor([0]), torch.tensor([[0, 1]]), PREFILL_MOE)
+    if PREFILL_MOE == 'group':
+        print(f'grouped prefill MoE (MOE_CAP={Q.MOE_CAP} MOE_HOT={Q.MOE_HOT} {Q.MOE_GG}/{Q.MOE_GD}): {mir.group_overflows[0]} of {mir.group_launches[0]} launches fell back to MOE=all')
     hn = Q.rms(h[:6], mir.heads[0]['norm'], mir.g.eps)
     e1, e2 = rel(hn, h_ref), rel(lg[0], lg_ref[-1])
     print(f'prefill chunk (6 of 8): final hidden rel L2 {e1:.3e}, last logits {e2:.3e}, top-1 {"same" if lg[0].argmax() == lg_ref[-1].argmax() else "DIFFERENT"}')

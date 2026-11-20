@@ -94,6 +94,13 @@ MTP_CHAIN_DBG = os.environ.get('MTP_CHAIN_DBG', '0') == '1'
 MTP_WIN = os.environ.get('MTP_WIN', 'arith')     # mtpc winner rank: arith (clamp arithmetic) | cmp (>= and a count)
 GDN_VPUT = os.environ.get('GDN_VPUT', 'stack')   # verify state writes: stack (one scatter of R * Q states) | seq (one scatter of R rows per token:
 #                                                  probe for the R > 1, Q = 2 buckets, whose gdn block costs 6.2 ms instead of 0.36 on the device)
+MOE_CAP = int(os.environ.get('MOE_CAP', '32'))     # MOE=group (prefill): slots per expert of the cold tier (tokens of one expert in one chunk)
+MOE_HOT = int(os.environ.get('MOE_HOT', '16'))     # MOE=group: the MOE_HOT most loaded experts of the chunk run on every token (hot tier)
+MOE_GE = int(os.environ.get('MOE_GE', '0'))        # MOE=group: cold-tier experts per pass (gather .. scatter); 0: all at once
+MOE_GSTAT = int(os.environ.get('MOE_GSTAT', '0'))  # MOE=group: also output the MOE_GSTAT largest expert loads of the chunk (sizing MOE_CAP / MOE_HOT from real prompts)
+MOE_GG = os.environ.get('MOE_GG', 'idx')           # MOE=group token gather: idx (index_select of the fp8 rows) | mm (one-hot fp8 matmul)
+MOE_GD = os.environ.get('MOE_GD', 'slot2')         # MOE=group, slot outputs back to the tokens by a one-hot matmul [T, E C] x [E C, H]: slot2 (the slot
+                                                   # scale folded into the one-hot matrix, bf16 operands) | slot (f32 slot outputs scaled first)
 VERIFY = os.environ.get('VERIFY', '0') == '1'   # speculative verify buckets (R = 1, Q = 1 + drafts tokens of one request): the gdn state after
 #                                                  EVERY position goes to its own slot (step input 'vslot' [Q]); docs/neuron-qwen397-mtp.md
 EXACT = os.environ.get('EXACT', '0') == '1'   # CPU tests: f32 matmuls, no bf16 rounding (sharding correctness vs the oracle)
@@ -644,6 +651,9 @@ def moe_block(n, t, g, allreduce, mode='all', ar_route=None):
         v = (comb if MOE_DEBUG == 'route' else torch.softmax(torch.matmul(n.float(), t['rw'].T), dim=-1)).reshape(T, -1).float()[:, :g.H]
         alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm', 'rcols')) * 0.0
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
+    if mode == 'group':
+        routed, ovf = moe_grouped(n, comb, t, g)
+        return allreduce(shared + routed), {'ovf': ovf}
     groups = MOE_SPLIT if (mode == 'gather' and MOE_SPLIT and T > MOE_SPLIT and T % MOE_SPLIT == 0 and not MOE_DEBUG) else T
     if groups != T:
         # rows in groups of MOE_SPLIT, each with its own slot union: the gathered slices of one group stay small
@@ -657,6 +667,124 @@ def moe_block(n, t, g, allreduce, mode='all', ar_route=None):
         alive = sum(w.reshape(-1)[:1].float().sum() for k, w in t.items() if k not in ('x', 'norm', 'rcols')) * 0.0   # every input stays a graph parameter
         return allreduce(torch.nn.functional.pad(v, (0, g.H - v.shape[1])) + alive), {}
     return allreduce(shared + routed), {}
+
+
+def moe_grouped(n, comb, t, g):
+    """Prefill MoE without running every expert on every token (MOE=group). A chunk of T tokens makes K T (token, expert)
+    pairs over E experts, so an expert sees K T / E tokens on average (10 of 256 at E = 205) while MOE=all contracts it with
+    all T. Two tiers, both static shapes:
+      hot   the MOE_HOT most loaded experts of the chunk (generalists) are gathered by index and run on every token, as
+            the decode graphs' MOE=gather does for its slot union;
+      cold  every other expert e gets MOE_CAP slots: slot c holds the c-th token routed to e. The token rows are gathered
+            into [E, C, H], one contraction per expert (bmm8g), and the slot outputs are added back to their tokens by a
+            one-hot matmul. MOE_GE experts at a time, so the intermediates of one group stay small.
+    -> (routed [T, H] f32 partial of this rank, ovf [1] f32 = the largest load among the cold experts). The result is the
+    exact MoE sum iff ovf <= MOE_CAP; otherwise the engine reruns the launch with the MOE=all graph of the bucket (the MoE
+    is stateless and the input residual is still intact). Same fp8 recipe as moe_routed (activation rows scaled by
+    amax / 224), the down projection quantised per slot instead of per token."""
+    T, E, C, S = n.shape[0], g.E, MOE_CAP, min(MOE_HOT, g.E)
+    dev = n.device
+    sel = (comb > 0).float()                                                           # [T, E]
+    load = sel.sum(dim=0, keepdim=True)                                                # [1, E]
+    ar = torch.arange(E, device=dev).float().reshape(1, E)
+    hot = torch.topk(load - ar * (0.5 / E), S, dim=-1)[1].reshape(S)                   # most loaded first, ties: the lower index
+    hotmask = (hot.reshape(S, 1).float() == ar).float().sum(dim=0, keepdim=True)      # [1, E]
+    cold = sel * (1.0 - hotmask)
+    cload = load * (1.0 - hotmask)                                                     # [1, E]
+    ovf = cload.amax(dim=-1)                                                           # [1]
+    if MOE_GSTAT:   # + the sorted loads of the most loaded experts (hot ones included): the engine logs them on request
+        ovf = torch.cat((ovf, torch.topk(load, MOE_GSTAT, dim=-1)[0].reshape(MOE_GSTAT)), dim=0)
+    # rank[t, e] = tokens before t routed to e: a 0 / 1 matmul (exact also with bf16 operands; blocks of 256 keep the counts exact)
+    rank = torch.cat([torch.matmul(torch.tril(torch.ones(min(256, T - b), min(256, T - b), device=dev), diagonal=-1), cold[b:b + 256])
+                      + (cold[:b].sum(dim=0, keepdim=True) if b else 0.0) for b in range(0, T, 256)], dim=0)
+    q8 = t.get('egu_s') is not None and not EXACT
+    a, n8 = quant8(n) if q8 else (None, None)                                          # [T, 1], [T, H] fp8
+    ne = MOE_GE if 0 < MOE_GE < E else E
+    out = None
+    for e0 in range(0, E, ne):
+        part = moe_cold(n, n8, a, comb, cold, rank, cload, t, g, e0, min(E, e0 + ne))
+        out = part if out is None else out + part
+    return moe_hot(n, comb, t, g, hot, out), ovf
+
+
+def moe_cold(n, n8, a, comb, cold, rank, cload, t, g, e0, e1):
+    """moe_grouped's cold tier for the experts [e0, e1) -> their sum [T, H] f32."""
+    T, E, EIl, H, C = n.shape[0], e1 - e0, g.EIl, g.H, MOE_CAP
+    dev = n.device
+    gu, gus, dw, dc = t['egu'][e0:e1], t.get('egu_s'), t['ed'][e0:e1], t.get('ed_c')   # [E, 2EIl, H], [E, 2EIl], [E, EIl, H], [E, EIl]
+    gus, dc = (gus[e0:e1] if gus is not None else None), (dc[e0:e1] if dc is not None else None)
+    q8 = n8 is not None
+    cold, rank, cload, comb = cold[:, e0:e1], rank[:, e0:e1], cload[:, e0:e1], comb[:, e0:e1]
+    slots = torch.arange(C, device=dev).float()
+    pm = cold.T.unsqueeze(1) * (rank.T.unsqueeze(1) == slots.reshape(1, C, 1)).float()   # [E, C, T] one-hot (zero rows: empty slots)
+    valid = (slots.reshape(1, C) < cload.reshape(E, 1)).float()                        # [E, C]
+    tok = (pm * torch.arange(T, device=dev).float().reshape(1, 1, T)).sum(dim=-1).round().long().reshape(E * C)   # empty slots: token 0, weight 0
+    wsel = torch.index_select(comb.T.reshape(E * T), 0, torch.arange(E, device=dev).repeat_interleave(C) * T + tok).reshape(E, C) * valid
+    if q8:
+        if MOE_GG == 'mm':
+            xg = G.mm8(pm.reshape(E * C, T).to(F8), n8).float().to(F8)                 # one nonzero term per element: exact
+        else:
+            xg = torch.index_select(n8, 0, tok)
+        ag = torch.index_select(a, 0, tok).reshape(E, C, 1)
+        hgu = bmm8g(xg.reshape(E, C, H), gu, wt=True) * ag * gus.reshape(E, 1, 2 * EIl)
+    else:
+        xg = torch.index_select(n if EXACT else n.to(torch.bfloat16), 0, tok).reshape(E, C, H)
+        hgu = torch.matmul(xg, (gu.float() if EXACT else gu.to(torch.bfloat16)).transpose(1, 2)).float()
+        if gus is not None:
+            hgu = hgu * gus.reshape(E, 1, 2 * EIl)
+    hgu = bf(hgu).reshape(E, C, 2, EIl)
+    act = bf(silu_mul(hgu[:, :, 0], hgu[:, :, 1])) * wsel.unsqueeze(-1)               # [E, C, EIl]
+    if dc is not None:
+        act = act * dc.reshape(E, 1, EIl)
+    if q8 and dc is not None and MOE_GD == 'slot2':
+        # the slot scale rides on the one-hot matrix and both operands of the scatter matmul are bf16 by construction:
+        # no pass over the [E C, H] slot outputs besides the contraction itself
+        s2 = torch.amax(torch.abs(act), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0   # [E, C, 1]
+        y = bmm8g((act / s2).to(F8), dw).reshape(E * C, H)                             # unscaled
+        ps = (pm * s2).reshape(E * C, T)
+        if y.device.type == 'cpu':
+            return torch.matmul(bf(ps).T, bf(y))
+        return torch.matmul(ps.T.to(torch.bfloat16), y.to(torch.bfloat16)).float()
+    if q8 and dc is not None:
+        s2 = torch.amax(torch.abs(act), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        y = bmm8g((act / s2).to(F8), dw) * s2                                          # [E, C, H]
+    else:
+        y = torch.matmul(act if EXACT else act.to(torch.bfloat16), dw.float() if EXACT else dw.to(torch.bfloat16)).float()
+    return torch.matmul(pm.reshape(E * C, T).T, y.reshape(E * C, H))                   # [T, H]: <= K nonzero terms per element
+
+
+def moe_hot(n, comb, t, g, hot, cold_out):
+    """moe_grouped's hot tier: the gathered experts `hot` [S] on every token (moe_routed's gather form) -> cold_out + their sum."""
+    T, E, EIl, H, S = n.shape[0], g.E, g.EIl, g.H, hot.shape[0]
+    gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')
+    q8 = gus is not None and not EXACT
+    comb2 = torch.index_select(comb, 1, hot)                                           # [T, S]
+    tt = {'w': torch.index_select(gu, 0, hot).reshape(S * 2 * EIl, H)}
+    if gus is not None:
+        tt['w_s'] = torch.index_select(gus, 0, hot).reshape(-1)
+    h2 = lin(n, tt, 'w').reshape(T, S, 2, EIl)
+    act2 = bf(silu_mul(h2[:, :, 0], h2[:, :, 1])) * comb2.unsqueeze(-1)
+    wd2 = torch.index_select(dw, 0, hot).reshape(S * EIl, H)
+    if dc is not None:
+        act2 = act2 * torch.index_select(dc, 0, hot).reshape(1, S, EIl)
+    a2 = act2.reshape(T, S * EIl)
+    if q8 and dc is not None:
+        s2 = torch.amax(torch.abs(a2), dim=-1, keepdim=True).clamp(min=1e-20) / 224.0
+        hot_out = G.mm8((a2 / s2).to(F8), wd2).float() * s2
+    elif EXACT:
+        hot_out = torch.matmul(a2, wd2.float())
+    else:
+        hot_out = torch.matmul(a2.to(torch.bfloat16), wd2.to(torch.bfloat16)).float()
+    return cold_out + hot_out
+
+
+def bmm8g(a8, w8, wt=False):
+    """per-expert fp8 x fp8 contraction a8 [E, C, K] x w8 [E, K, N] (wt: w8 [E, N, K]) -> [E, C, N] f32, as E 2-D matmuls (the
+    tensor-engine form of G.lin). Measured on trn1 / neuronx-cc 2.26: ONE batched matmul over the 205 experts is 3-4x slower
+    and returns non-finite values; and the .float() must follow every dot directly - the fp8 x fp8 product accumulates in
+    f32 only then (stacking the fp8-typed results first rounds them to E4M3: non-finite)."""
+    f = (lambda x: x.float()) if a8.device.type == 'cpu' else (lambda x: x)
+    return torch.stack([torch.matmul(f(a8[e]), f(w8[e].T if wt else w8[e])).float() for e in range(a8.shape[0])], dim=0)
 
 
 def moe_routed(n, comb, t, g, mode):
@@ -1199,11 +1327,14 @@ def main():
                     x, _ = sublayer(parts[1], {**common, **sub('m.'), 'x': x}, g, R, Q, P, allreduce, moe_mode)
                 for n_ in snames:
                     setattr(self, n_.replace('.', '_'), st[n_])   # mutated buffers: aliased input -> output (in place on the device)
+                if moe_mode == 'group' and kind == 'moe':   # output1: the cold tier's largest expert load (engine: > moe_cap -> rerun with MOE=all)
+                    return x, st['ovf']
                 return (x, *[st[n_] for n_ in xnames]) if xnames else x
         fn = Block()
         kwargs = {'enable_aliasing': True} if snames else {}
         meta = {'kind': 'qwen35_' + kind, 'seg': seg or [], 'R': R, 'Q': Q, 'P': P, 'pages': pages, 'slots': slots, 'inputs': names,
                 'states': snames, 'fp8': fp8, 'moe': moe_mode, 'moe_slots': MOE_SLOTS, 'moe_bmm': MOE_BMM, 'router': ROUTER, 'lin_cse': LIN_CSE, 'gdn_dec': GDN_DEC, 'gdn_form': GDN_FORM, 'row_form': ROW_FORM, 'moe_split': MOE_SPLIT, 'moe_kernel': MOE_KERNEL, 'moe_kstat': MOE_KSTAT, 'moe_kskip': MOE_KSKIP, 'moe_kyd': MOE_KYD, 'moe_kdense': MOE_KDENSE, 'moe_kfast': MOE_KFAST, 'moe_kpre': MOE_KPRE, 'egu_t': EGU_T, 'route': ROUTE, 'ar_bf16': AR_BF16, 'gdn_chunk': GDN_CHUNK, 'gdn_inv': GDN_INV, 'gdn_loop': GDN_LOOP, 'rlogit': RLOGIT, 'att_bf16': ATT_BF16, 'kv8': KV8, 'kv_code': KV_CODE, 'att_block': ATT_BLOCK, 'att_gather': ATT_GATHER, 'gdn_gather': GDN_GATHER, 'gdn_einsum': GDN_EINSUM, 'gdn_slot': GDN_SLOT, 'extra_outputs': xnames,
+                'moe_cap': MOE_CAP if moe_mode == 'group' and kind == 'moe' else 0, 'moe_hot': MOE_HOT, 'moe_gg': MOE_GG, 'moe_ge': MOE_GE, 'moe_stat': MOE_GSTAT if moe_mode == 'group' and kind == 'moe' else 0, 'moe_gd': MOE_GD,
                 'verify': bool(VERIFY and Q > 1)}
     meta['geometry'] = g.meta()
     try:
