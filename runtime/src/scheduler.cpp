@@ -167,6 +167,20 @@ ScheduledBatch Scheduler::schedule() {
             count = r.prefill_split - r.cached;
         if (!is_decode && r.prefill_align && r.cached % r.prefill_align)
             count = std::min(count, r.prefill_align - r.cached % r.prefill_align);
+        // A chunk-aligned request (recurrent models: the prefill arithmetic depends on the chunk partition) is not handed
+        // the leftover of the token budget behind another prefill of this step: it waits for the next step and gets its
+        // whole piece there. Otherwise e.g. a budget of one chunk + the decode rows gives the second of two prompts 8
+        // tokens, then chunk - 8, ... (off the grid of a solo run, and tiny pieces through the widest prefill bucket).
+        // A piece cut by decode rows alone is still scheduled (no starvation with budget == chunk).
+        if (!is_decode && r.prefill_align && prefill_tokens > 0 && prefill_cap == token_budget_) {
+            size_t want = std::min(r.history.size() - r.cached, chunk_);
+            if (r.prefill_split > r.cached && r.cached + want > r.prefill_split)
+                want = r.prefill_split - r.cached;
+            if (r.cached % r.prefill_align)
+                want = std::min(want, r.prefill_align - r.cached % r.prefill_align);
+            if (count < want)
+                return;
+        }
         if (!count)
             return;
         // Queued prefills cannot evict older work. Decode growth may reclaim newest unpinned
