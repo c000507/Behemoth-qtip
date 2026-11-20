@@ -504,6 +504,11 @@ core) and ran the 50k-token prompt through the P=4096 buckets.
   (two server starts): bit-identical. New set vs production: **prefill-end top-1 7 / 7**, logits rel L2 0.091-0.110, KL
   0.0005-0.0052; over the following greedy steps 32 / 36 compared steps agree, the 4 flips at production margins
   0.00 / 0.00 / 0.31 / 0.34. 0 non-finite logits in every run (parity, matrix, cache tests: ~1200 prefill chunks).
+  The set rebuilt from the committed `pfbuild.sh` (the one uploaded, 13.7): same layer_bench times (1.13 / 0.54 / 1.68 /
+  2.91 / 5.42 / 10.46 / 4.39 ms), prefill-end top-1 7 / 7, rel L2 0.083-0.159, KL 0.0005-0.0045, 32 / 36 steps, vs the
+  reference 0.073 / 0.114. (Two compiles of the same graph are not bit-identical to each other: the first and the rebuilt
+  set agree bit for bit on 3 of the 7 prompts and differ by 0.03 mean rel L2 over all.)
+* New engine + production graphs: all 56 logits records bit-identical to the production engine.
 * Is 0.1 rel L2 "the same"? `tests/qwen35_prepared_ref.py` (new): the graph functions in EXACT mode over the DEQUANTISED
   prepared weights, the whole prompt as one chunk = an f32 reference that isolates what the device adds (fp8 activations, bf16,
   int8 KV, block form). Prefill-end logits vs that reference (82-token / 501-token prompt): production 0.083 / 0.092, GDN
@@ -532,8 +537,12 @@ Graphs (7 NEFFs, ~4 min with 7 parallel compiles on the box; needs the prepared 
     #   moeg_1_256_32  MOE=group MOE_CAP=32 MOE_HOT=24 MOE_GE=69      moe 1 256 32
     # common: TP=2 PAGES=4097 SLOTS=9 WEIGHTS=fp8 (KV_CODE int8 is the default)
 
-The built NEFFs of this session are in `s3://behemoth-neuron-models-912935854432/tmp/ornith-prefill/graphs-pf/`
-(scratch prefix; `MANIFEST.md5`). Engine: `neuron/cpp/build.sh OUT srv` from this branch.
+The NEFFs built by that script in this session are in `s3://behemoth-neuron-models-912935854432/tmp/ornith-prefill/graphs-pf/`
+(scratch prefix; 7 directories with `graph.neff` + `meta.json`, `MANIFEST.md5`); logs and per-request JSON of every run under
+`.../tmp/ornith-prefill/{run,log}/`. Engine: `neuron/cpp/build.sh OUT srv` from this branch. The measurement drivers are
+in `deploy/neuron-reap/prefill/` (`matrix.sh` prompt matrix, `par.sh` + `cmp.py` logits parity, `cache.sh` prefix-cache
+exactness, `ref.sh` + `cmpref.py` prepared-weights reference, `loads.py` expert-load table, `lb.sh` / `devtest.sh` per-NEFF
+bench and device-vs-mirror test, `gb.sh` ad-hoc NEFF builds).
 
 To deploy (for the user):
 
