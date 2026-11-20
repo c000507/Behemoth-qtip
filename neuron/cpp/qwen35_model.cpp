@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -142,6 +143,9 @@ struct Graph {
     int chain = 0;                // kind mtpc: the head's first pass + chain - 1 chained passes in ONE launch (in-graph argmax across the
                                   // ranks, vocabulary-sharded embedding table); outputs drafts [1, chain] f32, then the aliased KV cache
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0, slots = 0;
+    int moe_stat = 0;             // kind moeg: output1 holds moe_stat more values after the load (the largest expert loads, for the load log)
+    int moe_cap = 0;              // kind moeg (meta moe "group", "moe_cap" > 0): the prefill MoE by expert groups (qwen35_graphs.moe_grouped);
+                                  // output1 = the largest token count of a grouped expert, > moe_cap: the launch is rerun with the moe NEFF
     int egu_t = -1;                          // meta "egu_t": experts stored as egu_t [E * 128, 2048] (nki_moe.relayout_egu); -1: no MoE
     std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
     std::vector<nrt_model_t *> model;        // [rank]
@@ -368,6 +372,14 @@ class Qwen35Model final : public Backend {
             }
             else if (gr.kind != "head")
                 gr.mlp = gr.kind;
+            gr.moe_cap = gr.kind == "moe" ? m.value("moe_cap", 0) : 0;
+            gr.moe_stat = m.value("moe_stat", 0);
+            if (gr.moe_cap > 0) { // the grouped prefill MoE: its own kind, the bucket's plain "moe" NEFF stays the fallback
+                static const bool off = std::getenv("BEHEMOTH_NEURON_QWEN35_MOE_GROUP") && !std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_MOE_GROUP"));
+                if (off)
+                    continue;
+                gr.kind = "moeg";
+            }
             if (gr.mtp && (mtp_manifest.is_null() || m.value("mtp_experts", 0) != mtp_manifest.at("geometry").at("experts").get<int>()))
                 continue; // no MTP set loaded (or one with another expert count): the head's graphs stay unused
             gr.has_gqa = gr.attn == "gqa" || std::find(gr.seg.begin(), gr.seg.end(), "gqa") != gr.seg.end();
@@ -895,6 +907,8 @@ class Qwen35Model final : public Backend {
             check(nrt_add_tensor_to_tensor_set(in, ("input" + std::to_string(i)).c_str(), d.t), "add input");
         }
         check(nrt_add_tensor_to_tensor_set(out, "output0", st.x[1 - parity].t), "add output");
+        if (g.moe_cap)
+            check(nrt_add_tensor_to_tensor_set(out, "output1", moe_load_dev_locked(g, r).t), "add moe load output");
         for (size_t e = 0; e < g.extra.size(); ++e) // bound verify: per-position states, not aliased
             check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(e + 1)).c_str(), bind_state(g.extra[e]).t), "add extra output");
         for (size_t s = 0; s < snames.size(); ++s)
@@ -903,6 +917,20 @@ class Qwen35Model final : public Backend {
             return bound_sets[{&g, l, parity, r, *slots}] = {in, out};
         return sets[key] = {in, out};
     }
+    // the grouped MoE's load output (f32 [1]), one device tensor per graph and rank
+    std::map<std::pair<const Graph *, int>, Dev> moe_load;
+    const Dev &moe_load_dev_locked(const Graph &g, int r) {
+        auto &d = moe_load[{&g, r}];
+        if (!d.t)
+            d = alloc(r, 4 * size_t(1 + g.moe_stat), "moe_load");
+        return d;
+    }
+    const Dev &moe_load_dev(const Graph &g, int r) {
+        std::lock_guard lock(sets_mutex);
+        return moe_load_dev_locked(g, r);
+    }
+    int moe_grouped = 0, moe_fallbacks = 0; // per forward(): grouped MoE launches / reruns with the dense NEFF (rank 0's count)
+    float moe_load_max = 0;
     std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> head_set(const Graph &h, int R, int Q, int r, int parity) {
         auto key = std::make_tuple(&h, R * 1000 + Q, parity, r);
         std::lock_guard lock(sets_mutex);
@@ -1298,7 +1326,8 @@ class Qwen35Model final : public Backend {
                 plan.push_back({f, l});
             else {
                 plan.push_back({find(attn_kind[size_t(l)], L.R, L.Q, L.P), l});
-                plan.push_back({find(mlp_kind[size_t(l)], L.R, L.Q, 0), l});
+                const Graph *grouped = mlp_kind[size_t(l)] == "moe" ? find("moeg", L.R, L.Q, 0) : nullptr;
+                plan.push_back({grouped ? grouped : find(mlp_kind[size_t(l)], L.R, L.Q, 0), l});
                 if (!plan[plan.size() - 2].first || !plan.back().first)
                     throw std::runtime_error("Qwen35: bucket R=" + std::to_string(L.R) + " Q=" + std::to_string(L.Q) + " P=" + std::to_string(L.P) +
                                              " has no graph for layer " + std::to_string(l));
@@ -1324,6 +1353,7 @@ class Qwen35Model final : public Backend {
         double t_layers = 0, t_head = 0;
         static const bool use_barrier = std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER") && std::atoi(std::getenv("BEHEMOTH_NEURON_QWEN35_BARRIER"));
         SpinBarrier barrier(tp);
+        const std::unique_ptr<std::atomic<int>[]> moe_votes(new std::atomic<int>[size_t(layers * tp)]()); // per layer and rank: 0 none, 1 fits, 2 overflow
         plan_ms += ms_since(tp0);
         const auto te0 = Clock::now();
         for (int r = 0; r < tp; ++r)
@@ -1357,6 +1387,49 @@ class Qwen35Model final : public Backend {
                         auto [in, o] = layer_set(*g, l, parity, r, g->bound ? (g->verify ? &L.vslot : &L.slot) : nullptr);
                         const auto te = Clock::now();
                         check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
+                        if (g->moe_cap) {
+                            // grouped MoE: exact iff no grouped expert got more tokens than it has slots. Every rank computes the
+                            // same routing from the same residual bits; the ranks still exchange their verdicts and rerun when
+                            // ANY of them saw an overflow, so they can never disagree on a launch whose collectives need them all.
+                            drain(r);
+                            float load = 0;
+                            check(nrt_tensor_read(moe_load_dev(*g, r).t, &load, 0, 4), "read moe load");
+                            moe_votes[size_t(l * tp + r)].store(load <= float(g->moe_cap) ? 1 : 2);
+                            bool over = false;
+                            for (int o = 0; o < tp; ++o) {
+                                int v;
+                                while (!(v = moe_votes[size_t(l * tp + o)].load())) {
+                                    if (barrier.failed.load())
+                                        throw std::runtime_error("Qwen35: another rank failed");
+#if defined(__x86_64__)
+                                    __builtin_ia32_pause();
+#endif
+                                }
+                                over |= v == 2;
+                            }
+                            if (over) {
+                                const Graph *dense = find(mlp_kind[size_t(l)], g->R, g->Q, 0);
+                                auto [in2, o2] = layer_set(*dense, l, parity, r);
+                                check(nrt_execute(dense->model[size_t(r)], in2, o2), "moe fallback execute");
+                            }
+                            if (r == 0) {
+                                ++moe_grouped;
+                                moe_fallbacks += over;
+                                moe_load_max = std::max(moe_load_max, load);
+                                static const bool log_load = std::getenv("BEHEMOTH_NEURON_QWEN35_MOE_LOAD_LOG") != nullptr;
+                                if (log_load) {
+                                    std::string top;
+                                    if (g->moe_stat) { // the chunk's largest expert loads, descending
+                                        std::vector<float> st(size_t(g->moe_stat));
+                                        check(nrt_tensor_read(moe_load_dev(*g, r).t, st.data(), 4, st.size() * 4), "read moe stats");
+                                        top = " top";
+                                        for (float v : st)
+                                            top += " " + std::to_string(int(v));
+                                    }
+                                    std::cerr << "moe_load layer " << l << " pos " << L.pos[0] << " load " << load << (over ? " FALLBACK" : "") << top << "\n";
+                                }
+                            }
+                        }
                         const auto tx = Clock::now();
                         pr[0] += std::chrono::duration<double, std::milli>(te - ts).count();
                         pr[g->attn == "gdn" ? 1 : g->attn == "gqa" ? 2 : 3] += std::chrono::duration<double, std::milli>(tx - te).count();
@@ -1778,6 +1851,8 @@ class Qwen35Model final : public Backend {
     std::span<const float> forward(const InferenceBatch &batch) override {
         const auto t0 = Clock::now();
         layers_ms = head_ms = exec_ms = plan_ms = 0;
+        moe_grouped = moe_fallbacks = 0;
+        moe_load_max = 0;
         prof.assign(size_t(tp), {});
         launches = 0;
         const auto &lay = batch.layout;
@@ -2028,7 +2103,7 @@ class Qwen35Model final : public Backend {
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"layers_ms", layers_ms}, {"head_ms", head_ms}, {"exec_ms", exec_ms}, {"plan_ms", plan_ms},
                    {"r0", {{"set", p0[0]}, {"gdn", p0[1]}, {"gqa", p0[2]}, {"moe", p0[3]}, {"put", p0[4]}, {"head", p0[5]}, {"read", p0[6]}}},
                    {"rmax", {{"set", pmax[0]}, {"gdn", pmax[1]}, {"gqa", pmax[2]}, {"moe", pmax[3]}, {"put", pmax[4]}, {"head", pmax[5]}, {"read", pmax[6]}}},
-                   {"tokens", batch.tokens.size()}, {"kda_spills", spills}, {"kda_restores", restores}, {"state_saves", state_saves}, {"state_restores", state_restores}};
+                   {"tokens", batch.tokens.size()}, {"moe_grouped", moe_grouped}, {"moe_fallbacks", moe_fallbacks}, {"moe_load_max", moe_load_max}, {"kda_spills", spills}, {"kda_restores", restores}, {"state_saves", state_saves}, {"state_restores", state_restores}};
         return logits;
     }
 };
