@@ -2068,6 +2068,14 @@ class Qwen35Model final : public Backend {
                 if (!Q) { // no prefill buckets: run the prompt as decode rows of one request
                     Q = 1;
                 }
+                // a wide chunk bucket may stop at fewer pages than the narrow ones (its long-context NEFFs are the largest of
+                // the set: 0.3 GiB of HBM for gqa_1_4096_4096): past its last page bucket the next narrower chunk bucket runs
+                if (Q > 1 && !bucket_pages(1, Q, pages_needed(req)))
+                    for (auto it = prefill_Q.rbegin(); it != prefill_Q.rend(); ++it)
+                        if (*it < Q && bucket_pages(1, *it, pages_needed(req))) {
+                            Q = *it;
+                            break;
+                        }
                 const int take = std::min(left, Q);
                 const int PQ = bucket_pages(1, Q, pages_needed(req));
                 if (!PQ)

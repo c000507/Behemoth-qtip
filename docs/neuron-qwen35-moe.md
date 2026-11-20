@@ -596,3 +596,253 @@ To deploy (for the user):
   here, and nothing was fetched from outside the account); the prepared-weights reference of 13.5 replaces it, on two prompts.
 * Decode at long context (29-31 ms per token at 50k) still uses the one-block attention; `ATT_BLOCK` for the decode / segment
   buckets is the same switch but was out of scope (decode numbers had to stay unchanged).
+
+## 14. Wide prefill chunks: can prefill run 4096 tokens per launch? (2026-11-20, branch ornith-chunk4096)
+
+Question: section 13 left a 256-token chunk at 248 ms, 76 % of it the grouped MoE whose cost is per chunk (it streams the
+expert weights once per launch), plus ~24 ms of launch overhead. Does `--prefill-chunk 4096` with Q=4096 graphs amortise that?
+Same box, artefacts and environment as section 13 (dev trn1.2xlarge, the production prepared set, the `-pf` graph set
+`graphs/ornith-reap20-v3-kv8-seg20-mtp-pf` as the 256-chunk baseline, the frozen prompt corpus); only `--prefill-chunk` /
+`--token-budget`, `BEHEMOTH_NEURON_QWEN35_BUCKET_FIT=1` and the added chunk bucket differ.
+
+**Answer.** A Q=4096 bucket compiles and computes correctly, but it does **not fit in HBM next to the served set** (it needs
+~1.25 GiB per core, ~0.55 GiB is free), and on a stripped set where it does load it is **no faster than a Q=1024 bucket**
+(1305 vs 1322 tok/s on a 24k prompt): the PE array is 128 rows wide, so an expert's weights are fully amortised at 128
+token slots - a block of ~1024 tokens - and everything else in a chunk is per-token work. **The largest chunk that pays is
+1024**: it fits (315 MiB, 235 MiB to spare), prefill goes from ~985 to **~1350-1400 tok/s (+37 %)**, bit-reproducible, prefix
+cache exact. The price of any wider chunk is paid by decode streams (one decode step per prefill chunk: 0.28 s -> 0.74 s ->
+3 s gaps) and by prefix-cache hits (a hit recomputes up to chunk - 1 tokens).
+
+### 14.1 HBM budget per core (measured, `prefill/mem.sh`, `prefill/memgroups.py`)
+
+The runtime's own accounting with the `-pf` set loaded (81 NEFFs): 15.40 GiB in use = tensors 13.99 (weights 13.32 GB, state,
+MTP head 0.38 GB, IO) + model code 0.70 + shared scratchpad 0.56 + DMA rings 0.11 + runtime 0.03. Allocations start to fail
+at ~15.94 GiB (the runtime's peak reading is 15.98), so **~0.55 GiB is free**. Three things grow with a new bucket: model code and "DMA ring spill" are per NEFF
+and add up; the scratchpad is shared and is the MAXIMUM over the loaded NEFFs (576 MiB today, set by `gqa_1_256_4096`).
+
+| NEFF group (MiB per core: code + ring spill) | NEFFs | HBM | largest scratch |
+|---|---|---|---|
+| decode R=1 / R=2 / R=4 / R=8 (sub-blocks + 20-layer segments) | 14 / 14 / 14 / 8 | 96 / 142 / 217 / 25 | 55 |
+| MTP + verify buckets (+ 365 MiB of MTP head weights) | 8 | 126 | 1 |
+| heads | 6 | ~30 | 0 |
+| prefill Q=64 | 8 | 36 | 215 |
+| prefill Q=256 (the `-pf` set) | 9 | 64 | 576 |
+| **prefill Q=1024** (this section; measured as the difference of two loaded sets) | 9 | **232** (+ 64 scratch, + 17 IO tensors = 315) | 640 |
+| **prefill Q=4096**: gdn 41, gqa P=256 / 512 / 1024 / 2048 / 4096: 22 / 37 / 79 / 157 / 311, MoE all 251, grouped MoE 89 | 9 | **~990** (+ 192 scratch, + IO) | 768 |
+
+The Q=4096 NEFFs are expensive because the instruction stream and its DMA descriptors grow with the unrolled
+(query block x key block) cells and (token sub-block x expert) matmuls: `gqa_1_4096_4096` alone is a 36 MB NEFF that takes
+311 MiB of HBM, 11 minutes and 13 GB of host RAM to compile; the sub-blocked MOE=all fallback takes 251 MiB.
+
+Load attempts: served set + the whole Q=4096 bucket: fails (out of HBM while allocating the MTP head). Served set + the
+Q=4096 bucket up to P=1024 (16k tokens of context; 519 MiB): fails ~150 MiB short. Without MTP, verify and Q=64 buckets but
+with the whole ladder: fails. It loads only on a **single-row decode set** (no MTP, no verify buckets, no Q=64, no 2 / 4 /
+8-row decode buckets: 34 NEFFs, 15.65 GiB) - that set is what the Q=4096 numbers below were measured on. A serving set
+would have to give up ~0.15 GiB for a Q=4096 bucket limited to 16k tokens of context (it needs ~650 MiB with scratch and IO)
+and ~0.7 GiB for the whole ladder (e.g. MTP with its verify buckets, 491 MiB, plus the 2-row and Q=64 buckets), for no gain
+over Q=1024.
+
+### 14.2 What a wider chunk amortises: per-NEFF cost
+
+layer_bench, ms per launch (in brackets: per 256 tokens); the Q=1024 / 4096 graphs are the forms of 14.3:
+
+| NEFF | Q=256 (`-pf`) | Q=1024 | Q=4096 |
+|---|---|---|---|
+| gdn (chunked delta rule, 128-token chunks) | 1.13 | 4.01 (1.00) | 15.9 (0.99) |
+| MoE all experts (Q >= 1024: 256-token sub-blocks) | 6.46 | 23.4 (5.84) | 88.4 (5.52) |
+| **grouped MoE** | 4.37 | **12.35 (3.09)** | 50.5 (3.16; 4 blocks of 1024) |
+| gqa P=128 (Q=4096: P=256) | 1.12 | 2.70 (0.68) | 15.7 (0.98) |
+| gqa P=512 | 1.69 | 5.94 (1.48) | 22.2 (1.39) |
+| gqa P=1024 | 2.92 | 10.3 (2.58) | 41.2 (2.57) |
+| gqa P=2048 | 5.43 | 19.1 (4.77) | 74.1 (4.63) |
+| gqa P=4096 | 10.46 | 42.1 (10.5) | 143.8 (8.99) |
+| median chunk of the prompt matrix in the engine (forward, ms; rank 0 in `nrt_execute`) | 263: gdn 39, gqa 31, moe 188 | **738**: gdn 127, gqa 105, moe 501 | **2944**: gdn 484, gqa 405, moe 2024 |
+| the same per 256 tokens | 263 | 185 | 184 |
+
+GDN and attention are per-token work (10-15 % better from fewer, larger launches). The MoE is the only block with a
+per-chunk cost, and it stops improving at 1024 tokens: an expert's weights pass the 128-row PE array once per 128 token
+rows, the 256-chunk form gives an expert 32 slots (a quarter of an array pass used), 1024 tokens fill it. Beyond that the
+remaining saving is the launch overhead (~24 ms per chunk whatever its width): 6 ms per 256 tokens at Q=1024 instead of 24,
+1.5 at Q=4096 - below the noise of the attention buckets.
+
+### 14.3 The graphs (`qwen35_graphs.py`; build: `deploy/neuron-reap/pfbuild_wide.sh OUT Q`)
+
+* **gdn**: unchanged form (`GDN_CHUNK=128 GDN_INV=diag GDN_SLOT=bound`), Q / 128 chunks in the sequential part.
+* **gqa**: `ATT_QBLOCK=256` - the blocked KV8 attention of section 13 per query block of 256 tokens, each with its own
+  running max / sum / accumulator; a key block is gathered once for all query blocks. The score cell stays
+  [256 queries, 8 heads, 4096 keys] as in the Q=256 graph; without it the Q=1024, P=1024 graph is 14.4 ms and needs a
+  576 MiB scratchpad instead of 10.3 ms / 192 MiB. Bit-identical to the unblocked form on the CPU (`test_qwen35_kvfp8.py`).
+* **MoE, all experts** (the overflow rerun): `MOE_TSUB=256`, token sub-blocks, so the [T, 205 x 512] intermediates stay those
+  of the Q=256 graph (1.7 GB otherwise at Q=4096).
+* **Grouped MoE, `MOE_GF=idx`** (`moe_grouped_idx`). The Q=256 form cannot be widened: its one-hot slot matrices are
+  [E, C, T] and its scatter-back is a one-hot matmul [T, E C] x [E C, H], both growing with T^2 once the slot count C grows
+  with T. The idx form numbers the K T (token, expert) pairs instead: a pair of a slotted expert gets slot
+  e C + (tokens before it on that expert); slot -> token, -> combine weight and -> pair are scatters of K T scalars with
+  unique targets; token rows are gathered per expert group, one 2-D fp8 matmul pair per expert over its C slots; the
+  slot outputs return by ONE assign-scatter of the slot rows into a [K T + 1, H] pair table that is summed over K. Same
+  contract as before (the graph returns the worst overflow, the engine reruns with MOE=all), same fp8 recipe, padding
+  tokens take no expert. Chosen: `MOE_HOT=32 MOE_CAP=128 MOE_GE=24 MOE_GB=sc1 MOE_TSUB=256` (12.35 ms); Q=4096 is four such
+  blocks in one graph (`MOE_GBLK=1024`).
+
+What was measured on the way (Q=1024, ms per launch):
+
+| | ms |
+|---|---|
+| router + shared expert + 24 hot experts + slot bookkeeping | 3.1 |
+| + token gather + expert matmuls of the 181 cold experts at 128 slots | 8.7 (the same work is 4 x 2.8 = 11.2 in four Q=256 launches) |
+| + outputs back by a row gather of the 8192 pairs from the [26240, 2048] slot table | **52.5** (44 ms: ~5 us per gathered row) |
+| + outputs back by an assign-scatter into the pair table, once / per expert group | **11.7** / 13.4 |
+| + outputs back by `index_add` | 2.8 ms and **garbage** on the device (rel 386 vs the mirror): not supported, removed |
+| token rows into the slots by an fp8 row scatter | neuronx-cc 2.26 fails (HLOToTensorizer) |
+| hot 32 / cap 128 (chosen), hot 24 / cap 160 | 12.35 / 19.7 |
+| load tiers (`MOE_TIERS`): 24 hot, then experts in load order with 176 .. 44 slots (11.1k slots instead of 26.2k) | 17.0: gathering 181 experts' weights in load order costs more than the slots it saves |
+| tiers with 176-208-slot classes | 750-790 (a cliff; not investigated) |
+
+Expert loads (`prefill/stat.sh`, a Q=256 grouped NEFF that returns every expert's load, `MOE_GSTAT=-1`; 13 520 chunk x layer
+samples of code and prose prompts, summed into wider windows by `loadsw.py`): the sorted load profile is scale-free - the
+r-th most loaded expert takes the same FRACTION of a window at 256, 1024, 2048 and 4096 tokens (maximum over the samples,
+% of the window: rank 8: 29, 16: 16, 24: 13.7, 32: 9.7, 48: 7.6, 64: 5.8, 96: 3.9, 128: 3.1; the medians are 15.5, 10.8, 8.4,
+6.8, 5.0, 3.8, 2.2, 1.2). So a wider chunk does not make routing more even; it only shrinks the relative fluctuation,
+which is why hot 32 / cap 128 (12.5 % of 1024) has headroom (largest cold load seen in the engine runs: 101 of 128; no
+fallback in ~3 600 grouped launches at Q=1024 and ~800 at Q=4096; hot 24 / cap 128 would fall back in 0.03 % of the windows).
+
+Device vs CPU mirror (random real-shape weights, `devtest.sh`): gdn_1_1024 4.19e-2, gdn_1_4096 4.18e-2, gqa_1_1024_1024
+4.17e-2, gqa_1_4096_512 4.10e-2, grouped MoE Q=1024 3.46e-2, Q=4096 3.45e-2, MOE=all Q=1024 3.49e-2 - the values of the Q=256
+NEFFs; both ranks bit-identical. CPU: `EXACT=1 PREFILL_MOE=group MOE_GF=idx ...` vs the f32 oracle 3e-7 (as MOE=all), also
+with tiers, blocks and forced overflow.
+
+### 14.4 Engine and scheduler
+
+Nothing in the engine assumes a 256-token chunk: buffers, page tables, the grouped-MoE vote and rerun, state snapshots are
+per bucket, and the Q=1024 set ran on the unchanged engine code. What a wide chunk needs:
+
+* `--token-budget` >= the chunk (default 1024; the scheduler hands a prompt min(chunk, budget left)). Used: chunk + 8 (the
+  decode rows of a step). **Scheduler change** (`runtime/src/scheduler.cpp`, commit `9eec0e5`): a chunk-aligned prefill is no
+  longer handed the budget's leftover behind another prefill of the same step (with chunk + 8 the second prompt got 8
+  tokens, then chunk - 8, ...: off the chunk grid of a solo run - other bits for a recurrent model - and tiny pieces
+  through the widest bucket); it waits for the next step. Consequence: with a budget of one chunk concurrent prompts
+  prefill one after the other (FIFO) instead of interleaved - better first-token times, same aggregate rate.
+* `BEHEMOTH_NEURON_QWEN35_BUCKET_FIT=1` (existed, opt-in): the tail of a prompt runs in the largest completely filled
+  bucket instead of one wide chunk padded by more than 25 %. Needed: without it a 501-token prompt is one padded 1024-token
+  launch (0.69 s instead of 0.52 s). With it short prompts change too (82 tokens: two Q=64 launches, 0.47 s, instead of one
+  padded Q=256 launch, 0.38 s), and a 601-token tail runs as 256 + 256 + 64 + 64 (1.06 s) where one padded 1024 chunk would
+  take 0.69 s: the 25 % rule is not the optimum for this bucket ladder (left as is; see 14.9).
+* **Engine change** (`qwen35_model.cpp`, commit `25f4461`): a chunk bucket without a page bucket for the request's context
+  hands over to the next narrower chunk bucket instead of throwing, so a wide bucket can stop at fewer pages than the
+  narrow ones (needed only for a truncated Q=4096 ladder; not exercised by the sets measured here).
+* Prefix cache: with `PREFIX_ALIGN=1` the snapshot grid IS the chunk grid, so a hit restores the last multiple of the chunk
+  and recomputes the rest (14.7). MTP and the decode path are untouched.
+
+### 14.5 Measured: TTFT and prefill rate
+
+Same session, engine of this branch for all three, production env. 256 = the `-pf` set as served (81 NEFFs); 1024 = the
+`-pf` set + the Q=1024 bucket (90 NEFFs, `--prefill-chunk 1024 --token-budget 1032`); 4096 = the Q=4096 bucket on the
+single-row decode set of 14.1 (34 NEFFs, no MTP, `--prefill-chunk 4096 --token-budget 4104`). TTFT at the client,
+in brackets prompt tokens / TTFT.
+
+| prompt (tokens) | 256 | 1024 | 4096 (stripped set) |
+|---|---|---|---|
+| 82 | 0.38 s | 0.47 s (BUCKET_FIT: 2 x Q=64) | 0.38 s |
+| 501 | 0.59 s (851) | 0.59 s (849) | 0.56 s |
+| 3029 | 3.08 s (984) | **2.16 s (1403)** | 3.06 s (991): below one chunk, runs in Q=256 |
+| 6715 | 6.80 s (988) | **4.95 s (1356)** | 5.57 s (1206): one 4096 chunk + 2619 tokens in Q=256 |
+| 23763 | 24.99 s (951) | **17.98 s (1322)** | 18.21 s (1305) |
+| 50111 | 58.21 s (861) | **42.54 s (1178)** | 42.27 s (1185) |
+| 4 concurrent x ~7k (28392): first / last first-token, aggregate | 24.3 / 28.8 s, 987 tok/s | 6.5 / 20.8 s, **1363** | 6.7 / 22.3 s, 1273 |
+| 8 concurrent x ~3.8k (30293) | 13.1 / 32.4 s, 934 | 3.1 / 24.9 s, **1217** | 2.8 / 23.1 s, 1311 |
+| 4 concurrent x ~60 | 0.91 s | 1.07 s | 1.06 s |
+
+A full chunk in the engine: 262.6 ms forward at 256 (975 tok/s), 737.7 ms at 1024 (**1388 tok/s**), 2944 ms at 4096
+(1391 tok/s) - per token the 4096 chunk is the 1024 chunk. The 4096 column is worse than 1024 wherever a prompt is not a
+multiple of 4096, because its tails fall back to the Q=256 bucket (both wide buckets do not fit together).
+
+Decode (engine step log, ms per step, 256 -> 1024 set): 1 stream 18.0 -> 18.0, with one MTP draft 25.3 -> 25.3, 4 rows 34.4
+-> 34.3, 8 rows 106.3 -> 106.4: unchanged. (The stripped 4096 set decodes 4 rows in 66.8 ms and 8 in 143 ms from single-row
+buckets, and has no MTP: that is the cost of making room, not of the chunk.) 0 non-finite logits in every run.
+
+### 14.6 Decode streams while a prompt prefills
+
+The scheduler puts one prefill chunk and one token of every decoding stream into a step, so a decoding stream advances one
+token per prefill chunk. `prefill/stall.sh`: one (four) decode streams running, then a 20.5k (26.8k) token prompt arrives;
+gaps between streamed chunks of a decode stream during that prefill:
+
+| | 256 | 1024 | 4096 (stripped set) |
+|---|---|---|---|
+| gap before the prefill (median) | 25 ms | 25 ms | 17 ms (no MTP) |
+| gap during the prefill: median / p90 / max, 1 decoder | 277 / 305 / 910 ms | 711 / 842 / 878 ms | one token per chunk: p90 2990 / max 3333 ms |
+| the same, 4 decoders | 304 / 352 / 919 ms | 772 / 890 / 895 ms | 2797 / 3376 / 3378 ms |
+| streamed chunks per second of a decode stream during the prefill (1 decoder) | 3.9 | 2.0 | one per ~3 s chunk (0.9 over the window: a burst before the first chunk) |
+| the prefill itself (20.5k prompt, 1 decoder) | 22.9 s (894 tok/s) | 15.7 s (1303 tok/s) | 15.3 s (1337 tok/s; the prompt is 5 x 4096 + 33 tokens) |
+
+A wide chunk trades decode smoothness for prefill rate one to one: the stream stalls for the length of a chunk. The
+scheduler's existing levers apply unchanged (`--prefill-interval N`: prefill only every N-th step while something decodes;
+`--mixed-prefill-tokens`: a smaller prefill piece per step while something decodes - but that leaves the chunk grid, so
+not with `PREFIX_ALIGN=1` exactness); neither was measured here.
+
+### 14.7 Parity, determinism, prefix cache
+
+* **1024 vs 256** (`par.sh`, 7 prompts 82 .. 23763 tokens x 8 greedy steps, MTP off): 0 non-finite; prefill-end top-1 7 / 7;
+  logits rel L2 0.08-0.16, KL 0.0007-0.0051 (section 13: the 256 set vs production 0.09-0.17); 44 of 46 compared greedy
+  steps agree, the two flips at margins 0.07 / 0.08. The 501-token prompt is bit-identical (it never reaches the wide
+  bucket); the 82-token one differs (0.08) only through BUCKET_FIT (Q=64 buckets instead of a padded Q=256 chunk).
+* **f32 reference** (`qwen35_prepared_ref.py`, the two reference prompts of section 13; the 501-token prompt run as ONE
+  padded 1024-token chunk, BUCKET_FIT off, so every wide NEFF is on its path): rel L2 **0.085** (KL 0.0014, top-1 same) vs
+  0.117 (KL 0.0017) for the 256 set on the same prompt and 0.092 for production - the wide forms sit in the same fp8 noise
+  band. The same prompt as one padded 4096-token chunk: 0.077 (KL 0.0068, top-1 same). A reference for a prompt longer than one chunk was started (1625 tokens) and abandoned: ~2 CPU
+  minutes per layer next to a running server.
+* **Run-to-run**: two server starts of the 1024 set: 56 / 56 logits records bit-identical. Two starts of the 4096 set: bit-identical as well.
+  4096 vs 256: 0 non-finite, prefill-end top-1 7 / 7, rel L2 0.10-0.14 (KL <= 0.012), 50 / 51 greedy steps (the flip at margin 0.13);
+  4096 vs 1024: rel L2 0.08-0.13. (Prompts that never reach a wide bucket still differ from the 256 run when their page bucket
+  does: the engine picks P by the end of the SCHEDULER chunk, so a 1625-token prompt runs all its Q=256 pieces at P=128
+  under `--prefill-chunk 4096` and the first one at P=32 under 256.)
+* **Prefix cache** (`cache.sh`, `PREFIX_ALIGN=1`, chunk grid 1024): full hit, partial hit (+487 tokens), the same pair for a
+  prompt with a padded tail, and a cold second server: all **bit-identical** to cold. The 4096 grid: the same five comparisons, all bit-identical.
+  What changes is how much a hit saves: the repeated 6715-token prompt restores 6144 tokens (6656 on the 256 grid) and
+  takes 0.79 s to first token (0.21 s); the 7202-token extension 1.03 s (0.79 s). On the 4096 grid the same two requests
+  restore 4096 tokens and take 2.87 s and 3.39 s. On average a follow-up turn recomputes half a chunk: ~0.13 s at 256,
+  ~0.5 s at 1024, ~2 s at 4096.
+
+### 14.8 Recommendation and what a deployment needs (nothing was pushed or deployed)
+
+* **Do not go to 4096** (or 2048): it does not fit next to the decode / MTP buckets, it is not faster than 1024, and it
+  costs 3 s decode stalls and a 4096-token cache grid.
+* **1024 is the chunk to consider**: +37 % prefill rate on prompts of several thousand tokens (TTFT 6.8 -> 5.0 s at 6.7k,
+  25.0 -> 18.0 s at 24k, 58.2 -> 42.5 s at 50k), aggregate under concurrency 987 -> 1363 tok/s, decode steps unchanged.
+  Against it: a decoding stream gets a token every ~0.74 s instead of every ~0.28 s while someone prefills, prefix-cache hits cost ~0.4-0.6 s more first-token time on average, and HBM
+  headroom drops from ~550 to ~235 MiB per core. For traffic dominated by long cold prompts (agentic / code context) it is
+  a clear win; for chat traffic that lives on prefix-cache hits and concurrent streams it is roughly a wash on TTFT and
+  worse on smoothness - there the 256 set should stay.
+
+To deploy the 1024 bucket (for the user):
+
+1. Graphs: `SRC=<tree> CONFIG=<prepared>/config.json bash deploy/neuron-reap/pfbuild_wide.sh OUT 1024` (9 NEFFs, ~4 min with
+   3 parallel compiles, <= 3.6 GB each): `gdn_1_1024_32`, `moe_1_1024_32`, `moeg_1_1024_32`, `gqa_1_1024_{128,512,1024,2048,4096}`,
+   `head_1024_1`. Copy `graphs/ornith-reap20-v3-kv8-seg20-mtp-pf/` to a NEW prefix and ADD the nine directories (nothing is
+   replaced; the Q=256 and Q=64 buckets serve prompt tails). The nine NEFFs as built by that script in this session are in
+   `s3://behemoth-neuron-models-912935854432/tmp/ornith-chunk4096/graphs-w1024/` (scratch prefix, `MANIFEST.md5`): their set
+   returns logits bit-identical (56 / 56 parity records) to the set measured above (grouped MoE 12.8 ms in layer_bench; the
+   measured one was built before the tier code was added, 12.35 ms). The Q=4096 NEFFs are in `.../graphs-w4096/`, logs and
+   per-request JSON of every run in `.../{run,log}/`.
+2. Backend image from this branch (the scheduler change; the graphs themselves run on the current engine).
+3. Server args `--prefill-chunk 1024 --token-budget 1032`, env `BEHEMOTH_NEURON_QWEN35_BUCKET_FIT=1`; `models.auto.tfvars`:
+   the new `graphs_s3_prefix`. `PREFIX_INTERVAL=2048` can stay (snapshots every second chunk + the tail one).
+4. Rollback: the old prefix and args. The 1024 bucket is inert without `--prefill-chunk 1024` (a 256-token scheduler chunk
+   never selects it), so prefix and image can go first and the two args last.
+5. Watch: `prefill_tokens_per_s`, `moe_fallbacks` in the step profile (0 in ~3 600 launches here; a fallback costs one
+   23 ms MOE=all launch), decode-gap complaints, HBM (`prefill/mem.sh`: 16086 MiB in use per core, allocations fail at ~16320).
+
+### 14.9 Not done / left
+
+* The stall and cache costs are structural, not tuned: a scheduler policy that uses wide chunks only while nothing decodes,
+  and a snapshot grid finer than the chunk for prompt tails, would remove most of both; they need an exactness rule for
+  mixed partitions (the gdn arithmetic depends on the chunk partition) and were out of scope.
+* BUCKET_FIT's 25 % rule and the Q=64 buckets (MOE=all, one-block attention) are a poor tail path next to a 1024 bucket: a
+  cost-based choice (padded wide chunk vs narrow pieces) would save 0.1-0.4 s on some prompt lengths.
+* Q=2048 was not built: 14.2 shows nothing to gain over 1024 (per-token cost flat from 1024 to 4096) and its NEFFs cost
+  about half of the Q=4096 HBM.
+* The grouped MoE at Q=1024 (3.1 ms per 256 tokens) is still 1.7x above the routed roof of section 13.2; what is left is
+  the hot tier (32 experts on every token), the slot over-provisioning (26k slots for ~3.7k cold pairs) and the scatter.
+  Load tiers reduce the slots but need the weights in load order, which costs more (14.3) - an NKI kernel is the next step.
+* Fallback statistics come from code and technical prose only (as in section 13).
+* The Q=4096 numbers are from a set without MTP and multi-row decode buckets; a serving-grade Q=4096 set was not built
+  because it cannot hold the 64k-context bucket.

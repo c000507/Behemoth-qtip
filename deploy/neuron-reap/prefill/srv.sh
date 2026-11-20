@@ -9,7 +9,8 @@ export STREAM_LOAD=0 BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE=1 BEHEMOTH_NEURON_QWEN3
 export BEHEMOTH_NEURON_PREFIX_HOST_GB=4 OMP_WAIT_POLICY=PASSIVE BEHEMOTH_NEURON_MTP_DIR=$S/model/mtp BEHEMOTH_NEURON_SPEC_MTP=1 BEHEMOTH_NEURON_SPEC_MTP_ADAPT=1
 export BEHEMOTH_NEURON_STEP_LOG=1
 for e in "$@"; do export "$e"; done
-nohup $BLD/neuron_server --model $S/model --host 127.0.0.1 --port 1337 --prefill-chunk ${CHUNK:-256} --max-batch-requests 8 --prefix-cache-gb 4 > $S/run/$TAG/server.log 2>&1 &
+nohup $BLD/neuron_server --model $S/model --host 127.0.0.1 --port 1337 --prefill-chunk ${CHUNK:-256} ${BUDGET:+--token-budget $BUDGET} --max-batch-requests 8 --prefix-cache-gb 4 > $S/run/$TAG/server.log 2>&1 &
 sp=$!; t0=$(date +%s)
 for i in $(seq 1 240); do curl -sf -m 2 http://127.0.0.1:1337/health >/dev/null && break; kill -0 $sp 2>/dev/null || { echo "server died"; tail -20 $S/run/$TAG/server.log; exit 1; }; sleep 3; done
+bash /root/op/mem.sh > $S/run/$TAG/mem.txt 2>&1
 echo "server up after $(( $(date +%s) - t0 ))s pid $sp"
