@@ -35,6 +35,8 @@ size_t ternary_scratch_bytes(int in, int tokens);
 // `acc` (optional, [tokens][out]) receives the raw int32 dot products for exactness tests.
 void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, int in, int out,
                      uint8_t *scratch, Stream, int tokens = 1, int32_t *acc = nullptr);
+// Per-token int8 absmax quantisation alone: q [tokens][in], meta [tokens]{scale, sum of codes}.
+void ternary_quantize(const B16 *x, int8_t *q, float *meta, int in, int tokens, Stream);
 // Dense BF16 projection (fp32 accumulation), the baseline of a ternary export.
 void dense_forward(const B16 *w, const B16 *x, B16 *y, int in, int out, Stream);
 void embedding(const B16 *, B16 *, int token, int hidden, Stream);

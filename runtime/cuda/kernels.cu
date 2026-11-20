@@ -729,6 +729,10 @@ void ternary_forward(const uint8_t *packed, float wscale, const B16 *x, B16 *y, 
     }
     launch_check();
 }
+void ternary_quantize(const B16 *x, int8_t *q, float *meta, int in, int tokens, Stream s) {
+    ternary_quant_kernel<<<tokens, 256, 0, s>>>(x, q, meta, in);
+    launch_check();
+}
 void dense_forward(const B16 *w, const B16 *x, B16 *y, int in, int out, Stream s) {
     glm53::gpu::Matrix m{w, nullptr, nullptr, out, in, 4, false, 1};
     glm53::gpu::gemv(m, x, y, false, s);
