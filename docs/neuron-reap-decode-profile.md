@@ -5,6 +5,9 @@ Box i-0cd98c451f018c0a3 (trn1.2xlarge, 2 NeuronCores, TP = 2), aws-neuronx-runti
 one), engine of branch `rocm-to-neff` 8eb7f41 with the production env and args (`deploy/ecs-neuron/models.auto.tfvars`, "ornith").
 Branch `ornith-decode-prof`. Session 2026-11-20. Nothing was pushed or deployed.
 
+**Follow-up (2026-11-21, branch `ornith-wt`): the complete WT set, its prefill MoE forms, the engine load path and the
+same-session measurements are in docs/neuron-reap-wt.md.**
+
 ## TL;DR
 
 * **The 1-row decode step is not weight-streaming bound and not latency bound: it is compute bound on the tensor engine (PE) and the
