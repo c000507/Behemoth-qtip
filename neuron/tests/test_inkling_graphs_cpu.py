@@ -185,6 +185,16 @@ def main():
         print(f'decode step {s} (pos {na} / {nb}): rel {e:.3e}')
         na, nb = na + 1, nb + 1
         nxtA, nxtB = int(la.argmax()), int(lb.argmax())
+    # a new sequence C reusing A's slot (state zeroed by the graph at position 0)
+    C = torch.randint(2, cfg.Vu, (5,))
+    tok = torch.zeros((1, Qc), dtype=torch.long)
+    pos = torch.full((1, Qc), -1, dtype=torch.long)
+    tok[0, :len(C)], pos[0, :len(C)] = C, torch.arange(len(C))
+    lm = m.launch(tok, pos, [0], tabA, 'all')
+    lr = ref.forward(C, {})[-1:]
+    e = rel(lm, lr)
+    worst = max(worst, e)
+    print(f'prefill C in A\'s slot ({len(C)} tokens): rel {e:.3e}')
     print(f'WORST rel {worst:.3e}  top1 {sum(top)}/{len(top)}')
     if IG.EXACT:
         assert worst < 1e-4, worst

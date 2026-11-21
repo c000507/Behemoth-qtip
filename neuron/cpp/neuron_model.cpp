@@ -1600,6 +1600,8 @@ NeuronModel::NeuronModel(const ModelOptions &o) {
         backend_ = make_glm_backend(o);
     else if (is_qwen35_prepared(o.model))
         backend_ = make_qwen35_backend(o);
+    else if (is_inkling_prepared(o.model))
+        backend_ = make_inkling_backend(o);
     else
         impl_ = std::make_unique<Impl>(o);
 }

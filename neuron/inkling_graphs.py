@@ -342,6 +342,12 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
     """One layer visit (attention + MoE) -> (x_new [T, NS, H], {state name: new tensor})."""
     T, H = R_ * Q_, g.H
     x = t['x'].reshape(T, NS, H)
+    t = dict(t)
+    for i in range(R_):   # a row starting at position 0 (new / re-prefilled sequence) starts from zero conv / buf state
+        sfx = f'_{i}' if R_ > 1 else ''
+        keep = (t['pos'][i * Q_] > 0).float()
+        t['conv' + sfx] = t['conv' + sfx] * keep
+        t['buf' + sfx] = t['buf' + sfx] * keep.to(t['buf' + sfx].dtype)
     c = t['ctl']
     ma, mmask, bnd, oh, first, restart = c[0:5], c[5:10], c[10], c[11:15], c[15], c[16]
     sl = [x[:, j] for j in range(NS)]
