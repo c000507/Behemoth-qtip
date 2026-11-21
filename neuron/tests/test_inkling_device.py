@@ -125,7 +125,7 @@ def check(d, meta, g, sh, neff_io):
         if len(kinds) > 1:
             xo, st = IG.segment(kinds, t, g, R_, Q_, P_, ar(r), moe_mode)
         else:
-            xo, st = IG.visit(kinds[0], t, g, R_, Q_, P_, ar(r), moe_mode)
+            xo, st = IG.visit(kinds[0], t, g, R_, Q_, P_, ar(r), moe_mode, meta.get('part', 'full'))
         ref[r], rst[r] = xo.reshape(T, -1), st
     th = [threading.Thread(target=run, args=(r,)) for r in range(g.TP)]
     [t_.start() for t_ in th]
@@ -150,7 +150,9 @@ def check(d, meta, g, sh, neff_io):
                   'worst tokens', [int(i) for i in torch.topk(pt, min(8, T)).indices])
             print('  slot rel:', ' '.join(f'{j}:{float(torch.linalg.norm(yd[:, j] - yr[:, j]) / (torch.linalg.norm(yr[:, j]) + 1e-30)):.2e}' for j in range(IG.NS)))
             for si, n in enumerate(meta['states']):
-                ref_s = rst[0][n]
+                ref_s = rst[0].get(n)
+                if ref_s is None:
+                    continue
                 raw = Path(io, f'out{si + 1}.r0').read_bytes()
                 if ref_s.dtype == torch.bfloat16:
                     dev_s = torch.from_numpy(np.frombuffer(raw, np.int16).copy()).view(torch.bfloat16)
