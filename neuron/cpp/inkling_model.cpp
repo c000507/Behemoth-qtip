@@ -12,7 +12,8 @@
 // row (one-slot slices of [slots, ...] tensors: no runtime-indexed state DMA, docs/neuron-reap-nonfinite.md); the 8 visits
 // of the 4 global layers also hold the server's paged K/V (keys farther than 1024 tokens). Sequences are identified by
 // their first page; slots are an LRU cache with host spill (as the Qwen3.5 GDN slots); the last slot is scratch. A row at
-// position 0 starts from zero state (the graph zeroes it). No prefix cache, no speculation (recurrent family).
+// position 0 starts from zero state (the graph zeroes it). Prefix cache: state snapshots (state_save / state_restore) + the
+// global visits' K/V pages (kv_copy), the recurrent-family contract of neuron_engine.cpp. No speculation.
 #include "neuron_model.hpp"
 #include "behemoth/worker.hpp"
 #include <nrt/nrt.h>
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -139,6 +141,10 @@ struct Graph {
     std::string part = "full";       // meta "part": full | attn | moe (a visit split into an attention and a MoE NEFF)
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0;
     bool wt = false;
+    int moe_cap = 0;                 // > 0: a grouped MoE part (meta "moe_cap"); output1 = ovf, exact iff ovf <= moe_cap
+    int extra = 0;                   // outputs between x and the aliased states (meta "extra_outputs")
+    size_t extra_bytes = 0;
+    std::vector<Dev> extra_dev;      // [rank] the ovf output
     std::vector<std::string> inputs, states; // NEFF inputs, then the aliased states
     std::vector<nrt_model_t *> model;        // [rank]
     std::vector<size_t> input_bytes;
@@ -150,6 +156,7 @@ class InklingModel final : public Backend {
     ModelOptions options;
     json prepared;
     std::filesystem::path root;
+    int far_skip = 0; // pages the page table never needs: the newest rel_extent tokens are read from the K|V buffer
     int tp = 1, hidden = 0, ns = 7, vocab_ = 0, vocab_shard = 0, nvis = 0, pages_total = 0, slots_total = 0, max_context_ = 0;
     std::vector<int> visit_layer;
     std::string visit_kind;
@@ -178,8 +185,9 @@ class InklingModel final : public Backend {
     std::map<int, int> slot_of;
     std::list<int> lru;
     std::map<int, std::vector<std::vector<char>>> spilled;
-    uint64_t spills = 0, restores = 0;
-    int launches = 0;
+    uint64_t spills = 0, restores = 0, state_saves = 0, state_restores = 0;
+    int launches = 0, moe_grouped = 0, moe_fallbacks = 0;
+    float moe_load_max = 0;
     double exec_ms = 0;
     std::array<double, 4> prof_ms{}; // rank 0: put, layers, head, read
 
@@ -192,6 +200,7 @@ class InklingModel final : public Backend {
         ns = g.at("ns");
         vocab_ = g.at("vocab");
         vocab_shard = (vocab_ + tp - 1) / tp;
+        far_skip = g.at("rel_extent").get<int>() / PAGE;
         for (const auto &v : prepared.at("visits")) {
             visit_layer.push_back(v.at("layer"));
             visit_kind += v.at("kind").get<std::string>();
@@ -282,6 +291,10 @@ class InklingModel final : public Backend {
                 for (const auto &k : m.at("kinds"))
                     gr.kinds += k.get<std::string>();
                 gr.part = m.value("part", std::string("full"));
+                gr.moe_cap = m.value("moe_cap", 0);
+                gr.extra = m.contains("extra_outputs") ? int(m.at("extra_outputs").size()) : 0;
+                if (gr.extra > 1 || (gr.extra == 1) != (gr.moe_cap > 0) || (gr.moe_cap > 0 && gr.part != "moe"))
+                    throw std::runtime_error("Inkling NEFF " + dir.path().string() + ": unsupported extra outputs");
                 gr.has_g = gr.kinds.find_first_of("gG") != std::string::npos && gr.part != "moe";
                 gr.R = m.at("R");
                 gr.Q = m.at("Q");
@@ -322,6 +335,15 @@ class InklingModel final : public Backend {
                 throw std::runtime_error("Inkling bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has no head NEFF");
         }
     }
+    // A prefill graph of a loop-pass kind (S / G: message gates) also serves the plain visits (s / g): the engine binds zero
+    // gate weights there, which makes the gates the identity ((1 - tanh 0) h + tanh(0) m = h, exact). Halves the prefill
+    // NEFFs. Decode segments are matched exactly (the gates cost DMA per token).
+    static bool serves(char graph_kind, char visit, int Q) {
+        return graph_kind == visit || (Q > 1 && graph_kind == std::toupper(visit));
+    }
+    static bool gate_leaf(const std::string &leaf) {
+        return leaf == "mg" || leaf.rfind("gd_", 0) == 0 || leaf.rfind("gf_", 0) == 0 || leaf.rfind("gg_", 0) == 0;
+    }
     // the graph running visits v.. for (R, Q) with >= P pages: the longest segment matching the visit kinds, else the visit's own
     const Graph *visit_graph(int v, int R, int Q, int P) const {
         static const bool noseg = std::getenv("BEHEMOTH_NEURON_INKLING_NOSEG") && std::atoi(std::getenv("BEHEMOTH_NEURON_INKLING_NOSEG"));
@@ -331,9 +353,16 @@ class InklingModel final : public Backend {
                 continue;
             if (noseg && g.kinds.size() > 1)
                 continue;
-            if (visit_kind.compare(size_t(v), g.kinds.size(), g.kinds) != 0)
+            bool match = true, exact = true;
+            for (size_t i = 0; i < g.kinds.size(); ++i) {
+                match &= serves(g.kinds[i], visit_kind[size_t(v) + i], Q);
+                exact &= g.kinds[i] == visit_kind[size_t(v) + i];
+            }
+            if (!match)
                 continue;
-            if (!best || g.kinds.size() > best->kinds.size() || (g.kinds.size() == best->kinds.size() && g.P < best->P))
+            const bool best_exact = best && visit_kind.compare(size_t(v), best->kinds.size(), best->kinds) == 0;
+            if (!best || g.kinds.size() > best->kinds.size() ||
+                (g.kinds.size() == best->kinds.size() && (exact > best_exact || (exact == best_exact && g.P < best->P))))
                 best = &g;
         }
         return best;
@@ -343,14 +372,34 @@ class InklingModel final : public Backend {
     std::pair<const Graph *, const Graph *> split_graphs(int v, int R, int Q, int P) const {
         const Graph *a = nullptr, *m = nullptr;
         for (const auto &g : graphs) {
-            if (g.kind == "head" || g.R != R || g.Q != Q || g.kinds.size() != 1 || g.kinds[0] != visit_kind[size_t(v)])
+            if (g.kind == "head" || g.R != R || g.Q != Q || g.kinds.size() != 1)
                 continue;
-            if (g.part == "attn" && (!g.has_g || g.P >= P) && (!a || g.P < a->P))
+            const char k = visit_kind[size_t(v)];
+            if (g.part == "attn" && serves(g.kinds[0], k, Q) && (!g.has_g || g.P >= P) &&
+                (!a || (g.kinds[0] == k) > (a->kinds[0] == k) || ((g.kinds[0] == k) == (a->kinds[0] == k) && g.P < a->P)))
                 a = &g;
-            if (g.part == "moe" && !m)
+            // the MoE part does not depend on the attention kind: an s (S) part serves g (G) visits and vice versa
+            if (g.part == "moe" && moe_serves(g, k) && (!m || moe_rank(g, k) > moe_rank(*m, k)))
                 m = &g;
         }
+        static const bool nogroup = std::getenv("BEHEMOTH_NEURON_INKLING_NOGROUP") && std::atoi(std::getenv("BEHEMOTH_NEURON_INKLING_NOGROUP"));
+        if (m && m->moe_cap && (nogroup || !dense_moe(v, R, Q)))
+            m = dense_moe(v, R, Q); // a grouped part needs the dense one of its bucket for the overflow rerun
         return a && m ? std::make_pair(a, m) : std::make_pair(nullptr, nullptr);
+    }
+    static bool moe_serves(const Graph &g, char visit) { return std::isupper(g.kinds[0]) || !std::isupper(visit); }
+    // preference among the MoE parts serving a visit: grouped before dense, then the visit's own gate kind
+    static int moe_rank(const Graph &g, char visit) {
+        return (g.moe_cap > 0 ? 2 : 0) + (bool(std::isupper(g.kinds[0])) == bool(std::isupper(visit)) ? 1 : 0);
+    }
+    const Graph *dense_moe(int v, int R, int Q) const {
+        const Graph *best = nullptr;
+        const char k = visit_kind[size_t(v)];
+        for (const auto &g : graphs)
+            if (g.kind != "head" && g.part == "moe" && !g.moe_cap && g.R == R && g.Q == Q && g.kinds.size() == 1 && moe_serves(g, k) &&
+                (!best || moe_rank(g, k) > moe_rank(*best, k)))
+                best = &g;
+        return best;
     }
     int bucket_pages(int R, int Q, int pages) const {
         int best = 0;
@@ -388,6 +437,8 @@ class InklingModel final : public Backend {
             gr.input_bytes.assign(n, 0);
             for (uint64_t i = 0; i < info->tensor_count; ++i) {
                 const auto &t = info->tensor_array[i];
+                if (t.usage == NRT_TENSOR_USAGE_OUTPUT && gr.extra && std::string(t.name) == "output1")
+                    gr.extra_bytes = t.size;
                 if (t.usage != NRT_TENSOR_USAGE_INPUT)
                     continue;
                 const size_t index = std::stoul(std::string(t.name).substr(5));
@@ -409,6 +460,12 @@ class InklingModel final : public Backend {
                     conv_bytes = b;
             }
             nrt_free_model_tensor_info(info);
+            if (gr.extra) {
+                if (gr.extra_bytes < 4)
+                    throw std::runtime_error(gr.neff.string() + ": no ovf output");
+                for (int r = 0; r < tp; ++r)
+                    gr.extra_dev.push_back(alloc(r, gr.extra_bytes, "ovf"));
+            }
             if (options.verbose)
                 std::cerr << "Inkling NEFF " << gr.kind << " R=" << gr.R << " Q=" << gr.Q << " P=" << gr.P << " T=" << gr.T << " S=" << gr.S << "\n";
         }
@@ -523,6 +580,9 @@ class InklingModel final : public Backend {
             return it->second;
         auto &st = steps.at({g.R, g.Q})[size_t(r)];
         auto &rank = ranks[size_t(r)];
+        std::vector<std::string> names = g.inputs;
+        names.insert(names.end(), g.states.begin(), g.states.end());
+        const std::string *names_ptr = names.data();
         auto bind = [&](const std::string &name) -> const Dev & {
             if (name == "x") return st.x[parity];
             if (name == "pos") return st.pos;
@@ -537,6 +597,17 @@ class InklingModel final : public Backend {
             }
             std::string full;
             const std::string base = leaf.substr(0, leaf.find('_'));
+            if (gate_leaf(leaf) && !std::isupper(visit_kind[size_t(vi)])) {
+                // a loop-pass graph on a first-pass visit: zero message gates (the layer's own gate weights belong to
+                // passes 2 and 3 only)
+                const size_t want = g.input_bytes[size_t(&name - names_ptr)];
+                auto &z = rank.t["Z." + leaf + "." + std::to_string(want)];
+                if (!z.t) {
+                    z = alloc(r, want, "zero gate");
+                    zero(z);
+                }
+                return z;
+            }
             if (leaf == "ctl" || leaf == "kv")
                 full = vname(vi, leaf);
             else if (base == "buf" || base == "conv") {
@@ -560,8 +631,6 @@ class InklingModel final : public Backend {
         nrt_tensor_set_t *in = nullptr, *out = nullptr;
         check(nrt_allocate_tensor_set(&in), "set");
         check(nrt_allocate_tensor_set(&out), "set");
-        std::vector<std::string> names = g.inputs;
-        names.insert(names.end(), g.states.begin(), g.states.end());
         for (size_t i = 0; i < names.size(); ++i) {
             const Dev &d = bind(names[i]);
             if (d.bytes != g.input_bytes[i])
@@ -570,8 +639,10 @@ class InklingModel final : public Backend {
             check(nrt_add_tensor_to_tensor_set(in, ("input" + std::to_string(i)).c_str(), d.t), "add input");
         }
         check(nrt_add_tensor_to_tensor_set(out, "output0", st.x[1 - parity].t), "add output");
+        if (g.extra)
+            check(nrt_add_tensor_to_tensor_set(out, "output1", g.extra_dev[size_t(r)].t), "add ovf output");
         for (size_t s = 0; s < g.states.size(); ++s)
-            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(s + 1)).c_str(), bind(g.states[s]).t), "add state output");
+            check(nrt_add_tensor_to_tensor_set(out, ("output" + std::to_string(s + 1 + size_t(g.extra))).c_str(), bind(g.states[s]).t), "add state output");
         return sets[{&g, v, parity, r, slots}] = {in, out};
     }
     std::pair<nrt_tensor_set_t *, nrt_tensor_set_t *> head_set(const Graph &h, int R, int Q, int r, int parity) {
@@ -672,6 +743,114 @@ class InklingModel final : public Backend {
         spilled.erase(seq);
     }
 
+    // ---- prefix cache: state snapshots + K/V pages (the engine's recurrent-family contract, as qwen35_model.cpp) --------
+    // One sequence's state = every visit's K|V buffer and conv state of its slot (per rank), in copy_slot()'s order.
+    size_t state_rank_bytes() const {
+        size_t n = 0;
+        for (int v = 0; v < nvis; ++v)
+            n += buf_bytes[visit_kind[size_t(v)] == 'g' || visit_kind[size_t(v)] == 'G'] + conv_bytes;
+        return n;
+    }
+    size_t state_bytes() const override { return state_rank_bytes() * size_t(tp); }
+    void state_save(int seq, std::byte *dst) override {
+        const size_t rb = state_rank_bytes();
+        if (auto sp = spilled.find(seq); sp != spilled.end() && !slot_of.count(seq)) {
+            for (int r = 0; r < tp; ++r) {
+                if (sp->second.at(size_t(r)).size() != rb)
+                    throw std::runtime_error("Inkling: spilled state size mismatch");
+                std::memcpy(dst + size_t(r) * rb, sp->second[size_t(r)].data(), rb);
+            }
+            return;
+        }
+        auto it = slot_of.find(seq);
+        if (it == slot_of.end())
+            throw std::runtime_error("Inkling: no state to snapshot for the sequence on page " + std::to_string(seq));
+        const int slot = it->second;
+        std::vector<std::future<void>> jobs;
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                size_t at = size_t(r) * rb;
+                for (int v = 0; v < nvis; ++v)
+                    for (const char *leaf : {"buf", "conv"}) {
+                        const Dev &d = ranks[size_t(r)].t.at(vname(v, leaf));
+                        const size_t n = d.bytes / size_t(slots_total);
+                        check(nrt_tensor_read(d.t, dst + at, size_t(slot) * n, n), "read state");
+                        at += n;
+                    }
+            }));
+        for (auto &j : jobs)
+            j.get();
+        ++state_saves;
+    }
+    // `src` becomes the state of the sequence that continues on first page `seq`: kept as its spilled blob, which
+    // acquire_slot() writes into a slot at the sequence's first launch (position > 0).
+    void state_restore(int seq, const std::byte *src) override {
+        state_drop(seq);
+        const size_t rb = state_rank_bytes();
+        auto &blob = spilled[seq];
+        blob.assign(size_t(tp), {});
+        for (int r = 0; r < tp; ++r)
+            blob[size_t(r)].assign(reinterpret_cast<const char *>(src) + size_t(r) * rb, reinterpret_cast<const char *>(src) + size_t(r + 1) * rb);
+        ++state_restores;
+    }
+    // K/V pages: the far keys of the global visits. Host page = [rank][global visit: this page's K|V bytes].
+    size_t kv_stride() const {
+        for (int v = 0; v < nvis; ++v)
+            if (visit_kind[size_t(v)] == 'g' || visit_kind[size_t(v)] == 'G')
+                return ranks[0].t.at(vname(v, "kv")).bytes / size_t(pages_total);
+        return 0;
+    }
+    size_t kv_rank_bytes() const {
+        size_t n = 0;
+        for (char k : visit_kind)
+            n += (k == 'g' || k == 'G') ? 1 : 0;
+        return n * kv_stride();
+    }
+    size_t kv_page_bytes() const override { return kv_rank_bytes() * size_t(tp); }
+    void kv_copy(std::span<const int> device, std::span<const int> host, std::byte *arena, bool save) override {
+        if (device.size() != host.size())
+            throw std::invalid_argument("kv copy: page lists differ in length");
+        for (int p : device)
+            if (p < 0 || p >= pages_total - 1)
+                throw std::invalid_argument("kv copy: page outside the pool");
+        const size_t stride = kv_stride(), rank_bytes = kv_rank_bytes(), page_bytes = rank_bytes * size_t(tp);
+        std::vector<std::pair<size_t, size_t>> runs; // runs of consecutive device pages: one transfer per visit
+        for (size_t i = 0; i < device.size();) {
+            size_t j = i + 1;
+            while (j < device.size() && device[j] == device[j - 1] + 1)
+                ++j;
+            runs.push_back({i, j});
+            i = j;
+        }
+        std::vector<std::future<void>> jobs;
+        for (int r = 0; r < tp; ++r)
+            jobs.push_back(workers[size_t(r)]->submit([&, r] {
+                std::vector<std::byte> buf;
+                size_t base = size_t(r) * rank_bytes;
+                for (int v = 0; v < nvis; ++v) {
+                    if (visit_kind[size_t(v)] != 'g' && visit_kind[size_t(v)] != 'G')
+                        continue;
+                    const Dev &t = ranks[size_t(r)].t.at(vname(v, "kv"));
+                    for (auto [a, b] : runs) {
+                        const size_t n = b - a;
+                        buf.resize(n * stride);
+                        if (save) {
+                            check(nrt_tensor_read(t.t, buf.data(), size_t(device[a]) * stride, n * stride), "kv save");
+                            for (size_t k = 0; k < n; ++k)
+                                std::memcpy(arena + size_t(host[a + k]) * page_bytes + base, buf.data() + k * stride, stride);
+                        } else {
+                            for (size_t k = 0; k < n; ++k)
+                                std::memcpy(buf.data() + k * stride, arena + size_t(host[a + k]) * page_bytes + base, stride);
+                            check(nrt_tensor_write(t.t, buf.data(), size_t(device[a]) * stride, n * stride), "kv restore");
+                        }
+                    }
+                    base += stride;
+                }
+            }));
+        for (auto &j : jobs)
+            j.get();
+    }
+
     // ---- one launch ------------------------------------------------------------------------------------------------
     struct Launch {
         int R = 0, Q = 0, P = 0;
@@ -736,9 +915,13 @@ class InklingModel final : public Backend {
             rows[i] = L.head_rows[i];
         static const int dump_x = std::getenv("NEURON_X_DUMP") ? std::atoi(std::getenv("NEURON_X_DUMP")) : 0;
         const auto te0 = Clock::now();
+        // grouped MoE launches: per plan entry and rank 0 none, 1 fits, 2 overflow (the ranks exchange their verdicts)
+        const std::unique_ptr<std::atomic<int>[]> votes(new std::atomic<int>[plan.size() * size_t(tp)]());
+        std::atomic<bool> failed{false};
         std::vector<std::future<void>> jobs;
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
+              try {
                 auto &st = steps.at({L.R, L.Q})[size_t(r)];
                 const auto t0 = Clock::now();
                 put(st.x[0], L.x.data(), L.x.size() * 4);
@@ -749,9 +932,44 @@ class InklingModel final : public Backend {
                 const auto t1 = Clock::now();
                 int parity = 0;
                 std::vector<float> xr;
-                for (const auto &[g, v] : plan) {
+                for (size_t pi = 0; pi < plan.size(); ++pi) {
+                    const auto &[g, v] = plan[pi];
                     auto [in, o] = visit_set(*g, v, parity, r, L.slot);
                     check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
+                    if (g->moe_cap) {
+                        // exact iff no slotted expert got more tokens than slots. Every rank computes the same routing from the
+                        // same bits; they still rerun when ANY rank saw an overflow (the collectives need all of them).
+                        std::vector<float> load(g->extra_bytes / 4);
+                        check(nrt_tensor_read(g->extra_dev[size_t(r)].t, load.data(), 0, load.size() * 4), "read moe load");
+                        votes[pi * size_t(tp) + size_t(r)].store(load[0] <= float(g->moe_cap) ? 1 : 2);
+                        bool over = false;
+                        for (int o2 = 0; o2 < tp; ++o2) {
+                            int vt;
+                            while (!(vt = votes[pi * size_t(tp) + size_t(o2)].load())) {
+                                if (failed.load())
+                                    throw std::runtime_error("Inkling: another rank failed");
+                                std::this_thread::yield();
+                            }
+                            over |= vt == 2;
+                        }
+                        if (over) {
+                            const Graph *dense = dense_moe(v, L.R, L.Q);
+                            auto [in2, o2] = visit_set(*dense, v, parity, r, L.slot);
+                            check(nrt_execute(dense->model[size_t(r)], in2, o2), "moe fallback execute");
+                        }
+                        if (r == 0) {
+                            ++moe_grouped;
+                            moe_fallbacks += over;
+                            moe_load_max = std::max(moe_load_max, load[0]);
+                            static const bool log_load = std::getenv("BEHEMOTH_NEURON_INKLING_MOE_LOAD_LOG") != nullptr;
+                            if (log_load) {
+                                std::string line = "moe load visit " + std::to_string(v) + ":";
+                                for (float f : load)
+                                    line += " " + std::to_string(int(f));
+                                std::cerr << line + "\n";
+                            }
+                        }
+                    }
                     parity ^= 1;
                     if (dump_x && r == 0) {
                         xr.resize(L.x.size());
@@ -794,6 +1012,10 @@ class InklingModel final : public Backend {
                     prof_ms[0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
                     prof_ms[1] += std::chrono::duration<double, std::milli>(t2 - t1).count();
                 }
+              } catch (...) {
+                failed.store(true);
+                throw;
+              }
             }));
         for (auto &j : jobs)
             j.get();
@@ -809,10 +1031,13 @@ class InklingModel final : public Backend {
             if (g.kind != "head" && g.Q == 1) r = std::max(r, g.R);
         return std::min(r, slots_total - 1);
     }
+    // The page table of a launch holds the FAR keys only (distance >= rel_extent): a context of n pages needs a bucket of
+    // n - rel_extent / 16 pages.
+    int far_pages(int pages) const { return std::max(1, pages - far_skip); }
     int decode_bucket_pages(int pages) const override {
         int best = 0;
         for (const auto &g : graphs)
-            if (g.has_g && g.Q == 1 && g.P >= pages && (!best || g.P < best)) best = g.P;
+            if (g.has_g && g.Q == 1 && g.P >= far_pages(pages) && (!best || g.P < best)) best = g.P;
         return best;
     }
     const std::vector<int> &eos() const override { return eos_; }
@@ -820,7 +1045,7 @@ class InklingModel final : public Backend {
         int p = 0;
         for (const auto &g : graphs)
             if (g.has_g) p = std::max(p, g.P);
-        return std::min(p * PAGE, max_context_);
+        return std::min({(p + far_skip) * PAGE, max_context_, (pages_total - 1) * PAGE});
     }
     json last_profile() const override { return profile; }
 
@@ -828,7 +1053,8 @@ class InklingModel final : public Backend {
         const auto t0 = Clock::now();
         exec_ms = 0;
         prof_ms = {};
-        launches = 0;
+        launches = moe_grouped = moe_fallbacks = 0;
+        moe_load_max = 0;
         const auto &lay = batch.layout;
         logits.resize(batch.sample_rows.size() * size_t(vocab_));
         std::vector<int> sample_of(size_t(lay.queries()), -1);
@@ -860,7 +1086,7 @@ class InklingModel final : public Backend {
                 pages = std::max(pages, pages_needed(rows[at + i]));
             int R = 0, P = 0;
             for (auto it = decode_R.lower_bound(int(n)); it != decode_R.end() && !P; ++it)
-                if (*it <= slots_total - 1 && (P = bucket_pages(*it, 1, pages)))
+                if (*it <= slots_total - 1 && (P = bucket_pages(*it, 1, far_pages(pages))))
                     R = *it;
             if (!P)
                 throw std::runtime_error("Inkling: no decode bucket for " + std::to_string(n) + " rows with " + std::to_string(pages) + " pages");
@@ -883,12 +1109,21 @@ class InklingModel final : public Backend {
             const int first = lay.query_offsets[size_t(req)], count = lay.query_offsets[size_t(req) + 1] - first;
             for (int done = 0; done < count;) {
                 const int left = count - done;
-                int Q = prefill_Q.empty() ? 1 : *prefill_Q.rbegin();
-                if (auto it = prefill_Q.lower_bound(left); it != prefill_Q.end()) Q = *it;
+                // the chunk bucket with the lowest cost per useful token that has a page bucket for this context (cost of
+                // a launch ~ its width + a fixed part: a short tail runs in the narrow bucket, not in a padded wide one)
+                int Q = 0, PQ = 0;
+                double best = 0;
+                for (int q : prefill_Q) {
+                    const int pq = bucket_pages(1, q, far_pages(pages_needed(req)));
+                    const double cost = double(q + 64) / double(std::min(left, q));
+                    if (pq && (!Q || cost < best - 1e-9))
+                        Q = q, PQ = pq, best = cost;
+                }
+                if (prefill_Q.empty()) // decode buckets only: token by token
+                    Q = 1, PQ = bucket_pages(1, 1, far_pages(pages_needed(req)));
+                if (!Q || !PQ)
+                    throw std::runtime_error("Inkling: no prefill bucket with " + std::to_string(far_pages(pages_needed(req))) + " pages");
                 const int take = std::min(left, Q);
-                const int PQ = bucket_pages(Q == 1 ? 1 : 1, Q, pages_needed(req));
-                if (!PQ)
-                    throw std::runtime_error("Inkling: no prefill bucket Q=" + std::to_string(Q) + " with " + std::to_string(pages_needed(req)) + " pages");
                 auto L = fresh(1, Q, PQ);
                 std::set<int> pinned;
                 for (int i = 0; i < take; ++i) {
@@ -912,7 +1147,7 @@ class InklingModel final : public Backend {
         }
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"exec_ms", exec_ms},
                    {"r0", {{"put", prof_ms[0]}, {"layers", prof_ms[1]}, {"head", prof_ms[2]}, {"read", prof_ms[3]}}},
-                   {"tokens", batch.tokens.size()}, {"spills", spills}, {"restores", restores}};
+                   {"tokens", batch.tokens.size()}, {"moe_grouped", moe_grouped}, {"moe_fallbacks", moe_fallbacks}, {"moe_load_max", moe_load_max}, {"spills", spills}, {"restores", restores}, {"state_saves", state_saves}, {"state_restores", state_restores}};
         return logits;
     }
 };
