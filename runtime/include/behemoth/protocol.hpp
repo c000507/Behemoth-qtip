@@ -26,6 +26,11 @@ struct ChatBackend {
     // A </think> outside a think block is dropped instead of streamed as answer text: Inkling 2 closes every message
     // with <|end_message|>, which its tokenizer path spells </think> (the end of its thinking message).
     bool drop_stray_think_close = false;
+    // Templates that take the request's reasoning_effort themselves (Inkling 2: a "Thinking effort level" preamble):
+    // renders messages (+ tools or null) with extra template variables. Set: reasoning_effort (none .. high, xhigh, max)
+    // is passed to the template, and "none" needs no constraint to be honoured.
+    std::function<std::string(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools,
+                              const nlohmann::ordered_json &vars)> render_vars;
 };
 const ChatBackend &chat_backend();
 void set_chat_backend(ChatBackend);

@@ -51,6 +51,32 @@ def main():
             if not ok:
                 print('  ours:', repr(ours['rendered'])[:400])
                 print('  hf:  ', repr(ref_text)[:400])
+        # tools (tool_declare system message, assistant tool calls, tool results) and reasoning_effort through the template
+        tools = [{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Weather for a city.',
+                                                   'parameters': {'type': 'object', 'properties': {'city': {'type': 'string'}, 'days': {'type': 'integer'}}, 'required': ['city']}}},
+                 {'type': 'function', 'function': {'name': 'now', 'description': 'Current time.', 'parameters': {'type': 'object', 'properties': {}}}}]
+        call = {'id': 'c1', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': {'city': 'Paris', 'days': 2}}}
+        tconvs = [
+            ([{'role': 'user', 'content': 'Weather in Paris?'}], tools, None),
+            ([{'role': 'system', 'content': 'Be brief.'}, {'role': 'user', 'content': 'Weather in Paris?'},
+              {'role': 'assistant', 'content': '', 'tool_calls': [call]}, {'role': 'tool', 'tool_call_id': 'c1', 'content': '{"temp": 21}'}], tools, None),
+            ([{'role': 'user', 'content': 'hi'}], None, 'low'),
+            ([{'role': 'user', 'content': 'hi'}], None, 'none'),
+            ([{'role': 'user', 'content': 'Weather in Paris?'}], tools, 'max'),
+        ]
+        for i, (conv, tl, eff) in enumerate(tconvs):
+            Path(d, 'm.json').write_text(json.dumps(conv))
+            Path(d, 't.json').write_text(json.dumps(tl))
+            Path(d, 'e.json').write_text(json.dumps({'reasoning_effort': eff} if eff else {}))
+            ours = run(binary, ours_dir, str(Path(d, 'm.json')), str(Path(d, 't.json')) if tl else '-', str(Path(d, 'e.json')))
+            kw = ({'tools': tl} if tl else {}) | ({'reasoning_effort': eff} if eff else {})
+            ref_text = hf.apply_chat_template(conv, tokenize=False, add_generation_prompt=True, **kw)
+            ok = ours['rendered'] == ref_text and ours['ids'] == hf.encode(ref_text, add_special_tokens=False)
+            bad += not ok
+            print(f'tools / effort conv {i} (tools {bool(tl)}, effort {eff}): {"OK" if ok else "MISMATCH"}')
+            if not ok:
+                print('  ours:', repr(ours['rendered'])[:900])
+                print('  hf:  ', repr(ref_text)[:900])
     print('mismatches:', bad)
     sys.exit(1 if bad else 0)
 

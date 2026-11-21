@@ -38,6 +38,11 @@ struct ToolFormat {
     int calls_token = -1, args_token = -1; // their control-token ids (streamed as the marker text)
     bool glm = false;
     bool qwen = false;
+    // Inkling 2: every message starts with <|message_model|> (calls / calls_token); a call is
+    // <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|> (args / args_token),
+    // an answer <|message_model|><|content_text|>text<|end_message|>. markers: <|content_text|>. The message end and
+    // the thinking marker reach the parser through the reasoning splitter (</think>, dropped / <think>).
+    bool inkling = false;
     // Mistral Tekken v13+ (Devstral 2507, Magistral): [AVAILABLE_TOOLS] once after the system prompt, not before the
     // last [INST] (v11), and no tool_instruction(): the checkpoint was trained on this format
     bool tools_first = false;
@@ -63,6 +68,7 @@ struct ToolFormat {
 };
 inline constexpr const char *glm_call_end = "</tool_call>", *glm_key_open = "<arg_key>", *glm_key_close = "</arg_key>",
                             *glm_value_open = "<arg_value>", *glm_value_close = "</arg_value>";
+inline constexpr const char *inkling_text = "<|content_text|>";
 inline constexpr const char *qwen_function_open = "<function=", *qwen_function_close = "</function>",
                             *qwen_parameter_open = "<parameter=", *qwen_parameter_close = "</parameter>";
 
@@ -144,7 +150,7 @@ class ToolCallParser {
     }
 
   private:
-    enum Mode { Content, Head, Name, Args, List, GlmName, GlmArgs, GlmKey, GlmValue, QwenHead, QwenArgs, QwenKey, QwenValue } mode_ = Content;
+    enum Mode { Content, Head, Name, Args, List, GlmName, GlmArgs, GlmKey, GlmValue, QwenHead, QwenArgs, QwenKey, QwenValue, InkHead, InkArgs } mode_ = Content;
     ToolFormat format_;
     std::string buffer_, content_, list_;
     std::vector<ToolCall> calls_;
@@ -164,6 +170,7 @@ class ToolCallParser {
     // call being parsed are kept in glm_args_
     std::string qwen_raw_;
     bool qwen_step(Delta &, bool finish);
+    bool ink_step(Delta &, bool finish);   // Inkling: after a message start / inside a call's JSON
 };
 
 // Lazy grammar (tool_choice auto): no constraint until `trigger` is sampled, then `inner` (a constraint whose answer

@@ -1,7 +1,7 @@
 // Host check of a checkpoint's tokenizer + chat template through the server's path (glm53::Tokenizer: tokenizer.json
 // ByteLevel BPE + minja chat template): prints the rendered prompt and the ids for a messages JSON (and optional tools),
 // to be compared with HF AutoTokenizer.apply_chat_template / encode (neuron/tests/test_qwen35_tokenizer.py).
-//   tok_check MODEL_DIR messages.json [tools.json]        (messages.json: OpenAI messages array)
+//   tok_check MODEL_DIR messages.json [tools.json|- [extra.json]]   (messages.json: OpenAI messages array; extra: template variables)
 //   tok_check MODEL_DIR --text file                        (encode raw text)
 //   tok_check MODEL_DIR --decode ids.json                  (decode an id array)
 // build: g++ -std=c++20 -O2 -I glm53/include -I third_party neuron/cpp/tok_check.cpp glm53/src/tokenizer.cpp glm53/src/config.cpp -lpcre2-8 -o tok_check
@@ -25,9 +25,17 @@ int main(int argc, char **argv) {
     } else {
         std::ifstream f(argv[2]);
         auto messages = nlohmann::ordered_json::parse(f);
-        if (argc > 3) {
-            std::ifstream t(argv[3]);
-            rendered = tok.chat_tools(messages, nlohmann::ordered_json::parse(t));
+        if (argc > 3) { // tools.json ("-": none) and optionally extra template variables (an object, e.g. reasoning_effort)
+            nlohmann::ordered_json tools, extra;
+            if (std::string(argv[3]) != "-") {
+                std::ifstream t(argv[3]);
+                tools = nlohmann::ordered_json::parse(t);
+            }
+            if (argc > 4) {
+                std::ifstream e(argv[4]);
+                extra = nlohmann::ordered_json::parse(e);
+            }
+            rendered = tok.chat_tools(messages, tools, argc > 4 ? &extra : nullptr);
         } else
             rendered = tok.chat(nlohmann::json::parse(messages.dump()), true);
     }

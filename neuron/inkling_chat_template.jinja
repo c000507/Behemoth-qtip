@@ -33,7 +33,12 @@
         {%- set tool_state.specs = tool_state.specs + [spec] -%}
     {%- endfor -%}
     {{- "<|message_system|>tool_declare<|content_xml|>" -}}
-    {{- tool_state.specs | tojson -}}
+    {#- the server passes the specs as HF's tojson(sort_keys=true, separators=(",", ":")) writes them (minja's tojson cannot) -#}
+    {%- if tools_json is defined and tools_json -%}
+        {{- tools_json -}}
+    {%- else -%}
+        {{- tool_state.specs | tojson -}}
+    {%- endif -%}
     {{- "<|end_message|>" -}}
 {%- endif -%}
 
@@ -110,6 +115,9 @@
             {%- if args is not mapping -%}
                 {{- raise_exception("tool call arguments must be an object") -}}
             {%- endif -%}
+            {%- if fn.call_json is defined and fn.call_json -%}
+                {{- "<|message_model|>" ~ fn.name ~ "<|content_invoke_tool_json|>" ~ fn.call_json ~ "<|end_message|>" -}}
+            {%- else -%}
             {{- "<|message_model|>" ~ fn.name ~ "<|content_invoke_tool_json|>" -}}
             {{- '{"name":' ~ (fn.name | tojson) ~ ',"args":' -}}
             {{- "{" -}}
@@ -118,6 +126,7 @@
                 {%- if not loop.last -%},{%- endif -%}
             {%- endfor -%}
             {{- "}}<|end_message|>" -}}
+            {%- endif -%}
         {%- endfor -%}
     {%- endif -%}
 
