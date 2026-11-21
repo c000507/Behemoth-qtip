@@ -24,6 +24,7 @@ from test_inkling_ref import TINY  # noqa: E402
 FP8 = os.environ.get('WEIGHTS', 'bf16') == 'fp8'
 MOE_DEC = os.environ.get('MOE', 'all')
 SEG = os.environ.get('SEG', '0') == '1'
+SPLIT = os.environ.get('SPLIT', '')   # visit kinds run as attention + MoE graphs (e.g. gG)
 PAGE = IG.PAGE
 
 
@@ -115,7 +116,18 @@ class Mirror:
                         v += 6
                         continue
                     w, st = self.inputs(r, v, rows)
-                    xr, new = IG.visit(g.kind(v), {**step, **w, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode)
+                    if SPLIT and g.kind(v) in SPLIT:   # attention NEFF then MoE NEFF (only their own inputs)
+                        k = g.kind(v)
+                        wa = {n: w[n] for n in IG.part_names(k, 'attn', list(w))}
+                        xr, new = IG.visit(k, {**step, **wa, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode, 'attn')
+                        self.store(r, v, rows, new)
+                        w, st = self.inputs(r, v, rows)
+                        wm = {n: w[n] for n in IG.part_names(k, 'moe', list(w))}
+                        stm = {n: x_ for n, x_ in st.items() if n.startswith('conv')}
+                        xr, new = IG.visit(k, {'pos': step['pos'], **wm, **stm, 'x': xr.reshape(T, -1)}, g, R_, Q_, P, ar(r), moe_mode, 'moe')
+                        new = {**{n: x_ for n, x_ in st.items() if not n.startswith('conv')}, **new}
+                    else:
+                        xr, new = IG.visit(g.kind(v), {**step, **w, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode)
                     xr = xr.reshape(T, -1)
                     self.store(r, v, rows, new)
                     v += 1

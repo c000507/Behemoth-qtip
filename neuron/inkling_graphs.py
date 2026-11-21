@@ -374,59 +374,75 @@ def moe_experts(n, comb, gu, gus, dw, dc, g):
     return routed
 
 
-def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
-    """One layer visit (attention + MoE) -> (x_new [T, NS, H], {state name: new tensor})."""
+def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all', part='full'):
+    """One layer visit -> (x_new [T, NS, H], {state name: new tensor}). part: full (attention + MoE), attn (up to the
+    residual after attention: slot 4 holds it, the blocks / restart are applied; conv state's MoE part passed through) or
+    moe (the rest: from that x and the conv state the attn part wrote)."""
     T, H = R_ * Q_, g.H
     x = t['x'].reshape(T, NS, H)
     t = dict(t)
-    for i in range(R_):   # a row starting at position 0 (new / re-prefilled sequence) starts from zero conv / buf state
-        sfx = f'_{i}' if R_ > 1 else ''
-        keep = (t['pos'][i * Q_] > 0).float()
-        t['conv' + sfx] = t['conv' + sfx] * keep
-        t['buf' + sfx] = t['buf' + sfx] * keep.to(t['buf' + sfx].dtype)
+    if part != 'moe':
+        for i in range(R_):   # a row starting at position 0 (new / re-prefilled sequence) starts from zero conv / buf state
+            sfx = f'_{i}' if R_ > 1 else ''
+            keep = (t['pos'][i * Q_] > 0).float()
+            t['conv' + sfx] = t['conv' + sfx] * keep
+            t['buf' + sfx] = t['buf' + sfx] * keep.to(t['buf' + sfx].dtype)
     c = t['ctl']
     ma, mmask, bnd, oh, first, restart = c[0:5], c[5:10], c[10], c[11:15], c[15], c[16]
     sl = [x[:, j] for j in range(NS)]
     msgs = kind in 'SG'
-    if msgs:   # loop restart (first loop layer of passes >= 2): message sources <- B2 / final partial, partial <- B1
+    if msgs and part != 'moe':   # loop restart (first loop layer of passes >= 2): message sources <- B2 / final partial, partial <- B1
         sl[5] = restart * sl[2] + (1 - restart) * sl[5]
         sl[6] = restart * sl[4] + (1 - restart) * sl[6]
         sl[4] = restart * sl[1] + (1 - restart) * sl[4]
-    part = sl[4]
-    stack = torch.stack(sl[0:5], dim=1)                                                # [T, 5, H]
     if msgs:
         mes = depth(torch.stack([sl[5], sl[6]], dim=1), t['mg'], torch.zeros(2, device=x.device))   # [T, 4, H]
-    if kind in 'sS':
-        hin = depth(stack, t['aq'], ma)[:, 0]
-        hin = first * part + (1 - first) * hin
-        if msgs:
-            qh = Q.rms(msg_gate(hin, mes[:, 0], t, 'q'), t['qn'], g.eps)
-            kh = Q.rms(msg_gate(hin, mes[:, 1], t, 'k'), t['qn'], g.eps)
-            vh = Q.rms(msg_gate(hin, mes[:, 2], t, 'v'), t['qn'], g.eps)
-        else:
-            qh = kh = vh = Q.rms(hin, t['qn'], g.eps)
+    st = {}
+    conv_parts = []
+    if part == 'moe':
+        res = sl[4]
+        for i in range(R_):
+            sfx = f'_{i}' if R_ > 1 else ''
+            conv_parts.append((None if Q_ == 1 else (t['pos'][i * Q_:(i + 1) * Q_] >= 0).sum(), None))
     else:
-        qkv = depth(stack, t['aq'], ma)
-        qi, ki, vi = [first * part + (1 - first) * qkv[:, j] for j in range(3)]
-        if msgs:
-            qi, ki, vi = msg_gate(qi, mes[:, 0], t, 'q'), msg_gate(ki, mes[:, 1], t, 'k'), msg_gate(vi, mes[:, 2], t, 'v')
-        qh, kh, vh = Q.rms(qi, t['qn'], g.eps), Q.rms(ki, t['kn'], g.eps), Q.rms(vi, t['vn'], g.eps)
-    qh, kh, vh = bf(qh), bf(kh), bf(vh)
-    a, st = attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce)
-    # post-attention conv (replicated, on the reduced output)
-    outs_a, outs_m, conv_parts = [], [], []
-    for i in range(R_):
-        sfx = f'_{i}' if R_ > 1 else ''
-        rows = slice(i * Q_, (i + 1) * Q_)
-        n = None if Q_ == 1 else (t['pos'][rows] >= 0).sum()
-        cst = t['conv' + sfx]
-        ya, na = conv_step(a[rows], t['ac'], cst[2 * g.CK:2 * g.CK + H], n)
-        outs_a.append(ya)
-        conv_parts.append((n, na))
-    a = torch.cat(outs_a, dim=0)
-    for j in range(4):
-        sl[j] = sl[j] + bnd * oh[j] * (part - sl[j])
-    res = a + (1 - bnd) * part
+        prt = sl[4]
+        stack = torch.stack(sl[0:5], dim=1)                                            # [T, 5, H]
+        if kind in 'sS':
+            hin = depth(stack, t['aq'], ma)[:, 0]
+            hin = first * prt + (1 - first) * hin
+            if msgs:
+                qh = Q.rms(msg_gate(hin, mes[:, 0], t, 'q'), t['qn'], g.eps)
+                kh = Q.rms(msg_gate(hin, mes[:, 1], t, 'k'), t['qn'], g.eps)
+                vh = Q.rms(msg_gate(hin, mes[:, 2], t, 'v'), t['qn'], g.eps)
+            else:
+                qh = kh = vh = Q.rms(hin, t['qn'], g.eps)
+        else:
+            qkv = depth(stack, t['aq'], ma)
+            qi, ki, vi = [first * prt + (1 - first) * qkv[:, j] for j in range(3)]
+            if msgs:
+                qi, ki, vi = msg_gate(qi, mes[:, 0], t, 'q'), msg_gate(ki, mes[:, 1], t, 'k'), msg_gate(vi, mes[:, 2], t, 'v')
+            qh, kh, vh = Q.rms(qi, t['qn'], g.eps), Q.rms(ki, t['kn'], g.eps), Q.rms(vi, t['vn'], g.eps)
+        qh, kh, vh = bf(qh), bf(kh), bf(vh)
+        a, st = attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce)
+        outs_a = []
+        for i in range(R_):   # post-attention conv (replicated, on the reduced output)
+            sfx = f'_{i}' if R_ > 1 else ''
+            rows = slice(i * Q_, (i + 1) * Q_)
+            n = None if Q_ == 1 else (t['pos'][rows] >= 0).sum()
+            ya, na = conv_step(a[rows], t['ac'], t['conv' + sfx][2 * g.CK:2 * g.CK + H], n)
+            outs_a.append(ya)
+            conv_parts.append((n, na))
+        a = torch.cat(outs_a, dim=0)
+        for j in range(4):
+            sl[j] = sl[j] + bnd * oh[j] * (prt - sl[j])
+        res = a + (1 - bnd) * prt
+        if part == 'attn':
+            sl[4] = res
+            for i in range(R_):
+                sfx = f'_{i}' if R_ > 1 else ''
+                nk, nv = st['conv' + sfx]
+                st['conv' + sfx] = torch.cat([nk, nv, conv_parts[i][1], t['conv' + sfx][2 * g.CK + H:]], dim=0)
+            return torch.stack(sl, dim=1), st
     hm = depth(torch.stack(sl[0:4] + [res], dim=1), t['mq'], mmask)[:, 0]
     if msgs:
         hm = msg_gate(hm, mes[:, 3], t, 'm')
@@ -434,6 +450,7 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
         mo = allreduce(hm * t['ed'][0, 0, :1].float() + t['egu'].reshape(-1)[:1].float() + t['rw'].reshape(-1)[:1] + t['rb'][:1] + t.get('egu_s', t['rb'])[..., :1].reshape(-1)[:1] + t.get('ed_c', t['rb'])[..., :1].reshape(-1)[:1])
     else:
         mo = moe(bf(Q.rms(hm, t['mn'], g.eps)), t, g, moe_mode, allreduce)
+    outs_m = []
     for i in range(R_):
         sfx = f'_{i}' if R_ > 1 else ''
         rows = slice(i * Q_, (i + 1) * Q_)
@@ -441,10 +458,29 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
         cst = t['conv' + sfx]
         ym, nm = conv_step(mo[rows], t['mc'], cst[2 * g.CK + H:], n)
         outs_m.append(ym)
-        nk, nv = st['conv' + sfx]
-        st['conv' + sfx] = torch.cat([nk, nv, na, nm], dim=0)
+        if part == 'moe':
+            st['conv' + sfx] = torch.cat([cst[:2 * g.CK + H], nm], dim=0)
+        else:
+            nk, nv = st['conv' + sfx]
+            st['conv' + sfx] = torch.cat([nk, nv, na, nm], dim=0)
     sl[4] = res + torch.cat(outs_m, dim=0)
     return torch.stack(sl, dim=1), st
+
+
+ATT_W = {'q', 'gt', 'k', 'v', 'o', 'r', 'sk', 'qs', 'rs', 'rp', 'kc', 'vc', 'ac', 'qn', 'kn', 'vn', 'aq', 'kw', 'vw'}
+
+
+def part_names(kind, part, names):
+    """the weight / ctl names a split part takes (mg and the message gates of q / k / v vs m)."""
+    if part == 'full':
+        return names
+    out = []
+    for n in names:
+        base = n.split('_s')[0] if n.endswith('_s') else n
+        att = base in ATT_W or n[:5] in ('gd_q', 'gf_q', 'gg_q', 'gd_k', 'gf_k', 'gg_k', 'gd_v', 'gf_v', 'gg_v')
+        if n in ('ctl', 'mg') or (att if part == 'attn' else not att):
+            out.append(n)
+    return out
 
 
 def head(t, g, rows):
@@ -510,20 +546,22 @@ def weight_shapes(kind, g, fp8=True):
     return s
 
 
-def state_shapes(kind, g, R_, pages):
-    """bound per-row buf / conv (suffix _i for R > 1); g / G: the paged pool kv."""
+def state_shapes(kind, g, R_, pages, part='full'):
+    """bound per-row buf / conv (suffix _i for R > 1); g / G: the paged pool kv. part moe: conv only."""
     kd = torch.float32 if EXACT else torch.bfloat16
     one = {'buf': ((g.nb(kind), 2, g.kvl, g.D), kd), 'conv': ((g.CS, g.K - 1), torch.float32)}
+    if part == 'moe':
+        one.pop('buf')
     s = dict(one) if R_ == 1 else {f'{k}_{i}': v for i in range(R_) for k, v in one.items()}
-    if kind in 'gG':
+    if kind in 'gG' and part != 'moe':
         s['kv'] = ((pages, 2, g.kvl, PAGE, g.D), kd)
     return s
 
 
-def step_shapes(kinds, R_, Q_, P, g):
+def step_shapes(kinds, R_, Q_, P, g, part='full'):
     T = R_ * Q_
     s = {'x': ((T, NS * g.H), torch.float32), 'pos': ((T,), torch.int64)}
-    if any(k in 'gG' for k in kinds):
+    if any(k in 'gG' for k in kinds) and part != 'moe':
         s['wslot'] = ((T,), torch.int64); s['table'] = ((R_, P), torch.int64)
     return s
 
@@ -577,12 +615,15 @@ def main():
         R_, Q_, P = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
         kinds = list(kind.split('_')[1]) if kind.startswith('seg_') else [kind]
         assert all(k in 'sSgG' for k in kinds), kind
-        step = step_shapes(kinds, R_, Q_, P, g)
+        part = os.environ.get('PART', 'full')
+        assert part == 'full' or len(kinds) == 1, 'split parts are single-visit graphs'
+        step = step_shapes(kinds, R_, Q_, P, g, part)
         wsh, ssh = {}, {}
         for i, k_ in enumerate(kinds):
             pre = f'l{i}.' if len(kinds) > 1 else ''
-            wsh.update({pre + n: v for n, v in weight_shapes(k_, g, fp8).items()})
-            ssh.update({pre + n: v for n, v in state_shapes(k_, g, R_, pages).items()})
+            ws = weight_shapes(k_, g, fp8)
+            wsh.update({pre + n: ws[n] for n in part_names(k_, part, list(ws))})
+            ssh.update({pre + n: v for n, v in state_shapes(k_, g, R_, pages, part).items()})
         names, snames = list(step) + list(wsh), list(ssh)
         inputs = [zeros(*step[n]) for n in step] + [torch.ones(*wsh[n][0]) if n.endswith('_s') or n.endswith('_c') else zeros(*wsh[n]) for n in wsh]
 
@@ -599,14 +640,14 @@ def main():
                 if len(kinds) > 1:
                     x, st = segment(kinds, t, g, R_, Q_, P, allreduce, moe_mode)
                 else:
-                    x, st = visit(kinds[0], t, g, R_, Q_, P, allreduce, moe_mode)
+                    x, st = visit(kinds[0], t, g, R_, Q_, P, allreduce, moe_mode, part)
                 for n_ in snames:
                     setattr(self, n_.replace('.', '_'), st[n_])
                 return x.reshape(R_ * Q_, NS * g.H)
         fn = Block()
         kwargs = {'enable_aliasing': True}
         meta = {'kind': 'inkling_' + kind, 'kinds': kinds, 'R': R_, 'Q': Q_, 'P': P, 'pages': pages, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE, 'moe_slots': MOE_SLOTS, 'moe_eg': MOE_EG, 'prof': sorted(PROF - {''})}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE, 'moe_slots': MOE_SLOTS, 'moe_eg': MOE_EG, 'part': part, 'prof': sorted(PROF - {''})}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

@@ -136,6 +136,7 @@ struct Graph {
     std::string kind;                // "s", "seg_sssssg", "head"
     std::string kinds;               // the visit kinds it runs, in order ("" for the head)
     bool has_g = false;              // binds a page table (contains a global visit)
+    std::string part = "full";       // meta "part": full | attn | moe (a visit split into an attention and a MoE NEFF)
     int R = 0, Q = 0, P = 0, T = 0, S = 0, pages = 0;
     bool wt = false;
     std::vector<std::string> inputs, states; // NEFF inputs, then the aliased states
@@ -280,7 +281,8 @@ class InklingModel final : public Backend {
             } else {
                 for (const auto &k : m.at("kinds"))
                     gr.kinds += k.get<std::string>();
-                gr.has_g = gr.kinds.find_first_of("gG") != std::string::npos;
+                gr.part = m.value("part", std::string("full"));
+                gr.has_g = gr.kinds.find_first_of("gG") != std::string::npos && gr.part != "moe";
                 gr.R = m.at("R");
                 gr.Q = m.at("Q");
                 gr.P = m.at("P");
@@ -307,6 +309,10 @@ class InklingModel final : public Backend {
         for (auto [R, Q] : groups) {
             for (int v = 0; v < nvis;) {
                 const Graph *g = visit_graph(v, R, Q, 1);
+                if (!g && split_graphs(v, R, Q, 1).first) {
+                    ++v;
+                    continue;
+                }
                 if (!g)
                     throw std::runtime_error("Inkling bucket R=" + std::to_string(R) + " Q=" + std::to_string(Q) + " has no graph for visit " +
                                              std::to_string(v) + " (kind " + visit_kind[size_t(v)] + ")");
@@ -321,7 +327,7 @@ class InklingModel final : public Backend {
         static const bool noseg = std::getenv("BEHEMOTH_NEURON_INKLING_NOSEG") && std::atoi(std::getenv("BEHEMOTH_NEURON_INKLING_NOSEG"));
         const Graph *best = nullptr;
         for (const auto &g : graphs) {
-            if (g.kind == "head" || g.R != R || g.Q != Q || (g.has_g && g.P < P) || v + int(g.kinds.size()) > nvis)
+            if (g.kind == "head" || g.part != "full" || g.R != R || g.Q != Q || (g.has_g && g.P < P) || v + int(g.kinds.size()) > nvis)
                 continue;
             if (noseg && g.kinds.size() > 1)
                 continue;
@@ -331,6 +337,20 @@ class InklingModel final : public Backend {
                 best = &g;
         }
         return best;
+    }
+    // the attention / MoE pair of a split visit v for (R, Q) with >= P pages ({nullptr, nullptr}: none). Used where no
+    // full graph serves the visit, or always with BEHEMOTH_NEURON_INKLING_SPLIT=1.
+    std::pair<const Graph *, const Graph *> split_graphs(int v, int R, int Q, int P) const {
+        const Graph *a = nullptr, *m = nullptr;
+        for (const auto &g : graphs) {
+            if (g.kind == "head" || g.R != R || g.Q != Q || g.kinds.size() != 1 || g.kinds[0] != visit_kind[size_t(v)])
+                continue;
+            if (g.part == "attn" && (!g.has_g || g.P >= P) && (!a || g.P < a->P))
+                a = &g;
+            if (g.part == "moe" && !m)
+                m = &g;
+        }
+        return a && m ? std::make_pair(a, m) : std::make_pair(nullptr, nullptr);
     }
     int bucket_pages(int R, int Q, int pages) const {
         int best = 0;
@@ -688,8 +708,15 @@ class InklingModel final : public Backend {
                 throw std::runtime_error("Inkling: no head NEFF for " + std::to_string(L.head_rows.size()) + " rows");
         }
         std::vector<std::pair<const Graph *, int>> plan;
+        static const bool prefer_split = std::getenv("BEHEMOTH_NEURON_INKLING_SPLIT") && std::atoi(std::getenv("BEHEMOTH_NEURON_INKLING_SPLIT"));
         for (int v = 0; v < nvis;) {
             const Graph *g = visit_graph(v, L.R, L.Q, L.P);
+            if (const auto [a, m] = split_graphs(v, L.R, L.Q, L.P); a && (!g || (prefer_split && g->kinds.size() == 1))) {
+                plan.push_back({a, v});
+                plan.push_back({m, v});
+                ++v;
+                continue;
+            }
             if (!g)
                 throw std::runtime_error("Inkling: bucket R=" + std::to_string(L.R) + " Q=" + std::to_string(L.Q) + " P=" + std::to_string(L.P) +
                                          " has no graph for visit " + std::to_string(v));
