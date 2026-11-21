@@ -23,6 +23,9 @@ struct ChatBackend {
     // Templates whose generation prompt already opens the think block (Qwen3.5: it ends with "<think>\n"): the ids of
     // the <think> / </think> tokens (their pieces are that text). An answer to such a prompt starts as reasoning.
     int think_open = -1, think_close = -1;
+    // A </think> outside a think block is dropped instead of streamed as answer text: Inkling 2 closes every message
+    // with <|end_message|>, which its tokenizer path spells </think> (the end of its thinking message).
+    bool drop_stray_think_close = false;
 };
 const ChatBackend &chat_backend();
 void set_chat_backend(ChatBackend);

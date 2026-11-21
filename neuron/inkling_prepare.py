@@ -296,9 +296,14 @@ def main():
                 'source': str(Path(a.model).resolve()), 'config': cfg}
     (out / 'prepared.json').write_text(json.dumps(manifest))
     (out / 'config.json').write_text(json.dumps(cfg))
-    for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'special_tokens_map.json', 'generation_config.json'):
+    for name in ('tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'generation_config.json'):
         if (Path(a.model) / name).exists():
             shutil.copyfile(Path(a.model) / name, out / name)
+    # the checkpoint's chat template rewritten for the server's minja (no trailing dict comma, no float / tojson kwargs /
+    # dictsort kwargs; same output: tests/test_inkling_tokenizer.py), the original kept next to it
+    if (Path(a.model) / 'chat_template.jinja').exists():
+        shutil.copyfile(Path(a.model) / 'chat_template.jinja', out / 'chat_template.orig.jinja')
+    shutil.copyfile(Path(__file__).resolve().parent / 'inkling_chat_template.jinja', out / 'chat_template.jinja')
     print('wrote', out)
 
 
