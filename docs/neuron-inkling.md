@@ -166,8 +166,8 @@ then 34.0 ms (non-WT segments); the WT layout took the segments 3.20 -> 2.89 / 3
 (26.7 ms); a segment of 6 visits (~0.28 GB) takes 2.9-3.2 ms = ~90 GB/s. At 4 rows the routed experts of the union (~29 of 128
 per visit) dominate: ~7.5 GB per step -> ~35 ms floor vs 77.8 ms.
 
-**Prefill** is far from its roof (the MoE alone streams 510 MB per visit and rank, ~1.2 GB per chunk... 48 visits x 2.5 ms at
-the wall ~= 0.12 s per chunk): per 256-token chunk at short context 20 x (8.9 + 8.9) + 20 x (9.4 + 9.1) + 4 x (16.4 + 13.5) +
+**Prefill** is far from its roof (the MoE streams all 510 MB of experts per visit and rank: 48 x 510 MB = 24.5 GB per chunk
+= ~0.12 s at the DMA wall, attention and projections far less): per 256-token chunk at short context 20 x (8.9 + 8.9) + 20 x (9.4 + 9.1) + 4 x (16.4 + 13.5) +
 4 x (Ga + Gm) ~= 0.97 s of launches; beyond 64 pages (1k tokens) the P = 512 attention of the 8 global visits costs **107 ms
 each** (dense far scores over 8192 keys, the Ornith lesson of section 13.2 of docs/neuron-qwen35-moe.md) - that is why 1k+ prompts
 run at 160-183 tok/s. Measured per NEFF (layer_bench, ms): `sa` 8.89, `sm` 8.88, `Sa` 9.43, `Sm` 9.06, `ga` 16.4 (P 64) /
