@@ -41,6 +41,8 @@ def shards(cfg, g, fp8):
         ex = PR.experts_from_dense(gu, dn, g, fp8)
         del gu, dn
         out[kind] = [PR.shard_layer(get, l, r, g, fp8, experts=ex[r]) for r in range(g.TP)]
+        for w in out[kind]:   # router logits of a realistic spread (std ~0.5): saturated sigmoids tie at 1.0 and flip the top-8
+            w['rw'] = w['rw'] * 0.1
     return out
 
 
@@ -82,7 +84,7 @@ def check(d, meta, g, sh, neff_io):
     x = torch.randn(T, IG.NS, g.H) * 0.5
     x[:, 5:] *= 0.8
     x = x.reshape(T, -1)
-    start = 1500
+    start = int(os.environ.get('DEV_START', min(1500, P_ * 16 - Q_ - 37 * R_)))   # every token's page inside the table (no duplicate writes)
     pos = torch.tensor([start + (i % Q_) if R_ == 1 else start + 37 * i for i in range(T)], dtype=torch.int64)
     pages = meta['pages']
     table = torch.stack([(torch.arange(P_, dtype=torch.int64) + r * P_) % (pages - 1) for r in range(R_)])
@@ -115,15 +117,16 @@ def check(d, meta, g, sh, neff_io):
                     t[pre + n] = IG.to_wt(n, w[n]) if meta.get('wt') else w[n]
         t.update({k: v.clone() for k, v in states.items()})
         per_rank.append(t)
-    ar, ref = ThreadAllReduce(g.TP), [None] * g.TP
+    ar, ref, rst = ThreadAllReduce(g.TP), [None] * g.TP, [None] * g.TP
     moe_mode = meta.get('moe', 'all')
 
     def run(r):
         t = dict(per_rank[r])
         if len(kinds) > 1:
-            ref[r] = IG.segment(kinds, t, g, R_, Q_, P_, ar(r), moe_mode)[0].reshape(T, -1)
+            xo, st = IG.segment(kinds, t, g, R_, Q_, P_, ar(r), moe_mode)
         else:
-            ref[r] = IG.visit(kinds[0], t, g, R_, Q_, P_, ar(r), moe_mode)[0].reshape(T, -1)
+            xo, st = IG.visit(kinds[0], t, g, R_, Q_, P_, ar(r), moe_mode)
+        ref[r], rst[r] = xo.reshape(T, -1), st
     th = [threading.Thread(target=run, args=(r,)) for r in range(g.TP)]
     [t_.start() for t_ in th]
     [t_.join() for t_ in th]
@@ -140,6 +143,26 @@ def check(d, meta, g, sh, neff_io):
         y_ref = ref[0] - x
         rel = float(torch.linalg.norm(y_dev - y_ref) / torch.linalg.norm(y_ref))
         fin = bool(np.isfinite(out).all())
+        if os.environ.get('DEV_DETAIL'):
+            yd, yr = y_dev.reshape(T, IG.NS, -1), y_ref.reshape(T, IG.NS, -1)
+            pt = torch.linalg.norm(yd[:, 4] - yr[:, 4], dim=-1) / torch.linalg.norm(yr[:, 4], dim=-1)
+            print('  slot 4 per-token rel: median', f'{float(pt.median()):.2e}', 'max', f'{float(pt.max()):.2e}', 'at', int(pt.argmax()),
+                  'worst tokens', [int(i) for i in torch.topk(pt, min(8, T)).indices])
+            print('  slot rel:', ' '.join(f'{j}:{float(torch.linalg.norm(yd[:, j] - yr[:, j]) / (torch.linalg.norm(yr[:, j]) + 1e-30)):.2e}' for j in range(IG.NS)))
+            for si, n in enumerate(meta['states']):
+                ref_s = rst[0][n]
+                raw = Path(io, f'out{si + 1}.r0').read_bytes()
+                if ref_s.dtype == torch.bfloat16:
+                    dev_s = torch.from_numpy(np.frombuffer(raw, np.int16).copy()).view(torch.bfloat16)
+                else:
+                    dev_s = torch.from_numpy(np.frombuffer(raw, np.float32).copy())
+                a, b_ = dev_s.float().reshape(-1), ref_s.float().reshape(-1)
+                d0 = per_rank[0][n].float().reshape(-1)
+                if n.split('.')[-1].startswith('conv'):
+                    C2 = 2 * g.CK
+                    parts = {'kv': slice(0, C2 * (g.K - 1)), 'a': slice(C2 * (g.K - 1), (C2 + g.H) * (g.K - 1)), 'm': slice((C2 + g.H) * (g.K - 1), None)}
+                    print('   conv parts rel:', ' '.join(f'{k}:{float(torch.linalg.norm(a[sl] - b_[sl]) / torch.linalg.norm(b_[sl])):.2e}' for k, sl in parts.items()))
+                print(f'  state {n}: rel {float(torch.linalg.norm(a - b_) / torch.linalg.norm(b_)):.2e}; changed part rel {float(torch.linalg.norm((a - d0) - (b_ - d0)) / (torch.linalg.norm(b_ - d0) + 1e-30)):.2e}')
         same = max([float(np.abs(np.frombuffer(Path(io, f'out0.r{r}').read_bytes(), np.float32).reshape(T, -1) - out).max()) for r in range(1, g.TP)] or [0.0])
     print(f'{d.name:24s} kinds={"".join(kinds)} R={R_} Q={Q_} P={P_} ({"fp8" if meta["fp8"] else "bf16"}, moe={moe_mode}, wt={meta.get("wt")}): '
           f'rel L2 vs CPU mirror {rel:.3e}; finite {fin}; ranks differ by {same:.1e}; neff_io {dt:.1f}s', flush=True)

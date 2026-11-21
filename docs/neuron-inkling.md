@@ -90,4 +90,33 @@ the K|V buffer 2 MB = ~49 MB; x 48 visits = 2.35 GB, + head 0.23 GB: **~2.6 GB p
 214 GB/s** (~80 tok/s). The loop triples the per-token bytes of layers 6..17: Inkling's active bytes are those of a
 48-layer model.
 
-(Sections 6-11: gates, end-to-end, performance, deploy recipe, open items - filled in below as measured.)
+## 6. Gates (trn1.2xlarge i-0cd98c451f018c0a3, neuronx-cc 2.26, 2026-11-21)
+
+**GATE 1 - oracle == HF.** `neuron/inkling_ref.py` (f32) against transformers PR 51050 (f32):
+* tiny random checkpoint written in the ORIGINAL format (NVFP4 + MXFP8 experts, loaded through HF's own conversion;
+  `tests/test_inkling_ref.py`, local): prefill (20 tokens > window 8 and rel extent 12, log-scaling active), 6 decode steps
+  with HF's DynamicCache, a 5-token continuation chunk: worst rel **6.4e-6**;
+* the real checkpoint on the box CPU (`tests/test_inkling_oracle_hf.py`: HF's dequant op cached per layer as f32 memmaps,
+  ~100 GB on the instance store; the oracle reads the same files): the oracle's own NVFP4 / MXFP8 dequant is bit-identical
+  to HF's (layers 0 and 20); chat prompt (27 tokens) and raw text (5 tokens) + 24 oracle-greedy tokens each, HF teacher-forced:
+  prefill logits rel **5.2e-7 / 3.3e-7**, decode steps max **9.9e-7**, max |d| 3e-5, **top-1 48 / 48**. Text:
+  `<|message_model|><|content_thinking|>The user asks for explanation in two short paragraphs why sky is blue. ...` and
+  ` Paris.\n\nA. True\nB. False ...`. PASS.
+
+**Graph mirror.** `tests/test_inkling_graphs_cpu.py` (TP = 2 ranks as threads, prepare sharding of a tiny original-format
+checkpoint, prefill chunks with padding, 2-row decode with bound states, slot reuse at position 0): EXACT **6.7e-6** vs the
+oracle (also WT, gathered MoE, 6-visit segments). bf16 / fp8 numerics on the TINY random model diverge over 48 visits (routing
+flips amplify; local per-visit bf16 error 2-7e-3), so those are judged on the device and end to end instead.
+
+**Device vs CPU mirror** (`tests/test_inkling_device.py`, random real-shape weights, the real visits' ctl, one launch per NEFF,
+both ranks bit-identical): decode visits s / g / S / G **3.5e-2 / 3.5e-2 / 5.9e-2 / 5.1e-2** (the stack's fp8 level), heads
+1.3-1.6e-2; prefill Q = 256 visits: per-token median 5.6e-2, a few tokens up to 0.49 (top-8 routing flips between the two fp8
+computations; the K|V buffer and k / v conv states agree to 1e-3), block rel 0.13-0.16. The random router had to be scaled to a
+realistic logit spread: with saturated sigmoids many scores tie at 1.0 and the device and CPU pick different experts.
+
+**GATE 3 - end to end.** `neuron_engine_cli` on the prepared set, greedy, 3 chat prompts x 32 tokens, the oracle teacher-forced
+over prompt + device tokens (`tests/inkling_gate3.py`): **91 / 96 top-1** against the fp8-weight oracle (x8d8), 90 / 96 against
+the exact-weight oracle; every miss is a near tie (oracle margin 0.03-0.33, the device's token being the oracle's runner-up);
+0 non-finite. Device text: *"<|message_model|><|content_thinking|>The user asks for an explanation in two short paragraphs why
+the sky is blue. Need answer concise, two short paragraphs. Need ensure accuracy"*; *"... capital of Australia and why it was
+chosen. Need answer factual. Need ensure accuracy. Australia capital is Canberra. Why chosen"*.
