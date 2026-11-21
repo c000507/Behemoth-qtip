@@ -48,8 +48,11 @@ PAGE = G.PAGE
 EXACT, WT = Q.EXACT, Q.WT
 NS = 7
 CTL = 17
-ROUTE = os.environ.get('ROUTE', 'topk')     # topk | pad64 (membership from a 64-row padded topk; see qwen35_graphs.route)
+ROUTE = os.environ.get('ROUTE', 'topk')
+MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')
+MOE_EG = int(os.environ.get('MOE_EG', '0'))       # MOE=all in groups of this many experts (0: one pass)   # gathered decode MoE slot selection: topk | onehot     # topk | pad64 (membership from a 64-row padded topk; see qwen35_graphs.route)
 NEG = -3e38
+PROF = set(os.environ.get('PROF', '').split(','))   # timing probes only (WRONG output): nofar, nodyn, nomsg, nomoe, nonear
 
 
 class Geo:
@@ -226,8 +229,9 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
         n = None if Q_ == 1 else (pr >= 0).sum()
         cst = t['conv' + sfx]
         ck, cv = cst[:g.CK], cst[g.CK:2 * g.CK]
-        k, nk = conv_step(kx[rows], t['kc'], ck, n, dk[rows] if glb else None)
-        v, nv = conv_step(vx[rows], t['vc'], cv, n, dv[rows] if glb else None)
+        dyn = glb and 'nodyn' not in PROF
+        k, nk = conv_step(kx[rows], t['kc'], ck, n, dk[rows] if dyn else None)
+        v, nv = conv_step(vx[rows], t['vc'], cv, n, dv[rows] if dyn else None)
         k = l2clip(k.reshape(Q_, kvl, D), g.c.qk_clip)
         v = urms(v.reshape(Q_, kvl, D), g.eps)
         k, v = bf(k), bf(v)
@@ -250,7 +254,9 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
             ok = ok & (dist < g.W)
         s = torch.where(ok.reshape(Q_, 1, 1, NB + Q_), s + B, torch.full_like(s, NEG))
         parts = [s]
-        if glb:
+        if glb and 'nofar' in PROF:
+            parts.append(s[..., :1] * 0 + t['kv'].reshape(-1)[:1].float() * 0 + NEG)
+        if glb and 'nofar' not in PROF:
             cache = t['kv']
             kvp = cache[t['table'][i]].float()                                         # [P, 2, kvl, 16, D]
             fk = kvp[:, 0].permute(1, 0, 2, 3).reshape(kvl, P * PAGE, D)
@@ -262,7 +268,7 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
         parts.append(sink[rows].reshape(Q_, kvl, rep, 1))
         p = torch.softmax(torch.cat(parts, dim=-1), dim=-1)
         o = torch.einsum('qhgk,khd->qhgd', bf(p[..., :NB + Q_]), vv)
-        if glb:
+        if glb and 'nofar' not in PROF:
             o = o + torch.einsum('qhgk,hkd->qhgd', bf(p[..., NB + Q_:NB + Q_ + P * PAGE]), fv)
         outs.append(o.reshape(Q_, hq * D))
         # state: the last NB valid keys, the conv inputs
@@ -272,7 +278,9 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
             nbuf = select_rows(allkv.reshape(NB + Q_, -1), n, NB).reshape(NB, 2, kvl, D).to(buf.dtype)
         states['buf' + sfx] = nbuf
         states['conv' + sfx] = (nk, nv)
-    if glb:
+    if glb and 'nofar' in PROF:
+        states['kv'] = t['kv']
+    if glb and 'nofar' not in PROF:
         cache = t['kv']
         page = torch.bitwise_right_shift(t['wslot'], 4)
         off = torch.bitwise_and(t['wslot'], PAGE - 1)
@@ -316,12 +324,34 @@ def moe(n, t, g, mode, allreduce):
         slots = g.topk * T
         used = (comb > 0).float().amax(dim=0, keepdim=True)
         ar = torch.arange(E, device=n.device).float().reshape(1, E)
-        idx = torch.topk(used - ar * (0.5 / E), slots, dim=-1)[1].reshape(slots)
-        comb = torch.index_select(comb, 1, idx)
+        if MOE_SLOTS == 'onehot':
+            # slot s <- the s-th used expert (ascending), empty slots <- expert 0 with weight 0; no top-k over the experts
+            # (qwen35_graphs MOE_SLOTS=onehot: the device's wide top-k of the multi-row buckets is not reliable on trn1)
+            before = (ar.reshape(E, 1) >= ar.reshape(1, E)).float()
+            order = (used * before).sum(dim=-1).reshape(1, E) - 1.0
+            sel = ((order == torch.arange(slots, device=n.device).float().reshape(slots, 1)) & (used > 0)).float()   # [slots, E]
+            idx = (sel * ar).sum(dim=-1).round().long()
+            comb = (comb.unsqueeze(1) * sel.unsqueeze(0)).sum(dim=-1)
+        else:
+            idx = torch.topk(used - ar * (0.5 / E), slots, dim=-1)[1].reshape(slots)
+            comb = torch.index_select(comb, 1, idx)
         gu, dw = torch.index_select(gu, 0, idx), torch.index_select(dw, 0, idx)
         gus = torch.index_select(gus, 0, idx) if gus is not None else None
         dc = torch.index_select(dc, 0, idx) if dc is not None else None
     E_ = gu.shape[0]
+    if mode == 'all' and MOE_EG and E_ > MOE_EG and E_ % MOE_EG == 0:
+        # every expert on every token in expert groups: the [T, EG 2 EIl] intermediates stay small (the whole [T, E 2 EIl]
+        # f32 tensor is 151 MB at T = 256 and spills); each group's activations are quantised on their own
+        routed = 0
+        for e0 in range(0, E_, MOE_EG):
+            sl = slice(e0, e0 + MOE_EG)
+            routed = routed + moe_experts(n, comb[:, sl], gu[sl], None if gus is None else gus[sl], dw[sl], None if dc is None else dc[sl], g)
+        return allreduce(routed)
+    return allreduce(moe_experts(n, comb, gu, gus, dw, dc, g))
+
+
+def moe_experts(n, comb, gu, gus, dw, dc, g):
+    T, EIl, E_ = n.shape[0], g.EIl, gu.shape[0]
     hgu = Q.egu_mm(n, gu, gus, EIl).reshape(T, E_, 2, EIl)
     a = bf(act(hgu, g)) * comb.unsqueeze(-1)
     if dc is not None:
@@ -335,7 +365,7 @@ def moe(n, t, g, mode, allreduce):
         routed = torch.matmul(a2, wd.float())
     else:
         routed = torch.matmul(a2.to(torch.bfloat16), wd.to(torch.bfloat16)).float()
-    return allreduce(routed)
+    return routed
 
 
 def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
@@ -394,7 +424,10 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all'):
     hm = depth(torch.stack(sl[0:4] + [res], dim=1), t['mq'], mmask)[:, 0]
     if msgs:
         hm = msg_gate(hm, mes[:, 3], t, 'm')
-    mo = moe(bf(Q.rms(hm, t['mn'], g.eps)), t, g, moe_mode, allreduce)
+    if 'nomoe' in PROF:
+        mo = allreduce(hm * t['ed'][0, 0, :1].float() + t['egu'].reshape(-1)[:1].float() + t['rw'].reshape(-1)[:1] + t['rb'][:1] + t.get('egu_s', t['rb'])[..., :1].reshape(-1)[:1] + t.get('ed_c', t['rb'])[..., :1].reshape(-1)[:1])
+    else:
+        mo = moe(bf(Q.rms(hm, t['mn'], g.eps)), t, g, moe_mode, allreduce)
     for i in range(R_):
         sfx = f'_{i}' if R_ > 1 else ''
         rows = slice(i * Q_, (i + 1) * Q_)
@@ -567,7 +600,7 @@ def main():
         fn = Block()
         kwargs = {'enable_aliasing': True}
         meta = {'kind': 'inkling_' + kind, 'kinds': kinds, 'R': R_, 'Q': Q_, 'P': P, 'pages': pages, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE, 'moe_slots': MOE_SLOTS, 'moe_eg': MOE_EG, 'prof': sorted(PROF - {''})}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)
