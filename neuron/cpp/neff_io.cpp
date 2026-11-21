@@ -60,8 +60,10 @@ int main(int argc, char **argv) {
                     continue;
                 nrt_tensor_t *dev = nullptr;
                 const int out_index = t.usage == NRT_TENSOR_USAGE_INPUT ? -1 : std::atoi(name.substr(6).c_str());
-                if (out_index >= 1 && out_index <= states)
-                    dev = by_input[size_t(inputs - states + out_index - 1)];
+                // NEFF_IO_EXTRA=k: k plain outputs sit between output0 and the aliased states (the grouped MoE's ovf)
+                static const int extra = std::getenv("NEFF_IO_EXTRA") ? std::atoi(std::getenv("NEFF_IO_EXTRA")) : 0;
+                if (out_index >= 1 + extra && out_index <= states + extra)
+                    dev = by_input[size_t(inputs - states + out_index - 1 - extra)];
                 else
                     check(nrt_tensor_allocate(NRT_TENSOR_PLACEMENT_DEVICE, r, t.size, t.name, &dev), "alloc", r);
                 if (t.usage == NRT_TENSOR_USAGE_INPUT) {

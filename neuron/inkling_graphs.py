@@ -50,8 +50,14 @@ NS = 7
 CTL = 17
 ROUTE = os.environ.get('ROUTE', 'topk')
 MOE_SLOTS = os.environ.get('MOE_SLOTS', 'topk')
+MOE_TSUB = Q.MOE_TSUB
 MOE_EG = int(os.environ.get('MOE_EG', '0'))       # MOE=all in groups of this many experts (0: one pass)   # gathered decode MoE slot selection: topk | onehot     # topk | pad64 (membership from a 64-row padded topk; see qwen35_graphs.route)
 NEG = -3e38
+ATT_BLOCK = int(os.environ.get('ATT_BLOCK', '0'))     # global visits: far keys in blocks of this many pages, online softmax (0: one block)
+ATT_QBLOCK = int(os.environ.get('ATT_QBLOCK', '0'))   # wide prefill chunks: queries in blocks of this many tokens
+SKEW = os.environ.get('SKEW', 'bank')                 # relative-bias skew: bank (per-query shifted profile bank, matmul) | banke | reshape | bits
+FARK = os.environ.get('FARK', 'dk')                   # far keys materialised as [kvl, D, keys] (dk) or [kvl, keys, D] (kd)
+ATT_BF16 = os.environ.get('ATT_BF16', '1') == '1'     # attention scores / values contracted in bf16 on the device (f32 accumulate)
 PROF = set(os.environ.get('PROF', '').split(','))   # timing probes only (WRONG output): nofar, nodyn, nomsg, nomoe, nonear
 
 
@@ -152,6 +158,17 @@ def mm(h, w):
     return torch.matmul(h.to(torch.bfloat16), wm.to(torch.bfloat16)).float()
 
 
+def dotm(a, b):
+    """Batched attention contraction a [h, M, X] x b [h, X, Y] of bf16-valued operands. ATT_BF16: bf16 operands on the
+    tensor engine; measured on trn1 (neuronx-cc 2.26): the result is ROUNDED to bf16 even when .float() follows directly
+    (unlike fp8 x fp8), so the CPU mirror rounds too. ATT_BF16=0 / EXACT: f32."""
+    if EXACT or not ATT_BF16:
+        return torch.matmul(a.float(), b.float())
+    if a.device.type == 'cpu':
+        return bf(torch.matmul(a.float(), b.float()))
+    return torch.matmul(a.to(torch.bfloat16), b.to(torch.bfloat16)).float()
+
+
 def tau(pos, g):
     c = g.c
     return 1.0 + c.alpha * torch.log(torch.clamp((pos + 1).float() / c.n_floor, min=1.0))
@@ -187,13 +204,23 @@ def conv_step(x, w, st, n, dyn=None):
 
 
 def skew(X):
-    """X [Q, h, L] -> Y [Q, h, L + Q - 1] with Y[t, :, c] = X[t, :, c - t] (0 outside): static pad / flatten / reshape."""
-    Qn, h, L = X.shape
+    """X [h, Q, L] -> Y [h, Q, L + Q - 1] with Y[:, t, c] = X[:, t, c - t] (0 outside). SKEW=reshape: static pad / flatten /
+    reshape (rows end up misaligned with the tiles: many small copies); bits: log2(Q) shift-and-select passes."""
+    h, Qn, L = X.shape
     if Qn == 1:
         return X
+    if SKEW == 'bits':
+        Y = torch.cat([X, torch.zeros(h, Qn, Qn - 1, device=X.device, dtype=X.dtype)], dim=-1)
+        tt = torch.arange(Qn, device=X.device).reshape(1, Qn, 1)
+        sh = 1
+        while sh < Qn:
+            moved = torch.cat([torch.zeros(h, Qn, sh, device=X.device, dtype=X.dtype), Y[..., :-sh]], dim=-1)
+            Y = torch.where(torch.bitwise_and(tt, sh) > 0, moved, Y)
+            sh *= 2
+        return Y
     M = L + Qn
-    Z = torch.cat([X, torch.zeros(Qn, h, Qn, device=X.device, dtype=X.dtype)], dim=-1).permute(1, 0, 2).reshape(h, Qn * M)
-    return Z[:, :Qn * (M - 1)].reshape(h, Qn, M - 1).permute(1, 0, 2)
+    Z = torch.cat([X, torch.zeros(h, Qn, Qn, device=X.device, dtype=X.dtype)], dim=-1).reshape(h, Qn * M)
+    return Z[:, :Qn * (M - 1)].reshape(h, Qn, M - 1)
 
 
 # --------------------------------------------------------------------------------------------------------- blocks
@@ -212,7 +239,8 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
     if glb:
         tq = tau(pos.clamp(min=0), g).reshape(T, 1, 1)
         q, r = q * tq, r * tq
-    rl = torch.matmul(r, t['rp'])                                                     # [T, hq, NB]
+    rpf = torch.flip(t['rp'], dims=[-1])                                              # [d_rel, NB]: column j = distance NB - 1 - j
+    rl_dev = r.device
     sink = mm(qh, t['sk']).reshape(T, hq)
     gate = torch.sigmoid(lin(qh, t, 'gt'))
     kx = lin(kh, t, 'k')
@@ -221,7 +249,24 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
         dk = mm(kh, t['kw']).reshape(T, kvl, 1, g.K).expand(T, kvl, D, g.K).reshape(T, kvl * D, g.K)
         dv = mm(vh, t['vw']).reshape(T, kvl, 1, g.K).expand(T, kvl, D, g.K).reshape(T, kvl * D, g.K)
     outs, states, news = [], {}, []
-    q = bf(q)
+    # scores = q . k / sqrt(D): the factor rides on the operands (cq on q before its bf16 rounding, the power of two ck on
+    # the keys: exact in bf16), so no pass over the score tensor is spent on it. The multiply on the gathered far keys /
+    # values also MATERIALISES them as one contiguous tensor: contracted straight out of the page gather, neuronx-cc
+    # emits one matmul (and weight load) per 16-key page.
+    sck = 2.0 ** -math.floor(math.log2(math.sqrt(D)))
+    cq = 1.0 / (math.sqrt(D) * sck)
+    scv = 0.125
+    q = bf(q * cq)
+    far = glb and 'nofar' not in PROF
+    qb = ATT_QBLOCK if ATT_QBLOCK and Q_ > ATT_QBLOCK and Q_ % ATT_QBLOCK == 0 else Q_      # queries per block
+    blk = ATT_BLOCK if ATT_BLOCK and P > ATT_BLOCK and P % ATT_BLOCK == 0 else P            # pages per far-key block
+    nq = Q_ // qb
+    bank3 = None
+    if SKEW.startswith('bank') and qb > 1:
+        # the bias as a matmul per query with ITS shifted copy of the profile bank (bank3[t, :, c] = profile of distance
+        # t + NB - c; the same for every query block and row): the shifts are along the free dimension of [d_rel, .]
+        # tiles, where the skew of the [queries, keys] bias itself is ~140 small DMA packets per row
+        bank3 = torch.stack([torch.nn.functional.pad(rpf, (t_ + 1, qb - 1 - t_)) for t_ in range(qb)], dim=0)   # [qb, d_rel, NB + qb]
     for i in range(R_):
         sfx = f'_{i}' if R_ > 1 else ''
         rows = slice(i * Q_, (i + 1) * Q_)
@@ -239,40 +284,80 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
         new = torch.stack((k, v), dim=1).to(buf.dtype)                                # [Q, 2, kvl, D]
         news.append(new)
         allkv = torch.cat([buf, new], dim=0)                                           # [NB + Q, 2, kvl, D]
-        kk, vv = allkv[:, 0].float(), allkv[:, 1].float()
-        qi = q[rows].reshape(Q_, kvl, rep, D)
-        s = torch.einsum('qhgd,khd->qhgk', qi, kk) / math.sqrt(D)                     # [Q, kvl, rep, NB + Q]
-        # relative bias: key kk of query tt sits at distance tt + NB - kk; bias = rl[tt, :, dist] for 0 <= dist < NB
-        Z0 = torch.cat([torch.zeros(Q_, hq, 1, device=rl.device), torch.flip(rl[rows], dims=[-1])], dim=-1)
-        B = skew(Z0).reshape(Q_, kvl, rep, NB + Q_)
-        tt = torch.arange(Q_, device=pos.device).reshape(Q_, 1)
-        kidx = torch.arange(NB + Q_, device=pos.device).reshape(1, NB + Q_)
-        dist = tt + NB - kidx
-        kpos = pr[:1].reshape(1, 1) - NB + kidx                                        # positions of the keys (p0 - NB + k)
-        ok = (dist >= 0) & (dist < NB) & (kpos >= 0) & (pr.reshape(Q_, 1) >= 0)
-        if kind in 'sS':
-            ok = ok & (dist < g.W)
-        s = torch.where(ok.reshape(Q_, 1, 1, NB + Q_), s + B, torch.full_like(s, NEG))
-        parts = [s]
-        if glb and 'nofar' in PROF:
-            parts.append(s[..., :1] * 0 + t['kv'].reshape(-1)[:1].float() * 0 + NEG)
-        if glb and 'nofar' not in PROF:
-            cache = t['kv']
-            if 'noread' in PROF:   # probe: the far keys from a static slice of the pool (no page gather)
-                kvp = cache[:P].float() + t['table'][i].float().sum() * 0
+        # head-major layout [kvl, rep, queries, keys]: the score and value contractions are batched matmuls over the kv
+        # heads with nothing to transpose in between (a [q, h, g, k] layout made neuronx-cc reload the whole softmax
+        # output from HBM once per head and key tile: 2.3 GB of DMA in a Q = 256 sliding visit)
+        qh = q[rows].reshape(Q_, kvl, rep, D).permute(1, 2, 0, 3)                      # [kvl, rep, Q, D]
+        rh = r[rows].permute(1, 0, 2)                                                  # [hq, Q, d_rel]
+        skh = sink[rows].t().reshape(kvl, rep, Q_)
+        # near keys (buffer + chunk) per query block of qb tokens: block j (first token b) sees the keys b .. b + NB + qb
+        # of [buf; chunk] only (older ones are >= NB away: outside the window / far keys; later ones are in the future),
+        # so a wide chunk costs Q / qb cells of the Q = qb size. Key kk of query tt (both block-local) is at distance
+        # tt + NB - kk; its bias is rl[tt, :, dist] for 0 <= dist < NB: a static skew of the query's profile.
+        m, l, acc = [None] * nq, [None] * nq, [None] * nq
+        for j in range(nq):
+            b = j * qb
+            qs = slice(b, b + qb)
+            nk_ = NB + qb
+            span = allkv[b:b + nk_]
+            qj = qh[:, :, qs].reshape(kvl, rep * qb, D)
+            s = dotm(qj, span[:, 0].permute(1, 2, 0).float() * sck).reshape(kvl, rep, qb, nk_)
+            if bank3 is not None:
+                if SKEW == 'bank':
+                    B = torch.matmul(r[rows][qs], bank3).permute(1, 0, 2).reshape(kvl, rep, qb, nk_)
+                else:
+                    B = torch.einsum('htd,tdc->htc', rh[:, qs], bank3).reshape(kvl, rep, qb, nk_)
             else:
-                kvp = cache[t['table'][i]].float()                                     # [P, 2, kvl, 16, D]
-            fk = kvp[:, 0].permute(1, 0, 2, 3).reshape(kvl, P * PAGE, D)
-            fv = kvp[:, 1].permute(1, 0, 2, 3).reshape(kvl, P * PAGE, D)
-            sf = torch.einsum('qhgd,hkd->qhgk', qi, fk) / math.sqrt(D)
-            fpos = torch.arange(P * PAGE, device=pos.device).reshape(1, 1, 1, P * PAGE)
-            vis = (fpos <= (pr.reshape(Q_, 1, 1, 1) - g.X)) & (pr.reshape(Q_, 1, 1, 1) >= 0)
-            parts.append(torch.where(vis, sf, torch.full_like(sf, NEG)))
-        parts.append(sink[rows].reshape(Q_, kvl, rep, 1))
-        p = torch.softmax(torch.cat(parts, dim=-1), dim=-1)
-        o = torch.einsum('qhgk,khd->qhgd', bf(p[..., :NB + Q_]), vv)
-        if glb and 'nofar' not in PROF:
-            o = o + torch.einsum('qhgk,hkd->qhgd', bf(p[..., NB + Q_:NB + Q_ + P * PAGE]), fv)
+                Z0 = torch.cat([torch.zeros(hq, qb, 1, device=rl_dev), torch.matmul(rh[:, qs], rpf)], dim=-1)   # [hq, qb, NB + 1]
+                B = skew(Z0).reshape(kvl, rep, qb, nk_)
+            tt = torch.arange(qb, device=pos.device).reshape(qb, 1)
+            kidx = torch.arange(nk_, device=pos.device).reshape(1, nk_)
+            dist = tt + NB - kidx
+            kpos = pr[:1].reshape(1, 1) + (b - NB) + kidx                              # positions of the keys
+            ok = (dist >= 0) & (dist < NB) & (kpos >= 0) & (pr[qs].reshape(qb, 1) >= 0)
+            if kind in 'sS':
+                ok = ok & (dist < g.W)
+            s = torch.where(ok.reshape(1, 1, qb, nk_), s + B, torch.full_like(s, NEG))
+            sk = skh[:, :, qs]
+            vj = span[:, 1].permute(1, 0, 2)                                           # [kvl, keys, D]
+            # online softmax over [near, sink, far blocks]: running max m, sum l, weighted values acc (the sink logit is
+            # finite on every row, so m is finite from the start)
+            m[j] = torch.maximum(torch.amax(s, dim=-1), sk)
+            p = torch.exp(s - m[j].unsqueeze(-1))
+            l[j] = p.sum(dim=-1) + torch.exp(sk - m[j])
+            acc[j] = dotm(bf(p).reshape(kvl, rep * qb, nk_), vj)
+        if far:
+            # far keys (distance >= rel_extent, no bias) from the request's pages, in blocks of blk pages: the gathered
+            # keys and the score / exp / value passes of one cell stay block-sized whatever the context (P)
+            cache = t['kv']
+            table = t['table'][i]
+            for b0 in range(0, P, blk):
+                if 'noread' in PROF:   # probe: the far keys from a static slice of the pool (no page gather)
+                    kvp = cache[b0:b0 + blk] + (table.float().sum() * 0).to(cache.dtype)
+                else:
+                    kvp = cache[table[b0:b0 + blk]]                                    # [blk, 2, kvl, 16, D]
+                nk_ = blk * PAGE
+                if FARK == 'dk':
+                    fk = kvp[:, 0].permute(1, 3, 0, 2).reshape(kvl, D, nk_).float() * sck
+                else:
+                    fk = (kvp[:, 0].permute(1, 0, 2, 3).reshape(kvl, nk_, D).float() * sck).transpose(1, 2)
+                fv = kvp[:, 1].permute(1, 0, 2, 3).reshape(kvl, nk_, D).float() * scv
+                fpos = torch.arange(b0 * PAGE, (b0 + blk) * PAGE, device=pos.device).reshape(1, nk_)
+                for j in range(nq):
+                    qs = slice(j * qb, (j + 1) * qb)
+                    pq = pr[qs].reshape(qb, 1)
+                    sf = dotm(qh[:, :, qs].reshape(kvl, rep * qb, D), fk).reshape(kvl, rep, qb, nk_)
+                    sf = torch.where(((fpos <= pq - g.X) & (pq >= 0)).reshape(1, 1, qb, nk_), sf, torch.full_like(sf, NEG))
+                    mn = torch.maximum(m[j], torch.amax(sf, dim=-1))
+                    c = torch.exp(m[j] - mn)
+                    p = torch.exp(sf - mn.unsqueeze(-1))
+                    l[j] = l[j] * c + p.sum(dim=-1)
+                    acc[j] = acc[j] * c.reshape(kvl, rep * qb, 1) + dotm(bf(p).reshape(kvl, rep * qb, nk_), fv) * (1.0 / scv)
+                    m[j] = mn
+        # (no softmax op and no [scores, sink] concatenation: the sink enters through m and l)
+        o = [acc[j] / l[j].reshape(kvl, rep * qb, 1) for j in range(nq)]
+        o = [x_.reshape(kvl, rep, qb, D) for x_ in o]
+        o = (o[0] if nq == 1 else torch.cat(o, dim=2)).permute(2, 0, 1, 3)             # [Q, kvl, rep, D]
         outs.append(o.reshape(Q_, hq * D))
         # state: the last NB valid keys, the conv inputs
         if Q_ == 1:
@@ -315,6 +400,21 @@ def route(n, t, g):
     return w / (w.sum(dim=-1, keepdim=True) + 1e-20) * g.c.route_scale
 
 
+def route_top(n, t, g):
+    """-> (top [T, K] expert indices, w [T, K] their combine weights): route() in index form (the grouped prefill MoE)."""
+    logits = torch.matmul(n.float(), t['rw'] if WT else t['rw'].T)
+    s = torch.sigmoid(logits)
+    top = torch.topk(s + t['rb'].reshape(1, -1), g.topk, dim=-1)[1]                    # [T, K]
+    onehot = (top.unsqueeze(-1) == torch.arange(g.E, device=n.device).reshape(1, 1, g.E)).float()
+    w = torch.einsum('tke,te->tk', onehot, s)
+    return top, w / (w.sum(dim=-1, keepdim=True) + 1e-20) * g.c.route_scale
+
+
+def act2(gate, up, g):
+    c = g.c
+    return torch.tanh(gate / c.gate_cap) * c.gate_cap * torch.sigmoid(gate) * torch.tanh(up / c.up_cap) * c.up_cap
+
+
 def act(gu, g):
     gate, up = gu[..., 0, :], gu[..., 1, :]
     c = g.c
@@ -324,6 +424,14 @@ def act(gu, g):
 def moe(n, t, g, mode, allreduce):
     """This rank's slices of the routed experts (no shared expert), one all-reduce."""
     T, E, EIl = n.shape[0], g.E, g.EIl
+    if mode == 'group':
+        # routed-only prefill MoE: qwen35_graphs.moe_grouped_idx (hot experts on every token, every other expert on its own
+        # MOE_CAP token slots) with this model's activation. -> (sum, ovf [1]): exact iff ovf <= MOE_CAP, otherwise the
+        # engine reruns the visit's MoE part with the MOE=all NEFF (the state update below is held back in that case).
+        top, w = route_top(n, t, g)
+        Q.silu_mul = lambda gate, up: act2(gate, up, g)
+        routed, ovf = Q.moe_grouped_idx(n, top, w, t, g)
+        return allreduce(routed), ovf
     comb = route(n, t, g)
     gu, gus, dw, dc = t['egu'], t.get('egu_s'), t['ed'], t.get('ed_c')
     if mode == 'gather' and g.topk * T < E:
@@ -352,8 +460,11 @@ def moe(n, t, g, mode, allreduce):
         for e0 in range(0, E_, MOE_EG):
             sl = slice(e0, e0 + MOE_EG)
             routed = routed + moe_experts(n, comb[:, sl], gu[sl], None if gus is None else gus[sl], dw[sl], None if dc is None else dc[sl], g)
-        return allreduce(routed)
-    return allreduce(moe_experts(n, comb, gu, gus, dw, dc, g))
+        return allreduce(routed), None
+    if mode == 'all' and MOE_TSUB and T > MOE_TSUB and T % MOE_TSUB == 0:
+        # a wide chunk in token sub-blocks: the [sub, E 2 EIl] intermediates stay those of the Q = MOE_TSUB graph
+        return allreduce(torch.cat([moe_experts(n[b:b + MOE_TSUB], comb[b:b + MOE_TSUB], gu, gus, dw, dc, g) for b in range(0, T, MOE_TSUB)], dim=0)), None
+    return allreduce(moe_experts(n, comb, gu, gus, dw, dc, g)), None
 
 
 def moe_experts(n, comb, gu, gus, dw, dc, g):
@@ -447,9 +558,13 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all', part='full'):
     if msgs:
         hm = msg_gate(hm, mes[:, 3], t, 'm')
     if 'nomoe' in PROF:
+        ovf = None
         mo = allreduce(hm * t['ed'][0, 0, :1].float() + t['egu'].reshape(-1)[:1].float() + t['rw'].reshape(-1)[:1] + t['rb'][:1] + t.get('egu_s', t['rb'])[..., :1].reshape(-1)[:1] + t.get('ed_c', t['rb'])[..., :1].reshape(-1)[:1])
     else:
-        mo = moe(bf(Q.rms(hm, t['mn'], g.eps)), t, g, moe_mode, allreduce)
+        mo, ovf = moe(bf(Q.rms(hm, t['mn'], g.eps)), t, g, moe_mode, allreduce)
+    if ovf is not None:
+        assert part == 'moe', 'MOE=group needs PART=moe (the rerun restarts from the MoE input)'
+        st['ovf'] = ovf
     outs_m = []
     for i in range(R_):
         sfx = f'_{i}' if R_ > 1 else ''
@@ -457,6 +572,8 @@ def visit(kind, t, g, R_, Q_, P, allreduce, moe_mode='all', part='full'):
         n, na = conv_parts[i]
         cst = t['conv' + sfx]
         ym, nm = conv_step(mo[rows], t['mc'], cst[2 * g.CK + H:], n)
+        if ovf is not None:   # an overflowed grouped launch leaves the state as it was (the engine reruns the part)
+            nm = torch.where(ovf[0] <= float(Q.MOE_CAP), nm, cst[2 * g.CK + H:])
         outs_m.append(ym)
         if part == 'moe':
             st['conv' + sfx] = torch.cat([cst[:2 * g.CK + H], nm], dim=0)
@@ -643,11 +760,14 @@ def main():
                     x, st = visit(kinds[0], t, g, R_, Q_, P, allreduce, moe_mode, part)
                 for n_ in snames:
                     setattr(self, n_.replace('.', '_'), st[n_])
+                if moe_mode == 'group':
+                    return x.reshape(R_ * Q_, NS * g.H), st['ovf']
                 return x.reshape(R_ * Q_, NS * g.H)
         fn = Block()
         kwargs = {'enable_aliasing': True}
         meta = {'kind': 'inkling_' + kind, 'kinds': kinds, 'R': R_, 'Q': Q_, 'P': P, 'pages': pages, 'inputs': names,
-                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE, 'moe_slots': MOE_SLOTS, 'moe_eg': MOE_EG, 'part': part, 'prof': sorted(PROF - {''})}
+                'states': snames, 'fp8': fp8, 'moe': moe_mode, 'wt': WT, 'route': ROUTE, 'moe_slots': MOE_SLOTS, 'moe_eg': MOE_EG, 'part': part, 'extra_outputs': ['ovf'] if moe_mode == 'group' else [], 'moe_cap': Q.MOE_CAP if moe_mode == 'group' else 0,
+                'moe_hot': Q.MOE_HOT, 'moe_ge': Q.MOE_GE, 'moe_tsub': MOE_TSUB, 'wt_moe': Q.WT_MOE, 'wt_grp': Q.WT_GRP, 'att_block': ATT_BLOCK, 'att_qblock': ATT_QBLOCK, 'att_bf16': ATT_BF16, 'skew': SKEW, 'fark': FARK, 'att_layout': 'hm', 'prof': sorted(PROF - {''})}
     meta['geometry'] = g.meta()
     try:
         torch_neuronx.trace(fn, tuple(inputs), compiler_workdir=workdir, **kwargs)

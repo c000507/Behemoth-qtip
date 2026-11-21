@@ -26,6 +26,9 @@ MOE_DEC = os.environ.get('MOE', 'all')
 SEG = os.environ.get('SEG', '0') == '1'
 SPLIT = os.environ.get('SPLIT', '')   # visit kinds run as attention + MoE graphs (e.g. gG)
 PAGE = IG.PAGE
+PREFILL_MOE = os.environ.get('PREFILL_MOE', 'all')   # group: the split visits' MoE part of prefill chunks grouped (MOE_CAP / MOE_HOT)
+STAT = {'grouped': 0, 'fallback': 0}
+UPPER = os.environ.get('UPPER', '0') == '1'   # prefill visits through the loop-pass graph kinds (S / G), zero gates on first-pass visits
 
 
 class Mirror:
@@ -53,11 +56,14 @@ class Mirror:
         self.pool = [[IG.zeros(*IG.state_shapes(g.kind(v_), g, 1, pages)['kv']) if g.kind(v_) in 'gG' else None
                       for v_ in range(nv)] for _ in range(tp)]
 
-    def inputs(self, r, v, rows):
+    def inputs(self, r, v, rows, as_kind=None):
+        """as_kind: the graph kind run for the visit (the engine runs first-pass visits of prefill buckets through the
+        loop-pass graphs S / G with ZERO message gates)."""
         g = self.g
-        kind = g.kind(v)
+        kind = as_kind or g.kind(v)
         l = g.visits[v][0]
-        w = {k: self.layers[r][l][k] for k in self.wsh[kind] if k != 'ctl'}
+        gate = lambda k: k == 'mg' or k[:3] in ('gd_', 'gf_', 'gg_')
+        w = {k: (IG.zeros(*self.wsh[kind][k]) if gate(k) and kind != g.kind(v) else self.layers[r][l][k]) for k in self.wsh[kind] if k != 'ctl'}
         w['ctl'] = torch.tensor(g.ctl(v), dtype=torch.float32)
         st = {}
         R_ = len(rows)
@@ -115,19 +121,30 @@ class Mirror:
                             self.store(r, v + i, rows, {k[len(pre):]: val for k, val in new.items() if k.startswith(pre)})
                         v += 6
                         continue
-                    w, st = self.inputs(r, v, rows)
+                    k = g.kind(v).upper() if UPPER and Q_ > 1 else g.kind(v)
+                    w, st = self.inputs(r, v, rows, k)
                     if SPLIT and g.kind(v) in SPLIT:   # attention NEFF then MoE NEFF (only their own inputs)
-                        k = g.kind(v)
                         wa = {n: w[n] for n in IG.part_names(k, 'attn', list(w))}
                         xr, new = IG.visit(k, {**step, **wa, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode, 'attn')
                         self.store(r, v, rows, new)
-                        w, st = self.inputs(r, v, rows)
+                        w, st = self.inputs(r, v, rows, k)
                         wm = {n: w[n] for n in IG.part_names(k, 'moe', list(w))}
                         stm = {n: x_ for n, x_ in st.items() if n.startswith('conv')}
-                        xr, new = IG.visit(k, {'pos': step['pos'], **wm, **stm, 'x': xr.reshape(T, -1)}, g, R_, Q_, P, ar(r), moe_mode, 'moe')
+                        tm = {'pos': step['pos'], **wm, **stm, 'x': xr.reshape(T, -1)}
+                        mode = 'group' if PREFILL_MOE == 'group' and Q_ > 1 else moe_mode
+                        xo, new = IG.visit(k, tm, g, R_, Q_, P, ar(r), mode, 'moe')
+                        if 'ovf' in new:   # the engine's rule: an overflowed grouped launch is rerun with MOE=all
+                            over = float(new.pop('ovf')[0]) > IG.Q.MOE_CAP
+                            if r == 0:
+                                STAT['grouped'] += 1
+                                STAT['fallback'] += int(over)
+                            if over:
+                                assert all(torch.equal(new[n], stm[n]) for n in stm), 'overflowed launch changed the state'
+                                xo, new = IG.visit(k, tm, g, R_, Q_, P, ar(r), 'all', 'moe')
+                        xr = xo
                         new = {**{n: x_ for n, x_ in st.items() if not n.startswith('conv')}, **new}
                     else:
-                        xr, new = IG.visit(g.kind(v), {**step, **w, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode)
+                        xr, new = IG.visit(k, {**step, **w, **st, 'x': xr}, g, R_, Q_, P, ar(r), moe_mode)
                     xr = xr.reshape(T, -1)
                     self.store(r, v, rows, new)
                     v += 1
@@ -207,7 +224,7 @@ def main():
     e = rel(lm, lr)
     worst = max(worst, e)
     print(f'prefill C in A\'s slot ({len(C)} tokens): rel {e:.3e}')
-    print(f'WORST rel {worst:.3e}  top1 {sum(top)}/{len(top)}')
+    print(f'WORST rel {worst:.3e}  top1 {sum(top)}/{len(top)}' + (f'  grouped MoE launches {STAT["grouped"]}, fallbacks {STAT["fallback"]}' if STAT['grouped'] else ''))
     if IG.EXACT:
         assert worst < 1e-4, worst
 

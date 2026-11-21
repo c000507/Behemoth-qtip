@@ -84,11 +84,13 @@ def check(d, meta, g, sh, neff_io):
     x = torch.randn(T, IG.NS, g.H) * 0.5
     x[:, 5:] *= 0.8
     x = x.reshape(T, -1)
-    start = int(os.environ.get('DEV_START', min(1500, P_ * 16 - Q_ - 37 * R_)))   # every token's page inside the table (no duplicate writes)
+    # the page table holds the far keys only (distance >= rel_extent): a bucket of P pages serves (P + rel_extent / 16) * 16 tokens
+    start = int(os.environ.get('DEV_START', max(0, min(1500, (P_ + g.X // 16) * 16 - Q_ - 37 * R_))))
     pos = torch.tensor([start + (i % Q_) if R_ == 1 else start + 37 * i for i in range(T)], dtype=torch.int64)
     pages = meta['pages']
     table = torch.stack([(torch.arange(P_, dtype=torch.int64) + r * P_) % (pages - 1) for r in range(R_)])
-    wslot = torch.stack([table[i // Q_, min(int(pos[i]) // 16, P_ - 1)] * 16 + pos[i] % 16 for i in range(T)])
+    # row r's logical page j is pool page (j + r P) % (pages - 1): every token writes its own slot
+    wslot = torch.stack([((int(pos[i]) // 16 + (i // Q_) * P_) % (pages - 1)) * 16 + pos[i] % 16 for i in range(T)])
     step = {'x': x, 'pos': pos, 'wslot': wslot, 'table': table}
     v0 = visit_range(g, kinds)
     names = meta['inputs'] + meta['states']
@@ -134,7 +136,8 @@ def check(d, meta, g, sh, neff_io):
         for r in range(g.TP):
             for i, n in enumerate(names):
                 Path(io, f'in{i}.r{r}').write_bytes(RP.tensor_bytes(per_rank[r][n].contiguous()))
-        env = dict(os.environ, NEFF_IO_STATES=str(len(meta['states'])))
+        nx = len(meta.get('extra_outputs', []))
+        env = dict(os.environ, NEFF_IO_STATES=str(len(meta['states'])), NEFF_IO_EXTRA=str(nx))
         t0 = time.time()
         subprocess.run([neff_io, str(d / 'graph.neff'), io, str(g.TP)], check=True, stdout=subprocess.DEVNULL, env=env)
         dt = time.time() - t0
@@ -153,7 +156,7 @@ def check(d, meta, g, sh, neff_io):
                 ref_s = rst[0].get(n)
                 if ref_s is None:
                     continue
-                raw = Path(io, f'out{si + 1}.r0').read_bytes()
+                raw = Path(io, f'out{si + 1 + nx}.r0').read_bytes()
                 if ref_s.dtype == torch.bfloat16:
                     dev_s = torch.from_numpy(np.frombuffer(raw, np.int16).copy()).view(torch.bfloat16)
                 else:
@@ -165,6 +168,9 @@ def check(d, meta, g, sh, neff_io):
                     parts = {'kv': slice(0, C2 * (g.K - 1)), 'a': slice(C2 * (g.K - 1), (C2 + g.H) * (g.K - 1)), 'm': slice((C2 + g.H) * (g.K - 1), None)}
                     print('   conv parts rel:', ' '.join(f'{k}:{float(torch.linalg.norm(a[sl] - b_[sl]) / torch.linalg.norm(b_[sl])):.2e}' for k, sl in parts.items()))
                 print(f'  state {n}: rel {float(torch.linalg.norm(a - b_) / torch.linalg.norm(b_)):.2e}; changed part rel {float(torch.linalg.norm((a - d0) - (b_ - d0)) / (torch.linalg.norm(b_ - d0) + 1e-30)):.2e}')
+        if nx:   # grouped MoE: the overflow output (exact iff <= moe_cap)
+            ovf = np.frombuffer(Path(io, 'out1.r0').read_bytes(), np.float32)
+            print(f'  ovf device {ovf[:4]} mirror {rst[0]["ovf"].reshape(-1)[:4].tolist()} cap {meta.get("moe_cap")}')
         same = max([float(np.abs(np.frombuffer(Path(io, f'out0.r{r}').read_bytes(), np.float32).reshape(T, -1) - out).max()) for r in range(1, g.TP)] or [0.0])
     print(f'{d.name:24s} kinds={"".join(kinds)} R={R_} Q={Q_} P={P_} ({"fp8" if meta["fp8"] else "bf16"}, moe={moe_mode}, wt={meta.get("wt")}): '
           f'rel L2 vs CPU mirror {rel:.3e}; finite {fin}; ranks differ by {same:.1e}; neff_io {dt:.1f}s', flush=True)
