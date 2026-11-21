@@ -34,6 +34,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -82,6 +83,65 @@ void zero(const Dev &d) {
     for (size_t off = 0; off < d.bytes; off += z.size())
         put(d, z.data(), std::min(z.size(), d.bytes - off), off);
 }
+// WT layout (qwen35_graphs.to_wt): which prepared tensors are stored transposed. name = the tensor's own name (after the last '.').
+bool wt_2d(const std::string &name) {
+    static const std::set<std::string> proj = {"qkv", "z", "b", "a", "o", "q", "k", "v", "sg", "su", "sd", "fc", "rw", "w"};
+    return proj.count(name) > 0;
+}
+
+// dst[c * rows + r] = src[r * cols + c] for elements of `el` bytes, in 64 x 64 blocks
+void transpose_into(uint8_t *dst, const uint8_t *src, size_t rows, size_t cols, size_t el) {
+    constexpr size_t B = 64;
+    for (size_t r0 = 0; r0 < rows; r0 += B)
+        for (size_t c0 = 0; c0 < cols; c0 += B) {
+            const size_t r1 = std::min(rows, r0 + B), c1 = std::min(cols, c0 + B);
+            if (el == 1) {
+                for (size_t r = r0; r < r1; ++r)
+                    for (size_t c = c0; c < c1; ++c)
+                        dst[c * rows + r] = src[r * cols + c];
+            } else {
+                for (size_t r = r0; r < r1; ++r)
+                    for (size_t c = c0; c < c1; ++c)
+                        std::memcpy(dst + (c * rows + r) * el, src + (r * cols + c) * el, el);
+            }
+        }
+}
+
+// A prepared tensor in the WT layout: 2-D projections / router / head [out, in] -> [in, out]; egu [E, 2 EIl, H] -> [E, H, 2 EIl]
+// (one transpose per expert, split over a few threads). -> false when the tensor keeps its layout.
+bool to_wt(const std::string &name, const json &shape, size_t bytes, const uint8_t *src, std::vector<uint8_t> &out) {
+    const std::string base = name.substr(name.rfind('.') + 1);
+    std::vector<size_t> sh;
+    for (const auto &d : shape)
+        sh.push_back(d.get<size_t>());
+    size_t n = 1;
+    for (size_t d : sh)
+        n *= d;
+    if (!n || bytes % n)
+        throw std::runtime_error(name + ": shape does not match its byte count");
+    const size_t el = bytes / n;
+    if (sh.size() == 2 && wt_2d(base)) {
+        out.resize(bytes);
+        transpose_into(out.data(), src, sh[0], sh[1], el);
+        return true;
+    }
+    if (sh.size() == 3 && base == "egu") {
+        out.resize(bytes);
+        const size_t E = sh[0], per = sh[1] * sh[2] * el;
+        const size_t nt = std::min<size_t>(4, std::max<size_t>(1, E / 16));
+        std::vector<std::thread> th;
+        for (size_t k = 0; k < nt; ++k)
+            th.emplace_back([&, k] {
+                for (size_t e = k; e < E; e += nt)
+                    transpose_into(out.data() + e * per, src + e * per, sh[1], sh[2], el);
+            });
+        for (auto &t : th)
+            t.join();
+        return true;
+    }
+    return false;
+}
+
 std::vector<char> slurp(const std::filesystem::path &p) {
     std::ifstream f(p, std::ios::binary);
     if (!f)
@@ -147,6 +207,8 @@ struct Graph {
     int moe_cap = 0;              // kind moeg (meta moe "group", "moe_cap" > 0): the prefill MoE by expert groups (qwen35_graphs.moe_grouped);
                                   // output1 = the largest token count of a grouped expert, > moe_cap: the launch is rerun with the moe NEFF
     int egu_t = -1;                          // meta "egu_t": experts stored as egu_t [E * 128, 2048] (nki_moe.relayout_egu); -1: no MoE
+    bool wt = false;                         // meta "wt": built for the transposed weight layout (qwen35_graphs WT=1, to_wt): projections, router
+                                             // and head [in, out], experts' gate|up [E, H, 2 EIl]. One layout per set (the weights are shared)
     std::vector<std::string> inputs, states; // NEFF inputs: inputs..., then the aliased states (module buffers)
     std::vector<nrt_model_t *> model;        // [rank]
     std::vector<size_t> input_bytes;          // by NEFF input index
@@ -401,6 +463,7 @@ class Qwen35Model final : public Backend {
             }
             if (std::any_of(gr.inputs.begin(), gr.inputs.end(), [](const std::string &n) { return n == "egu" || n.ends_with(".egu"); }))
                 gr.egu_t = m.value("egu_t", false) ? 1 : 0;
+            gr.wt = m.value("wt", false);
             gr.neff = dir.path() / "graph.neff";
             if (gr.kind == "head") {
                 gr.T = m.at("T");
@@ -639,6 +702,20 @@ class Qwen35Model final : public Backend {
                 need_rws |= n == "rws" || n.ends_with(".rws");
                 need_rw |= n == "rw" || n.ends_with(".rw");
             }
+        // WT sets (meta "wt"): every NEFF, the MTP head's included (they bind head.w), must be built for the transposed layout; the
+        // prepared weights are transposed here at load (or are already: prepared.json "wt", e.g. an offline mkwt.py copy).
+        const bool wt = !graphs.empty() && graphs.front().wt;
+        for (const auto &g : graphs)
+            if (g.wt != wt)
+                throw std::runtime_error(std::string("Qwen3.5 NEFFs disagree on the weight layout (meta wt): ") + graphs.front().neff.string() + " is " +
+                                         (wt ? "WT" : "not WT") + ", " + g.neff.string() + " is " + (g.wt ? "WT" : "not WT") + " - one graph set must be one layout");
+        const bool stored_wt = prepared.value("wt", false);
+        if (stored_wt && !wt)
+            throw std::runtime_error("Qwen3.5: the prepared weights are in the WT layout (prepared.json wt), the graph set is not");
+        if (wt && (egu_t == 1 || need_rws))
+            throw std::runtime_error("Qwen3.5: WT graphs do not support the egu_t expert layout or ROUTER=shard");
+        const bool relayout = wt && !stored_wt;
+        std::atomic<size_t> wt_bytes{0};
         std::vector<std::future<void>> jobs;
         for (int r = 0; r < tp; ++r)
             jobs.push_back(workers[size_t(r)]->submit([&, r] {
@@ -680,6 +757,9 @@ class Qwen35Model final : public Backend {
                                         for (size_t p = 0; p < 128; ++p)
                                             t[((e * 128 + p) * KT + kt) * O + o] = src[(e * O + o) * H + kt * 128 + p];
                             put(d, t.data(), bytes);
+                        } else if (std::vector<uint8_t> t; relayout && to_wt(name, e.at("shape"), bytes, reinterpret_cast<const uint8_t *>(data.data() + offset), t)) {
+                            put(d, t.data(), bytes);
+                            wt_bytes += bytes;
                         } else
                             put(d, data.data() + offset, bytes);
                         ranks[size_t(r)].t[name] = d;
@@ -726,7 +806,7 @@ class Qwen35Model final : public Backend {
         for (auto &j : jobs)
             j.get();
         if (options.verbose)
-            std::cerr << "Qwen35: weights resident in " << ms_since(t0) / 1000 << " s\n";
+            std::cerr << "Qwen35: weights resident in " << ms_since(t0) / 1000 << " s" << (relayout ? " (WT layout: " + std::to_string(wt_bytes / (1 << 20)) + " MiB transposed at load)" : wt ? " (WT layout, stored)" : "") << "\n";
         mtp_ready = mtp_graph(1) && mtp_max_drafts() > 0;
         if (options.verbose && !mtp_manifest.is_null()) {
             size_t b = 0;

@@ -34,6 +34,9 @@ class Mirror:
         get = P.Getter(weights)
         self.layers = [[P.shard_layer(get, l, r, g, FP8) for l in range(g.L)] for r in range(tp)]
         self.heads = [P.shard_head(get, r, g, FP8) for r in range(tp)]
+        if Q.WT:   # WT=1: the transposed layout (qwen35_graphs.to_wt), as an engine / prepare step would store it
+            self.layers = [[{k: Q.to_wt(k.split('.', 1)[1], v) for k, v in lr.items()} for lr in rl] for rl in self.layers]
+            self.heads = [{k: Q.to_wt(k, v) for k, v in h.items()} for h in self.heads]
         self.embed = get('embed_tokens.weight')
         self.pages, self.slots = pages, slots
         self.group_launches, self.group_overflows = [0] * tp, [0] * tp
@@ -130,6 +133,7 @@ def main():
             print(f'layer {l} gdn state slot 0 vs oracle: recurrent {dS:.2e} conv {dC:.2e}')
             if os.environ.get('EXACT') == '1':
                 assert dS < 1e-4 and dC < 1e-4
+    print(f'digest: last logits sum {float(lg.double().sum())!r} abs {float(lg.double().abs().sum())!r}')   # layout variants must match bit for bit
     mode = 'EXACT' if os.environ.get('EXACT') == '1' else ('fp8' if FP8 else 'bf16')
     print(f'[{mode}, decode MOE={MOE_DEC}] worst rel L2 {worst:.3e}')
     if os.environ.get('EXACT') == '1':
