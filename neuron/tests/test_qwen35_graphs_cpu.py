@@ -133,6 +133,7 @@ def main():
             print(f'layer {l} gdn state slot 0 vs oracle: recurrent {dS:.2e} conv {dC:.2e}')
             if os.environ.get('EXACT') == '1':
                 assert dS < 1e-4 and dC < 1e-4
+    print(f'digest: last logits sum {float(lg.double().sum())!r} abs {float(lg.double().abs().sum())!r}')   # layout variants must match bit for bit
     mode = 'EXACT' if os.environ.get('EXACT') == '1' else ('fp8' if FP8 else 'bf16')
     print(f'[{mode}, decode MOE={MOE_DEC}] worst rel L2 {worst:.3e}')
     if os.environ.get('EXACT') == '1':
