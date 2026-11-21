@@ -114,6 +114,17 @@ both ranks bit-identical): decode visits s / g / S / G **3.5e-2 / 3.5e-2 / 5.9e-
 computations; the K|V buffer and k / v conv states agree to 1e-3), block rel 0.13-0.16. The random router had to be scaled to a
 realistic logit spread: with saturated sigmoids many scores tie at 1.0 and the device and CPU pick different experts.
 
+**GATE 2 - fp8 re-encode cost** (`tests/inkling_kl.py`, f32 oracle, reference = exact dequantised experts + bf16 dense;
+held-out text: 2304 tokens of the repo's prose in one pass; 5 chat-template prompts, 134 positions):
+
+| variant | text KL mean / p99 / max (nats) | text top-1 | chat KL mean | chat top-1 |
+|---|---|---|---|---|
+| x8: experts E4M3 per output row (gate\|up) / input channel (down) - the prepared format | 0.0075 / 0.055 / 0.62 | 95.7 % | 0.030 | 99.3 % |
+| x8d8: x8 + dense projections and head E4M3 per row (what the graphs use) | 0.0109 / 0.084 / 0.34 | 94.9 % | 0.048 | 92.5 % |
+| xb128: experts with one scale per 128 input columns | 0.0069 / 0.056 / 0.23 | 96.1 % | (not run) | |
+
+Small (mean KL ~0.01 nats per token): per-row fp8 is kept; 128-column blocks would buy little (0.0069 vs 0.0075). PASS.
+
 **GATE 3 - end to end.** `neuron_engine_cli` on the prepared set, greedy, 3 chat prompts x 32 tokens, the oracle teacher-forced
 over prompt + device tokens (`tests/inkling_gate3.py`): **91 / 96 top-1** against the fp8-weight oracle (x8d8), 90 / 96 against
 the exact-weight oracle; every miss is a near tie (oracle margin 0.03-0.33, the device's token being the oracle's runner-up);
