@@ -426,27 +426,29 @@ def quant_mxfp8(w):
     return q, s
 
 
-def random_checkpoint(cfg, seed=0, scale=0.05, mxfp8_layers=None):
+def random_checkpoint(cfg, seed=0, scale=0.05, mxfp8_layers=None, layers=None, experts=True, vocab=None):
     """Random tensors in the ORIGINAL checkpoint naming / dtypes (bf16 dense, f32 attn_res / queries / router bias,
-    NVFP4 experts, MXFP8 experts in `mxfp8_layers`)."""
+    NVFP4 experts, MXFP8 experts in `mxfp8_layers`). layers: only these layers (device tests at real shapes);
+    experts=False leaves the expert tensors out; vocab: embedding / unembedding rows (default: the config's)."""
     c = cfg if isinstance(cfg, Cfg) else Cfg(cfg)
     gen = torch.Generator().manual_seed(seed)
     mx = set(mxfp8_layers if mxfp8_layers is not None else [])
+    V = vocab or c.V
 
     def r(*s, sc=scale, dt=torch.bfloat16):
         return (torch.randn(*s, generator=gen) * sc).to(dt)
 
     H, nh, kvh, D, K, E, I = c.H, c.heads, c.kvh, c.D, c.K, c.E, c.I
     t = {}
-    t[P + 'embed.weight'] = r(c.V, H, sc=1.0)
+    t[P + 'embed.weight'] = r(V, H, sc=1.0)
     t[P + 'embed_norm.weight'] = (1 + r(H, sc=0.1, dt=torch.float32)).bfloat16()
     t[P + 'norm.weight'] = (1 + r(H, sc=0.1, dt=torch.float32)).bfloat16()
-    t[P + 'unembed.weight'] = r(c.V, H, sc=0.05)
+    t[P + 'unembed.weight'] = r(V, H, sc=0.05)
     t[P + 'attn_res.output_query'] = r(H, sc=0.5, dt=torch.float32)
     nl = c.le - c.ls
     t[P + 'middle_cycle_cross_pass_queries'] = r(2 * nl, H, sc=0.5, dt=torch.float32)
     t[P + 'middle_cycle_cross_pass_kv_queries'] = r(2 * nl, H, sc=0.5, dt=torch.float32)
-    for l in range(c.L):
+    for l in (range(c.L) if layers is None else layers):
         p = f'{P}layers.{l}.'
         g = c.swa[l]
         if l > 0:
@@ -484,6 +486,8 @@ def random_checkpoint(cfg, seed=0, scale=0.05, mxfp8_layers=None):
                 t[b + 'down_weight'] = r(c.rank, 2 * H, sc=0.1)
                 t[b + 'forget_weight'] = r(H, c.rank, sc=0.1)
                 t[b + 'gain_weight'] = r(H, c.rank, sc=0.1)
+        if not experts:
+            continue
         e = p + 'mlp.experts.'
         w13 = torch.randn(E, 2 * I, H, generator=gen) * scale
         w2 = torch.randn(E, H, I, generator=gen) * scale

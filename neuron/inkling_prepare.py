@@ -107,6 +107,11 @@ def dense(w):
 def expert_tensors(get, l, g, fp8=True):
     """dequantised experts of layer l -> per-rank dicts {egu, egu_s, ed, ed_c} (quantised once for all ranks)."""
     gu, dn = R.dequant_experts(get.raw, l)                                             # [E, 2I, H] (gate rows first), [E, H, I]
+    return experts_from_dense(gu, dn, g, fp8)
+
+
+def experts_from_dense(gu, dn, g, fp8=True):
+    """f32 gate|up [E, 2I, H] (gate rows first) and down [E, H, I] -> per-rank expert dicts."""
     dnt = dn.transpose(1, 2).contiguous()                                              # [E, I, H]: rows = input channels
     I = g.I
     if fp8:
