@@ -258,7 +258,10 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
             parts.append(s[..., :1] * 0 + t['kv'].reshape(-1)[:1].float() * 0 + NEG)
         if glb and 'nofar' not in PROF:
             cache = t['kv']
-            kvp = cache[t['table'][i]].float()                                         # [P, 2, kvl, 16, D]
+            if 'noread' in PROF:   # probe: the far keys from a static slice of the pool (no page gather)
+                kvp = cache[:P].float() + t['table'][i].float().sum() * 0
+            else:
+                kvp = cache[t['table'][i]].float()                                     # [P, 2, kvl, 16, D]
             fk = kvp[:, 0].permute(1, 0, 2, 3).reshape(kvl, P * PAGE, D)
             fv = kvp[:, 1].permute(1, 0, 2, 3).reshape(kvl, P * PAGE, D)
             sf = torch.einsum('qhgd,hkd->qhgk', qi, fk) / math.sqrt(D)
@@ -286,7 +289,10 @@ def attention(t, g, kind, R_, Q_, P, qh, kh, vh, allreduce):
         off = torch.bitwise_and(t['wslot'], PAGE - 1)
         at = (page[:, None, None], torch.arange(2, dtype=torch.int64, device=pos.device)[None, :, None],
               torch.arange(kvl, dtype=torch.int64, device=pos.device)[None, None, :], off[:, None, None])
-        states['kv'] = cache.index_put(at, torch.cat(news, dim=0).to(cache.dtype))
+        if 'nowrite' in PROF:   # probe: the pool passes through (the chunk's keys are not written)
+            states['kv'] = cache + (torch.cat(news, dim=0).float().sum() * 0 + t['wslot'].float().sum() * 0).to(cache.dtype)
+        else:
+            states['kv'] = cache.index_put(at, torch.cat(news, dim=0).to(cache.dtype))
     o = torch.cat(outs, dim=0) * gate
     return allreduce(lin_partial(bf(o), t, 'o')), states
 
