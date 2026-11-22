@@ -67,10 +67,12 @@ StructuredOutput parse_structured(const nlohmann::ordered_json &j, bool tool_con
     if (j.contains("reasoning_effort") && !j.at("reasoning_effort").is_null()) {
         const auto &e = j.at("reasoning_effort");
         static const std::vector<std::string> levels = {"none", "minimal", "low", "medium", "high"};
-        if (!e.is_string() || std::find(levels.begin(), levels.end(), e.get<std::string>()) == levels.end())
+        const bool native = bool(chat_backend().render_vars); // the template takes the effort (also xhigh / max)
+        if (!e.is_string() || (std::find(levels.begin(), levels.end(), e.get<std::string>()) == levels.end() &&
+                               !(native && (e == "xhigh" || e == "max"))))
             throw RequestError("reasoning_effort must be none, minimal, low, medium or high", "reasoning_effort");
         if (e == "none") {
-            if (out.kind == StructuredOutput::None && !tool_constraint)
+            if (out.kind == StructuredOutput::None && !tool_constraint && !native)
                 throw RequestError("reasoning_effort=none is only enforced together with response_format "
                                    "json_object/json_schema or grammar",
                                    "reasoning_effort");
@@ -121,7 +123,14 @@ ChatRequest parse_chat(const nlohmann::json &j, const nlohmann::ordered_json *or
                 throw RequestError(std::string("Invalid tool parameters schema: ") + e.what(), "tools");
             }
     }
-    if (tools && (r.tools.active() || tool_messages)) {
+    if (backend().render_vars && j.contains("reasoning_effort") && !j.at("reasoning_effort").is_null()) {
+        static const std::vector<std::string> levels = {"none", "minimal", "low", "medium", "high", "xhigh", "max"};
+        const auto &e = j.at("reasoning_effort");
+        if (!e.is_string() || std::find(levels.begin(), levels.end(), e.get<std::string>()) == levels.end())
+            throw RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max", "reasoning_effort");
+        r.rendered = backend().render_vars(tools ? o.at("messages") : nlohmann::ordered_json(messages), tools && r.tools.active() ? r.tools.tools : nlohmann::ordered_json(),
+                                           {{"reasoning_effort", j.at("reasoning_effort")}});
+    } else if (tools && (r.tools.active() || tool_messages)) {
         r.rendered = backend().render_tools(o.at("messages"), r.tools.active() ? r.tools.tools : nlohmann::ordered_json());
     } else if (backend().render) {
         r.rendered = backend().render(messages);

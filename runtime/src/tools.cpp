@@ -376,11 +376,38 @@ nlohmann::json coerce_tool_argument(const std::string &text, const ojson &schema
     return text; // a string, or typed and not that type: the text rather than no argument
 }
 
+// Inkling 2: <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}</think> per call (</think> is
+// how the message end reads on the text path).
+std::string inkling_tool_call_grammar(const ToolRequest &r, const ToolFormat &f) {
+    std::vector<ojson> schemas;
+    std::vector<std::string> names;
+    for (const auto &t : r.tools) {
+        const auto &fn = t.at("function");
+        if (r.choice == ToolRequest::Named && fn.at("name") != r.name)
+            continue;
+        names.push_back(fn.at("name"));
+        schemas.push_back(fn.at("parameters"));
+    }
+    if (names.empty())
+        throw std::invalid_argument("No tools to call");
+    return grammar::json_schemas_grammar(schemas, [&](const std::vector<std::string> &rules) {
+        std::string call = grammar::gbnf_literal(f.calls) + " (";
+        for (size_t i = 0; i < rules.size(); ++i)
+            call += (i ? " | " : " ") + grammar::gbnf_literal(names[i] + f.args + "{\"name\":" + nlohmann::json(names[i]).dump() + ",\"args\":") +
+                    " " + rules[i] + " " + grammar::gbnf_literal("}");
+        // ONE call: the constrained answer starts with the call (no thinking message before it), and forced past the
+        // message end the model keeps calling instead of ending the turn (measured: tool_choice required ran to max_tokens)
+        return call + " ) " + grammar::gbnf_literal("</think>");
+    });
+}
+
 std::string tool_call_grammar(const ToolRequest &r, const ToolFormat &f) {
     if (f.glm)
         return glm_tool_call_grammar(r);
     if (f.qwen)
         return qwen_tool_call_grammar(r);
+    if (f.inkling)
+        return inkling_tool_call_grammar(r, f);
     std::vector<ojson> schemas;
     std::vector<std::string> names;
     for (const auto &t : r.tools) {
@@ -855,6 +882,63 @@ void ToolCallParser::finish_list(Delta &d) {
     list_.clear();
 }
 
+// Inkling: InkHead = right after a message start (<|message_model|>): <|content_text|> opens an answer (Content), another
+// message start is skipped (the thinking message between them went to the reasoning splitter), anything else is a call's
+// name up to <|content_invoke_tool_json|>. InkArgs = the call's JSON {"name": .., "args": {..}} up to the next message
+// start or the end; its args object becomes the arguments (unparseable text is passed on as it is).
+bool ToolCallParser::ink_step(Delta &d, bool finish) {
+    const std::string_view text_open = inkling_text;
+    if (mode_ == InkHead) {
+        size_t i = 0;
+        while (i < buffer_.size() && is_space(buffer_[i]))
+            ++i;
+        const std::string_view rest = std::string_view(buffer_).substr(i);
+        if (rest.empty())
+            return false;
+        for (const std::string_view m : {text_open, std::string_view(format_.calls), std::string_view("</think>")}) {
+            if (rest.substr(0, m.size()) == m) {
+                buffer_.erase(0, i + m.size());
+                if (m == text_open)
+                    mode_ = Content;
+                return true;
+            }
+            if (!finish && m.substr(0, rest.size()) == rest)
+                return false; // a partial marker
+        }
+        const size_t at = buffer_.find(format_.args);
+        if (at == std::string::npos) {
+            if (finish || buffer_.find(format_.calls) != std::string::npos) { // no call after all: text
+                mode_ = Content;
+                return true;
+            }
+            return false;
+        }
+        start_call(trim(std::string_view(buffer_).substr(0, at)), d);
+        buffer_.erase(0, at + format_.args.size());
+        mode_ = InkArgs;
+        return true;
+    }
+    const size_t at = buffer_.find(format_.calls);
+    if (at == std::string::npos && !finish)
+        return false;
+    std::string body = trim(std::string_view(buffer_).substr(0, std::min(at, buffer_.size())));
+    // the message end reads </think> on the text path; a constrained answer does not pass the splitter that drops it
+    for (const std::string_view close = "</think>"; body.size() >= close.size() && std::string_view(body).substr(body.size() - close.size()) == close;)
+        body = trim(std::string_view(body).substr(0, body.size() - close.size()));
+    const auto parsed = ojson::parse(body, nullptr, false);
+    if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("args"))
+        add_arguments(parsed.at("args").dump(), d);
+    else
+        add_arguments(body, d);
+    if (at == std::string::npos) {
+        buffer_.clear();
+        return false;
+    }
+    buffer_.erase(0, at + format_.calls.size());
+    mode_ = InkHead;
+    return true;
+}
+
 ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
     Delta d;
     buffer_ += text;
@@ -888,7 +972,7 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
                 if (!leading || !trim(std::string_view(buffer_).substr(0, at)).empty())
                     d.content += buffer_.substr(0, at);
                 buffer_.erase(0, at + format_.calls.size());
-                mode_ = format_.glm ? GlmName : Head;
+                mode_ = format_.glm ? GlmName : format_.inkling ? InkHead : Head;
                 progress = true;
                 break;
             }
@@ -976,6 +1060,10 @@ ToolCallParser::Delta ToolCallParser::feed(std::string_view text, bool finish) {
         case QwenKey:
         case QwenValue:
             progress = qwen_step(d, finish);
+            break;
+        case InkHead:
+        case InkArgs:
+            progress = ink_step(d, finish);
             break;
         }
     }

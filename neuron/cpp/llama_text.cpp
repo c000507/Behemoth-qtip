@@ -36,6 +36,7 @@ struct Tokenizer::Impl {
     // (the reasoning split and the tool-call parser read them). GLM / Mistral: empty.
     std::vector<std::pair<int, std::string>> text_tokens;
     int think_open = -1, think_close = -1; // Qwen: the <think> / </think> ids
+    bool inkling = false;                  // Inkling 2 message markers (see the constructor)
     int text_token(const std::string &text) const {
         for (const auto &[id, t] : text_tokens)
             if (t == text)
@@ -61,11 +62,33 @@ struct Tokenizer::Impl {
             for (const char *t : {"<think>", "</think>", "<tool_call>", glm_call_end, "<tool_response>", "</tool_response>"})
                 if (const int id = control(t); id >= 0 && t != eos)
                     text_tokens.push_back({id, t});
+        // Inkling 2 (<|message_model|><|content_thinking|> reasoning <|end_message|><|message_model|><|content_text|> answer
+        // <|end_message|><|content_model_end_sampling|>): the thinking content marker reads as <think>, the message end as
+        // </think> (ChatBackend::drop_stray_think_close drops the one after the answer); the other markers stay silent
+        if (const int th = control("<|content_thinking|>"), em = control("<|end_message|>"); th >= 0 && em >= 0) {
+            inkling = true;
+            text_tokens.push_back({th, "<think>"});
+            text_tokens.push_back({em, "</think>"});
+        }
         think_open = text_token("<think>");
         think_close = text_token("</think>");
+        if (inkling)
+            think_open = think_close = -1; // no generation prompt opens a think block
         const char *enabled = std::getenv("BEHEMOTH_TOOLS");
         if (enabled && std::atoi(enabled) == 0)
             return;
+        // Inkling 2 (<|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}<|end_message|>; the template
+        // renders tools as a tool_declare system message). No lazy grammar trigger: every message starts with the calls
+        // marker, so tool_choice auto is parsed, not constrained.
+        if (const int mm = control("<|message_model|>"), inv = control("<|content_invoke_tool_json|>"), ct = control(inkling_text);
+            inkling && mm >= 0 && inv >= 0 && ct >= 0) {
+            tools.calls = "<|message_model|>";
+            tools.args = "<|content_invoke_tool_json|>";
+            tools.args_token = inv;
+            tools.inkling = true;
+            tools.markers = {{mm, tools.calls}, {ct, inkling_text}};
+            return;
+        }
         // Qwen3-Coder / Qwen3.5 (<tool_call> <function=name> <parameter=key> value ...; the template renders tools)
         if (const int open = text_token("<tool_call>"); qwen && open >= 0) {
             tools.calls = "<tool_call>";
@@ -154,14 +177,26 @@ Tokenizer::Tokenizer(const std::filesystem::path &root)
                         [impl](const nlohmann::json &messages) { return impl->bpe.chat(text_only(messages), true); }};
     // Constrained answers may open with <think> only for templates that know it (reasoning models); others (Cydonia)
     // are constrained from the first token unless the request sets reasoning_effort.
-    backend.think = template_source(root).find("<think>") != std::string::npos;
+    backend.think = template_source(root).find("<think>") != std::string::npos || impl->inkling;
+    backend.drop_stray_think_close = impl->inkling;
+    if (impl->inkling) // the template writes the request's reasoning_effort as its "Thinking effort level" preamble
+        backend.render_vars = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools,
+                                     const nlohmann::ordered_json &vars) {
+            return impl->bpe.chat_tools(messages, tools, &vars);
+        };
     // the generation prompt opens the think block itself (Qwen3.5: "<|im_start|>assistant\n<think>\n")
     if (impl->think_open >= 0 && impl->think_close >= 0 &&
         impl->bpe.chat(nlohmann::json::array({{{"role", "user"}, {"content", "x"}}}), true).ends_with("<think>\n")) {
         backend.think_open = impl->think_open;
         backend.think_close = impl->think_close;
     }
-    if (impl->tools.glm || impl->tools.qwen) {
+    if (impl->tools.inkling) {
+        backend.tools = impl->tools;
+        backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
+            return impl->bpe.chat_tools(messages, tools);
+        };
+        std::cerr << "Tool calling: Inkling format (<|message_model|>NAME<|content_invoke_tool_json|>{json}, chat template renders tools)\n";
+    } else if (impl->tools.glm || impl->tools.qwen) {
         backend.tools = impl->tools;
         backend.render_tools = [impl](const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
             return impl->bpe.chat_tools(messages, tools);

@@ -242,7 +242,59 @@ std::string Tokenizer::chat(const json &messages, bool generation) const {
     }
     return render(nlohmann::ordered_json::parse(messages.dump()), generation, nullptr);
 }
-std::string Tokenizer::chat_tools(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) const {
+// Templates that ask for them (Inkling 2: the variable names appear in the template source): what a template cannot write
+// as HF does with minja's tojson. tools_json: the tool specs as
+// tojson(sort_keys=true, separators=(",", ":")); per assistant tool call function.call_json:
+// {"name":NAME,"args":{...}} with the top-level argument keys sorted and compact values in their own key order.
+static nlohmann::ordered_json template_json_vars(nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools) {
+    nlohmann::ordered_json vars = nlohmann::ordered_json::object();
+    if (tools.is_array() && !tools.empty()) {
+        nlohmann::json specs = nlohmann::json::array(); // std::map objects: keys sorted at every level
+        for (const auto &t : tools) {
+            const auto &fn = t.contains("function") ? t.at("function") : t;
+            const bool has_desc = fn.contains("description") && fn.at("description").is_string() && !fn.at("description").get<std::string>().empty();
+            const bool has_params = fn.contains("parameters") && fn.at("parameters").is_object() && !fn.at("parameters").empty();
+            specs.push_back({{"description", has_desc ? nlohmann::json(fn.at("description")) : nlohmann::json("")},
+                             {"name", nlohmann::json(fn.at("name"))},
+                             {"parameters", has_params ? nlohmann::json(fn.at("parameters")) : nlohmann::json::object()},
+                             {"type", t.contains("type") && t.at("type").is_string() && !t.at("type").get<std::string>().empty() ? nlohmann::json(t.at("type")) : nlohmann::json("function")}});
+        }
+        vars["tools_json"] = specs.dump();
+    }
+    if (messages.is_array())
+        for (auto &m : messages) {
+            if (!m.is_object() || !m.contains("tool_calls") || !m.at("tool_calls").is_array())
+                continue;
+            for (auto &call : m.at("tool_calls")) {
+                if (!call.is_object() || !call.contains("function") || !call.at("function").contains("name") || !call.at("function").at("name").is_string())
+                    continue;
+                auto &fn = call.at("function");
+                nlohmann::ordered_json args = fn.contains("arguments") ? fn.at("arguments") : nlohmann::ordered_json::object();
+                if (args.is_string()) {
+                    args = nlohmann::ordered_json::parse(args.get<std::string>(), nullptr, false);
+                    if (args.is_discarded())
+                        check(false, "tool call arguments must be a JSON object");
+                }
+                if (args.is_null())
+                    args = nlohmann::ordered_json::object();
+                if (!args.is_object())
+                    check(false, "tool call arguments must be a JSON object");
+                std::map<std::string, std::string> sorted;
+                for (auto it = args.begin(); it != args.end(); ++it)
+                    sorted[it.key()] = it.value().dump();
+                std::string body = "{\"name\":" + nlohmann::json(fn.at("name")).dump() + ",\"args\":{";
+                bool first = true;
+                for (const auto &[k, v] : sorted) {
+                    body += (first ? "" : ",") + nlohmann::json(k).dump() + ":" + v;
+                    first = false;
+                }
+                fn["call_json"] = body + "}}";
+            }
+        }
+    return vars;
+}
+std::string Tokenizer::chat_tools(const nlohmann::ordered_json &messages, const nlohmann::ordered_json &tools,
+                                  const nlohmann::ordered_json *extra) const {
     check(messages.is_array() && !messages.empty(), "messages must be nonempty array");
     nlohmann::ordered_json m = messages;
     for (auto &message : m) {
@@ -266,9 +318,17 @@ std::string Tokenizer::chat_tools(const nlohmann::ordered_json &messages, const 
                     call["function"]["arguments"] = parsed;
                 }
     }
-    return render(m, true, tools.is_array() && !tools.empty() ? tools : nlohmann::ordered_json());
+    if (config_.at("chat_template").dump().find("tools_json") != std::string::npos) {
+        nlohmann::ordered_json vars = template_json_vars(m, tools);
+        if (extra && extra->is_object())
+            for (auto it = extra->begin(); it != extra->end(); ++it)
+                vars[it.key()] = it.value();
+        return render(m, true, tools.is_array() && !tools.empty() ? tools : nlohmann::ordered_json(), &vars);
+    }
+    return render(m, true, tools.is_array() && !tools.empty() ? tools : nlohmann::ordered_json(), extra);
 }
-std::string Tokenizer::render(const nlohmann::ordered_json &messages, bool generation, const nlohmann::ordered_json &tools) const {
+std::string Tokenizer::render(const nlohmann::ordered_json &messages, bool generation, const nlohmann::ordered_json &tools,
+                              const nlohmann::ordered_json *extra) const {
     auto source = config_.at("chat_template");
     if (source.is_array()) {
         json chosen;
@@ -291,6 +351,9 @@ std::string Tokenizer::render(const nlohmann::ordered_json &messages, bool gener
                                      {"eos_token", token("eos_token")},
                                      {"add_generation_prompt", generation},
                                      {"tools", tools}};
+    if (extra && extra->is_object())
+        for (auto it = extra->begin(); it != extra->end(); ++it)
+            inputs[it.key()] = it.value();
     // HF supplies strftime_now; minja does not, so supply date_string for
     // templates that call it. A template with a fixed default date (Anubis)
     // must keep that default, just as it does in Hugging Face.

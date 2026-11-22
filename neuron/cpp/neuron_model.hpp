@@ -58,6 +58,9 @@ std::unique_ptr<Backend> make_glm_backend(const ModelOptions &);
 // options.model is a Qwen3.5 MoE prepared directory (prepared.json written by neuron/qwen35_prepare.py): qwen35_model.cpp.
 bool is_qwen35_prepared(const std::filesystem::path &);
 std::unique_ptr<Backend> make_qwen35_backend(const ModelOptions &);
+// options.model is an Inkling 2 Mini prepared directory (prepared.json written by neuron/inkling_prepare.py): inkling_model.cpp.
+bool is_inkling_prepared(const std::filesystem::path &);
+std::unique_ptr<Backend> make_inkling_backend(const ModelOptions &);
 
 class NeuronModel {
     struct Impl;

@@ -71,7 +71,8 @@ static void run_rank(int rank, int ranks, const std::vector<char>& neff, int ste
         if (is_input != (pass == 0)) continue;                       // inputs first, so the aliased outputs find their tensor
         nrt_tensor_t* dev = nullptr;
         const int idx = std::atoi(t.name + (is_input ? 5 : 6));
-        const int sidx = is_input ? idx - (n_inputs - g_states) : idx - 1;
+        static const int extra = std::getenv("LAYER_BENCH_EXTRA") ? std::atoi(std::getenv("LAYER_BENCH_EXTRA")) : 0;   // plain outputs between output0 and the states
+        const int sidx = is_input ? idx - (n_inputs - g_states) : idx - 1 - extra;
         if (!is_input && sidx >= 0 && sidx < g_states && state_of[size_t(sidx)])
             dev = state_of[size_t(sidx)];
         else
