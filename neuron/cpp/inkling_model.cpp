@@ -190,6 +190,7 @@ class InklingModel final : public Backend {
     float moe_load_max = 0;
     double exec_ms = 0;
     std::array<double, 4> prof_ms{}; // rank 0: put, layers, head, read
+    std::map<std::string, double> by_ms; // rank 0: ms in nrt_execute by launch class
 
   public:
     explicit InklingModel(const ModelOptions &o) : options(o), root(o.model) {
@@ -935,7 +936,10 @@ class InklingModel final : public Backend {
                 for (size_t pi = 0; pi < plan.size(); ++pi) {
                     const auto &[g, v] = plan[pi];
                     auto [in, o] = visit_set(*g, v, parity, r, L.slot);
+                    const auto tk = Clock::now();
                     check(nrt_execute(g->model[size_t(r)], in, o), g->kind + " execute");
+                    if (r == 0) // rank 0's time in nrt_execute by launch class (profile "by")
+                        by_ms[g->part == "moe" ? (g->moe_cap ? "moe_grouped" : "moe") : g->part == "attn" ? (g->has_g ? "attn_global" : "attn_sliding") : "segment"] += ms_since(tk);
                     if (g->moe_cap) {
                         // exact iff no slotted expert got more tokens than slots. Every rank computes the same routing from the
                         // same bits; they still rerun when ANY rank saw an overflow (the collectives need all of them).
@@ -955,7 +959,10 @@ class InklingModel final : public Backend {
                         if (over) {
                             const Graph *dense = dense_moe(v, L.R, L.Q);
                             auto [in2, o2] = visit_set(*dense, v, parity, r, L.slot);
+                            const auto tf = Clock::now();
                             check(nrt_execute(dense->model[size_t(r)], in2, o2), "moe fallback execute");
+                            if (r == 0)
+                                by_ms["moe_rerun"] += ms_since(tf);
                         }
                         if (r == 0) {
                             ++moe_grouped;
@@ -1053,6 +1060,7 @@ class InklingModel final : public Backend {
         const auto t0 = Clock::now();
         exec_ms = 0;
         prof_ms = {};
+        by_ms.clear();
         launches = moe_grouped = moe_fallbacks = 0;
         moe_load_max = 0;
         const auto &lay = batch.layout;
@@ -1147,7 +1155,7 @@ class InklingModel final : public Backend {
         }
         profile = {{"launches", launches}, {"forward_ms", ms_since(t0)}, {"exec_ms", exec_ms},
                    {"r0", {{"put", prof_ms[0]}, {"layers", prof_ms[1]}, {"head", prof_ms[2]}, {"read", prof_ms[3]}}},
-                   {"tokens", batch.tokens.size()}, {"moe_grouped", moe_grouped}, {"moe_fallbacks", moe_fallbacks}, {"moe_load_max", moe_load_max}, {"spills", spills}, {"restores", restores}, {"state_saves", state_saves}, {"state_restores", state_restores}};
+                   {"by", by_ms}, {"tokens", batch.tokens.size()}, {"moe_grouped", moe_grouped}, {"moe_fallbacks", moe_fallbacks}, {"moe_load_max", moe_load_max}, {"spills", spills}, {"restores", restores}, {"state_saves", state_saves}, {"state_restores", state_restores}};
         return logits;
     }
 };

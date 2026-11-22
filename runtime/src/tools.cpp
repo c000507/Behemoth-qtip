@@ -395,8 +395,9 @@ std::string inkling_tool_call_grammar(const ToolRequest &r, const ToolFormat &f)
         for (size_t i = 0; i < rules.size(); ++i)
             call += (i ? " | " : " ") + grammar::gbnf_literal(names[i] + f.args + "{\"name\":" + nlohmann::json(names[i]).dump() + ",\"args\":") +
                     " " + rules[i] + " " + grammar::gbnf_literal("}");
-        call += " ) " + grammar::gbnf_literal("</think>");
-        return r.parallel ? call + " ( " + call + " )*" : call;
+        // ONE call: the constrained answer starts with the call (no thinking message before it), and forced past the
+        // message end the model keeps calling instead of ending the turn (measured: tool_choice required ran to max_tokens)
+        return call + " ) " + grammar::gbnf_literal("</think>");
     });
 }
 
@@ -894,7 +895,7 @@ bool ToolCallParser::ink_step(Delta &d, bool finish) {
         const std::string_view rest = std::string_view(buffer_).substr(i);
         if (rest.empty())
             return false;
-        for (const std::string_view m : {text_open, std::string_view(format_.calls)}) {
+        for (const std::string_view m : {text_open, std::string_view(format_.calls), std::string_view("</think>")}) {
             if (rest.substr(0, m.size()) == m) {
                 buffer_.erase(0, i + m.size());
                 if (m == text_open)
@@ -920,7 +921,10 @@ bool ToolCallParser::ink_step(Delta &d, bool finish) {
     const size_t at = buffer_.find(format_.calls);
     if (at == std::string::npos && !finish)
         return false;
-    const std::string body = trim(std::string_view(buffer_).substr(0, std::min(at, buffer_.size())));
+    std::string body = trim(std::string_view(buffer_).substr(0, std::min(at, buffer_.size())));
+    // the message end reads </think> on the text path; a constrained answer does not pass the splitter that drops it
+    for (const std::string_view close = "</think>"; body.size() >= close.size() && std::string_view(body).substr(body.size() - close.size()) == close;)
+        body = trim(std::string_view(body).substr(0, body.size() - close.size()));
     const auto parsed = ojson::parse(body, nullptr, false);
     if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("args"))
         add_arguments(parsed.at("args").dump(), d);

@@ -52,6 +52,12 @@ int main() {
                 CHECK(p.calls()[0].id != p.calls()[1].id);
             }
         }
+        { // a constrained answer: the message end arrives as </think> (not dropped by the reasoning splitter)
+            auto p = run(call1 + "</think>", step);
+            CHECK(p.calls().size() == 1 && p.content().empty());
+            if (p.calls().size() == 1)
+                CHECK(nlohmann::json::parse(p.calls()[0].arguments, nullptr, false) == nlohmann::json({{"city", "Paris"}, {"days", 2}}));
+        }
         { // broken JSON is passed on as the arguments text
             auto p = run("<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":", step);
             CHECK(p.calls().size() == 1 && p.calls()[0].name == "f" && !p.calls()[0].arguments.empty());

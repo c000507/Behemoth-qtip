@@ -2,7 +2,9 @@
 # set.sh OUT: the Inkling 2 Mini serving graph set (WT layout, 32k context: PAGES=2049), built one compile at a time
 # (JOBS=1: the trn1.2xlarge has 32 GB of RAM) with deploy/neuron-inkling/build.sh. See docs/neuron-inkling.md section 7.
 #   SRC=<tree> CONFIG=<model>/config.json bash deploy/neuron-inkling/set.sh OUT
-#   env: DEC_R="1 2 4" (decode rows), DEC_P="64 512 2048", PRE_Q="256 1024" (prefill chunks), PRE_P="64 512 2048", JOBS
+#   env: DEC_R="1 2 4" (decode rows), DEC_P="64 512 2048" (far pages: 2 k / 9 k / 32 k tokens of context), PRE_Q="256"
+#        (prefill chunks; "256 1024" adds the wide bucket with the grouped MoE: measured, not served - docs section 13),
+#        PRE_P="64 512 2048", JOBS, GRP_EXTRA (e.g. MOE_GSTAT=24: the grouped MoE also returns the largest expert loads)
 # Decode: 6-visit segments (attention + gathered MoE), far keys of the global visit in blocks of 256 pages.
 # Prefill: every visit split into an attention and a MoE NEFF, loop-pass kinds only (S / G: the engine binds zero message
 # gates on first-pass visits); attention in query blocks of 256 tokens, far keys in blocks of 128 pages; MoE grouped
@@ -10,7 +12,7 @@
 # as the overflow rerun.
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:?usage: set.sh OUT}
-DEC_R=${DEC_R:-"1 2 4"}; DEC_P=${DEC_P:-"64 512 2048"}; PRE_Q=${PRE_Q:-"256 1024"}; PRE_P=${PRE_P:-"64 512 2048"}
+DEC_R=${DEC_R:-"1 2 4"}; DEC_P=${DEC_P:-"64 512 2048"}; PRE_Q=${PRE_Q:-"256"}; PRE_P=${PRE_P:-"64 512 2048"}
 specs=()
 dec() { r=$1; rt=$([ $r -gt 1 ] && echo pad64 || echo topk)
   for p in $DEC_P; do for k in sssssg SSSSSG; do
