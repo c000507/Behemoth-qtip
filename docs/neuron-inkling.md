@@ -284,7 +284,7 @@ built by `deploy/neuron-inkling/set.sh` (`WT=1 PAGES=2049`).
 | decode 1 stream (engine step, median) | 26.7 ms (37.4 tok/s) | **24.1 ms (41.4 tok/s) up to 2k tokens of context, 24.8 ms (40.3 tok/s) beyond** |
 | decode 2 / 4 / 8 streams | 44.0 / 77.8 / 155.6 ms (45.4 / 51.4 / 51.4 tok/s aggregate) | **41.1 / 71.9 / 143.1 ms (48.7 / 55.6 / 55.9)** |
 | decode after a 1k / 4k / 16k / 30k prompt | 28.9 / 28.2 ms / - / - | 25.5 / 27.0 / 30.9 / 30.8 ms |
-| gate 3 (top-1 vs the fp8 oracle, 3 x 32 tokens) | 91 / 96 | **93 / 96** (misses at oracle margins 0.11 - 0.36) |
+| gate 3 (top-1 vs the fp8 oracle, 3 x 32 tokens) | 91 / 96 | **95 / 96** (served set; the miss at an oracle margin of 0.019); 93 / 96 with 6-visit segments only |
 | long-context gate | - | 24 / 24 top-1 vs the fp8 oracle on a 2 526-token prompt (far attention active); needle retrieved at 3k / 16k / 30k |
 | non-finite logits | 0 | 0 |
 | serving | no prefix cache, no tools, fixed effort | prefix cache (state snapshots), tool calls, `reasoning_effort` (13.7) |
@@ -330,7 +330,7 @@ One numerics fact found on the way: **a bf16 x bf16 matmul returns a bf16-ROUNDE
 directly** (unlike fp8 x fp8, which accumulates into f32): `mmtest.py`, device == bf16(f32 reference) bit for bit. The
 attention scores (|s| <= 45) therefore carry up to half a bf16 ulp (<= 0.06) of rounding. Device vs the f32-attention CPU
 mirror: sliding part 7.4e-3 (the first set's f32 form: 7.6e-3), global part with far blocks 2.5e-2 - 2.9e-2 (first set's
-P = 64 form 2.3e-2); gate 3 went from 91 to 93 of 96.
+P = 64 form 2.3e-2); gate 3 went from 91 to 93 - 95 of 96.
 
 ### 13.3 Prefill: where a 256-token chunk goes now, and the rooflines
 
@@ -426,8 +426,10 @@ Measured / decided, in the order of the brief:
   blocks) / 3.0e-2 (`G`, P = 512), per token median 2.9e-2 / max 6e-2 (uniform: no edge effect), both ranks bit-identical;
   6-visit decode segments cannot be judged this way (one top-8 flip in visit 2 of a single random token: 0.26 new,
   0.43 first set against the same mirror; the first visit agrees: attention 9e-3, MoE 5e-2).
-* **Gate 3** (3 chat prompts x 32 greedy tokens, oracle teacher-forced, fp8 weights): **93 / 96** top-1 (31 + 32 + 30), the
-  three misses at oracle margins 0.36 / 0.33 / 0.11; 0 non-finite.
+* **Gate 3** (3 chat prompts x 32 greedy tokens, oracle teacher-forced, fp8 weights): the served set (12-visit segments on
+  these short contexts) **95 / 96** top-1 (31 + 32 + 32; the miss at an oracle margin of 0.019, the "for explanation" / "for
+  an explanation" tie); the same set without the 12-visit segments 93 / 96 (31 + 32 + 30, misses at margins 0.36 / 0.33 /
+  0.11); 0 non-finite in both.
 * **Long-context gates**: (a) a 2 526-token chat prompt (prose), 24 greedy device tokens, the oracle teacher-forced over all
   2 550 positions with the fp8 weights (`pf.sh` + `inkling_gate3.py`, 33 min on the box CPU): **24 / 24 top-1**; every
   query beyond position 1024 attends far keys through the P = 512 bucket (4 key blocks). (b) the needle runs below at
