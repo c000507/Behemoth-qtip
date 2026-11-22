@@ -9,6 +9,10 @@ default_model     = "ornith" # requests without a `model` field
 max_active_models = 2        # x 8 vCPU (trn1.2xlarge) <= 32 vCPU 'All Trn Spot Instance Requests' quota
 cap_policy        = "evict"  # cold model beyond the cap: stop the longest-idle idle model, else 503 + Retry-After
 
+# Pin the backend AMI to the one serving now (al2023-ami-ecs-neuron-hvm-2023.0.20261113): the SSM "recommended" AMI moved
+# to 20261119, and a new AMI can bring a Neuron driver the container's pinned runtime was not tested with. Unpin deliberately.
+backend_ami_id = "ami-0118eb03990cc3ef7"
+
 models = {
   # Ornith 1.5 35B-A3B REAP20 v3 FP8 (Qwen3.5 MoE, 205 experts, TP=2 fp8, KV8 int8, 64k context). legacy_names: the
   # resources of the single-model stack (service behemoth-backend, capacity provider behemoth-trn-spot) are this entry.
