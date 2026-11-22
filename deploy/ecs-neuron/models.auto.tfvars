@@ -16,7 +16,7 @@ models = {
     legacy_names       = true
     model_s3_prefix    = "models/ornith-reap20-v3-fp8"
     graphs_s3_prefix   = "graphs/ornith-reap20-v3-kv8-seg20-mtp-pf1024" # = -pf (docs/neuron-qwen35-moe.md section 13: chunked GDN, blocked GQA, grouped MoE with dense fallback) + the 9 Q=1024 prefill NEFFs of section 14 (pfbuild_wide.sh 1024); needs the ornith-chunk4096 engine. Rollback: the -pf prefix with --prefill-chunk 256 and no --token-budget
-    prepared_s3_prefix = "" # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
+    prepared_s3_prefix = ""                                             # the Qwen3.5 prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
     model_ids          = ["ornith-1.5-35b-a3b-reap20-v3"]
     model_name         = "ornith-1.5-35b-a3b-reap20-v3"
     shm_size_mib       = 6144 # as served so far (backend_shm_size_mib of terraform.tfvars)
@@ -38,12 +38,12 @@ models = {
       BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB = "4"
       BEHEMOTH_NEURON_PREFIX_HOST_GB         = "4"
       # idle OpenMP threads (sampling) must not spin: spinning ones delayed the rank workers by ~2.7 ms per step (docs/neuron-reap-launches.md)
-      OMP_WAIT_POLICY                        = "PASSIVE"
+      OMP_WAIT_POLICY = "PASSIVE"
       # MTP speculative decoding, 1 draft per step while ONE stream decodes (docs/neuron-reap-mtp.md): the head (mtp.json + r0/r1 mtp.bin)
       # is pulled with the model dir (models/ornith-reap20-v3-fp8/mtp/); 2+ concurrent streams decode without drafts
-      BEHEMOTH_NEURON_MTP_DIR                = "/data/models/ornith-reap20-v3-fp8/mtp"
-      BEHEMOTH_NEURON_SPEC_MTP               = "1"
-      BEHEMOTH_NEURON_SPEC_MTP_ADAPT         = "1" # k in {0, 1} by measured acceptance and step times: no loss on low-acceptance text
+      BEHEMOTH_NEURON_MTP_DIR        = "/data/models/ornith-reap20-v3-fp8/mtp"
+      BEHEMOTH_NEURON_SPEC_MTP       = "1"
+      BEHEMOTH_NEURON_SPEC_MTP_ADAPT = "1" # k in {0, 1} by measured acceptance and step times: no loss on low-acceptance text
     }
 
     use_spot      = false # spot disabled (spot placement score 1/10: launches fail); on-demand with a warm pool
@@ -67,6 +67,31 @@ models = {
       STREAM_UNLINK                  = "1"
       STREAM_AHEAD                   = "8"
       BEHEMOTH_NEURON_EMBED_RESIDENT = "1"
+    }
+
+    use_spot      = false # spot disabled, see ornith
+    spot_fallback = false
+  }
+
+  # Inkling-2-Mini-Uncensored (text only), TP=2 fp8, WT layout, 32k context (docs/neuron-inkling.md sections 10 and 13).
+  # Graph set and engine must match: the inkling-wt-32k set needs the engine of section 13 (far-page buckets, loop-pass
+  # prefill graphs). The prepared dir carries neuron/inkling_chat_template.jinja (tools / reasoning_effort).
+  inkling = {
+    model_s3_prefix    = "models/inkling-2-mini-uncensored-tp2-fp8"
+    graphs_s3_prefix   = "graphs/inkling-2-mini-wt-32k" # WT decode segments R 1/2/4 x P 64/512/2048, split prefill visits Q 256
+    prepared_s3_prefix = ""                             # the prepared dir (r0/ r1/ L<layer>.bin) is the model dir itself
+    model_ids          = ["inkling-2-mini-uncensored"]
+    model_name         = "inkling-2-mini-uncensored"
+    shm_size_mib       = 6144
+
+    extra_server_args = "--prefill-chunk 256 --max-batch-requests 8" # 32768 tokens of K/V pool (one request may use all of it)
+    extra_env = {
+      STREAM_LOAD                            = "0"
+      OMP_WAIT_POLICY                        = "PASSIVE"
+      BEHEMOTH_NEURON_QWEN35_PREFIX_CACHE    = "1" # state snapshots (198 MiB each on the host)
+      BEHEMOTH_NEURON_QWEN35_PREFIX_ALIGN    = "1"
+      BEHEMOTH_NEURON_QWEN35_PREFIX_INTERVAL = "2048"
+      BEHEMOTH_NEURON_QWEN35_PREFIX_STATE_GB = "4"
     }
 
     use_spot      = false # spot disabled, see ornith
