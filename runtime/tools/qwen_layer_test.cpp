@@ -529,7 +529,7 @@ int main(int argc, char **argv) {
         HIP_CHECK(hipMemsetAsync(S.data(), 0, S.bytes(), s));
         for (int t = 0; t < rows; ++t)
             q_delta_step(zbig.data(), d_conv.data(), d_dn.data(), a_dt.data(), ring.data(), S.data(),
-                         d_o.data(), rows, t, Wq, V, kd, vd, c.lin_nk, nv, c.conv_k, c.eps, s);
+                         d_o.data(), rows, t, 0, Wq, V, kd, vd, c.lin_nk, nv, c.conv_k, c.eps, s);
         HIP_CHECK(hipStreamSynchronize(s));
         {
             auto og = d_o.download();

@@ -24,7 +24,7 @@ void q_zc_norm(uint16_t *x, long rows, int n, const uint16_t *w, float eps, hipS
 // state = bf16(state + bf16(z * sv))
 void q_sv_add(const float *z, const float *sv, uint16_t *state, long rows, int n, long ldz, int lds,
               hipStream_t s);
-// h = bf16(silu(bf16(zg * svg)) * bf16(zu * svu)); z/zu row stride ld
+// h = bf16(silu(g) * u), g = bf16(zg * svg), u = bf16(zu * svu); z/zu row stride ld
 void q_gateup(const float *zg, const float *zu, const float *svg, const float *svu, uint16_t *h,
               long rows, int F, long ld, hipStream_t s);
 // state[r][:] = embed[tokens[r]]
@@ -41,9 +41,11 @@ void q_qk_norm_rope(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G, uint16_t
 // out[r][h*hd+d] = softmax(q·K/sqrt(hd)) · V, gated by sigmoid(G); one block per (row, head).
 void q_attn(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
             uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, hipStream_t s);
-// One Gated DeltaNet step at token t of T (single sequence): qkvz rows [T][conv_dim+value_dim+2nv].
+// One Gated DeltaNet step at row t of a T-row chunk (single sequence): qkvz rows [T][conv_dim+value_dim+2nv].
+// pos0 = absolute position of row 0: the conv ring is indexed by the absolute position (pos0 + t) so
+// the causal conv window carries across chunks / decode steps.
 void q_delta_step(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt,
-                  float *ring, float *S, uint16_t *out, int T, int t, int conv_dim, int value_dim,
+                  float *ring, float *S, uint16_t *out, int T, int t, int pos0, int conv_dim, int value_dim,
                   int kd, int vd, int nk, int nv, int K, float eps, hipStream_t s);
 
 // ------------------------------------------------------------------ MoE (softmax top-k renorm routing)

@@ -238,7 +238,7 @@ __global__ void q_gateup_kernel(const float *zg, const float *zu, const float *s
     int c = int(idx % F);
     float g = bf2f(f2bf(zg[r * ld + c] * svg[c]));
     float u = bf2f(f2bf(zu[r * ld + c] * svu[c]));
-    h[idx] = f2bf(bf2f(silu_f(g)) * u);
+    h[idx] = f2bf(silu_f(g) * u);  // was bf2f(silu_f(g)): a float silently truncated to uint16_t
 }
 
 __global__ void q_embed_gather_kernel(const uint16_t *embed, const int *tokens, uint16_t *state,
@@ -403,7 +403,7 @@ void q_attn(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uin
 // one sequence processed sequentially by the host loop; qkvz rows [t][conv_dim + value_dim + 2nv].
 __global__ void q_delta_step_kernel(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm,
                                     const float *a_dt, float *ring, float *S, uint16_t *out, int T,
-                                    int t, int conv_dim, int value_dim, int kd, int vd, int nk, int nv,
+                                    int t, int pos0, int conv_dim, int value_dim, int kd, int vd, int nk, int nv,
                                     int K, float eps) {
     int hv = blockIdx.x;
     const int group = nv / nk;
@@ -414,22 +414,23 @@ __global__ void q_delta_step_kernel(const float *qkvz, const uint16_t *conv_w, c
     const float *row = qkvz + long(t) * W;
     const int cq = kh * kd + d, ck = key_dim + kh * kd + d, cv = 2 * key_dim + hv * vd + d;
     float *rg_q = ring + long(cq) * K, *rg_k = ring + long(ck) * K, *rg_v = ring + long(cv) * K;
-    rg_q[t % K] = row[cq];
-    rg_k[t % K] = row[ck];
-    rg_v[t % K] = row[cv];
+    const int tp = pos0 + t;  // absolute position: the ring persists across chunks / decode steps
+    rg_q[tp % K] = row[cq];
+    rg_k[tp % K] = row[ck];
+    rg_v[tp % K] = row[cv];
     float qv = 0, kvv = 0, vv = 0;
     {
         const uint16_t *cw = conv_w + long(cq) * K;
         float a = 0;
-        for (int i = 0; i < K; ++i) a += rg_q[(t + 1 + i) % K] * bf2f(cw[i]);
+        for (int i = 0; i < K; ++i) a += rg_q[(tp + 1 + i) % K] * bf2f(cw[i]);
         qv = silu_f(a);
         cw = conv_w + long(ck) * K;
         a = 0;
-        for (int i = 0; i < K; ++i) a += rg_k[(t + 1 + i) % K] * bf2f(cw[i]);
+        for (int i = 0; i < K; ++i) a += rg_k[(tp + 1 + i) % K] * bf2f(cw[i]);
         kvv = silu_f(a);
         cw = conv_w + long(cv) * K;
         a = 0;
-        for (int i = 0; i < K; ++i) a += rg_v[(t + 1 + i) % K] * bf2f(cw[i]);
+        for (int i = 0; i < K; ++i) a += rg_v[(tp + 1 + i) % K] * bf2f(cw[i]);
         vv = silu_f(a);
     }
     float qs = block_sum(qv * qv);
@@ -469,11 +470,11 @@ __global__ void q_delta_step_kernel(const float *qkvz, const uint16_t *conv_w, c
     out[long(t) * value_dim + long(hv) * vd + d] = f2bf(o * oinv * bf2f(dn_norm[d]) * silu_f(z));
 }
 void q_delta_step(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt,
-                  float *ring, float *S, uint16_t *out, int T, int t, int conv_dim, int value_dim,
+                  float *ring, float *S, uint16_t *out, int T, int t, int pos0, int conv_dim, int value_dim,
                   int kd, int vd, int nk, int nv, int K, float eps, hipStream_t s) {
     if (kd != vd || vd > 256) throw std::runtime_error("delta step requires kd == vd <= 256");
     q_delta_step_kernel<<<unsigned(nv), vd, 0, s>>>(qkvz, conv_w, dn_norm, a_dt, ring, S, out, T, t,
-                                                    conv_dim, value_dim, kd, vd, nk, nv, K, eps);
+                                                    pos0, conv_dim, value_dim, kd, vd, nk, nv, K, eps);
     HIP_CHECK(hipGetLastError());
 }
 

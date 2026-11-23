@@ -168,7 +168,7 @@ struct QwenModel::Impl {
     // scratch (sized for chunk rows)
     DeviceBuffer<uint16_t> state, h_norm, u, q, k, v, gate, attn_out, o_in, gu, eX;
     DeviceBuffer<float> partial, z, z2, logits_d;
-    DeviceBuffer<float> ones_f;  // all-1 "SV" for bf16 experts (max of inter/hidden)
+    DeviceBuffer<float> ones_f;  // all-1 "SV" for every bf16 linear epilogue (widest output, incl. q_proj)
     // MoE scratch
     DeviceBuffer<float> rlog, rwts, y_moe, sg_logit, slot_w;
     DeviceBuffer<int> rids, rcnt, rbase, rrun, slot_tok;
@@ -176,6 +176,9 @@ struct QwenModel::Impl {
     std::vector<float> logits_h, logits_all;
     int pos = 0;
     size_t max_slices = 0;
+    // "model.layers." (quantized checkpoints written by qtip_quant) or "model.language_model.layers."
+    // (original HF Qwen3.5 checkpoints, loaded through the bf16-linear fallback)
+    std::string layer_prefix = "model.layers.";
 
     void load(const std::filesystem::path &dir);
     qtip::HostLinear load_host(const QwenCheckpoint &ck, int layer, const std::string &name, int in, int out);
@@ -195,7 +198,7 @@ struct QwenModel::Impl {
 
 qtip::HostLinear QwenModel::Impl::load_host(const QwenCheckpoint &ck, int layer, const std::string &name,
                                             int in, int out) {
-    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    const std::string base = layer_prefix + std::to_string(layer) + "." + name + ".";
     ck.tensor(base + "trellis");  // existence + index check
     const SafeTensorFile &f = ck.tensor(base + "trellis");
     qtip::HostLinear l;
@@ -228,7 +231,7 @@ void QwenModel::Impl::upload_linear(Linear &L, const qtip::HostLinear &h) {
 // plain BF16 `weight` tensor there instead (unquantized model) — as a bf16 linear.
 void QwenModel::Impl::load_linear(Linear &L, const QwenCheckpoint &ck, int layer, const std::string &name,
                                   int in, int out) {
-    const std::string base = "model.layers." + std::to_string(layer) + "." + name + ".";
+    const std::string base = layer_prefix + std::to_string(layer) + "." + name + ".";
     if (ck.index.count(base + "trellis")) {
         auto h = load_host(ck, layer, name, in, out);
         if (h.in != in || h.out != out)
@@ -266,20 +269,29 @@ void QwenModel::Impl::run_linear(const Linear &L, const uint16_t *x, int ldx, in
 
 void QwenModel::Impl::load(const std::filesystem::path &dir) {
     QwenCheckpoint ck(dir);
+    const int max_context = cfg.max_context;  // set by the constructor; read() would reset it
     cfg = QwenRuntimeConfig::read(dir);
+    cfg.max_context = max_context;
+    layer_prefix = "model.layers.";
+    if (!ck.index.count("model.layers.0.input_layernorm.weight") &&
+        ck.index.count("model.language_model.layers.0.input_layernorm.weight"))
+        layer_prefix = "model.language_model.layers.";
     const bool f0 = cfg.is_full(0);
-    qtip::HostLinear probe =
-        load_host(ck, 0, f0 ? "self_attn.q_proj" : "linear_attn.in_proj_qkv", cfg.hidden,
-                  f0 ? cfg.nq * 2 * cfg.hd : cfg.conv_dim());
-    qtip::Codebook cb = qtip::make_codebook(std::span<const uint16_t>(probe.tlut));
-    codebook.upload(cb);
+    const std::string probe_name = f0 ? "self_attn.q_proj" : "linear_attn.in_proj_qkv";
+    if (ck.index.count(layer_prefix + "0." + probe_name + ".trellis")) {
+        // the codebook comes from the first trellis' tlut; a fully bf16 checkpoint never needs one
+        qtip::HostLinear probe =
+            load_host(ck, 0, probe_name, cfg.hidden, f0 ? cfg.nq * 2 * cfg.hd : cfg.conv_dim());
+        qtip::Codebook cb = qtip::make_codebook(std::span<const uint16_t>(probe.tlut));
+        codebook.upload(cb);
+    }
     const int H = cfg.hidden, V = cfg.value_dim(), A = cfg.nq * cfg.hd;
     layers.resize(size_t(cfg.layers));
     for (int L = 0; L < cfg.layers; ++L) {
         LayerW &w = layers[size_t(L)];
         w.full = cfg.is_full(L);
         w.moe = cfg.num_experts > 0;
-        std::string p = "model.layers." + std::to_string(L) + ".";
+        std::string p = layer_prefix + std::to_string(L) + ".";
         auto up16 = [&](DeviceBuffer<uint16_t> &d, const std::string &name) {
             d.upload(bf16_raw(ck, p + name));
         };
@@ -372,7 +384,9 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
     z.resize(size_t(R) * Wz);
     z2.resize(size_t(R) * Wz);
     tokens_d.resize(size_t(R));
-    ones_f.resize(size_t(std::max(FS, H)));
+    // bf16 linears reuse the trellis epilogues with SV = 1: must cover the widest output row, which
+    // is q_proj (nq * 2 * hd = 4096 on 0.8B) -- sizing by max(inter, hidden) read past the end
+    ones_f.resize(size_t(std::max({FS, H, cfg.nq * 2 * cfg.hd, cfg.nkv * cfg.hd, cfg.conv_dim(), V})));
     {
         std::vector<float> ones(ones_f.size(), 1.0f);
         ones_f.upload(ones);
@@ -540,6 +554,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
     HIP_CHECK(hipMemcpyAsync(tokens_d.data(), tokens_h, size_t(rows) * 4, hipMemcpyHostToDevice, stream));
     q_embed_gather(embed.data(), tokens_d.data(), state.data(), rows, H, stream);
     if (std::getenv("QWEN_RT_DBG")) {
+        HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
         std::vector<uint16_t> h = state.download();
         std::fprintf(stderr, "embed row0: %.4f %.4f %.4f %.4f  raw %04x %04x\n",
                      float(BFloat16::from_bits(h[0])), float(BFloat16::from_bits(h[1])),
@@ -633,7 +648,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
                        stream);
             for (int t = 0; t < rows; ++t)
                 q_delta_step(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
-                             w.dstate.data(), o_in.data(), rows, t, Wq, V, c.lin_kd, c.lin_vd,
+                             w.dstate.data(), o_in.data(), rows, t, pos0, Wq, V, c.lin_kd, c.lin_vd,
                              c.lin_nk, nv, c.conv_k, c.eps, stream);
             if (!w.l_out.bf16) {
                 q_input_transform(o_in.data(), rows, V, nullptr, 0, w.l_out.su.data(), V, u.data(), V,
@@ -647,6 +662,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             }
         }
         if (std::getenv("QWEN_RT_DBG")) {
+            HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
             std::vector<uint16_t> h = state.download();
             double ss = 0;
             for (int i = 0; i < H; ++i) {
@@ -684,6 +700,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             q_moe_residual_add(state.data(), z.data(), rows, H, stream);
         }
         if (std::getenv("QWEN_RT_DBG")) {
+            HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
             std::vector<uint16_t> h = state.download();
             double ss = 0;
             for (int i = 0; i < H; ++i) {
@@ -699,6 +716,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
             static int dump_rows = 0;
             if (!dump_rows) dump_rows = rows;
             if (rows == dump_rows && pos == 0) {
+                HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
                 std::vector<uint16_t> h = state.download();
                 std::ofstream f(std::string(dbg) + "/rt_layer" + std::to_string(L) + ".bin",
                                 std::ios::binary);
@@ -814,3 +832,4 @@ std::vector<int> QwenModel::generate(const int *prompt, size_t n_prompt, size_t 
 double QwenModel::perplexity(const int *tokens, size_t n) { return impl_->perplexity(tokens, n); }
 
 }  // namespace behemoth
+
