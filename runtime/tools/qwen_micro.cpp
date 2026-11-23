@@ -1,0 +1,199 @@
+// Micro bisect for the Qwen runtime kernel hang: stage-by-stage pipeline pieces.
+// usage: qwen_micro <model_dir> <stage 1..6>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <vector>
+
+#include "behemoth/qtip.hpp"
+#include "behemoth/qtip_gpu.hpp"
+#include "behemoth/qwen_kernels.hpp"
+#include "behemoth/qwen_model.hpp"
+
+using namespace behemoth;
+static float b16(uint16_t b) { return float(BFloat16::from_bits(b)); }
+
+int main(int argc, char **argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::filesystem::path dir = argv[1];
+    int stage = std::atoi(argv[2]);
+    QwenRuntimeConfig c = QwenRuntimeConfig::read(dir);
+    const int H = c.hidden, hd = c.hd, nq = c.nq, nkv = c.nkv;
+    const int rows = 8;
+    std::string fn = "model-layer-00003.safetensors";
+    SafeTensorFile f(dir / fn);
+    std::string b = "model.layers.3.self_attn.q_proj.";
+    qtip::HostLinear h;
+    {
+        auto tre = f.bytes(b + "trellis");
+        h.trellis.resize(tre.size() / 2);
+        std::memcpy(h.trellis.data(), tre.data(), tre.size());
+        auto su = f.floats(b + "SU"), sv = f.floats(b + "SV");
+        h.su.resize(su.size());
+        for (size_t i = 0; i < su.size(); ++i) h.su[i] = su[i];
+        h.sv.resize(sv.size());
+        for (size_t i = 0; i < sv.size(); ++i) h.sv[i] = sv[i];
+        auto tl = f.bytes(b + "tlut");
+        h.tlut.resize(tl.size() / 2);
+        std::memcpy(h.tlut.data(), tl.data(), tl.size());
+        h.in = int(h.su.size());
+        h.out = int(h.sv.size());
+    }
+    qtip::Codebook cb = qtip::make_codebook(std::span<const uint16_t>(h.tlut));
+    qtip::GpuCodebook lut;
+    lut.upload(cb);
+    qtip::GpuLinear gl;
+    gl.upload({std::span<const uint16_t>(h.trellis)}, h.in);
+    hipStream_t s;
+    HIP_CHECK(hipStreamCreate(&s));
+    std::mt19937 rng(3);
+    std::normal_distribution<float> nd(0, 1);
+    DeviceBuffer<uint16_t> x(size_t(rows) * H), u(size_t(rows) * H);
+    DeviceBuffer<float> su, sv, z(size_t(rows) * h.out), partial;
+    su.upload(h.su);
+    sv.upload(h.sv);
+    {
+        auto v = x.download();
+        (void)v;
+    }
+    std::vector<uint16_t> hx(size_t(rows) * H);
+    for (auto &v : hx) v = uint16_t(0x3d80);  // ~1.0 bf16 pattern-ish
+    HIP_CHECK(hipMemcpy(x.data(), hx.data(), hx.size() * 2, hipMemcpyHostToDevice));
+    std::printf("stage 1: input_transform\n");
+    q_input_transform(x.data(), rows, H, nullptr, c.eps, su.data(), H, u.data(), H, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  ok\n");
+    if (stage < 2) return 0;
+    std::printf("stage 2: matmul\n");
+    int slices = qtip::matmul_slices(gl.view(), rows);
+    partial.resize(size_t(slices) * rows * h.out);
+    qtip::matmul(gl.view(), lut.lut.data(), reinterpret_cast<const BFloat16 *>(u.data()), H, rows,
+                 partial.data(), slices, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  ok (slices %d)\n", slices);
+    if (stage < 3) return 0;
+    std::printf("stage 3: sum slices\n");
+    q_sum_slices(partial.data(), slices, size_t(rows) * h.out, z.data(), s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  ok\n");
+    if (stage < 4) return 0;
+    std::printf("stage 4: hadamard %d\n", h.out);
+    q_hadamard_rows(z.data(), rows, h.out, h.out, false, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    {
+        // correctness vs host double hadamard for several dims
+        for (int n2 : {512, 1024, 2048, 3584, 4096, 6144}) {
+            std::vector<float> v(size_t(rows) * n2);
+            std::mt19937 r2(n2);
+            std::normal_distribution<float> nd2(0, 1);
+            for (auto &vv : v) vv = nd2(r2);
+            DeviceBuffer<float> dv2;
+            dv2.upload(v);
+            q_hadamard_rows(dv2.data(), rows, n2, n2, false, s);
+            auto back = dv2.download();
+            double md = 0;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<double> t2(v.begin() + r * n2, v.begin() + (r + 1) * n2);
+                qtip::hadamard(t2.data(), n2, false);
+                for (int i = 0; i < n2; ++i)
+                    md = std::max(md, double(std::fabs(double(back[size_t(r) * n2 + i]) - t2[size_t(i)])));
+            }
+            std::printf("  hadamard n=%d max|diff| %.5f\n", n2, md);
+        }
+    }
+    std::printf("  ok\n");
+    if (stage < 5) return 0;
+    std::printf("stage 5: sv_cast\n");
+    DeviceBuffer<uint16_t> y(size_t(rows) * h.out);
+    q_sv_cast(z.data(), sv.data(), y.data(), rows, h.out, h.out, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  ok\n");
+    if (stage < 6) return 0;
+    std::printf("stage 6: attention kernels\n");
+    if (std::getenv("ROPE_ONLY")) {
+        DeviceBuffer<uint16_t> q3(size_t(rows) * nq * 2 * hd), k3(size_t(rows) * nkv * hd),
+            v3(size_t(rows) * nkv * hd), g3(size_t(rows) * nq * hd), kc3(size_t(64) * nkv * hd),
+            vc3(size_t(64) * nkv * hd);
+        DeviceBuffer<uint16_t> qn(hd), kn(hd);  // device buffers (kernel args)
+        std::printf("  rope only: q3=%p k3=%p v3=%p g3=%p kc3=%p vc3=%p qn=%p kn=%p\n",
+                    (void *)q3.data(), (void *)k3.data(), (void *)v3.data(), (void *)g3.data(),
+                    (void *)kc3.data(), (void *)vc3.data(), (void *)qn.data(), (void *)kn.data());
+        q_qk_norm_rope(q3.data(), k3.data(), v3.data(), g3.data(), kc3.data(), vc3.data(), rows, 0,
+                       nq, nkv, hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        std::printf("  rope ok\n");
+        DeviceBuffer<uint16_t> ao3(size_t(rows) * nq * hd);
+        std::printf("  attn only\n");
+        q_attn(q3.data(), kc3.data(), vc3.data(), g3.data(), ao3.data(), rows, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        std::printf("  attn ok\n");
+        return 0;
+    }
+    DeviceBuffer<uint16_t> q(size_t(rows) * nq * 2 * hd), k(size_t(rows) * nkv * hd),
+        v2(size_t(rows) * nkv * hd), g(size_t(rows) * nq * hd), ao(size_t(rows) * nq * hd);
+    DeviceBuffer<uint16_t> kc(size_t(64) * nkv * hd), vc(size_t(64) * nkv * hd);
+    {
+        auto qv = q.download(), kv = k.download(), vv = v2.download();
+        HIP_CHECK(hipMemcpy(q.data(), qv.data(), qv.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(k.data(), kv.data(), kv.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(v2.data(), vv.data(), vv.size() * 2, hipMemcpyHostToDevice));
+    }
+    DeviceBuffer<uint16_t> qn(hd), kn(hd);  // device buffers (kernel args)
+    q_qk_norm_rope(q.data(), k.data(), v2.data(), g.data(), kc.data(), vc.data(), rows, 0, nq, nkv,
+                   hd, c.rot_dim, c.theta, qn.data(), kn.data(), c.eps, s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  rope ok\n");
+    q_attn(q.data(), kc.data(), vc.data(), g.data(), ao.data(), rows, 0, nq, nkv, hd,
+           1.0f / std::sqrt(float(hd)), s);
+    HIP_CHECK(hipStreamSynchronize(s));
+    std::printf("  attn ok\n");
+    // crafted: rows=3, q=k (all equal) => uniform softmax over [0..t] => out = mean(v[0..t]) * sig(g)
+    {
+        const int R3 = 3;
+        DeviceBuffer<uint16_t> q4(size_t(R3) * nq * 2 * hd), k4(size_t(R3) * nkv * hd),
+            v4(size_t(R3) * nkv * hd), g4(size_t(R3) * nq * hd), ao4(size_t(R3) * nq * hd);
+        DeviceBuffer<uint16_t> kc4(size_t(64) * nkv * hd), vc4(size_t(64) * nkv * hd);
+        std::vector<uint16_t> qh2(size_t(R3) * nq * 2 * hd, 0), kh4(size_t(R3) * nkv * hd, 0),
+            vh4(size_t(R3) * nkv * hd, 0), gh4(size_t(R3) * nq * hd, 0);
+        for (int r = 0; r < R3; ++r) {
+            for (int i = 0; i < nq * 2 * hd; ++i) qh2[size_t(r) * nq * 2 * hd + size_t(i)] = uint16_t(0x3f80);
+            for (int h = 0; h < nkv; ++h) {
+                float base = 1.0f + 0.25f * r + 0.5f * h;
+                for (int d = 0; d < hd; ++d) {
+                    vh4[size_t(r) * nkv * hd + size_t(h) * hd + size_t(d)] = uint16_t(0x3f80 + d % 4);
+                    kh4[size_t(r) * nkv * hd + size_t(h) * hd + size_t(d)] = uint16_t(0x3f80);
+                    (void)base;
+                }
+            }
+        }
+        // gate = large positive => sigmoid ~ 1
+        for (auto &g5 : gh4) g5 = uint16_t(0x4248);  // ~50
+        HIP_CHECK(hipMemcpy(q4.data(), qh2.data(), qh2.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(k4.data(), kh4.data(), kh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(v4.data(), vh4.data(), vh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(g4.data(), gh4.data(), gh4.size() * 2, hipMemcpyHostToDevice));
+        q_attn(q4.data(), kc4.data(), vc4.data(), g4.data(), ao4.data(), R3, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        // simulate the cache: k/v of rows 0..2 written by the same kernel? no cache here, so feed
+        // the cache manually first
+        std::printf("(cache empty variant above; refill)\n");
+        HIP_CHECK(hipMemcpy(kc4.data(), kh4.data(), kh4.size() * 2, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(vc4.data(), vh4.data(), vh4.size() * 2, hipMemcpyHostToDevice));
+        q_attn(q4.data(), kc4.data(), vc4.data(), g4.data(), ao4.data(), R3, 0, nq, nkv, hd,
+               1.0f / std::sqrt(float(hd)), s);
+        HIP_CHECK(hipStreamSynchronize(s));
+        auto out4 = ao4.download();
+        // expected: scores all equal (q=k=1 vectors scaled) => p uniform over [0..t] => mean of v
+        auto b16v = [](uint16_t h) {
+            uint32_t u = uint32_t(h) << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            return f;
+        };
+        std::printf("crafted attn out r0 [0:4]: %.4f %.4f (want ~1.0..1.75 mean of v) r2: %.4f\n",
+                    b16v(out4[0]), b16v(out4[1]), b16v(out4[size_t(2) * nq * hd]));
+    }
+    return 0;
+}

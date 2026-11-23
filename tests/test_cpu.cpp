@@ -1,15 +1,20 @@
 // CPU unit tests vs committed vectors from the unmodified upstream QTIP reference.
 // usage: qtip_tests_cpu <refvec_dir>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 #include "common.hpp"
 #include "qtip_core.hpp"
+#include "qwen35.hpp"
 
 using namespace qtip;
+static void fs_create(const std::string& d) { mkdir(d.c_str(), 0755); }
 static std::string D;
 static int g_fail = 0;
 #define EXPECT(c, ...)                         \
@@ -185,6 +190,117 @@ static void chol_bench(int n, int threads) {
               threads, ok, t, double(n) * n * n / 3 / t / 1e9, g_chol_t[0], g_chol_t[1], g_chol_t[2], g_chol_t[3]);
 }
 
+// Qwen3.5 config parsing (0.8B dense shape, written to a temp dir; no checkpoint needed).
+static void test_qwen_config() {
+  std::printf("[qwen35] config parsing\n");
+  std::string dir = "/tmp/qtip_qwen_cfg_test";
+  fs_create(dir);
+  {
+    const char* cfg = R"({
+      "architectures": ["Qwen3_5ForConditionalGeneration"],
+      "model_type": "qwen3_5",
+      "text_config": {
+        "hidden_size": 1024, "intermediate_size": 3584, "num_hidden_layers": 24, "vocab_size": 248320,
+        "num_attention_heads": 8, "num_key_value_heads": 2, "head_dim": 256, "attn_output_gate": true,
+        "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+        "linear_num_value_heads": 16, "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4, "rms_norm_eps": 1e-06, "tie_word_embeddings": true,
+        "full_attention_interval": 4,
+        "rope_parameters": {"partial_rotary_factor": 0.25, "rope_theta": 10000000.0}
+      }
+    })";
+    std::ofstream f(dir + "/config.json");
+    f << cfg;
+  }
+  QwenConfig c = load_qwen_config(dir);
+  EXPECT(c.hidden == 1024 && c.inter == 3584 && c.layers == 24 && c.vocab == 248320, "dims");
+  EXPECT(c.nq == 8 && c.nkv == 2 && c.hd == 256, "attn heads");
+  EXPECT(c.rot_dim == 64, "rot_dim %d", c.rot_dim);
+  EXPECT(std::fabs(c.theta - 1e7f) < 1, "theta");
+  EXPECT(c.lin_nk == 16 && c.lin_kd == 128 && c.lin_nv == 16 && c.lin_vd == 128, "linear dims");
+  EXPECT(c.conv_k == 4 && c.conv_dim() == 3 * 2048, "conv dim %d", c.conv_dim());
+  EXPECT(c.key_dim() == 2048 && c.value_dim() == 2048, "key/value dim");
+  EXPECT(c.tied, "tied");
+  EXPECT(!c.moe(), "dense");
+  int full = 0;
+  for (int i = 0; i < c.layers; ++i) {
+    EXPECT(c.is_full(i) == ((i + 1) % 4 == 0), "layer %d type", i);
+    full += c.is_full(i);
+  }
+  EXPECT(full == 6, "full layers %d", full);
+  // MoE shape (122B-A10B text_config subset)
+  {
+    const char* cfg = R"({
+      "model_type": "qwen3_5_moe",
+      "text_config": {
+        "hidden_size": 3072, "num_hidden_layers": 4, "vocab_size": 248320,
+        "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 256,
+        "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+        "linear_num_value_heads": 64, "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4, "num_experts": 256, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 1024, "shared_expert_intermediate_size": 1024,
+        "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        "partial_rotary_factor": 0.25, "rope_theta": 10000000.0
+      }
+    })";
+    std::ofstream f(dir + "/config.json");
+    f << cfg;
+  }
+  QwenConfig m = load_qwen_config(dir);
+  EXPECT(m.moe() && m.n_experts == 256 && m.topk == 8 && m.moe_inter == 1024 && m.shared_inter == 1024, "moe fields");
+  EXPECT(m.lin_group() == 4, "lin group %d", m.lin_group());
+  EXPECT(m.layers == 4 && m.is_full(3) && !m.is_full(2), "layer_types parse");
+  EXPECT(m.key_dim() == 2048 && m.value_dim() == 8192 && m.conv_dim() == 12288, "moe dims");
+  // non-qwen dir must be rejected
+  {
+    std::ofstream f(dir + "/config.json");
+    f << "{\"model_type\": \"llama\", \"hidden_size\": 1}";
+  }
+  EXPECT(!is_qwen35_dir(dir), "llama not qwen");
+}
+
+// Tiny synthetic qwen3_5_moe checkpoint end-to-end CPU forward (qwen_make_tiny_moe output).
+// Skipped unless QWEN_TINY_MOE points at the checkpoint dir.
+static void test_qwen_tiny_moe() {
+  const char* dp = std::getenv("QWEN_TINY_MOE");
+  if (!dp) {
+    std::printf("[qwen35] tiny moe forward (skipped; set QWEN_TINY_MOE=<dir>)\n");
+    return;
+  }
+  std::printf("[qwen35] tiny moe forward\n");
+  QwenConfig cfg = load_qwen_config(dp);
+  EXPECT(cfg.moe() && cfg.n_experts > 0 && cfg.topk >= 2, "moe config");
+  SafeTensorsReader st(dp);
+  std::vector<std::shared_ptr<QwenLayer>> layers;
+  for (int L = 0; L < cfg.layers; ++L) layers.push_back(read_qwen_layer(st, cfg, L));
+  std::vector<int32_t> toks{1, 1500, 42, 999, 2047 % cfg.vocab, 3, 777, 512};
+  std::vector<float> logits(size_t(toks.size()) * cfg.vocab);
+  qwen_cpu_forward(cfg, st, layers, QwenCpuRefs{}, toks.data(), int(toks.size()), logits.data(), 8);
+  bool fin = true;
+  int nmax = 0;
+  std::vector<int> seen;
+  for (int t = 0; t < int(toks.size()); ++t) {
+    int am = 0;
+    for (long v = 1; v < cfg.vocab; ++v) {
+      float x = logits[size_t(t) * cfg.vocab + v];
+      fin = fin && std::isfinite(x);
+      if (x > logits[size_t(t) * cfg.vocab + am]) am = int(v);
+    }
+    if (std::find(seen.begin(), seen.end(), am) == seen.end()) seen.push_back(am);
+    nmax++;
+  }
+  EXPECT(fin, "logits finite");
+  EXPECT(!seen.empty(), "argmax computed");
+  std::printf("  argmax (first 8):");
+  for (int t = 0; t < int(toks.size()); ++t) {
+    int am = 0;
+    for (long v = 1; v < cfg.vocab; ++v)
+      if (logits[size_t(t) * cfg.vocab + v] > logits[size_t(t) * cfg.vocab + am]) am = int(v);
+    std::printf(" %d", am);
+  }
+  std::printf("\n");
+}
+
 int main(int argc, char** argv) {
   if (argc >= 4 && std::string(argv[1]) == "--chol") {
     chol_bench(std::atoi(argv[2]), std::atoi(argv[3]));
@@ -197,6 +313,8 @@ int main(int argc, char** argv) {
   test_viterbi();
   test_packing();
   test_ldl();
+  test_qwen_config();
+  test_qwen_tiny_moe();
   std::printf(g_fail ? "CPU TESTS FAILED (%d)\n" : "ALL CPU TESTS PASSED\n", g_fail);
   return g_fail ? 1 : 0;
 }

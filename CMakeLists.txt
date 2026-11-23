@@ -24,8 +24,9 @@ set(QTIP_CPU_ARCH "native" CACHE STRING "-march for the host fp64 Cholesky (AVX-
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Threads REQUIRED)
 
-# host-only core (codebook, hadamard reference, reference viterbi, packing, fp64 LDL, NVFP4 host codec)
-add_library(qtip_core STATIC src/qtip_core.cpp src/log.cpp src/safetensors.cpp src/nvfp4.cpp)
+# host-only core (codebook, hadamard reference, reference viterbi, packing, fp64 LDL, NVFP4 host codec,
+# qwen3.5 config/ref)
+add_library(qtip_core STATIC src/qtip_core.cpp src/log.cpp src/safetensors.cpp src/nvfp4.cpp src/qwen35.cpp)
 target_include_directories(qtip_core PUBLIC src third_party)
 target_compile_options(qtip_core PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall -Wextra)
 target_link_libraries(qtip_core PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
@@ -36,12 +37,12 @@ if(QTIP_CUDA)
   find_package(CUDAToolkit REQUIRED)
   # the .hip sources are single-source: compile unmodified copies as CUDA (gpu.hpp switches on QTIP_CUDA)
   set(QTIP_GPU_KERNELS)
-  foreach(fn IN ITEMS kernels attention viterbi nvfp4_gpu)
+  foreach(fn IN ITEMS kernels attention viterbi nvfp4_gpu qwen_kernels)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/${fn}.hip ${CMAKE_BINARY_DIR}/cuda/${fn}.cu COPYONLY)
     list(APPEND QTIP_GPU_KERNELS ${CMAKE_BINARY_DIR}/cuda/${fn}.cu)
   endforeach()
   add_library(qtip_gpu STATIC ${QTIP_GPU_KERNELS} src/gemm.cpp src/staging.cpp src/quantizer.cpp src/model.cpp
-                               src/pipeline.cpp)
+                               src/pipeline.cpp src/qwen_runner.cpp)
   target_compile_definitions(qtip_gpu PUBLIC QTIP_CUDA)
   target_include_directories(qtip_gpu PUBLIC src third_party)
   target_link_libraries(qtip_gpu PUBLIC qtip_core CUDA::cudart CUDA::cublasLt)
@@ -53,8 +54,9 @@ else()
   find_package(hip REQUIRED CONFIG)
   find_package(hipblaslt REQUIRED CONFIG)
   # GPU kernels + hipBLASLt wrapper + quantizer + model forward + pipeline
-  add_library(qtip_gpu STATIC src/kernels.hip src/attention.hip src/viterbi.hip src/nvfp4_gpu.hip src/gemm.cpp src/staging.cpp
-                              src/quantizer.cpp src/model.cpp src/pipeline.cpp)
+  add_library(qtip_gpu STATIC src/kernels.hip src/attention.hip src/viterbi.hip src/nvfp4_gpu.hip src/qwen_kernels.hip
+                              src/gemm.cpp src/staging.cpp src/quantizer.cpp src/model.cpp src/pipeline.cpp
+                              src/qwen_runner.cpp)
   target_include_directories(qtip_gpu PUBLIC src third_party)
   target_link_libraries(qtip_gpu PUBLIC qtip_core hip::host roc::hipblaslt)
   target_compile_options(qtip_gpu PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64 -O3>
@@ -91,6 +93,12 @@ if(QTIP_CUDA)
   add_executable(qtip_tests_cuda tests/test_cuda.cpp)
   target_link_libraries(qtip_tests_cuda PRIVATE qtip_gpu)
 endif()
+add_executable(qwen35_ref tools/qwen35_ref.cpp)
+target_link_libraries(qwen35_ref PRIVATE qtip_core)
+target_compile_options(qwen35_ref PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall)
+add_executable(qwen_make_tiny_moe tools/qwen_make_tiny_moe.cpp)
+target_link_libraries(qwen_make_tiny_moe PRIVATE qtip_core)
+target_compile_options(qwen_make_tiny_moe PRIVATE -O3 -march=${QTIP_CPU_ARCH} -Wall)
 
 enable_testing()
 add_test(NAME cpu COMMAND qtip_tests_cpu ${CMAKE_SOURCE_DIR}/tests/refvec)

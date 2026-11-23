@@ -17,6 +17,8 @@
 #include "nlohmann/json.hpp"
 #include "quantizer.hpp"
 #include "qtip_core.hpp"
+#include "qwen35.hpp"
+#include "qwen_runner.hpp"
 #include "safetensors.hpp"
 
 namespace qtip {
@@ -37,6 +39,7 @@ struct Options {
   int batch_rows = 4096;
   int backlog = 2;
   bool keep_hessians = false;
+  int moe_min_tok = 64;  // Qwen3.5 MoE: experts with fewer routed calibration tokens use the pooled Hessian
   bool fp8_kv = true;
   bool kv_explicit = false;  // --kv-format was passed (BF16 sources default to qtip)
   uint64_t seed = 0;
@@ -59,6 +62,8 @@ struct LayerState {
   enum St { kNone, kPartial, kReady, kQuantizing, kDone } st = kNone;
   std::vector<std::vector<float>> H;  // combined (normalised) Hessians in RAM when kReady (may be empty: on disk)
   std::vector<std::vector<float>> partial;
+  // Qwen3.5 MoE: [0,E) = per-expert sum of routing-weight^2, [E,2E) = per-expert routed token counts
+  std::vector<float> moe_stats, moe_stats_partial;
   long partial_count = 0;
   int partial_parts = 0;
 };
@@ -80,6 +85,11 @@ class Pipeline {
   void chain_step(int wi, LayerRunner& R, int L, bool collect);
   void quantize_layer(int wi, LayerRunner* R, hipStream_t s, Gemm& g, int L);
   void deposit_partial(int L, HessAcc& acc, LayerRunner& R);
+  // ---- Qwen3.5 (hybrid Gated DeltaNet / gated attention, dense or MoE MLP); see docs/QWEN35.md
+  void chain_step_qwen(int wi, QwenLayerRunner& R, int L, bool collect);
+  void quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L);
+  void deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R, MoeHessAcc* moe);
+  int layers_total() const { return qwen_ ? qcfg_.layers : cfg_.layers; }
   std::vector<std::vector<float>> take_hessians(int L);
   // shared QTIP group quantization of one layer; fills jl like quantize_layer does
   std::vector<LinearOut> run_qtip_groups(int L, std::vector<std::vector<float>>&& H,
@@ -114,6 +124,9 @@ class Pipeline {
   SafeTensorsReader st_;
   ModelConfig cfg_;
   LayerCache cache_;
+  QwenConfig qcfg_;  // raw_json empty unless the model is Qwen3.5
+  bool qwen_ = false;
+  std::unique_ptr<QwenLayerCache> qcache_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::map<int, LayerState> layers_;

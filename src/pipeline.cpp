@@ -46,8 +46,84 @@ static std::vector<std::vector<float>> read_hess(const std::string& path) {
   return H;
 }
 
-Pipeline::Pipeline(const Options& o) : o_(o), st_(o.model), cfg_(load_model_config(o.model, &st_)), cache_(st_, cfg_, 4) {
-  if (o_.layer_end < 0) o_.layer_end = cfg_.layers;
+// --- MoE Hessian file: qkv/o/gateup/down (pooled, shared expert) + per-expert gateup/down + stats.
+// Layout of the returned vector: [0,4) as dense, [4+2e] expert e gateup, [5+2e] expert e down.
+// stats (out-param): [0,E) sum of routing-weight^2, [E,2E) routed token counts (both still summed).
+static std::vector<std::vector<float>> read_hess_moe(const std::string& path, std::vector<float>& stats,
+                                                     int& experts) {
+  std::ifstream f(path, std::ios::binary);
+  QCHECK(f, "cannot open " + path);
+  uint64_t hl = 0;
+  f.read(reinterpret_cast<char*>(&hl), 8);
+  std::string hs(hl, '\0');
+  f.read(hs.data(), std::streamsize(hl));
+  json h = json::parse(hs);
+  QCHECK(h.contains("__metadata__") && h["__metadata__"].value("format", "") == "moe",
+         "not a MoE Hessian file: " + path);
+  experts = std::stoi(h["__metadata__"].at("experts").get<std::string>());
+  auto read_t = [&](const std::string& name) {
+    auto& t = h.at(name);
+    auto off = t["data_offsets"].get<std::vector<uint64_t>>();
+    std::vector<float> v((off[1] - off[0]) / 4);
+    f.seekg(std::streamoff(8 + hl + off[0]));
+    f.read(reinterpret_cast<char*>(v.data()), std::streamsize(off[1] - off[0]));
+    QCHECK(f.good(), "short read " + path + " tensor " + name);
+    return v;
+  };
+  std::vector<std::vector<float>> H(4 + size_t(2 * experts));
+  for (int i = 0; i < 4; ++i) H[size_t(i)] = read_t(kHessName[i]);
+  stats = read_t("stats");
+  for (int e = 0; e < experts; ++e) {
+    H[size_t(4 + 2 * e)] = read_t("e" + std::to_string(e) + ".gateup");
+    H[size_t(5 + 2 * e)] = read_t("e" + std::to_string(e) + ".down");
+  }
+  return H;
+}
+
+static void write_hess_moe(const std::string& path, const std::vector<std::vector<float>>& H,
+                           const std::vector<float>& stats, const int dims[4], int moe_inter, int experts,
+                           long count) {
+  SafeTensorsWriter w;
+  for (int i = 0; i < 4; ++i)
+    w.add(kHessName[i], "F32", {dims[i], dims[i]}, H[size_t(i)].data(), H[size_t(i)].size() * 4);
+  w.add("stats", "F32", {long(stats.size())}, stats.data(), stats.size() * 4);
+  for (int e = 0; e < experts; ++e) {
+    w.add("e" + std::to_string(e) + ".gateup", "F32", {dims[2], dims[2]}, H[size_t(4 + 2 * e)].data(),
+          H[size_t(4 + 2 * e)].size() * 4);
+    w.add("e" + std::to_string(e) + ".down", "F32", {moe_inter, moe_inter}, H[size_t(5 + 2 * e)].data(),
+          H[size_t(5 + 2 * e)].size() * 4);
+  }
+  w.write(path, {{"format", "moe"},
+                 {"count", std::to_string(count)},
+                 {"normalised", "1"},
+                 {"experts", std::to_string(experts)}});
+}
+
+// Qwen3.5 checkpoints have no Llama-style config: the qwen path uses qcfg_ instead of cfg_.
+static ModelConfig load_model_config_qtip(const std::string& dir, const SafeTensorsReader* st) {
+  if (is_qwen35_dir(dir)) return ModelConfig{};
+  return load_model_config(dir, st);
+}
+static QwenConfig load_qwen_config_or_empty(const std::string& dir) {
+  if (!is_qwen35_dir(dir)) return QwenConfig{};  // raw_json stays empty
+  return load_qwen_config(dir);
+}
+
+Pipeline::Pipeline(const Options& o)
+    : o_(o),
+      st_(o.model),
+      cfg_(load_model_config_qtip(o.model, &st_)),
+      cache_(st_, cfg_, 4),
+      qcfg_(load_qwen_config_or_empty(o.model)),
+      qwen_(!qcfg_.raw_json.empty()),
+      qcache_(qwen_ ? std::make_unique<QwenLayerCache>(st_, qcfg_, 4) : nullptr) {
+  if (o_.layer_end < 0) o_.layer_end = layers_total();
+  if (qwen_) {
+    // BF16 source; every attention/DeltaNet/MLP linear (incl. K/V) is QTIP-quantized
+    QCHECK(o_.mode != "adaptive", "--mode adaptive is not supported for Qwen3.5 yet");
+    QCHECK(!(o_.kv_explicit && o_.fp8_kv), "--kv-format fp8 is not supported for Qwen3.5");
+    o_.fp8_kv = false;
+  }
   if (o_.hess_dir.empty()) o_.hess_dir = o_.work + "/hess";
   // BF16 sources (e.g. Llama 3.x) default to all-QTIP; an explicit --kv-format fp8 converts K/V to FP8-Dynamic
   // (per-output-channel bf16 scale) instead of quantizing them.
@@ -216,6 +292,161 @@ void Pipeline::chain_step(int wi, LayerRunner& R, int L, bool collect) {
     f.write(reinterpret_cast<const char*>(act_[0].get()), std::streamsize(size_t(o_.seq_len) * cfg_.hidden * 2));
   }
   if (collect) deposit_partial(L, *acc, R);
+}
+
+void Pipeline::chain_step_qwen(int wi, QwenLayerRunner& R, int L, bool collect) {
+  qcache_->prefetch(L + 1);
+  double t0 = now_s();
+  auto QL = qcache_->get(L);
+  double t_read = now_s() - t0;
+  t0 = now_s();
+  R.upload(*QL);
+  double t_up = now_s() - t0;
+  HessAcc* acc = nullptr;
+  MoeHessAcc* moe = nullptr;
+  static thread_local std::unique_ptr<HessAcc> tacc;
+  static thread_local std::unique_ptr<MoeHessAcc> tmoe;
+  if (collect) {
+    const bool moe_layer = QL->moe;
+    const int dim1 = qcfg_.is_full(L) ? qcfg_.nq * qcfg_.hd : qcfg_.value_dim();
+    const int dim3 = moe_layer ? qcfg_.shared_inter : qcfg_.inter;
+    if (!tacc || tacc->dim[1] != dim1 || tacc->dim[3] != dim3 || (moe_layer && !tmoe) ||
+        (!moe_layer && tmoe)) {
+      tacc = std::make_unique<HessAcc>();
+      R.alloc_hess(*tacc, qcfg_.is_full(L), moe_layer);
+      tmoe.reset();
+      if (moe_layer) {
+        tmoe = std::make_unique<MoeHessAcc>();
+        R.alloc_moe_hess(*tmoe);
+      }
+    } else {
+      R.zero_hess(*tacc);
+      if (tmoe) R.zero_moe_hess(*tmoe);
+    }
+    acc = tacc.get();
+    moe = tmoe.get();
+  }
+  QCHECK(!QL->moe || moe, "MoE layer without a MoE Hessian accumulator");
+  R.gemm_flops = 0;
+  t0 = now_s();
+  R.forward(act_[size_t(wi)].get(), act_nseq_[size_t(wi)], acc, moe);
+  double t_fwd = now_s() - t0;
+  long ntok = act_nseq_[size_t(wi)] * o_.seq_len;
+  logf("gpu%d qwen layer %d %s: %ld tokens in %.1fs (%.0f tok/s, %.1f TFLOPS), weights read %.1fs upload %.1fs",
+       R.device(), L, collect ? "collect" : "forward", ntok, t_fwd, ntok / t_fwd, R.gemm_flops / t_fwd / 1e12,
+       t_read, t_up);
+  if (!o_.dump_acts.empty() && wi == 0) {
+    fs::create_directories(o_.dump_acts);
+    std::ofstream f(o_.dump_acts + "/act_after_layer" + std::to_string(L) + ".bf16", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(act_[0].get()),
+            std::streamsize(size_t(o_.seq_len) * qcfg_.hidden * 2));
+  }
+  if (collect) deposit_partial_qwen(L, *acc, R, moe);
+}
+
+void Pipeline::deposit_partial_qwen(int L, HessAcc& acc, QwenLayerRunner& R, MoeHessAcc* moe) {
+  R.symmetrize_hess(acc);
+  const int E = moe ? qcfg_.n_experts : 0;
+  if (moe) R.symmetrize_moe_hess(*moe);
+  std::vector<std::vector<float>> part(4 + size_t(2 * E));
+  for (int i = 0; i < 4; ++i) {
+    part[size_t(i)].resize(size_t(acc.dim[i]) * acc.dim[i]);
+    d2h_staged(part[size_t(i)].data(), acc.h[i], part[size_t(i)].size() * 4, R.stream());
+  }
+  std::vector<float> stats;
+  if (moe) {
+    for (int e = 0; e < E; ++e) {
+      auto& g = part[size_t(4 + 2 * e)];
+      g.resize(size_t(qcfg_.hidden) * qcfg_.hidden);
+      d2h_staged(g.data(), moe->gate[size_t(e)], g.size() * 4, R.stream());
+      auto& d = part[size_t(5 + 2 * e)];
+      d.resize(size_t(qcfg_.moe_inter) * qcfg_.moe_inter);
+      d2h_staged(d.data(), moe->down[size_t(e)], d.size() * 4, R.stream());
+    }
+    stats.resize(size_t(2 * E));
+    d2h_staged(stats.data(), moe->wsum, size_t(E) * 4, R.stream());
+    HIP_CHECK(hipStreamSynchronize(R.stream()));
+    std::vector<int> cnt_h{size_t(E)};  // tiny copy after the sync: plain pageable memcpy is safe
+    HIP_CHECK(hipMemcpy(cnt_h.data(), moe->cnt, size_t(E) * 4, hipMemcpyDeviceToHost));
+    for (int e = 0; e < E; ++e) stats[size_t(E + e)] = float(cnt_h[size_t(e)]);
+  }
+  long cnt = acc.count;
+  bool complete = false;
+  std::vector<std::vector<float>> mine;
+  std::vector<float> my_stats;
+  long total = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    LayerState& S = layers_[L];
+    if (S.partial.empty()) {
+      S.partial = std::move(part);
+      S.moe_stats_partial = std::move(stats);
+      S.partial_count = cnt;
+    } else {
+      QCHECK(S.partial.size() == part.size(), "partial Hessian count mismatch (dense vs MoE?)");
+      for (size_t i = 0; i < S.partial.size(); ++i) {
+        float* a = S.partial[i].data();
+        const float* b = part[i].data();
+        long n = long(S.partial[i].size());
+        QCHECK(n == long(part[i].size()), "partial Hessian size mismatch");
+#pragma omp parallel for schedule(static) num_threads(16)
+        for (long k = 0; k < n; ++k) a[k] += b[k];
+      }
+      for (size_t i = 0; i < S.moe_stats_partial.size() && i < stats.size(); ++i)
+        S.moe_stats_partial[i] += stats[i];
+      S.partial_count += cnt;
+    }
+    S.partial_parts++;
+    S.st = LayerState::kPartial;
+    if (S.partial_parts == int(o_.gpus.size())) {
+      complete = true;
+      mine = std::move(S.partial);
+      my_stats = std::move(S.moe_stats_partial);
+      total = S.partial_count;
+      S.partial.clear();
+      S.moe_stats_partial.clear();
+    }
+  }
+  if (!complete) return;
+  // normalise: attn groups + pooled (shared expert) by the token count; each expert by its own
+  // routing-weight mass (sum of w^2), so every Hessian is an average xx^T under its own distribution
+  double inv = 1.0 / double(total);
+  for (size_t i = 0; i < mine.size(); ++i) {
+    double s = inv;
+    if (E && i >= 4) {
+      int e = int((i - 4) / 2);
+      double ws = my_stats[size_t(e)];
+      s = ws > 0 ? 1.0 / ws : 0.0;
+    }
+    long n = long(mine[i].size());
+    float* a = mine[i].data();
+    float f = float(s);
+#pragma omp parallel for schedule(static) num_threads(16)
+    for (long k = 0; k < n; ++k) a[k] *= f;
+  }
+  double t0 = now_s();
+  if (E) {
+    int moe_dims[4] = {acc.dim[0], acc.dim[1], acc.dim[2], acc.dim[3]};
+    write_hess_moe(hess_path(L), mine, my_stats, moe_dims, qcfg_.moe_inter, E, total);
+  } else {
+    write_hess(hess_path(L), mine, acc.dim, total);
+  }
+  logf("qwen layer %d: Hessians complete (%ld tokens%s), saved in %.1fs", L, total, E ? ", MoE" : "",
+       now_s() - t0);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    LayerState& S = layers_[L];
+    if (o_.mode == "collect") {
+      S.st = LayerState::kDone;
+    } else {
+      S.H = std::move(mine);
+      S.moe_stats = std::move(my_stats);
+      S.st = LayerState::kReady;
+    }
+    hess_on_disk_.insert(L);
+    save_progress_locked();
+  }
+  cv_.notify_all();
 }
 
 std::vector<std::vector<float>> Pipeline::take_hessians(int L) {
@@ -817,17 +1048,267 @@ void Pipeline::adaptive_decide(int wi, LayerRunner* chain, hipStream_t qs, Gemm&
   }
 }
 
+void Pipeline::quantize_qwen_layer(int wi, hipStream_t s, Gemm& g, int L) {
+  (void)wi;
+  double t_layer = now_s();
+  std::vector<std::vector<float>> H;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    H = std::move(layers_[L].H);
+  }
+  auto QL = qcache_->get(L);
+  const bool is_moe = QL->moe;
+  std::vector<float> moe_stats;
+  if (H.empty()) {
+    if (is_moe) {
+      int E = 0;
+      H = read_hess_moe(hess_path(L), moe_stats, E);
+      QCHECK(E == qcfg_.n_experts, "MoE Hessian expert count mismatch");
+      std::lock_guard<std::mutex> lk(mu_);
+      layers_[L].moe_stats = moe_stats;
+    } else {
+      H = read_hess(hess_path(L));
+    }
+  } else if (is_moe) {
+    std::lock_guard<std::mutex> lk(mu_);
+    moe_stats = layers_[L].moe_stats;
+    QCHECK(moe_stats.size() == size_t(2 * qcfg_.n_experts), "missing MoE Hessian stats");
+  }
+  int dev = 0;
+  HIP_CHECK(hipGetDevice(&dev));
+  const bool full = qcfg_.is_full(L);
+  const int Hid = qcfg_.hidden;
+  // linear index space of this layer type -> output tensor name, host fp32 weight and dims
+  struct QLin {
+    std::string name;
+    int m = 0, n = 0;
+    std::vector<float> w;  // fp32 rows of this linear [m][n]
+  };
+  std::vector<QLin> lins;
+  auto add_lin = [&](std::string name, int m, int n, std::vector<float> w) {
+    QLin q;
+    q.name = std::move(name), q.m = m, q.n = n, q.w = std::move(w);
+    lins.push_back(std::move(q));
+  };
+  if (full) {
+    const int A = qcfg_.nq * qcfg_.hd;
+    add_lin("self_attn.q_proj", qcfg_.nq * 2 * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_q));
+    add_lin("self_attn.k_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_k));
+    add_lin("self_attn.v_proj", qcfg_.nkv * qcfg_.hd, Hid, bf16_to_f32_vec(QL->w_v));
+    add_lin("self_attn.o_proj", Hid, A, bf16_to_f32_vec(QL->w_o));
+  } else {
+    const long nv = qcfg_.lin_nv, V = qcfg_.value_dim();
+    add_lin("linear_attn.in_proj_qkv", qcfg_.conv_dim(), Hid, bf16_to_f32_vec(QL->w_in_qkv));
+    add_lin("linear_attn.in_proj_z", int(V), Hid, bf16_to_f32_vec(QL->w_in_z));
+    add_lin("linear_attn.out_proj", Hid, int(V), bf16_to_f32_vec(QL->w_out));
+  }
+  if (is_moe) {
+    const int E = qcfg_.n_experts, F = qcfg_.moe_inter, S = qcfg_.shared_inter;
+    for (int e = 0; e < E; ++e) {
+      std::string ep = "mlp.experts." + std::to_string(e) + ".";
+      add_lin(ep + "gate_proj", F, Hid, bf16_to_f32_vec(QL->w_exp_gate[size_t(e)]));
+      add_lin(ep + "up_proj", F, Hid, bf16_to_f32_vec(QL->w_exp_up[size_t(e)]));
+      add_lin(ep + "down_proj", Hid, F, bf16_to_f32_vec(QL->w_exp_down[size_t(e)]));
+    }
+    add_lin("mlp.shared_expert.gate_proj", S, Hid, bf16_to_f32_vec(QL->w_sh_gate));
+    add_lin("mlp.shared_expert.up_proj", S, Hid, bf16_to_f32_vec(QL->w_sh_up));
+    add_lin("mlp.shared_expert.down_proj", Hid, S, bf16_to_f32_vec(QL->w_sh_down));
+  } else {
+    add_lin("mlp.gate_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_gate));
+    add_lin("mlp.up_proj", qcfg_.inter, Hid, bf16_to_f32_vec(QL->w_up));
+    add_lin("mlp.down_proj", Hid, qcfg_.inter, bf16_to_f32_vec(QL->w_down));
+  }
+  // groups: (Hessian matrix index in H, n, lins). MoE Hessian layout: [0,4) dense slots
+  // (2/3 = pooled, shared expert), [4+2e] expert gateup, [5+2e] expert down.
+  struct Grp {
+    int hess;
+    int n;
+    std::vector<int> lins;
+    std::string tag;  // log/seed tag
+  };
+  std::vector<Grp> groups;
+  if (full)
+    groups.push_back({0, Hid, {0, 1, 2}, "qkv"});
+  else
+    groups.push_back({0, Hid, {0, 1}, "qkv"});
+  groups.push_back({1, full ? qcfg_.nq * qcfg_.hd : qcfg_.value_dim(), {full ? 3 : 2}, "o"});
+  if (is_moe) {
+    const int E = qcfg_.n_experts, F = qcfg_.moe_inter, S = qcfg_.shared_inter;
+    int base = full ? 4 : 3;
+    for (int e = 0; e < E; ++e) {
+      int g0 = base + 3 * e;
+      // starved experts (< moe_min_tok routed calibration tokens) use the pooled Hessian
+      bool starved = moe_stats[size_t(E + e)] < float(o_.moe_min_tok);
+      groups.push_back({starved ? 2 : 4 + 2 * e, Hid, {g0, g0 + 1}, "e" + std::to_string(e) + (starved ? "g*" : "g")});
+      groups.push_back({starved ? 3 : 5 + 2 * e, starved ? S : F, {g0 + 2}, "e" + std::to_string(e) + (starved ? "d*" : "d")});
+    }
+    groups.push_back({2, Hid, {base + 3 * E, base + 3 * E + 1}, "sg"});
+    groups.push_back({3, S, {base + 3 * E + 2}, "sd"});
+  } else {
+    groups.push_back({2, Hid, {full ? 4 : 3, full ? 5 : 4}, "gateup"});
+    groups.push_back({3, qcfg_.inter, {full ? 6 : 5}, "down"});
+  }
+  std::vector<LinearOut> outs(lins.size());
+  json jl = json::object();
+  int n_starved = 0;
+  std::vector<HessPrep> preps(groups.size());
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const Grp& G = groups[gi];
+    int n = G.n;
+    QCHECK(long(H[size_t(G.hess)].size()) == long(n) * n, "Hessian size mismatch (group " + G.tag + ")");
+    uint64_t seed = (o_.seed * 1000003ull + uint64_t(L)) * 16 + uint64_t(G.hess) + 1009ull * uint64_t(gi);
+    rotate_hessian(s, H[size_t(G.hess)].data(), n, seed, o_.q, preps[gi]);
+  }
+  std::mutex lmu;
+  std::condition_variable lcv;
+  int ldl_done = 0;
+  std::thread ldl_th([&] {
+    for (size_t gi = 0; gi < groups.size(); ++gi) {
+      ldl_hessian(preps[gi], o_.q.ldl_threads, "L" + std::to_string(L) + "_" + groups[gi].tag);
+      std::lock_guard<std::mutex> lk(lmu);
+      ldl_done = int(gi) + 1;
+      lcv.notify_all();
+    }
+  });
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const Grp& G = groups[gi];
+    std::vector<LinearIn> ins;
+    for (int li : G.lins) {
+      LinearIn in;
+      in.name = lins[size_t(li)].name;
+      in.m = lins[size_t(li)].m;
+      QCHECK(int(lins[size_t(li)].w.size()) == long(in.m) * lins[size_t(li)].n, "weight size mismatch");
+      in.w_f32 = lins[size_t(li)].w.data();
+      ins.push_back(in);
+    }
+    std::unique_lock<std::mutex> lk(lmu);
+    lcv.wait(lk, [&] { return ldl_done > int(gi); });
+    lk.unlock();
+    GroupTiming tm;
+    auto res = quantize_group(s, g, ins, preps[gi], o_.q, &tm, "L" + std::to_string(L));
+    preps[gi].HRr.clear();
+    preps[gi].HRr.shrink_to_fit();
+    bool expert_grp = G.tag.size() > 1 && (G.tag[0] == 'e') && G.tag[1] >= '0' && G.tag[1] <= '9';
+    if (expert_grp) {
+      if (G.tag.find("g*") != std::string::npos) n_starved++;
+      // keep the JSON log small: one summary line per expert group, not into progress json
+      logf("  qwen layer %d %-6s %5d x %5d  %.1fs  proxy %.6f", L, G.tag.c_str(), res[0].m, res[0].n,
+           res[0].seconds, res[0].proxy);
+    } else {
+      logf("gpu%d qwen layer %d group %s: total %.1fs (load %.1f rht %.1f ldl_cpu %.1f ldlq %.1f [viterbi %.1f] "
+           "proxy %.1f pack %.1f)",
+           dev, L, G.tag.c_str(), tm.total, tm.load, tm.rht, tm.ldl_cpu, tm.ldlq, tm.viterbi, tm.proxy, tm.pack);
+    }
+    for (size_t k = 0; k < res.size(); ++k) {
+      const LinearOut& r = res[k];
+      if (!expert_grp) {
+        logf("  qwen layer %d %-24s %5d x %5d  %.1fs  proxy %.6f  proxy_rot_reg %.6f  Wscale %.6g", L,
+             r.name.c_str(), r.m, r.n, r.seconds, r.proxy, r.proxy_rot_reg, r.wscale);
+        jl[r.name] = {{"m", r.m}, {"n", r.n}, {"seconds", r.seconds}, {"proxy", r.proxy},
+                      {"proxy_rot_reg", r.proxy_rot_reg}, {"wscale", r.wscale}};
+      }
+      outs[size_t(G.lins[k])] = res[k];
+    }
+  }
+  ldl_th.join();
+  if (is_moe) {
+    double px = 0;
+    int np = 0;
+    for (auto& o : outs)
+      if (o.proxy >= 0) px += o.proxy, np++;
+    jl["experts"] = {{"n", qcfg_.n_experts}, {"starved_pooled", n_starved},
+                     {"mean_proxy", np ? px / np : 0.0}};
+    logf("qwen layer %d: %d experts (%d starved -> pooled Hessian), mean proxy %.6f", L, qcfg_.n_experts,
+         n_starved, np ? px / np : 0.0);
+  }
+  // ---- write layer file: QTIP tensors with the original HF names + unquantised small tensors
+  SafeTensorsWriter w;
+  std::string pre = "model.layers." + std::to_string(L) + ".";
+  const Codebook& cb = codebook();
+  for (size_t li = 0; li < lins.size(); ++li) {
+    const LinearOut& r = outs[li];
+    std::string b = pre + lins[li].name + ".";
+    w.add(b + "trellis", "I16", {long(r.m / 16) * (r.n / 16), kWordsPerTrellis}, r.trellis.data(),
+          r.trellis.size() * 2);
+    w.add(b + "SU", "BF16", {r.n}, r.su_bf16.data(), r.su_bf16.size() * 2);
+    std::vector<float> sv(r.sv.size());
+    for (size_t i = 0; i < sv.size(); ++i) sv[i] = r.sv[i] * r.wscale;
+    w.add(b + "SV", "F32", {r.m}, sv.data(), sv.size() * 4);
+    w.add(b + "tlut", "F16", {512, 2}, &cb.tlut_h[0][0], 512 * 2 * 2);
+    int64_t zero = 0, eight = 8;
+    w.add(b + "rcp", "I64", {}, &zero, 8);
+    w.add(b + "tp_rank", "I64", {}, &eight, 8);
+  }
+  w.add(pre + "input_layernorm.weight", "BF16", {qcfg_.hidden}, QL->ln_in.data(), QL->ln_in.size() * 2);
+  w.add(pre + "post_attention_layernorm.weight", "BF16", {qcfg_.hidden}, QL->ln_post.data(),
+        QL->ln_post.size() * 2);
+  if (full) {
+    w.add(pre + "self_attn.q_norm.weight", "BF16", {qcfg_.hd}, QL->q_norm.data(), QL->q_norm.size() * 2);
+    w.add(pre + "self_attn.k_norm.weight", "BF16", {qcfg_.hd}, QL->k_norm.data(), QL->k_norm.size() * 2);
+  } else {
+    w.add(pre + "linear_attn.conv1d.weight", "BF16", {qcfg_.conv_dim(), 1, qcfg_.conv_k}, QL->conv_w.data(),
+          QL->conv_w.size() * 2);
+    {  // in_proj_b / in_proj_a stay bf16 (16 rows: below the 32-row trellis minimum)
+      std::vector<uint16_t> b(QL->w_in_ba.begin(), QL->w_in_ba.begin() + size_t(qcfg_.lin_nv) * Hid);
+      std::vector<uint16_t> a(QL->w_in_ba.begin() + size_t(qcfg_.lin_nv) * Hid, QL->w_in_ba.end());
+      w.add(pre + "linear_attn.in_proj_b.weight", "BF16", {qcfg_.lin_nv, Hid}, b.data(), b.size() * 2);
+      w.add(pre + "linear_attn.in_proj_a.weight", "BF16", {qcfg_.lin_nv, Hid}, a.data(), a.size() * 2);
+    }
+    w.add(pre + "linear_attn.A_log", "F32", {qcfg_.lin_nv}, QL->a_log.data(), QL->a_log.size() * 4);
+    w.add(pre + "linear_attn.dt_bias", "F32", {qcfg_.lin_nv}, QL->dt_bias.data(), QL->dt_bias.size() * 4);
+    w.add(pre + "linear_attn.norm.weight", "BF16", {qcfg_.lin_vd}, QL->dn_norm.data(), QL->dn_norm.size() * 2);
+  }
+  if (is_moe) {  // router + shared-expert gate stay unquantised (bf16/f32 verbatim)
+    w.add(pre + "mlp.gate.weight", "BF16", {qcfg_.n_experts, qcfg_.hidden}, QL->w_router.data(),
+          QL->w_router.size() * 2);
+    if (!QL->w_router_bias.empty())
+      w.add(pre + "mlp.gate.e_score_correction_bias", "F32", {qcfg_.n_experts}, QL->w_router_bias.data(),
+            QL->w_router_bias.size() * 4);
+    if (qcfg_.shared_gate)
+      w.add(pre + "mlp.shared_expert_gate.weight", "BF16", {1, qcfg_.hidden}, QL->w_sh_gate_w.data(),
+            QL->w_sh_gate_w.size() * 2);
+  }
+  size_t bytes = w.write(layer_path(L));
+  double secs = now_s() - t_layer;
+  logf("gpu%d qwen layer %d quantized in %.1fs -> %s (%.1f MB)", dev, L, secs, layer_path(L).c_str(), bytes / 1e6);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    jl["status"] = "done";
+    jl["seconds"] = secs;
+    jl["gpu"] = dev;
+    jl["finished"] = long(std::time(nullptr));
+    progress_["layers"][std::to_string(L)] = jl;
+    layers_[L].st = LayerState::kDone;
+    done_.insert(L);
+    if (!o_.keep_hessians && o_.mode == "run") {
+      std::error_code ec;
+      fs::remove(hess_path(L), ec);
+      hess_on_disk_.erase(L);
+    }
+    save_progress_locked();
+    std::ofstream jf(o_.work + "/quant_log.jsonl", std::ios::app);
+    json rec = jl;
+    rec["layer"] = L;
+    jf << rec.dump() << "\n";
+  }
+  cv_.notify_all();
+}
+
 // ------------------------------------------------------------------ workers / run
 
 void Pipeline::worker(int wi) {
   int dev = o_.gpus[size_t(wi)];
   HIP_CHECK(hipSetDevice(dev));
   std::unique_ptr<LayerRunner> R;
+  std::unique_ptr<QwenLayerRunner> QR;
   hipStream_t qs;
   HIP_CHECK(hipStreamCreateWithFlags(&qs, hipStreamNonBlocking));
   Gemm qg(qs);
   bool need_chain = chain_end_ > 0 && o_.mode != "quantize";
-  if (need_chain) R = std::make_unique<LayerRunner>(dev, cfg_, o_.batch_rows, o_.seq_len);
+  if (need_chain) {
+    if (qwen_) QR = std::make_unique<QwenLayerRunner>(dev, qcfg_, o_.batch_rows, o_.seq_len);
+    else R = std::make_unique<LayerRunner>(dev, cfg_, o_.batch_rows, o_.seq_len);
+  }
   int refwd = -1;  // adaptive quantized-input: layer whose chain output must be recomputed with chosen weights
   for (;;) {
     int task = -1;
@@ -881,6 +1362,7 @@ void Pipeline::worker(int wi) {
           if (R) {
             R.reset();
           }
+          QR.reset();
           (void)hipStreamDestroy(qs);
           return;
         }
@@ -895,7 +1377,10 @@ void Pipeline::worker(int wi) {
     }
     if (is_quant) {
       if (adaptive_) adaptive_decide(wi, R.get(), qs, qg, task);
+      else if (qwen_) quantize_qwen_layer(wi, qs, qg, task);
       else quantize_layer(wi, R.get(), qs, qg, task);
+    } else if (qwen_) {
+      chain_step_qwen(wi, *QR, task, collect);
     } else {
       // adaptive quantized-input chaining: snapshot the calibration activations entering this layer
       if (adaptive_ && o_.adaptive_next_input == "quantized" && collect && !act_in_[size_t(wi)]) {
@@ -970,13 +1455,19 @@ void Pipeline::run() {
            o_.kl_threshold, o_.kl_tokens, o_.adaptive_next_input.c_str());
     }
     // embeddings
-    const TensorInfo& ei = st_.info("model.embed_tokens.weight");
+    std::string embed_name = "model.embed_tokens.weight";
+    if (qwen_) {
+      for (std::string nm : {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"})
+        if (st_.has(nm)) embed_name = nm;
+    }
+    const TensorInfo& ei = st_.info(embed_name);
     std::vector<uint16_t> emb(size_t(ei.numel()));
     double t0 = now_s();
-    st_.read_into("model.embed_tokens.weight", emb.data(), emb.size() * 2);
+    st_.read_into(embed_name, emb.data(), emb.size() * 2);
     logf("calibration: %ld sequences x %d tokens (%ld tokens); embeddings read in %.1fs", nseq, o_.seq_len,
          nseq * o_.seq_len, now_s() - t0);
-    const long H = cfg_.hidden;
+    const long H = qwen_ ? qcfg_.hidden : cfg_.hidden;
+    const int vocab = qwen_ ? qcfg_.vocab : cfg_.vocab;
     act_.resize(static_cast<size_t>(ng));
     act_in_.resize(static_cast<size_t>(ng));
     act_nseq_.resize(static_cast<size_t>(ng));
@@ -989,7 +1480,7 @@ void Pipeline::run() {
 #pragma omp parallel for schedule(static) num_threads(32)
       for (long t = 0; t < (s1 - s0) * o_.seq_len; ++t) {
         int id = tok[size_t(s0 * o_.seq_len + t)];
-        QCHECK(id >= 0 && id < cfg_.vocab, "token id out of range");
+        QCHECK(id >= 0 && id < vocab, "token id out of range");
         std::memcpy(a + size_t(t) * H, emb.data() + size_t(id) * H, size_t(H) * 2);
       }
     }
@@ -1017,24 +1508,27 @@ void Pipeline::run() {
   for (auto& t : th) t.join();
   logf("pipeline finished in %.1fs", now_s() - t0);
   bool all = true;
-  for (int L = 0; L < cfg_.layers; ++L) all = all && fs::exists(layer_path(L));
+  for (int L = 0; L < layers_total(); ++L) all = all && fs::exists(layer_path(L));
   if (all) assemble();
-  else logf("not all %d layers present in %s yet: run --mode assemble when complete", cfg_.layers, o_.out.c_str());
+  else logf("not all %d layers present in %s yet: run --mode assemble when complete", layers_total(),
+            o_.out.c_str());
 }
 
 void Pipeline::assemble() {
   // config.json (QTIP hfized llama layout), embeddings/norm/lm_head, index, tokenizer files
-  json c = json::parse(cfg_.raw_json);
+  json c = json::parse(qwen_ ? qcfg_.raw_json : cfg_.raw_json);
   c.erase("quantization_config");
-  c["architectures"] = {"LlamaForCausalLM"};
-  c["model_type"] = "llama";
-  c["torch_dtype"] = "bfloat16";
-  c["attention_bias"] = false;
-  c["mlp_bias"] = false;
-  c["pretraining_tp"] = 1;
-  // Keep the source RoPE configuration: Behemoth (plain RoPE) gets an explicit null like before;
-  // Llama 3.3 keeps its llama3 rope_scaling block verbatim (the runtime needs it).
-  if (!c.contains("rope_scaling") || c["rope_scaling"].is_null()) c["rope_scaling"] = nullptr;
+  if (!qwen_) {  // Qwen3.5 keeps its original qwen3_5 arch/layer_types; the runtime reads the qwen fields itself
+    c["architectures"] = {"LlamaForCausalLM"};
+    c["model_type"] = "llama";
+    c["torch_dtype"] = "bfloat16";
+    c["attention_bias"] = false;
+    c["mlp_bias"] = false;
+    c["pretraining_tp"] = 1;
+    // Keep the source RoPE configuration: Behemoth (plain RoPE) gets an explicit null like before;
+    // Llama 3.3 keeps its llama3 rope_scaling block verbatim (the runtime needs it).
+    if (!c.contains("rope_scaling") || c["rope_scaling"].is_null()) c["rope_scaling"] = nullptr;
+  }
   c["quip_params"] = {{"codebook", "bitshift"}, {"codebook_version", 0}, {"L", kL},      {"K", kK},
                       {"V", kV},                {"tlut_bits", kTlutBits}, {"decode_mode", "quantlut_sym"},
                       {"td_x", kTd},            {"td_y", kTd},           {"split_for_tp", false},
@@ -1062,10 +1556,42 @@ void Pipeline::assemble() {
   std::string ef = o_.out + "/model-embed.safetensors";
   if (!fs::exists(ef)) {
     SafeTensorsWriter w;
-    for (std::string nm : {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}) {
-      const TensorInfo& t = st_.info(nm);
-      std::vector<uint8_t> v = st_.read(nm);
-      w.add(nm, t.dtype, t.shape, v.data(), v.size());
+    if (qwen_) {
+      // explicit candidates first: a plain suffix scan also matches mtp.norm.weight /
+      // model.visual.merger.norm.weight and the last match would win with the WRONG tensor
+      std::string norm_name, embed_name;
+      for (std::string nm : {"model.language_model.norm.weight", "model.norm.weight"})
+        if (st_.has(nm)) norm_name = nm;
+      for (std::string nm : {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"})
+        if (st_.has(nm)) embed_name = nm;
+      if (norm_name.empty() || embed_name.empty()) {
+        for (auto& kv : st_.tensors()) {
+          if (kv.first.find("mtp.") == 0 || kv.first.find("model.visual.") == 0) continue;
+          if (kv.first.size() >= 11 && kv.first.substr(kv.first.size() - 11) == "norm.weight" &&
+              kv.first.find("layers.") == std::string::npos && norm_name.empty())
+            norm_name = kv.first;
+          if (kv.first.size() > 19 && kv.first.substr(kv.first.size() - 19) == "embed_tokens.weight" &&
+              embed_name.empty())
+            embed_name = kv.first;
+        }
+      }
+      QCHECK(!norm_name.empty() && !embed_name.empty(), "cannot find final norm / embeddings");
+      for (std::string nm : {embed_name, norm_name}) {
+        const TensorInfo& t = st_.info(nm);
+        std::vector<uint8_t> v = st_.read(nm);
+        w.add(nm, t.dtype, t.shape, v.data(), v.size());
+      }
+      if (!qcfg_.tied && st_.has("lm_head.weight")) {
+        const TensorInfo& t = st_.info("lm_head.weight");
+        std::vector<uint8_t> v = st_.read("lm_head.weight");
+        w.add("lm_head.weight", t.dtype, t.shape, v.data(), v.size());
+      }
+    } else {
+      for (std::string nm : {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}) {
+        const TensorInfo& t = st_.info(nm);
+        std::vector<uint8_t> v = st_.read(nm);
+        w.add(nm, t.dtype, t.shape, v.data(), v.size());
+      }
     }
     w.write(ef);
   }
@@ -1090,7 +1616,7 @@ void Pipeline::assemble() {
     f << idx.dump(2);
   }
   for (std::string fn : {"tokenizer.model", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "chat_template.jinja",
-                         "generation_config.json"}) {
+                         "generation_config.json", "vocab.json", "merges.txt"}) {
     fs::path src = fs::path(o_.model) / fn;
     if (fs::exists(src)) fs::copy_file(src, fs::path(o_.out) / fn, fs::copy_options::overwrite_existing);
   }

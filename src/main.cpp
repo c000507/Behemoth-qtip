@@ -14,7 +14,7 @@ static void usage() {
   std::printf(
       "usage: qtip_quant --out DIR --work DIR [--tokens FILE] [options]\n"
       "  --mode run|collect|quantize|assemble|adaptive  (default run: collect Hessians + quantize)\n"
-      "  --model DIR          FP8-Dynamic checkpoint (default /mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic)\n"
+      "  --model DIR          FP8-Dynamic / BF16 Llama or BF16 Qwen3.5 checkpoint (default /mnt/evo/Behemoth-R1-123B-v2-FP8-Dynamic)\n"
       "  --tokens FILE        calibration tokens, raw int32 [nseq][seq_len]\n"
       "  --ntok N             calibration tokens to use (default 4194304)\n"
       "  --seq-len N          sequence length of the token file (default 2048)\n"
@@ -31,6 +31,8 @@ static void usage() {
       "  --dump-dir DIR       write W / reconstructed hatW (fp32) per linear for validation\n"
       "  --seed N             sign-vector seed (default 0)\n"
       "  --dump-acts DIR      debug: dump sequence 0 (GPU 0) activations after each chain layer\n"
+      "  --moe-min-tok N      Qwen3.5 MoE: experts with < N routed calibration tokens fall back to the pooled\n"
+      "                       Hessian (default 64)\n"
       "adaptive mode (--mode adaptive; see docs/ADAPTIVE.md):\n"
       "  --kl-threshold X     per-layer metric value above which the layer is written as NVFP4 (default 0.05)\n"
       "  --kl-metric lmkl|mse layer quality metric (default lmkl: mean token KL of the next-token\n"
@@ -78,6 +80,7 @@ static Options parse(int argc, char** argv) {
     else if (a == "--dump-dir") o.q.dump_dir = next();
     else if (a == "--seed") o.seed = std::stoull(next());
     else if (a == "--dump-acts") o.dump_acts = next();
+    else if (a == "--moe-min-tok") o.moe_min_tok = std::stoi(next());
     else if (a == "--kl-threshold") o.kl_threshold = std::stod(next());
     else if (a == "--kl-metric") o.kl_metric = next();
     else if (a == "--kl-tokens") o.kl_tokens = std::stoi(next());
