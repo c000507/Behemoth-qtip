@@ -4,11 +4,13 @@
 // expert gate) run as bf16 host GEMMs. This is the reference for GPU-runtime parity: it measures the
 // QUANTIZED model, so runtime-vs-this isolates runtime bugs from quantization error.
 // usage: qwen_qt_ref <model_dir> [tokens_file] [T] [logits_out.bin] [x] [--ppl]
+// QWEN_QT_DUMP=DIR: write the fp32 residual after every layer (qt_layer<L>.bin) for runtime parity.
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 
@@ -396,6 +398,10 @@ int main(int argc, char** argv) {
                 }
             }
             for (size_t i = 0; i < x.size(); ++i) x[i] = float(BFloat16(x[i] + float(BFloat16(y[i]))));
+            if (const char* dd = std::getenv("QWEN_QT_DUMP")) {  // fp32 residual after layer L (parity debugging)
+                std::ofstream f(std::string(dd) + "/qt_layer" + std::to_string(L) + ".bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(x.data()), std::streamsize(x.size() * 4));
+            }
         }
         // final norm + head
         std::vector<float> xf = x;
