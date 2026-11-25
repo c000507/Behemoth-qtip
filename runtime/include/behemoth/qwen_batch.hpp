@@ -3,6 +3,7 @@
 // per-token x 128-column activation scales, paged KV gated attention, per-slot Gated DeltaNet decode
 // step, device-flag tensor-parallel all-reduce through pinned host memory, top-k candidates.
 #include "gpu.hpp"
+#include "qwen_kernels.hpp"
 #include <cstddef>
 #include <cstdint>
 
@@ -79,10 +80,16 @@ namespace behemoth {
 void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, uint16_t *kc, uint16_t *vc, const int *meta, int bmax,
               int B, const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
               const uint16_t *k_norm, float eps, hipStream_t st);
+void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, const QKvCache &kv, const int *meta, int bmax, int B,
+              const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
+              const uint16_t *k_norm, float eps, hipStream_t st);
 size_t q_attn_b_scratch(int bmax, int nq, int max_context);
 void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
               const int *meta, int bmax, int B, const int *ptab, int maxpages, int nq, int nkv, int max_context,
               float scale, float *scratch, hipStream_t st);
+void q_attn_b(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, const int *meta, int bmax, int B,
+              const int *ptab, int maxpages, int nq, int nkv, int max_context, float scale, float *scratch,
+              hipStream_t st);
 // One DeltaNet step per row; ring [slots][conv_dim][K], S [slots][nv][128][128] (f32).
 void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
                uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
@@ -97,4 +104,6 @@ namespace behemoth {
 // (pt: page table, 64-token pages; null: contiguous), out bf16 [rows][nq*hd]. hd 256.
 void q_flash_prefill(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
                      int rows, int pos0, int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st);
+void q_flash_prefill(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, int rows, int pos0,
+                     int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st);
 }  // namespace behemoth

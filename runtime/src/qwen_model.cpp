@@ -207,8 +207,32 @@ struct QwenStage {
         DeviceBuffer<uint16_t> conv_w, dn_norm;     // linear attention
         DeviceBuffer<float> a_dt;                   // [2nv] = A_log | dt_bias
         DeviceBuffer<float> ring, dstate;           // per-layer delta state (f32)
-        DeviceBuffer<uint16_t> kc, vc;              // KV cache [maxctx][nkv][hd] bf16
+        // KV cache [pool rows][nkv][hd]: bf16, or e4m3 bytes + fp32 scale per (row, kv head) (kv_k8 / kv_v8)
+        DeviceBuffer<uint8_t> kc, vc;
+        DeviceBuffer<float> ksc, vsc;
     };
+    // KV cache element types (QWEN_KV = bf16 | k8v16 | fp8 (K and V e4m3) | k16v8), read once at pool setup
+    bool kv_k8 = false, kv_v8 = false;
+    void read_kv_mode() {
+        const char *e = std::getenv("QWEN_KV");
+        const std::string m = e ? e : "bf16";
+        if (m == "bf16") kv_k8 = kv_v8 = false;
+        else if (m == "fp8" || m == "k8v8") kv_k8 = kv_v8 = true;
+        else if (m == "k8v16" || m == "k8") kv_k8 = true, kv_v8 = false;
+        else if (m == "k16v8") kv_k8 = false, kv_v8 = true;
+        else throw std::runtime_error("QWEN_KV: expected bf16 | k8v16 | fp8 | k16v8, got " + m);
+    }
+    QKvCache kvc(LayerW &w) {
+        QKvCache c;
+        c.k = w.kc.data();
+        c.v = w.vc.data();
+        c.ks = kv_k8 ? w.ksc.data() : nullptr;
+        c.vs = kv_v8 ? w.vsc.data() : nullptr;
+        return c;
+    }
+    // bytes of one pool row (all kv heads) of K / V
+    size_t k_row_bytes() const { return size_t(cfg.nkv) * (kv_k8 ? cfg.hd + 4 : cfg.hd * 2); }
+    size_t v_row_bytes() const { return size_t(cfg.nkv) * (kv_v8 ? cfg.hd + 4 : cfg.hd * 2); }
     QwenRuntimeConfig cfg;
     int device = 0, chunk = 256;
     // pipeline stage: layers [l_begin, l_end); first stage embeds, last stage owns norm + lm_head
@@ -335,7 +359,7 @@ struct QwenStage {
     size_t page_bytes() const {
         size_t b = 0;
         for (int L = l_begin; L < l_end; ++L)
-            if (cfg.is_full(L)) b += size_t(PAGE) * cfg.nkv * cfg.hd * 2 * 2;
+            if (cfg.is_full(L)) b += size_t(PAGE) * (k_row_bytes() + v_row_bytes());
         return b;
     }
     void alloc_pools(int slots, int pages, int mp) {
@@ -345,10 +369,15 @@ struct QwenStage {
         for (int L = l_begin; L < l_end; ++L) {
             LayerW &w = layers[size_t(L)];
             if (w.full) {
-                w.kc.resize(size_t(pages) * PAGE * cfg.nkv * cfg.hd);
-                w.vc.resize(size_t(pages) * PAGE * cfg.nkv * cfg.hd);
+                const size_t rows = size_t(pages) * PAGE, n = rows * cfg.nkv * cfg.hd;
+                w.kc.resize(n * (kv_k8 ? 1 : 2));
+                w.vc.resize(n * (kv_v8 ? 1 : 2));
                 HIP_CHECK(hipMemset(w.kc.data(), 0, w.kc.bytes()));
                 HIP_CHECK(hipMemset(w.vc.data(), 0, w.vc.bytes()));
+                w.ksc.resize(kv_k8 ? rows * cfg.nkv : 0);
+                w.vsc.resize(kv_v8 ? rows * cfg.nkv : 0);
+                if (kv_k8) HIP_CHECK(hipMemset(w.ksc.data(), 0, w.ksc.bytes()));
+                if (kv_v8) HIP_CHECK(hipMemset(w.vsc.data(), 0, w.vsc.bytes()));
             } else {
                 w.ring.resize(size_t(slots) * cfg.conv_dim() * cfg.conv_k);
                 w.dstate.resize(size_t(slots) * cfg.lin_nv * cfg.lin_kd * cfg.lin_vd);
@@ -369,15 +398,22 @@ struct QwenStage {
     }
     void copy_slot(int src, int dst, const std::vector<int> &sp, const std::vector<int> &dp) {
         const size_t rn = size_t(cfg.conv_dim()) * cfg.conv_k, sn = size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd;
-        const size_t pe = size_t(PAGE) * cfg.nkv * cfg.hd;
+        const size_t pe = size_t(PAGE) * cfg.nkv * cfg.hd;  // elements per page
+        const size_t pk = pe * (kv_k8 ? 1 : 2), pv = pe * (kv_v8 ? 1 : 2), ps = size_t(PAGE) * cfg.nkv;
         for (int L = l_begin; L < l_end; ++L) {
             LayerW &w = layers[size_t(L)];
             if (w.full) {
                 for (size_t i = 0; i < dp.size(); ++i) {
-                    HIP_CHECK(hipMemcpyAsync(w.kc.data() + dp[i] * pe, w.kc.data() + sp[i] * pe, pe * 2,
+                    HIP_CHECK(hipMemcpyAsync(w.kc.data() + dp[i] * pk, w.kc.data() + sp[i] * pk, pk,
                                              hipMemcpyDeviceToDevice, stream));
-                    HIP_CHECK(hipMemcpyAsync(w.vc.data() + dp[i] * pe, w.vc.data() + sp[i] * pe, pe * 2,
+                    HIP_CHECK(hipMemcpyAsync(w.vc.data() + dp[i] * pv, w.vc.data() + sp[i] * pv, pv,
                                              hipMemcpyDeviceToDevice, stream));
+                    if (kv_k8)
+                        HIP_CHECK(hipMemcpyAsync(w.ksc.data() + dp[i] * ps, w.ksc.data() + sp[i] * ps, ps * 4,
+                                                 hipMemcpyDeviceToDevice, stream));
+                    if (kv_v8)
+                        HIP_CHECK(hipMemcpyAsync(w.vsc.data() + dp[i] * ps, w.vsc.data() + sp[i] * ps, ps * 4,
+                                                 hipMemcpyDeviceToDevice, stream));
                 }
             } else {
                 HIP_CHECK(hipMemcpyAsync(w.ring.data() + dst * rn, w.ring.data() + src * rn, rn * 4,
@@ -980,22 +1016,21 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
             for (const Seg &sg : sv) {
                 const int *spt = ptab_d.data() + size_t(sg.slot) * maxpages;
                 q_qk_norm_rope(q.data() + size_t(sg.row0) * Wq, k.data() + size_t(sg.row0) * Wk,
-                               v.data() + size_t(sg.row0) * Wk, gate.data() + size_t(sg.row0) * A, w.kc.data(),
-                               w.vc.data(), sg.n, sg.pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
+                               v.data() + size_t(sg.row0) * Wk, gate.data() + size_t(sg.row0) * A, kvc(w), sg.n, sg.pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
                                w.k_norm.data(), c.eps, stream, spt);
                 static const bool split_attn = std::getenv("QWEN_ATTN_SPLIT") != nullptr;
                 if (c.hd == 256 && sg.n >= 16 && !split_attn)  // bf16 WMMA flash attention
-                    q_flash_prefill(q.data() + size_t(sg.row0) * Wq, w.kc.data(), w.vc.data(),
+                    q_flash_prefill(q.data() + size_t(sg.row0) * Wq, kvc(w),
                                     gate.data() + size_t(sg.row0) * A, attn_out.data() + size_t(sg.row0) * A, sg.n,
                                     sg.pos0, c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), spt, stream);
                 else if (c.hd == 256)
-                    q_attn_split(q.data() + size_t(sg.row0) * Wq, w.kc.data(), w.vc.data(),
+                    q_attn_split(q.data() + size_t(sg.row0) * Wq, kvc(w),
                                  gate.data() + size_t(sg.row0) * A, attn_out.data() + size_t(sg.row0) * A, sg.n,
                                  sg.pos0, c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
                                  attn_part.size(), stream, spt);
             }
             if (c.hd != 256)  // contiguous-cache fallback: single sequence only (identity page table)
-                q_attn(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0, c.nq,
+                q_attn(q.data(), kvc(w), gate.data(), attn_out.data(), rows, pos0, c.nq,
                        c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), stream);
             if (!w.lo.bf16) {
                 q_input_transform(attn_out.data(), rows, A, nullptr, 0, w.lo.su.data(), A, u.data(), A,
@@ -1245,9 +1280,9 @@ void QwenStage::decode_enqueue(int B) {
         if (w.full) {
             const int Wf = c.nq * 2 * c.hd + 2 * c.nkv * c.hd;
             run_linear_q(w.f_qkv, B, z.data());
-            q_rope_b(z.data(), Wf, bq.data(), bG.data(), w.kc.data(), w.vc.data(), meta_d.data(), bmax, B, ptab_d.data(),
+            q_rope_b(z.data(), Wf, bq.data(), bG.data(), kvc(w), meta_d.data(), bmax, B, ptab_d.data(),
                      maxpages, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(), w.k_norm.data(), c.eps, stream);
-            q_attn_b(bq.data(), w.kc.data(), w.vc.data(), bG.data(), battn.data(), meta_d.data(), bmax, B, ptab_d.data(),
+            q_attn_b(bq.data(), kvc(w), bG.data(), battn.data(), meta_d.data(), bmax, B, ptab_d.data(),
                      maxpages, c.nq, c.nkv, c.max_context, 1.0f / std::sqrt(float(c.hd)), battn_scr.data(), stream);
             run_linear(w.lo, battn.data(), A, B, zr);
         } else {
@@ -1371,6 +1406,7 @@ struct QwenModel::Impl {
     }
     void setup_pools(int seqs, long kv_tokens, double reserve_gb) {
         max_seqs = seqs;
+        for (auto &s : st) s->read_kv_mode();
         const int mp = (cfg.max_context + QwenStage::PAGE - 1) / QwenStage::PAGE;
         int pages = mp;
         n_slots = 1;

@@ -9,12 +9,14 @@
 //                       "decode_s":s}
 // usage  : qwen_worker --model DIR [--gpus 0,1] [--tp] [--chunk N] [--max-context N] [--max-seqs N]
 //          [--kv-tokens N] [--prefill-tokens N (prompt tokens per decode step, default chunk)]
+//          [--kv bf16|k8v16|fp8 (KV cache element type; sets QWEN_KV)]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <map>
@@ -110,6 +112,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--max-seqs")) max_seqs = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--kv-tokens")) kv_tokens = std::atol(next().c_str());
         else if (!std::strcmp(argv[i], "--prefill-tokens")) prefill_tokens = std::atol(next().c_str());
+        else if (!std::strcmp(argv[i], "--kv")) setenv("QWEN_KV", next().c_str(), 1);
         else {
             std::fprintf(stderr, "unknown arg %s\n", argv[i]);
             return 1;
@@ -133,9 +136,10 @@ int main(int argc, char **argv) {
         const int K = m.topk(), PT = m.page_tokens();
         const long pages = m.kv_pages_total();
         std::fprintf(stderr,
-                     "qwen_worker: loaded in %.1f s on %zu gpu(s); %d slots, KV pool %ld tokens, max_context %d, "
+                     "qwen_worker: loaded in %.1f s on %zu gpu(s); %d slots, KV pool %ld tokens (%s), max_context %d, "
                      "chunk %d\n",
-                     now_s() - t0, devs.size(), max_seqs, pages * PT, max_context, chunk);
+                     now_s() - t0, devs.size(), max_seqs, pages * PT, std::getenv("QWEN_KV") ? std::getenv("QWEN_KV") : "bf16",
+                     max_context, chunk);
         emit(json{{"ready", true}, {"max_context", max_context}, {"max_seqs", max_seqs}, {"kv_tokens", pages * PT}});
         flush_out();
 

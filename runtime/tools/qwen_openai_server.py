@@ -28,7 +28,7 @@ class Worker:
 
     def __init__(self, args):
         cmd = [args.worker, "--model", args.model, "--gpus", args.gpus, "--max-context", str(args.max_context),
-               "--chunk", str(args.chunk), "--max-seqs", str(args.max_seqs)] + (["--tp"] if args.tp else [])
+               "--chunk", str(args.chunk), "--max-seqs", str(args.max_seqs), "--kv", args.kv] + (["--tp"] if args.tp else [])
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         ready = json.loads(self.p.stdout.readline())
         assert ready.get("ready"), ready
@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--max-context", type=int, default=32768)
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--max-seqs", type=int, default=32, help="concurrent sequences (continuous batching, <= 64)")
+    ap.add_argument("--kv", default="bf16", choices=["bf16", "k8v16", "fp8"], help="KV cache element type")
     ap.add_argument("--tp", action="store_true", help="tensor parallel over the 2 GPUs (default: layer pipeline)")
     ap.add_argument("--name", default="qwen3.8-27b-fp8")
     args = ap.parse_args()

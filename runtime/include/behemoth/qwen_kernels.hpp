@@ -7,6 +7,16 @@
 
 namespace behemoth {
 
+// Paged KV cache of one full-attention layer: pool rows [n_pages * 64][nkv][hd]. A tensor whose scale
+// pointer is null is bf16; otherwise it is OCP e4m3 bytes with one fp32 scale per (pool row, kv head)
+// (value = e4m3 * scale, scale = amax(row of the head) / 448, written by the K/V append kernels).
+struct QKvCache {
+    void *k = nullptr, *v = nullptr;
+    float *ks = nullptr, *vs = nullptr;
+    bool k8() const { return ks != nullptr; }
+    bool v8() const { return vs != nullptr; }
+};
+
 // In-place row Hadamard on X (rows x n, row stride ld): hadU (transpose = false) / hadUt.
 // Supports n = K * P with P a power of two <= 1024 and K in {1, 12, 20, 28}.
 void q_hadamard_rows(float *X, long rows, int n, long ld, bool transpose, hipStream_t s);
@@ -39,9 +49,14 @@ void q_qk_norm_rope(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G, uint16_t
                     int rows, int pos0, int nq, int nkv, int hd, int rot, float theta,
                     const uint16_t *q_norm, const uint16_t *k_norm, float eps, hipStream_t s,
                     const int *pt = nullptr);  // pt: page table of the sequence (64-token pages)
+void q_qk_norm_rope(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G, const QKvCache &kv, int rows, int pos0,
+                    int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm, const uint16_t *k_norm,
+                    float eps, hipStream_t s, const int *pt = nullptr);
 // out[r][h*hd+d] = softmax(q·K/sqrt(hd)) · V, gated by sigmoid(G); one block per (row, head).
 void q_attn(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
             uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, hipStream_t s);
+void q_attn(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, int rows, int pos0, int nq,
+            int nkv, int hd, float scale, hipStream_t s);
 // One Gated DeltaNet step at row t of a T-row chunk (single sequence): qkvz rows [T][conv_dim+value_dim+2nv].
 // pos0 = absolute position of row 0: the conv ring is indexed by the absolute position (pos0 + t) so
 // the causal conv window carries across chunks / decode steps.
@@ -90,6 +105,9 @@ size_t q_attn_split_scratch(int rows, int nq, int nkv, int hd, int max_len);
 void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
                   uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, float *scratch,
                   size_t scratch_floats, hipStream_t s, const int *pt = nullptr);
+void q_attn_split(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, int rows, int pos0, int nq,
+                  int nkv, int hd, float scale, float *scratch, size_t scratch_floats, hipStream_t s,
+                  const int *pt = nullptr);
 
 // Whole-chunk Gated DeltaNet (same math as T calls of q_delta_step): causal conv of all T rows
 // (conv_scratch f32 [T][conv_dim]), ring update, then one kernel per v-head over the T tokens with

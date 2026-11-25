@@ -7,6 +7,7 @@
 
 #include "behemoth/gpu.hpp"
 #include "behemoth/qwen_batch.hpp"
+#include "qwen_kv_dev.hpp"
 
 namespace behemoth {
 namespace {
@@ -805,9 +806,9 @@ __device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
 __device__ __forceinline__ long kvrow_b(const int *pt, int t) { return long(pt[t >> 6]) * 64 + (t & 63); }
 
 // grid (nq + nkv, B), block hd (256)
+template <bool K8, bool V8>
 __global__ __launch_bounds__(256) void rope_b_kernel(const float *__restrict__ z, int Wf, uint16_t *__restrict__ qout,
-                                                     uint16_t *__restrict__ G, uint16_t *__restrict__ kc,
-                                                     uint16_t *__restrict__ vc, const int *__restrict__ meta, int bmax,
+                                                     uint16_t *__restrict__ G, QKvCache kv, const int *__restrict__ meta, int bmax,
                                                      const int *__restrict__ ptab, int maxpages, int nq, int nkv, int rot,
                                                      float theta, const uint16_t *__restrict__ q_norm,
                                                      const uint16_t *__restrict__ k_norm, float eps) {
@@ -825,9 +826,10 @@ __global__ __launch_bounds__(256) void rope_b_kernel(const float *__restrict__ z
         const int kh = h - nq;
         raw = rbf(zr[nq * 2 * hd + kh * hd + d]);
         kvr = kvrow_b(ptab + long(slot) * maxpages, pos);
-        vc[(kvr * nkv + kh) * hd + d] = f2bf(zr[nq * 2 * hd + nkv * hd + kh * hd + d]);
     }
-    __shared__ float red[8], sh[hd];
+    __shared__ float red[32], sh[hd];
+    if (!is_q)  // uniform over the block
+        kvd::st_row<V8>(kv.v, kv.vs, kvr * nkv + (h - nq), hd, d, rbf(zr[nq * 2 * hd + nkv * hd + (h - nq) * hd + d]), red);
     const float ss = bsum256(raw * raw, red);
     const float inv = rsqrtf(ss / hd + eps);
     const uint16_t *w = is_q ? q_norm : k_norm;
@@ -848,15 +850,14 @@ __global__ __launch_bounds__(256) void rope_b_kernel(const float *__restrict__ z
         o = sv;
     }
     if (is_q) qout[long(b) * nq * hd + h * hd + d] = f2bf(o);
-    else kc[(kvr * nkv + (h - nq)) * hd + d] = f2bf(o);
+    else kvd::st_row<K8>(kv.k, kv.ks, kvr * nkv + (h - nq), hd, d, rbf(o), red);
 }
 
 // grid (maxsplit, nkv, B), block 256 (8 waves): split of 512 positions; in-block ordered merge of
 // the 8 wave partials; one (m, l, acc[256]) partial per (b, q head, split).
 constexpr int ASPLIT = 512;
-template <int GQ>
-__global__ __launch_bounds__(256) void attn_b_kernel(const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc,
-                                                     const uint16_t *__restrict__ vc, const int *__restrict__ meta,
+template <int GQ, bool K8, bool V8>
+__global__ __launch_bounds__(256) void attn_b_kernel(const uint16_t *__restrict__ q, QKvCache kv, const int *__restrict__ meta,
                                                      int bmax, const int *__restrict__ ptab, int maxpages, int nq,
                                                      int nkv, int maxsplit, float scale, float *__restrict__ pml,
                                                      float *__restrict__ pacc) {
@@ -890,19 +891,22 @@ __global__ __launch_bounds__(256) void attn_b_kernel(const uint16_t *__restrict_
         float dot[GQ];
 #pragma unroll
         for (int g = 0; g < GQ; ++g) dot[g] = 0.f;
+        const long krow = kvrow_b(pt, base) + lane;  // base is 32-aligned: the 32 positions share one page
         if (ok) {
-            const uint4 *kp = reinterpret_cast<const uint4 *>(kc + kvrow_b(pt, t) * kstride + long(kh) * HD);
+            const long koff = krow * kstride + long(kh) * HD;
 #pragma unroll 4
             for (int c = 0; c < HD / 8; ++c) {
-                const uint4 kv = kp[c];
-                const uint32_t w4[4] = {kv.x, kv.y, kv.z, kv.w};
+                float kf[8];
+                kvd::ld8<K8>(kv.k, koff + c * 8, kf);
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const float k0 = bf2f(uint16_t(w4[e])), k1 = bf2f(uint16_t(w4[e] >> 16));
+                for (int e = 0; e < 8; ++e)
 #pragma unroll
-                    for (int g = 0; g < GQ; ++g)
-                        dot[g] = fmaf(qs[g][c * 8 + 2 * e + 1], k1, fmaf(qs[g][c * 8 + 2 * e], k0, dot[g]));
-                }
+                    for (int g = 0; g < GQ; ++g) dot[g] = fmaf(qs[g][c * 8 + e], kf[e], dot[g]);
+            }
+            if constexpr (K8) {
+                const float ksc = kv.ks[krow * nkv + kh];
+#pragma unroll
+                for (int g = 0; g < GQ; ++g) dot[g] *= ksc;
             }
         }
         float p[GQ];
@@ -919,16 +923,15 @@ __global__ __launch_bounds__(256) void attn_b_kernel(const uint16_t *__restrict_
             for (int i = 0; i < DPL; ++i) acc[g][i] *= corr;
         }
         const int nj = min(32, t_end - base);
-        const long vrow0 = kvrow_b(pt, base);  // base is 32-aligned: the 32 positions share one page
-        for (int j = 0; j < nj; ++j) {
-            const uint4 vv = *reinterpret_cast<const uint4 *>(vc + (vrow0 + j) * kstride + long(kh) * HD + lane * DPL);
-            const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
-            float v[DPL];
+        const long vrow0 = krow - lane;
+        if constexpr (V8) {  // fold the per-position V scale into the probabilities (l keeps the raw p)
+            const float vsc = ok ? kv.vs[krow * nkv + kh] : 0.f;
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                v[2 * e] = bf2f(uint16_t(w4[e]));
-                v[2 * e + 1] = bf2f(uint16_t(w4[e] >> 16));
-            }
+            for (int g = 0; g < GQ; ++g) p[g] *= vsc;
+        }
+        for (int j = 0; j < nj; ++j) {
+            float v[DPL];
+            kvd::ld8<V8>(kv.v, (vrow0 + j) * kstride + long(kh) * HD + lane * DPL, v);
 #pragma unroll
             for (int g = 0; g < GQ; ++g) {
                 const float pg = __shfl(p[g], j, 32);
@@ -1157,35 +1160,66 @@ __global__ __launch_bounds__(1024) void topk_kernel(const float *__restrict__ lo
 }
 }  // namespace
 
+void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, const QKvCache &kv, const int *meta, int bmax, int B,
+              const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
+              const uint16_t *k_norm, float eps, hipStream_t st) {
+    if (hd != 256) throw std::runtime_error("q_rope_b: head dim 256 only");
+    const dim3 grid{unsigned(nq + nkv), unsigned(B)};
+#define ROPE_B(K8, V8) \
+    rope_b_kernel<K8, V8><<<grid, 256, 0, st>>>(z, Wf, qout, G, kv, meta, bmax, ptab, maxpages, nq, nkv, rot, theta, q_norm, k_norm, eps)
+    if (kv.k8() && kv.v8()) ROPE_B(true, true);
+    else if (kv.k8()) ROPE_B(true, false);
+    else if (kv.v8()) ROPE_B(false, true);
+    else ROPE_B(false, false);
+#undef ROPE_B
+    HIP_CHECK(hipGetLastError());
+}
 void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, uint16_t *kc, uint16_t *vc, const int *meta, int bmax,
               int B, const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
               const uint16_t *k_norm, float eps, hipStream_t st) {
-    if (hd != 256) throw std::runtime_error("q_rope_b: head dim 256 only");
-    rope_b_kernel<<<dim3(unsigned(nq + nkv), unsigned(B)), 256, 0, st>>>(z, Wf, qout, G, kc, vc, meta, bmax, ptab,
-                                                                         maxpages, nq, nkv, rot, theta, q_norm, k_norm,
-                                                                         eps);
-    HIP_CHECK(hipGetLastError());
+    QKvCache kv;
+    kv.k = kc;
+    kv.v = vc;
+    q_rope_b(z, Wf, qout, G, kv, meta, bmax, B, ptab, maxpages, nq, nkv, hd, rot, theta, q_norm, k_norm, eps, st);
 }
 size_t q_attn_b_scratch(int bmax, int nq, int max_context) {
     const int maxsplit = (max_context + ASPLIT - 1) / ASPLIT;
     return size_t(bmax) * nq * maxsplit * (256 + 2);
 }
-void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
-              const int *meta, int bmax, int B, const int *ptab, int maxpages, int nq, int nkv, int max_context,
-              float scale, float *scratch, hipStream_t st) {
+template <bool K8, bool V8>
+static void attn_b_launch(int g, dim3 grid, hipStream_t st, const uint16_t *q, const QKvCache &kv, const int *meta,
+                          int bmax, const int *ptab, int maxpages, int nq, int nkv, int maxsplit, float scale, float *pml,
+                          float *pacc) {
+    switch (g) {
+    case 1: attn_b_kernel<1, K8, V8><<<grid, 256, 0, st>>>(q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 2: attn_b_kernel<2, K8, V8><<<grid, 256, 0, st>>>(q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 4: attn_b_kernel<4, K8, V8><<<grid, 256, 0, st>>>(q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 6: attn_b_kernel<6, K8, V8><<<grid, 256, 0, st>>>(q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    default: throw std::runtime_error("q_attn_b: unsupported GQA group");
+    }
+}
+void q_attn_b(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, const int *meta, int bmax, int B,
+              const int *ptab, int maxpages, int nq, int nkv, int max_context, float scale, float *scratch,
+              hipStream_t st) {
     const int maxsplit = (max_context + ASPLIT - 1) / ASPLIT;
     float *pml = scratch, *pacc = scratch + size_t(bmax) * nq * maxsplit * 2;
     const dim3 grid{unsigned(maxsplit), unsigned(nkv), unsigned(B)};
-    switch (nq / nkv) {
-    case 1: attn_b_kernel<1><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
-    case 2: attn_b_kernel<2><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
-    case 4: attn_b_kernel<4><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
-    case 6: attn_b_kernel<6><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
-    default: throw std::runtime_error("q_attn_b: unsupported GQA group");
-    }
+    const int g = nq / nkv;
+    if (kv.k8() && kv.v8()) attn_b_launch<true, true>(g, grid, st, q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc);
+    else if (kv.k8()) attn_b_launch<true, false>(g, grid, st, q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc);
+    else if (kv.v8()) attn_b_launch<false, true>(g, grid, st, q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc);
+    else attn_b_launch<false, false>(g, grid, st, q, kv, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc);
     HIP_CHECK(hipGetLastError());
     attn_b_combine_kernel<<<dim3(unsigned(nq), unsigned(B)), 256, 0, st>>>(pml, pacc, maxsplit, meta, bmax, G, out, nq);
     HIP_CHECK(hipGetLastError());
+}
+void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+              const int *meta, int bmax, int B, const int *ptab, int maxpages, int nq, int nkv, int max_context,
+              float scale, float *scratch, hipStream_t st) {
+    QKvCache kv;
+    kv.k = const_cast<uint16_t *>(kc);
+    kv.v = const_cast<uint16_t *>(vc);
+    q_attn_b(q, kv, G, out, meta, bmax, B, ptab, maxpages, nq, nkv, max_context, scale, scratch, st);
 }
 void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
                uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
@@ -1213,13 +1247,12 @@ typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
 __device__ __forceinline__ v8f wmma_bf(uint4 a, uint4 b, v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b), c);
 }
+__device__ __forceinline__ uint32_t pack_bf2(float a, float b) { return uint32_t(f2bf(a)) | (uint32_t(f2bf(b)) << 16); }
 constexpr int FK = 32;           // keys per LDS tile
 constexpr int FKP = 256 + 8;     // K tile row stride (bf16)
 constexpr int FVP = FK + 8;      // V^T tile row stride (bf16)
-template <int GQ>
-__global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *__restrict__ q,
-                                                                const uint16_t *__restrict__ kc,
-                                                                const uint16_t *__restrict__ vc,
+template <int GQ, bool K8, bool V8>
+__global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *__restrict__ q, QKvCache kv,
                                                                 const uint16_t *__restrict__ G,
                                                                 uint16_t *__restrict__ out, int rows, int pos0, int nq,
                                                                 int nkv, float scale, const int *__restrict__ pt) {
@@ -1255,13 +1288,30 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
         for (int i = threadIdx.x; i < FK * (HD / 8); i += NT) {
             const int key = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
             const int t = kt0 + key;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
-            if (t <= last) {
-                const long row = (pt ? long(pt[t >> 6]) * 64 + (t & 63) : long(t)) * kst + long(kh) * HD + d8;
-                kv = *reinterpret_cast<const uint4 *>(kc + row);
-                vv = *reinterpret_cast<const uint4 *>(vc + row);
+            uint4 kq = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (t <= last) {  // e4m3 caches: dequantised (x scale) into the bf16 tiles
+                const long prow = pt ? long(pt[t >> 6]) * 64 + (t & 63) : long(t);
+                const long row = prow * kst + long(kh) * HD + d8;
+                if constexpr (K8) {
+                    float f[8];
+                    kvd::ld8<true>(kv.k, row, f);
+                    const float sc = kv.ks[prow * nkv + kh];
+                    kq = make_uint4(pack_bf2(f[0] * sc, f[1] * sc), pack_bf2(f[2] * sc, f[3] * sc),
+                                    pack_bf2(f[4] * sc, f[5] * sc), pack_bf2(f[6] * sc, f[7] * sc));
+                } else {
+                    kq = *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(kv.k) + row);
+                }
+                if constexpr (V8) {
+                    float f[8];
+                    kvd::ld8<true>(kv.v, row, f);
+                    const float sc = kv.vs[prow * nkv + kh];
+                    vv = make_uint4(pack_bf2(f[0] * sc, f[1] * sc), pack_bf2(f[2] * sc, f[3] * sc),
+                                    pack_bf2(f[4] * sc, f[5] * sc), pack_bf2(f[6] * sc, f[7] * sc));
+                } else {
+                    vv = *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(kv.v) + row);
+                }
             }
-            *reinterpret_cast<uint4 *>(&ks[key][d8]) = kv;
+            *reinterpret_cast<uint4 *>(&ks[key][d8]) = kq;
             const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -1332,18 +1382,34 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
 }
 }  // namespace
 
-void q_flash_prefill(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
-                     int rows, int pos0, int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st) {
-    if (hd != 256) throw std::runtime_error("q_flash_prefill: head dim 256 only");
-    const dim3 grid{unsigned((rows + 15) / 16), unsigned(nkv), 1u};
-    switch (nq / nkv) {
-    case 1: flash_prefill_kernel<1><<<grid, 32, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
-    case 2: flash_prefill_kernel<2><<<grid, 64, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
-    case 4: flash_prefill_kernel<4><<<grid, 128, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
-    case 6: flash_prefill_kernel<6><<<grid, 192, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
-    case 8: flash_prefill_kernel<8><<<grid, 256, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+template <bool K8, bool V8>
+static void flash_launch(int g, dim3 grid, hipStream_t st, const uint16_t *q, const QKvCache &kv, const uint16_t *G,
+                         uint16_t *out, int rows, int pos0, int nq, int nkv, float scale, const int *pt) {
+    switch (g) {
+    case 1: flash_prefill_kernel<1, K8, V8><<<grid, 32, 0, st>>>(q, kv, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 2: flash_prefill_kernel<2, K8, V8><<<grid, 64, 0, st>>>(q, kv, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 4: flash_prefill_kernel<4, K8, V8><<<grid, 128, 0, st>>>(q, kv, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 6: flash_prefill_kernel<6, K8, V8><<<grid, 192, 0, st>>>(q, kv, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 8: flash_prefill_kernel<8, K8, V8><<<grid, 256, 0, st>>>(q, kv, G, out, rows, pos0, nq, nkv, scale, pt); break;
     default: throw std::runtime_error("q_flash_prefill: unsupported GQA group");
     }
+}
+void q_flash_prefill(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, int rows, int pos0,
+                     int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st) {
+    if (hd != 256) throw std::runtime_error("q_flash_prefill: head dim 256 only");
+    const dim3 grid{unsigned((rows + 15) / 16), unsigned(nkv), 1u};
+    const int g = nq / nkv;
+    if (kv.k8() && kv.v8()) flash_launch<true, true>(g, grid, st, q, kv, G, out, rows, pos0, nq, nkv, scale, pt);
+    else if (kv.k8()) flash_launch<true, false>(g, grid, st, q, kv, G, out, rows, pos0, nq, nkv, scale, pt);
+    else if (kv.v8()) flash_launch<false, true>(g, grid, st, q, kv, G, out, rows, pos0, nq, nkv, scale, pt);
+    else flash_launch<false, false>(g, grid, st, q, kv, G, out, rows, pos0, nq, nkv, scale, pt);
     HIP_CHECK(hipGetLastError());
+}
+void q_flash_prefill(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+                     int rows, int pos0, int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st) {
+    QKvCache kv;
+    kv.k = const_cast<uint16_t *>(kc);
+    kv.v = const_cast<uint16_t *>(vc);
+    q_flash_prefill(q, kv, G, out, rows, pos0, nq, nkv, hd, scale, pt, st);
 }
 }  // namespace behemoth

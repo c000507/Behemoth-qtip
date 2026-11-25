@@ -1,6 +1,6 @@
 // Qwen3.5 eval: greedy generation + perplexity from a token file (int32 raw).
 // usage: qwen_eval --model DIR [--tokens FILE] [--prompt FILE] [--greedy N] [--ppl FILE]
-//          [--chunk N] [--device N] [--max-context N] [--window W [--stride S]]
+//          [--chunk N] [--device N] [--max-context N] [--window W [--stride S]] [--kv bf16|k8v16|fp8]
 // --window: score W-token windows (state reset per window) every S tokens (default S = W - 64), the
 // same windows as qwen35_ref / qwen_qt_ref --ppl (512 / 448), so the numbers are directly comparable.
 #include <algorithm>
@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
     int serve_seqs = 0, bench_ctx = 1024, bench_steps = 32, btest_n = 0, btest_gen = 32;
     std::vector<int> bench_batch;
     std::string btest_file;
+    int decode_ppl = 0;  // --window scoring through decode steps after a decode_ppl-token prefill
     int greedy = 0, chunk = 256, device = 0, max_context = 8192, window = 0, stride = 0;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
@@ -68,6 +69,8 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--batch-test-gen")) btest_gen = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--window")) window = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--stride")) stride = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--kv")) setenv("QWEN_KV", next().c_str(), 1);
+        else if (!std::strcmp(argv[i], "--decode-ppl")) decode_ppl = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
     if (model.empty()) {
@@ -101,6 +104,11 @@ int main(int argc, char **argv) {
             const int K = m.topk();
             for (int B : bench_batch) {  // aggregate decode throughput: one prefilled context forked to B slots
                 if (B > m.max_seqs()) continue;
+                const long need = long(B) * ((bench_ctx + bench_steps + 2 + 63) / 64);
+                if (need > m.kv_pages_free()) {
+                    std::printf("batch %2d ctx %d: skipped (needs %ld KV pages, %ld free)\n", B, bench_ctx, need, m.kv_pages_free());
+                    continue;
+                }
                 std::vector<int> ctx(static_cast<size_t>(bench_ctx));
                 for (int i = 0; i < bench_ctx; ++i) ctx[size_t(i)] = 1000 + (i * 7919) % 100000;
                 std::vector<behemoth::QwenCand> cand(size_t(B) * K);
@@ -124,19 +132,25 @@ int main(int argc, char **argv) {
                 std::fflush(stdout);
                 for (int b = 0; b < B; ++b) m.seq_free(b);
             }
-            if (greedy > 0 && !prompt_file.empty()) {  // greedy through the serving path (B = 1)
-                auto toks = load_tokens(prompt_file);
+            // greedy through the serving path (B = 1); --prompt a,b,c: one line per file
+            for (size_t p0 = 0; greedy > 0 && p0 < prompt_file.size();) {
+                size_t p1 = prompt_file.find(',', p0);
+                if (p1 == std::string::npos) p1 = prompt_file.size();
+                const std::string pf = prompt_file.substr(p0, p1 - p0);
+                p0 = p1 + 1;
+                auto toks = load_tokens(pf);
                 std::vector<behemoth::QwenCand> cand(static_cast<size_t>(K));
                 m.seq_start(0);
                 m.seq_prefill(0, toks.data(), toks.size(), cand.data());
                 int slot = 0;
-                std::printf("serve greedy %d:", greedy);
+                std::printf("serve greedy %d %s:", greedy, pf.c_str());
                 for (int g = 0; g < greedy; ++g) {
                     int t = cand[0].id;
                     std::printf(" %d", t);
                     if (g + 1 < greedy) m.decode_batch(&slot, &t, 1, cand.data());
                 }
                 std::printf("\n");
+                std::fflush(stdout);
                 m.seq_free(0);
             }
             if (btest_n > 0) {  // batch invariance: greedy alone vs together
@@ -236,7 +250,27 @@ int main(int argc, char **argv) {
         if (!ppl_file.empty()) {
             auto toks = load_tokens(ppl_file);
             double t0 = behemoth_now();
-            if (window > 1) {
+            if (window > 1 && decode_ppl > 0) {  // teacher-forced decode steps (decode attention path)
+                const size_t W = size_t(window), S = size_t(stride > 0 ? stride : std::max(1, window - 64));
+                const size_t P = size_t(decode_ppl);
+                std::vector<float> lg(size_t(c.vocab));
+                double nll = 0;
+                long cnt = 0;
+                for (size_t i = 0; i + W + 1 < toks.size(); i += S) {
+                    m.reset();
+                    m.prefill(toks.data() + i, P, lg.data());
+                    for (size_t t = P; t < W; ++t) {
+                        double mx = -1e30, se = 0;
+                        for (float v : lg) mx = std::max(mx, double(v));
+                        for (float v : lg) se += std::exp(double(v) - mx);
+                        nll += mx + std::log(se) - double(lg[size_t(toks[i + t])]);
+                        ++cnt;
+                        if (t + 1 < W) m.decode(toks[i + t], lg.data());
+                    }
+                }
+                std::printf("decode ppl over %ld predictions (%zu-token windows, %zu-token prefill, stride %zu): %.4f (%.1f tok/s)\n",
+                            cnt, W, P, S, std::exp(nll / double(cnt)), double(cnt) / (behemoth_now() - t0));
+            } else if (window > 1) {
                 const size_t W = size_t(window), S = size_t(stride > 0 ? stride : std::max(1, window - 64));
                 double nll = 0;
                 long cnt = 0;
