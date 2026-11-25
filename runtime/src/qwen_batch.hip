@@ -528,7 +528,8 @@ void q_ar_add_local(uint16_t *state, const float *own, const void *peer_dev, boo
 void q_ar_push(float *part, long n, void *hbase, long slot_bytes, bool bf16, unsigned *hflag, const unsigned *seq,
                unsigned *ctr, int nslot, hipStream_t st) {
     const long n4 = n / 4;
-    const unsigned blocks = unsigned(std::min<long>(256, (n4 + 255) / 256));
+    // 64 blocks: grid-stride (256 blocks hit a ~20 us floor on zero-copy writes on this box)
+    const unsigned blocks = unsigned(std::min<long>(64, (n4 + 255) / 256));
     ar_push_kernel<<<blocks, 256, 0, st>>>(part, n4, static_cast<char *>(hbase), slot_bytes, bf16 ? 1 : 0, hflag, seq,
                                            ctr, nslot);
     HIP_CHECK(hipGetLastError());
@@ -537,8 +538,10 @@ void q_ar_pull_add(uint16_t *state, const float *own, const void *peer_hbase, lo
                    int rank, const unsigned *peer_flag, unsigned *seq, unsigned *ctr, int nslot, hipStream_t st) {
     const long n4 = n / 4;
     const unsigned blocks = unsigned(std::min<long>(1024, (n4 + 255) / 256));
+    static const bool spin_all = std::getenv("QWEN_AR_SPIN_ALL") != nullptr;
+    if (!spin_all) ar_wait_kernel<<<1, 1, 0, st>>>(peer_flag, seq, nslot);  // one spinner, not one per block
     ar_pull_kernel<<<blocks, 256, 0, st>>>(state, own, static_cast<const char *>(peer_hbase), slot_bytes, bf16 ? 1 : 0,
-                                           n4, rank, peer_flag, seq, ctr, nslot);
+                                           n4, rank, spin_all ? peer_flag : nullptr, seq, ctr, nslot);
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth
@@ -706,6 +709,415 @@ void q_delta_chunk2(float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm
     HIP_CHECK(hipGetLastError());
     dnorm_kernel<<<dim3(unsigned(T), unsigned(nv)), 128, 0, st>>>(conv, qkvz, W, dn_norm, out, conv_dim, value_dim, nk,
                                                                   eps);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ batched decode (one token per sequence)
+// Rows b < B carry (token, slot, pos) in meta = [tokens | slots | pos] (3 x bmax ints). KV: 64-token
+// pages, page table ptab[slot][maxpages]. DeltaNet ring / state: per-slot pools.
+namespace behemoth {
+namespace {
+__device__ __forceinline__ float bsum256(float v, float *red) {  // block of 256: sum to every thread
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float r = 0.f;
+    for (int i = 0; i < int(blockDim.x >> 5); ++i) r += red[i];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
+__device__ __forceinline__ long kvrow_b(const int *pt, int t) { return long(pt[t >> 6]) * 64 + (t & 63); }
+
+// grid (nq + nkv, B), block hd (256)
+__global__ __launch_bounds__(256) void rope_b_kernel(const float *__restrict__ z, int Wf, uint16_t *__restrict__ qout,
+                                                     uint16_t *__restrict__ G, uint16_t *__restrict__ kc,
+                                                     uint16_t *__restrict__ vc, const int *__restrict__ meta, int bmax,
+                                                     const int *__restrict__ ptab, int maxpages, int nq, int nkv, int rot,
+                                                     float theta, const uint16_t *__restrict__ q_norm,
+                                                     const uint16_t *__restrict__ k_norm, float eps) {
+    constexpr int hd = 256;
+    const int h = blockIdx.x, b = blockIdx.y, d = threadIdx.x;
+    const int slot = meta[bmax + b], pos = meta[2 * bmax + b];
+    const float *zr = z + long(b) * Wf;
+    const bool is_q = h < nq;
+    float raw;
+    long kvr = 0;
+    if (is_q) {
+        raw = rbf(zr[h * 2 * hd + d]);
+        G[long(b) * nq * hd + h * hd + d] = f2bf(zr[h * 2 * hd + hd + d]);
+    } else {
+        const int kh = h - nq;
+        raw = rbf(zr[nq * 2 * hd + kh * hd + d]);
+        kvr = kvrow_b(ptab + long(slot) * maxpages, pos);
+        vc[(kvr * nkv + kh) * hd + d] = f2bf(zr[nq * 2 * hd + nkv * hd + kh * hd + d]);
+    }
+    __shared__ float red[8], sh[hd];
+    const float ss = bsum256(raw * raw, red);
+    const float inv = rsqrtf(ss / hd + eps);
+    const uint16_t *w = is_q ? q_norm : k_norm;
+    const float sv = raw * inv * (1.0f + bf2f(w[d]));
+    sh[d] = sv;
+    __syncthreads();
+    float o;
+    if (d < rot / 2) {
+        const float inv_freq = __powf(theta, -2.0f * float(d) / float(rot));
+        const float ang = float(pos) * inv_freq;
+        o = sv * cosf(ang) - sh[d + rot / 2] * sinf(ang);
+    } else if (d < rot) {
+        const int dd = d - rot / 2;
+        const float inv_freq = __powf(theta, -2.0f * float(dd) / float(rot));
+        const float ang = float(pos) * inv_freq;
+        o = sv * cosf(ang) + sh[dd] * sinf(ang);
+    } else {
+        o = sv;
+    }
+    if (is_q) qout[long(b) * nq * hd + h * hd + d] = f2bf(o);
+    else kc[(kvr * nkv + (h - nq)) * hd + d] = f2bf(o);
+}
+
+// grid (maxsplit, nkv, B), block 256 (8 waves): split of 512 positions; in-block ordered merge of
+// the 8 wave partials; one (m, l, acc[256]) partial per (b, q head, split).
+constexpr int ASPLIT = 512;
+template <int GQ>
+__global__ __launch_bounds__(256) void attn_b_kernel(const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc,
+                                                     const uint16_t *__restrict__ vc, const int *__restrict__ meta,
+                                                     int bmax, const int *__restrict__ ptab, int maxpages, int nq,
+                                                     int nkv, int maxsplit, float scale, float *__restrict__ pml,
+                                                     float *__restrict__ pacc) {
+    constexpr int HD = 256, DPL = HD / 32;
+    const int split = blockIdx.x, kh = blockIdx.y, b = blockIdx.z;
+    const int len = meta[2 * bmax + b] + 1;
+    if (split * ASPLIT >= len) return;
+    const int *pt = ptab + long(meta[bmax + b]) * maxpages;
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float qs[GQ][HD];
+    __shared__ float wm[8][GQ], wl[8][GQ];
+    __shared__ float red[8][HD];
+    for (int i = threadIdx.x; i < GQ * HD; i += 256) {
+        const int g = i / HD, d = i % HD;
+        qs[g][d] = bf2f(q[long(b) * nq * HD + long(kh * GQ + g) * HD + d]) * scale;
+    }
+    __syncthreads();
+    const int t_beg = split * ASPLIT, t_end = min(len, t_beg + ASPLIT);
+    float m[GQ], l[GQ], acc[GQ][DPL];
+#pragma unroll
+    for (int g = 0; g < GQ; ++g) {
+        m[g] = -1e30f;
+        l[g] = 0.f;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f;
+    }
+    const long kstride = long(nkv) * HD;
+    for (int base = t_beg + wave * 32; base < t_end; base += 8 * 32) {
+        const int t = base + lane;
+        const bool ok = t < t_end;
+        float dot[GQ];
+#pragma unroll
+        for (int g = 0; g < GQ; ++g) dot[g] = 0.f;
+        if (ok) {
+            const uint4 *kp = reinterpret_cast<const uint4 *>(kc + kvrow_b(pt, t) * kstride + long(kh) * HD);
+#pragma unroll 4
+            for (int c = 0; c < HD / 8; ++c) {
+                const uint4 kv = kp[c];
+                const uint32_t w4[4] = {kv.x, kv.y, kv.z, kv.w};
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float k0 = bf2f(uint16_t(w4[e])), k1 = bf2f(uint16_t(w4[e] >> 16));
+#pragma unroll
+                    for (int g = 0; g < GQ; ++g)
+                        dot[g] = fmaf(qs[g][c * 8 + 2 * e + 1], k1, fmaf(qs[g][c * 8 + 2 * e], k0, dot[g]));
+                }
+            }
+        }
+        float p[GQ];
+#pragma unroll
+        for (int g = 0; g < GQ; ++g) {
+            float cm = ok ? dot[g] : -1e30f;
+            for (int off = 16; off > 0; off >>= 1) cm = fmaxf(cm, __shfl_xor(cm, off, 32));
+            const float mn = fmaxf(m[g], cm);
+            const float corr = __expf(m[g] - mn);
+            m[g] = mn;
+            p[g] = ok ? __expf(dot[g] - mn) : 0.f;
+            l[g] = l[g] * corr + p[g];
+#pragma unroll
+            for (int i = 0; i < DPL; ++i) acc[g][i] *= corr;
+        }
+        const int nj = min(32, t_end - base);
+        const long vrow0 = kvrow_b(pt, base);  // base is 32-aligned: the 32 positions share one page
+        for (int j = 0; j < nj; ++j) {
+            const uint4 vv = *reinterpret_cast<const uint4 *>(vc + (vrow0 + j) * kstride + long(kh) * HD + lane * DPL);
+            const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
+            float v[DPL];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                v[2 * e] = bf2f(uint16_t(w4[e]));
+                v[2 * e + 1] = bf2f(uint16_t(w4[e] >> 16));
+            }
+#pragma unroll
+            for (int g = 0; g < GQ; ++g) {
+                const float pg = __shfl(p[g], j, 32);
+#pragma unroll
+                for (int i = 0; i < DPL; ++i) acc[g][i] = fmaf(pg, v[i], acc[g][i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < GQ; ++g) {
+        float ls = l[g];
+        for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor(ls, off, 32);
+        if (lane == 0) {
+            wm[wave][g] = m[g];
+            wl[wave][g] = ls;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < GQ; ++g) {
+        float M = -1e30f;
+        for (int w = 0; w < 8; ++w) M = fmaxf(M, wm[w][g]);
+        const float f = wl[wave][g] > 0.f ? __expf(m[g] - M) : 0.f;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) red[wave][lane * DPL + i] = acc[g][i] * f;
+        __syncthreads();
+        const int d = threadIdx.x;
+        float a = 0.f, L = 0.f;
+        for (int w = 0; w < 8; ++w) {
+            a += red[w][d];
+            L += wl[w][g] > 0.f ? wl[w][g] * __expf(wm[w][g] - M) : 0.f;
+        }
+        const long e = (long(b) * nq + kh * GQ + g) * maxsplit + split;
+        pacc[e * HD + d] = a;
+        if (d == 0) {
+            pml[2 * e] = M;
+            pml[2 * e + 1] = L;
+        }
+        __syncthreads();
+    }
+}
+// grid (nq, B), block 256
+__global__ __launch_bounds__(256) void attn_b_combine_kernel(const float *pml, const float *pacc, int maxsplit,
+                                                             const int *meta, int bmax, const uint16_t *G,
+                                                             uint16_t *out, int nq) {
+    constexpr int HD = 256;
+    const int h = blockIdx.x, b = blockIdx.y, d = threadIdx.x;
+    const int len = meta[2 * bmax + b] + 1, ns = (len + ASPLIT - 1) / ASPLIT;
+    const long e0 = (long(b) * nq + h) * maxsplit;
+    float M = -1e30f;
+    for (int s = 0; s < ns; ++s) M = fmaxf(M, pml[2 * (e0 + s)]);
+    float num = 0.f, den = 0.f;
+    for (int s = 0; s < ns; ++s) {
+        const float w = __expf(pml[2 * (e0 + s)] - M);
+        den += w * pml[2 * (e0 + s) + 1];
+        num += w * pacc[(e0 + s) * HD + d];
+    }
+    const float gt = bf2f(G[long(b) * nq * HD + h * HD + d]);
+    out[long(b) * nq * HD + h * HD + d] = f2bf(num / den / (1.0f + __expf(-gt)));
+}
+
+// grid (nv, B), block 256: thread (col = tid / 2, half = tid & 1)
+__global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ qkvz, long W,
+                                                      const uint16_t *__restrict__ conv_w,
+                                                      const uint16_t *__restrict__ dn_norm,
+                                                      const float *__restrict__ a_dt, float *__restrict__ ring,
+                                                      float *__restrict__ S, uint16_t *__restrict__ out,
+                                                      const int *__restrict__ meta, int bmax, int conv_dim,
+                                                      int value_dim, int nk, int nv, int K, float eps) {
+    const int hv = blockIdx.x, b = blockIdx.y, tid = threadIdx.x;
+    const int slot = meta[bmax + b], pos = meta[2 * bmax + b];
+    const int kh = hv / (nv / nk), key_dim = nk * 128;
+    const float *row = qkvz + long(b) * W;
+    float *rg = ring + long(slot) * conv_dim * K;
+    __shared__ float sq[128], sk[128], sv[128], red[8];
+    // causal conv of this head's q / k (threads < 128) and v (threads >= 128) channel
+    float cq = 0.f, ck = 0.f;
+    {
+        const int i = tid & 127;
+        const int c0 = tid < 128 ? kh * 128 + i : 2 * key_dim + hv * 128 + i;
+        const int c1 = key_dim + kh * 128 + i;  // k (threads < 128 only)
+        auto conv1 = [&](int c) {
+            const float x = row[c];
+            float a = 0.f;
+            for (int k = 0; k < K - 1; ++k) {
+                const int p = pos - K + 1 + k;
+                a += (p >= 0 ? rg[long(c) * K + (p % K)] : 0.f) * bf2f(conv_w[long(c) * K + k]);
+            }
+            a += x * bf2f(conv_w[long(c) * K + K - 1]);
+            return silu_d(a);
+        };
+        cq = conv1(c0);
+        if (tid < 128) ck = conv1(c1);
+    }
+    __syncthreads();  // all ring reads of this block done before the writes below
+    {
+        const int i = tid & 127;
+        const int c0 = tid < 128 ? kh * 128 + i : 2 * key_dim + hv * 128 + i;
+        rg[long(c0) * K + (pos % K)] = row[c0];
+        if (tid < 128) rg[long(key_dim + kh * 128 + i) * K + (pos % K)] = row[key_dim + kh * 128 + i];
+    }
+    const float qs = bsum256(tid < 128 ? cq * cq : 0.f, red);
+    const float ks = bsum256(tid < 128 ? ck * ck : 0.f, red);
+    if (tid < 128) {
+        sq[tid] = cq * rsqrtf(qs + 1e-6f) * rsqrtf(128.f);
+        sk[tid] = ck * rsqrtf(ks + 1e-6f);
+    } else {
+        sv[tid - 128] = cq;
+    }
+    __syncthreads();
+    const float beta = 1.0f / (1.0f + __expf(-row[conv_dim + value_dim + hv]));
+    const float decay = __expf(-__expf(a_dt[hv]) * softplus_d(row[conv_dim + value_dim + nv + hv] + a_dt[nv + hv]));
+    const int col = tid >> 1, half = tid & 1;
+    float *Sh = S + (long(slot) * nv + hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    float s[64];
+#pragma unroll
+    for (int i = 0; i < 64; ++i) s[i] = Sh[long(i) * 128] * decay;
+    float m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        m0 = fmaf(s[4 * i], sk[half * 64 + 4 * i], m0);
+        m1 = fmaf(s[4 * i + 1], sk[half * 64 + 4 * i + 1], m1);
+        m2 = fmaf(s[4 * i + 2], sk[half * 64 + 4 * i + 2], m2);
+        m3 = fmaf(s[4 * i + 3], sk[half * 64 + 4 * i + 3], m3);
+    }
+    float mem = (m0 + m1) + (m2 + m3);
+    const float mo = __shfl_xor(mem, 1, 32);
+    mem = half ? mo + mem : mem + mo;
+    const float delta = (sv[col] - mem) * beta;
+    float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        s[4 * i] = fmaf(sk[half * 64 + 4 * i], delta, s[4 * i]);
+        s[4 * i + 1] = fmaf(sk[half * 64 + 4 * i + 1], delta, s[4 * i + 1]);
+        s[4 * i + 2] = fmaf(sk[half * 64 + 4 * i + 2], delta, s[4 * i + 2]);
+        s[4 * i + 3] = fmaf(sk[half * 64 + 4 * i + 3], delta, s[4 * i + 3]);
+        o0 = fmaf(s[4 * i], sq[half * 64 + 4 * i], o0);
+        o1 = fmaf(s[4 * i + 1], sq[half * 64 + 4 * i + 1], o1);
+        o2 = fmaf(s[4 * i + 2], sq[half * 64 + 4 * i + 2], o2);
+        o3 = fmaf(s[4 * i + 3], sq[half * 64 + 4 * i + 3], o3);
+    }
+#pragma unroll
+    for (int i = 0; i < 64; ++i) Sh[long(i) * 128] = s[i];
+    float o = (o0 + o1) + (o2 + o3);
+    const float oo = __shfl_xor(o, 1, 32);
+    o = half ? oo + o : o + oo;
+    const float os = bsum256(half ? 0.f : o * o, red);
+    if (!half) {
+        const float zz = row[conv_dim + hv * 128 + col];
+        out[long(b) * value_dim + hv * 128 + col] = f2bf(o * rsqrtf(os / 128.f + eps) * bf2f(dn_norm[col]) * silu_d(zz));
+    }
+}
+
+// Top-K (K <= 64) of each row: 4-pass 8-bit radix select of the K-th largest key, then collect.
+// grid rows, block 1024. Output unsorted.
+__device__ __forceinline__ uint32_t fkey(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__global__ __launch_bounds__(1024) void topk_kernel(const float *__restrict__ logits, int V, int K, int voff,
+                                                    float *__restrict__ oval, int *__restrict__ oid, int ostride) {
+    const float *x = logits + long(blockIdx.x) * V;
+    __shared__ unsigned hist[256];
+    __shared__ uint32_t s_prefix, s_mask;
+    __shared__ int s_need, cgt, ceq;
+    if (threadIdx.x == 0) {
+        s_prefix = 0;
+        s_mask = 0;
+        s_need = K;
+    }
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        if (threadIdx.x < 256) hist[threadIdx.x] = 0;
+        __syncthreads();
+        const uint32_t prefix = s_prefix, mask = s_mask;
+        for (int i = threadIdx.x; i < V; i += 1024) {
+            const uint32_t k = fkey(x[i]);
+            if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int need = s_need, cum = 0, sel = 0;
+            for (int bin = 255; bin >= 0; --bin) {
+                if (cum + int(hist[bin]) >= need) {
+                    sel = bin;
+                    need -= cum;
+                    break;
+                }
+                cum += int(hist[bin]);
+            }
+            s_need = need;
+            s_prefix = prefix | (uint32_t(sel) << shift);
+            s_mask = mask | (255u << shift);
+        }
+        __syncthreads();
+    }
+    const uint32_t T = s_prefix;
+    const int need = s_need, ngt = K - need;
+    if (threadIdx.x == 0) {
+        cgt = 0;
+        ceq = 0;
+    }
+    __syncthreads();
+    float *ov = oval + long(blockIdx.x) * ostride;
+    int *oi = oid + long(blockIdx.x) * ostride;
+    for (int i = threadIdx.x; i < V; i += 1024) {
+        const uint32_t k = fkey(x[i]);
+        if (k > T) {
+            const int p = atomicAdd(&cgt, 1);
+            ov[p] = x[i];
+            oi[p] = i + voff;
+        } else if (k == T) {
+            const int p = atomicAdd(&ceq, 1);
+            if (p < need) {
+                ov[ngt + p] = x[i];
+                oi[ngt + p] = i + voff;
+            }
+        }
+    }
+}
+}  // namespace
+
+void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, uint16_t *kc, uint16_t *vc, const int *meta, int bmax,
+              int B, const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
+              const uint16_t *k_norm, float eps, hipStream_t st) {
+    if (hd != 256) throw std::runtime_error("q_rope_b: head dim 256 only");
+    rope_b_kernel<<<dim3(unsigned(nq + nkv), unsigned(B)), 256, 0, st>>>(z, Wf, qout, G, kc, vc, meta, bmax, ptab,
+                                                                         maxpages, nq, nkv, rot, theta, q_norm, k_norm,
+                                                                         eps);
+    HIP_CHECK(hipGetLastError());
+}
+size_t q_attn_b_scratch(int bmax, int nq, int max_context) {
+    const int maxsplit = (max_context + ASPLIT - 1) / ASPLIT;
+    return size_t(bmax) * nq * maxsplit * (256 + 2);
+}
+void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+              const int *meta, int bmax, int B, const int *ptab, int maxpages, int nq, int nkv, int max_context,
+              float scale, float *scratch, hipStream_t st) {
+    const int maxsplit = (max_context + ASPLIT - 1) / ASPLIT;
+    float *pml = scratch, *pacc = scratch + size_t(bmax) * nq * maxsplit * 2;
+    const dim3 grid{unsigned(maxsplit), unsigned(nkv), unsigned(B)};
+    switch (nq / nkv) {
+    case 1: attn_b_kernel<1><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 2: attn_b_kernel<2><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 4: attn_b_kernel<4><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    case 6: attn_b_kernel<6><<<grid, 256, 0, st>>>(q, kc, vc, meta, bmax, ptab, maxpages, nq, nkv, maxsplit, scale, pml, pacc); break;
+    default: throw std::runtime_error("q_attn_b: unsupported GQA group");
+    }
+    HIP_CHECK(hipGetLastError());
+    attn_b_combine_kernel<<<dim3(unsigned(nq), unsigned(B)), 256, 0, st>>>(pml, pacc, maxsplit, meta, bmax, G, out, nq);
+    HIP_CHECK(hipGetLastError());
+}
+void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
+               uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
+               float eps, hipStream_t st) {
+    const long W = long(conv_dim) + value_dim + 2 * nv;
+    delta_b_kernel<<<dim3(unsigned(nv), unsigned(B)), 256, 0, st>>>(qkvz, W, conv_w, dn_norm, a_dt, ring, S, out, meta, bmax,
+                                                                   conv_dim, value_dim, nk, nv, K, eps);
+    HIP_CHECK(hipGetLastError());
+}
+void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st) {
+    if (K > 64 || K < 1) throw std::runtime_error("q_topk: K <= 64");
+    topk_kernel<<<unsigned(rows), 1024, 0, st>>>(logits, V, K, voff, oval, oid, ostride);
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth

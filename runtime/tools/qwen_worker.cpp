@@ -1,18 +1,28 @@
-// Qwen3.5 generation worker for tools/qwen_openai_server.py: loads the model once (optionally split
-// over several GPUs), then serves one request at a time over stdin/stdout JSON lines.
-// request : {"tokens":[...], "max_new":N, "temperature":T, "top_p":P, "top_k":K, "seed":S, "stop":[ids]}
-// replies : {"t":id} per generated token, then
-//           {"done":reason, "prompt":n, "completion":n, "prefill_s":s, "decode_s":s}
-// usage   : qwen_worker --model DIR [--gpus 0,1] [--chunk N] [--max-context N]
+// Qwen3.5 generation worker for tools/qwen_openai_server.py: loads the model once (tensor parallel
+// over 2 GPUs or one GPU), then serves many requests concurrently with continuous batching: new
+// requests are admitted between decode steps, prompts are prefilled in chunks interleaved with the
+// batched decode steps, finished sequences are retired immediately.
+// stdin  (JSON lines): {"id":"r1","tokens":[...],"max_new":N,"temperature":T,"top_p":P,"top_k":K,"seed":S,
+//                       "stop":[ids]}   |   {"cancel":"r1"}
+// stdout (JSON lines): {"ready":true,...} once, then {"id":"r1","t":id} per token and
+//                      {"id":"r1","done":"stop|length|cancelled|error","prompt":n,"completion":n,"ttft_s":s,
+//                       "decode_s":s}
+// usage  : qwen_worker --model DIR [--gpus 0,1] [--tp] [--chunk N] [--max-context N] [--max-seqs N]
+//          [--kv-tokens N] [--prefill-per-step N]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <iostream>
-#include <numeric>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -20,32 +30,25 @@
 #include "behemoth/qwen_model.hpp"
 
 using json = nlohmann::json;
+using behemoth::QwenCand;
 
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-static int sample(const std::vector<float> &logits, float temperature, float top_p, int top_k,
-                  std::mt19937_64 &rng) {
-    const int V = int(logits.size());
-    if (temperature <= 0) return int(std::max_element(logits.begin(), logits.end()) - logits.begin());
-    // candidates: top_k (default / cap 512) by logit
-    int k = top_k > 0 ? std::min(top_k, V) : std::min(512, V);
-    std::vector<int> idx(static_cast<size_t>(V));
-    std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                      [&](int a, int b) { return logits[size_t(a)] > logits[size_t(b)]; });
-    idx.resize(size_t(k));
+// Samples from the sorted top-K candidates (K = 64: top_k 0 or > 64 is truncated to 64).
+static int sample(const QwenCand *c, int K, float temperature, float top_p, int top_k, std::mt19937_64 &rng) {
+    if (temperature <= 0) return c[0].id;
+    const int k = top_k > 0 ? std::min(top_k, K) : K;
     std::vector<double> p(static_cast<size_t>(k));
-    const double mx = logits[size_t(idx[0])];
     double sum = 0;
-    for (int i = 0; i < k; ++i) sum += p[size_t(i)] = std::exp((logits[size_t(idx[size_t(i)])] - mx) / temperature);
+    for (int i = 0; i < k; ++i) sum += p[size_t(i)] = std::exp(double(c[i].logit - c[0].logit) / temperature);
     int keep = k;
     if (top_p > 0 && top_p < 1) {
-        double c = 0;
+        double acc = 0;
         for (int i = 0; i < k; ++i) {
-            c += p[size_t(i)] / sum;
-            if (c >= top_p) {
+            acc += p[size_t(i)] / sum;
+            if (acc >= top_p) {
                 keep = i + 1;
                 break;
             }
@@ -56,15 +59,46 @@ static int sample(const std::vector<float> &logits, float temperature, float top
     double u = std::uniform_real_distribution<double>(0, tot)(rng);
     for (int i = 0; i < keep; ++i) {
         u -= p[size_t(i)];
-        if (u <= 0) return idx[size_t(i)];
+        if (u <= 0) return c[i].id;
     }
-    return idx[size_t(keep - 1)];
+    return c[keep - 1].id;
+}
+
+struct Req {
+    std::string id;
+    std::vector<int> toks, stop;
+    int max_new = 256, top_k = 0;
+    float temperature = 0, top_p = 1;
+    std::mt19937_64 rng;
+    int slot = -1;
+    size_t prefilled = 0;
+    int ngen = 0, last = -1;
+    bool decoding = false;
+    double t_arrive = 0, t_first = 0;
+};
+
+struct Inbox {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<json> q;
+    bool eof = false;
+};
+
+static std::mutex out_mu;
+static void emit(const json &j) {
+    std::lock_guard<std::mutex> g(out_mu);
+    std::cout << j.dump() << '\n';
+}
+static void flush_out() {
+    std::lock_guard<std::mutex> g(out_mu);
+    std::cout.flush();
 }
 
 int main(int argc, char **argv) {
     bool tp = false;
     std::string model, gpus = "0";
-    int chunk = 512, max_context = 32768;
+    int chunk = 2048, max_context = 32768, max_seqs = 32, prefill_per_step = 1;
+    long kv_tokens = 0;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
         if (!std::strcmp(argv[i], "--model")) model = next();
@@ -72,6 +106,9 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--tp")) tp = true;
         else if (!std::strcmp(argv[i], "--chunk")) chunk = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--max-context")) max_context = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--max-seqs")) max_seqs = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--kv-tokens")) kv_tokens = std::atol(next().c_str());
+        else if (!std::strcmp(argv[i], "--prefill-per-step")) prefill_per_step = std::atoi(next().c_str());
         else {
             std::fprintf(stderr, "unknown arg %s\n", argv[i]);
             return 1;
@@ -84,57 +121,183 @@ int main(int argc, char **argv) {
         devs.push_back(std::atoi(gpus.substr(p, q - p).c_str()));
         p = q + 1;
     }
+    max_seqs = std::max(1, std::min(64, max_seqs));
     try {
         double t0 = now_s();
-        behemoth::QwenModel m(model, devs, chunk, max_context, tp);
-        std::fprintf(stderr, "qwen_worker: loaded in %.1f s on %zu gpu(s), max_context %d\n", now_s() - t0,
-                     devs.size(), max_context);
-        std::cout << json{{"ready", true}, {"max_context", max_context}}.dump() << std::endl;
-        std::vector<float> logits(size_t(m.config().vocab));
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line.empty()) continue;
-            json rq;
-            try {
-                rq = json::parse(line);
-            } catch (const std::exception &e) {
-                std::cout << json{{"done", "error"}, {"error", e.what()}}.dump() << std::endl;
-                continue;
-            }
-            std::vector<int> toks = rq.value("tokens", std::vector<int>{});
-            int max_new = rq.value("max_new", 256);
-            const float temperature = rq.value("temperature", 0.0f), top_p = rq.value("top_p", 1.0f);
-            const int top_k = rq.value("top_k", 0);
-            std::mt19937_64 rng(rq.value("seed", uint64_t(std::random_device{}())));
-            std::vector<int> stop = rq.value("stop", std::vector<int>{});
-            if (toks.empty() || int(toks.size()) >= max_context) {
-                std::cout << json{{"done", "error"}, {"error", "prompt empty or longer than max_context"}}.dump()
-                          << std::endl;
-                continue;
-            }
-            max_new = std::min(max_new, max_context - int(toks.size()));
-            m.reset();
-            double a = now_s();
-            m.prefill(toks.data(), toks.size(), logits.data());
-            double b = now_s();
-            std::string reason = "length";
-            int n = 0;
-            while (n < max_new) {
-                int t = sample(logits, temperature, top_p, top_k, rng);
-                ++n;
-                std::cout << json{{"t", t}}.dump() << std::endl;
-                if (std::find(stop.begin(), stop.end(), t) != stop.end()) {
-                    reason = "stop";
-                    break;
+        behemoth::QwenServeOptions so;
+        so.max_seqs = max_seqs;
+        so.kv_tokens = kv_tokens;
+        behemoth::QwenModel m(model, devs, chunk, max_context, tp, so);
+        const int K = m.topk(), PT = m.page_tokens();
+        const long pages = m.kv_pages_total();
+        std::fprintf(stderr,
+                     "qwen_worker: loaded in %.1f s on %zu gpu(s); %d slots, KV pool %ld tokens, max_context %d, "
+                     "chunk %d\n",
+                     now_s() - t0, devs.size(), max_seqs, pages * PT, max_context, chunk);
+        emit(json{{"ready", true}, {"max_context", max_context}, {"max_seqs", max_seqs}, {"kv_tokens", pages * PT}});
+        flush_out();
+
+        Inbox inbox;
+        std::thread reader([&]() {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line.empty()) continue;
+                json j;
+                try {
+                    j = json::parse(line);
+                } catch (const std::exception &e) {
+                    emit(json{{"id", ""}, {"done", "error"}, {"error", e.what()}});
+                    flush_out();
+                    continue;
                 }
-                if (n >= max_new) break;
-                m.decode(t, logits.data());
+                std::lock_guard<std::mutex> g(inbox.mu);
+                inbox.q.push_back(std::move(j));
+                inbox.cv.notify_one();
             }
-            double c = now_s();
-            std::cout << json{{"done", reason}, {"prompt", toks.size()}, {"completion", n},
-                              {"prefill_s", b - a}, {"decode_s", c - b}}
-                             .dump()
-                      << std::endl;
+            std::lock_guard<std::mutex> g(inbox.mu);
+            inbox.eof = true;
+            inbox.cv.notify_one();
+        });
+        reader.detach();
+
+        std::deque<std::unique_ptr<Req>> waiting;
+        std::map<int, std::unique_ptr<Req>> running;  // slot -> request
+        std::vector<int> free_slots;
+        for (int s = max_seqs - 1; s >= 0; --s) free_slots.push_back(s);
+        std::vector<QwenCand> cand(size_t(max_seqs) * K);
+
+        auto finish = [&](Req &r, const std::string &reason) {
+            const double t = now_s();
+            emit(json{{"id", r.id}, {"done", reason}, {"prompt", r.toks.size()}, {"completion", r.ngen},
+                      {"ttft_s", r.t_first > 0 ? r.t_first - r.t_arrive : 0.0},
+                      {"decode_s", r.t_first > 0 ? t - r.t_first : 0.0}});
+        };
+        auto retire = [&](int slot, const std::string &reason) {
+            auto it = running.find(slot);
+            finish(*it->second, reason);
+            m.seq_free(slot);
+            free_slots.push_back(slot);
+            running.erase(it);
+        };
+        // accepts token t for r; returns the finish reason if r is done
+        auto accept = [&](Req &r, int t) -> std::string {
+            if (r.ngen == 0) r.t_first = now_s();
+            ++r.ngen;
+            r.last = t;
+            emit(json{{"id", r.id}, {"t", t}});
+            if (std::find(r.stop.begin(), r.stop.end(), t) != r.stop.end()) return "stop";
+            if (r.ngen >= r.max_new) return "length";
+            if (m.seq_len(r.slot) + 1 >= max_context) return "length";
+            return "";
+        };
+        bool eof = false;
+        while (true) {
+            {  // inbox
+                std::unique_lock<std::mutex> lk(inbox.mu);
+                if (inbox.q.empty() && waiting.empty() && running.empty()) {
+                    if (inbox.eof) break;
+                    inbox.cv.wait(lk, [&] { return !inbox.q.empty() || inbox.eof; });
+                }
+                eof = inbox.eof;
+                while (!inbox.q.empty()) {
+                    json j = std::move(inbox.q.front());
+                    inbox.q.pop_front();
+                    if (j.contains("cancel")) {
+                        const std::string id = j["cancel"].get<std::string>();
+                        for (auto it = waiting.begin(); it != waiting.end(); ++it)
+                            if ((*it)->id == id) {
+                                finish(**it, "cancelled");
+                                waiting.erase(it);
+                                break;
+                            }
+                        for (auto &kv : running)
+                            if (kv.second->id == id) {
+                                retire(kv.first, "cancelled");
+                                break;
+                            }
+                        continue;
+                    }
+                    auto r = std::make_unique<Req>();
+                    r->id = j.value("id", std::string(""));
+                    r->toks = j.value("tokens", std::vector<int>{});
+                    r->max_new = j.value("max_new", 256);
+                    r->temperature = j.value("temperature", 0.0f);
+                    r->top_p = j.value("top_p", 1.0f);
+                    r->top_k = j.value("top_k", 0);
+                    r->stop = j.value("stop", std::vector<int>{});
+                    r->rng.seed(j.value("seed", uint64_t(std::random_device{}())));
+                    r->t_arrive = now_s();
+                    if (r->toks.empty() || int(r->toks.size()) >= max_context || r->max_new < 1) {
+                        emit(json{{"id", r->id}, {"done", "error"},
+                                  {"error", "prompt empty or longer than max_context (" + std::to_string(max_context) + ")"}});
+                        continue;
+                    }
+                    r->max_new = std::min(r->max_new, max_context - int(r->toks.size()));
+                    waiting.push_back(std::move(r));
+                }
+            }
+            (void)eof;
+            // admit: a free slot and KV pages for the prompt + some headroom
+            while (!waiting.empty() && !free_slots.empty()) {
+                Req &r = *waiting.front();
+                const long need = long((r.toks.size() + std::min(r.max_new, 256) + PT - 1) / PT) + long(running.size());
+                if (m.kv_pages_free() < need && !running.empty()) break;
+                r.slot = free_slots.back();
+                free_slots.pop_back();
+                m.seq_start(r.slot);
+                running[r.slot] = std::move(waiting.front());
+                waiting.pop_front();
+            }
+            // prefill: oldest prefilling sequences, prefill_per_step chunks per decode step
+            bool any_decoding = false;
+            for (auto &kv : running) any_decoding |= kv.second->decoding;
+            int budget = any_decoding ? prefill_per_step : 1;
+            std::vector<int> pre;
+            for (auto &kv : running)
+                if (!kv.second->decoding) pre.push_back(kv.first);
+            std::sort(pre.begin(), pre.end(), [&](int a, int b) { return running[a]->t_arrive < running[b]->t_arrive; });
+            for (int slot : pre) {
+                if (budget <= 0) break;
+                Req &r = *running[slot];
+                const size_t n = std::min<size_t>(size_t(chunk), r.toks.size() - r.prefilled);
+                const bool last = r.prefilled + n == r.toks.size();
+                if (!m.seq_prefill(slot, r.toks.data() + r.prefilled, n, last ? cand.data() : nullptr)) {
+                    retire(slot, "error");  // no KV pages even for the prompt
+                    continue;
+                }
+                --budget;
+                r.prefilled += n;
+                if (last) {
+                    r.decoding = true;
+                    const int t = sample(cand.data(), K, r.temperature, r.top_p, r.top_k, r.rng);
+                    const std::string why = accept(r, t);
+                    if (!why.empty()) retire(slot, why);
+                }
+            }
+            // batched decode of every decoding sequence
+            std::vector<int> slots, toks;
+            for (auto &kv : running)
+                if (kv.second->decoding) {
+                    slots.push_back(kv.first);
+                    toks.push_back(kv.second->last);
+                }
+            if (!slots.empty()) {
+                if (!m.decode_batch(slots.data(), toks.data(), int(slots.size()), cand.data())) {
+                    // out of KV pages: finish the longest sequence and retry next iteration
+                    int victim = slots[0];
+                    for (int s : slots)
+                        if (m.seq_len(s) > m.seq_len(victim)) victim = s;
+                    retire(victim, "length");
+                } else {
+                    for (size_t i = 0; i < slots.size(); ++i) {
+                        Req &r = *running[slots[i]];
+                        const int t = sample(cand.data() + i * K, K, r.temperature, r.top_p, r.top_k, r.rng);
+                        const std::string why = accept(r, t);
+                        if (!why.empty()) retire(slots[i], why);
+                    }
+                }
+            }
+            flush_out();
         }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "error: %s\n", e.what());

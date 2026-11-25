@@ -68,3 +68,22 @@ void q_delta_chunk2(float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm
                     float *S, uint16_t *out, float *conv, int T, int pos0, int conv_dim, int value_dim, int nk, int nv,
                     int K, float eps, hipStream_t st);
 }  // namespace behemoth
+
+namespace behemoth {
+// ------------------------------------------------------------------ batched decode
+// meta = [tokens | slots | positions] (3 x bmax ints); ptab [slots][maxpages] (64-token pages).
+// Gated attention input z f32 [B][Wf]: per q head [q hd | gate hd], then k (nkv*hd), v (nkv*hd).
+void q_rope_b(const float *z, int Wf, uint16_t *qout, uint16_t *G, uint16_t *kc, uint16_t *vc, const int *meta, int bmax,
+              int B, const int *ptab, int maxpages, int nq, int nkv, int hd, int rot, float theta, const uint16_t *q_norm,
+              const uint16_t *k_norm, float eps, hipStream_t st);
+size_t q_attn_b_scratch(int bmax, int nq, int max_context);
+void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+              const int *meta, int bmax, int B, const int *ptab, int maxpages, int nq, int nkv, int max_context,
+              float scale, float *scratch, hipStream_t st);
+// One DeltaNet step per row; ring [slots][conv_dim][K], S [slots][nv][128][128] (f32).
+void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
+               uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
+               float eps, hipStream_t st);
+// Top-K (unsorted, K <= 64) of each row of logits [rows][V]; ids offset by voff.
+void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st);
+}  // namespace behemoth

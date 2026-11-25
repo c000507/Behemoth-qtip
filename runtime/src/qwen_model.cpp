@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <barrier>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -245,7 +246,6 @@ struct QwenStage {
     DeviceBuffer<int> rids, rcnt, rbase, rrun, slot_tok;
     DeviceBuffer<int> tokens_d;
     std::vector<float> logits_h, logits_all;
-    int pos = 0;
     size_t max_slices = 0;
     // "model.layers." (quantized checkpoints written by qtip_quant) or "model.language_model.layers."
     // (original HF Qwen3.5 checkpoints, loaded through the bf16-linear fallback)
@@ -289,7 +289,7 @@ struct QwenStage {
     hipEvent_t send_ev[2]{}, pulled_ev[2]{};
     unsigned ar_round = 0;
     int voff = 0;  // first vocab row of this rank's lm_head shard
-    void residual_reduce(const float *zpart, int rows);  // state += sum over ranks of zpart
+    void residual_reduce(const float *zpart, int rows, bool decode = false);  // state += sum over ranks of zpart
     // pinned host slots of the all-reduce, allocated while the PEER device is current: the runtime
     // places them on the peer's NUMA node, so the latency-bound zero-copy reads stay socket-local
     void alloc_ar_host() {
@@ -309,7 +309,92 @@ struct QwenStage {
     float *hsend[2]{};  // no P2P: pinned coherent host buffers both ranks' kernels read directly
     void lm_head_enqueue(int row0, int nrows);
     void run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *out, int ldy = 0);
-    void forward_chunk(const int *tokens_h, int rows);
+    void forward_chunk(const int *tokens_h, int rows, int slot, int pos0);
+    // ---- sequence pools: KV in 64-token pages (pool rows [n_pages * 64]), DeltaNet ring / state per slot
+    static constexpr int PAGE = 64;
+    int n_slots = 1, n_pages = 0, maxpages = 0;
+    DeviceBuffer<int> ptab_d;  // [n_slots][maxpages]
+    size_t slot_bytes() const {  // DeltaNet state per slot (all layers of this stage)
+        size_t b = 0;
+        for (int L = l_begin; L < l_end; ++L)
+            if (!cfg.is_full(L))
+                b += (size_t(cfg.conv_dim()) * cfg.conv_k + size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd) * 4;
+        return b;
+    }
+    size_t page_bytes() const {
+        size_t b = 0;
+        for (int L = l_begin; L < l_end; ++L)
+            if (cfg.is_full(L)) b += size_t(PAGE) * cfg.nkv * cfg.hd * 2 * 2;
+        return b;
+    }
+    void alloc_pools(int slots, int pages, int mp) {
+        n_slots = slots;
+        n_pages = pages;
+        maxpages = mp;
+        for (int L = l_begin; L < l_end; ++L) {
+            LayerW &w = layers[size_t(L)];
+            if (w.full) {
+                w.kc.resize(size_t(pages) * PAGE * cfg.nkv * cfg.hd);
+                w.vc.resize(size_t(pages) * PAGE * cfg.nkv * cfg.hd);
+                HIP_CHECK(hipMemset(w.kc.data(), 0, w.kc.bytes()));
+                HIP_CHECK(hipMemset(w.vc.data(), 0, w.vc.bytes()));
+            } else {
+                w.ring.resize(size_t(slots) * cfg.conv_dim() * cfg.conv_k);
+                w.dstate.resize(size_t(slots) * cfg.lin_nv * cfg.lin_kd * cfg.lin_vd);
+            }
+        }
+        ptab_d.resize(size_t(slots) * mp);
+        HIP_CHECK(hipMemset(ptab_d.data(), 0, ptab_d.bytes()));
+    }
+    void reset_slot(int slot) {
+        for (int L = l_begin; L < l_end; ++L) {
+            LayerW &w = layers[size_t(L)];
+            if (w.full) continue;
+            const size_t rn = size_t(cfg.conv_dim()) * cfg.conv_k, sn = size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd;
+            HIP_CHECK(hipMemsetAsync(w.ring.data() + slot * rn, 0, rn * 4, stream));
+            HIP_CHECK(hipMemsetAsync(w.dstate.data() + slot * sn, 0, sn * 4, stream));
+        }
+    }
+    void copy_slot(int src, int dst, const std::vector<int> &sp, const std::vector<int> &dp) {
+        const size_t rn = size_t(cfg.conv_dim()) * cfg.conv_k, sn = size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd;
+        const size_t pe = size_t(PAGE) * cfg.nkv * cfg.hd;
+        for (int L = l_begin; L < l_end; ++L) {
+            LayerW &w = layers[size_t(L)];
+            if (w.full) {
+                for (size_t i = 0; i < dp.size(); ++i) {
+                    HIP_CHECK(hipMemcpyAsync(w.kc.data() + dp[i] * pe, w.kc.data() + sp[i] * pe, pe * 2,
+                                             hipMemcpyDeviceToDevice, stream));
+                    HIP_CHECK(hipMemcpyAsync(w.vc.data() + dp[i] * pe, w.vc.data() + sp[i] * pe, pe * 2,
+                                             hipMemcpyDeviceToDevice, stream));
+                }
+            } else {
+                HIP_CHECK(hipMemcpyAsync(w.ring.data() + dst * rn, w.ring.data() + src * rn, rn * 4,
+                                         hipMemcpyDeviceToDevice, stream));
+                HIP_CHECK(hipMemcpyAsync(w.dstate.data() + dst * sn, w.dstate.data() + src * sn, sn * 4,
+                                         hipMemcpyDeviceToDevice, stream));
+            }
+        }
+        HIP_CHECK(hipStreamSynchronize(stream));
+    }
+    // ---- batched decode (serving): one token per row, rows padded to a graph bucket
+    int bmax = 0;
+    DeviceBuffer<int> meta_d;    // [tokens | slots | pos] x bmax
+    int *meta_h = nullptr;       // pinned
+    DeviceBuffer<uint16_t> bq, bG, battn;
+    DeviceBuffer<float> battn_scr, cand_v;
+    DeviceBuffer<int> cand_i;
+    float *cand_vh = nullptr;    // pinned [bmax][TOPK]
+    int *cand_ih = nullptr;
+    static constexpr int TOPK = 64;
+    struct Graph {
+        hipGraphExec_t exec{};
+        unsigned exchanges = 0;
+    };
+    std::map<int, Graph> graphs;
+    void alloc_batch(int bm);
+    void decode_enqueue(int B);
+    void decode_launch(int B);  // graph per bucket (captured on first use) unless QWEN_NO_GRAPH
+    void topk_rows(int nrows);  // logits_d rows -> cand (device) -> host
     void moe_block(LayerW &w, int rows);
     void lm_head_rows(int row0, int nrows);  // logits_all[row0..] from state rows
     void reset();
@@ -481,8 +566,6 @@ void QwenStage::load(const std::filesystem::path &dir) {
             load_linear(w.lo, ck, L, "self_attn.o_proj", G.nq * hd, H, cols1(r * hq * hd, hq * hd));
             up16(w.q_norm, "self_attn.q_norm.weight");
             up16(w.k_norm, "self_attn.k_norm.weight");
-            w.kc.resize(size_t(cfg.max_context) * cfg.nkv * cfg.hd);
-            w.vc.resize(size_t(cfg.max_context) * cfg.nkv * cfg.hd);
         } else {
             load_linear(w.l_in_qkv, ck, L, "linear_attn.in_proj_qkv", H, G.conv_dim(), s_qkv);
             load_linear(w.l_in_z, ck, L, "linear_attn.in_proj_z", H, G.value_dim(), rows1(r * nvl * vd, nvl * vd));
@@ -507,8 +590,6 @@ void QwenStage::load(const std::filesystem::path &dir) {
                 for (int i = r * nvl; i < (r + 1) * nvl; ++i) aux.push_back(db[size_t(i)]);
                 w.a_dt.upload(aux);
             }
-            w.ring.resize(size_t(cfg.conv_dim()) * cfg.conv_k);
-            w.dstate.resize(size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd);
         }
         if (w.moe) {
             const int E = cfg.num_experts, F = cfg.moe_inter, S = cfg.shared_inter;
@@ -791,10 +872,12 @@ void QwenStage::moe_block(LayerW &w, int rows) {
     q_moe_residual_add(state.data(), y_moe.data(), rows, H, stream);
 }
 
-void QwenStage::forward_chunk(const int *tokens_h, int rows) {
+void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0) {
     const QwenRuntimeConfig &c = cfg;
     const int H = c.hidden, A = c.nq * c.hd, V = c.value_dim(), F = c.inter;
-    const int pos0 = pos;
+    const int *pt = ptab_d.data() + size_t(slot) * maxpages;
+    const size_t ring_off = size_t(slot) * c.conv_dim() * c.conv_k;
+    const size_t st_off = size_t(slot) * c.lin_nv * c.lin_kd * c.lin_vd;
     if (next) HIP_CHECK(hipStreamWaitEvent(stream, next->took_ev, 0));  // state free to overwrite
     if (first) {
         if (rows == 1 && tok_pinned) {  // decode: callers sync every step, the pinned slot is free
@@ -865,12 +948,12 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
             }
             q_qk_norm_rope(q.data(), k.data(), v.data(), gate.data(), w.kc.data(), w.vc.data(), rows,
                            pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
-                           w.k_norm.data(), c.eps, stream);
-            if (c.hd == 256 && !std::getenv("QWEN_ATTN_SCALAR"))
+                           w.k_norm.data(), c.eps, stream, pt);
+            if (c.hd == 256)
                 q_attn_split(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0,
                              c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
-                             attn_part.size(), stream);
-            else
+                             attn_part.size(), stream, pt);
+            else  // contiguous-cache fallback: single sequence only (identity page table)
                 q_attn(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0, c.nq,
                        c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), stream);
             if (!w.lo.bf16) {
@@ -924,16 +1007,16 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
             }
             static const bool delta_v1 = std::getenv("QWEN_DELTA_V1") != nullptr;
             if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP") && !delta_v1)
-                q_delta_chunk2(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
-                               w.dstate.data(), o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_nk, nv, c.conv_k, c.eps,
+                q_delta_chunk2(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data() + ring_off,
+                               w.dstate.data() + st_off, o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_nk, nv, c.conv_k, c.eps,
                                stream);
             else if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))
-                q_delta_chunk(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
-                              w.dstate.data(), o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_kd, c.lin_vd,
+                q_delta_chunk(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data() + ring_off,
+                              w.dstate.data() + st_off, o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_kd, c.lin_vd,
                               c.lin_nk, nv, c.conv_k, c.eps, stream);
             else for (int t = 0; t < rows; ++t)
-                q_delta_step(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
-                             w.dstate.data(), o_in.data(), rows, t, pos0, Wq, V, c.lin_kd, c.lin_vd,
+                q_delta_step(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data() + ring_off,
+                             w.dstate.data() + st_off, o_in.data(), rows, t, pos0, Wq, V, c.lin_kd, c.lin_vd,
                              c.lin_nk, nv, c.conv_k, c.eps, stream);
             if (!w.l_out.bf16) {
                 q_input_transform(o_in.data(), rows, V, nullptr, 0, w.l_out.su.data(), V, u.data(), V,
@@ -1007,7 +1090,7 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
         if (const char *dbg = std::getenv("QWEN_DUMP_LAYERS")) {
             static int dump_rows = 0;
             if (!dump_rows) dump_rows = rows;
-            if (rows == dump_rows && pos == 0) {
+            if (rows == dump_rows && pos0 == 0) {
                 HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
                 std::vector<uint16_t> h = state.download();
                 std::ofstream f(std::string(dbg) + "/rt_layer" + std::to_string(L) + ".bin",
@@ -1017,7 +1100,6 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
             }
         }
     }
-    pos += rows;
     HIP_CHECK(hipEventRecord(done_ev, stream));
 }
 
@@ -1025,7 +1107,7 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
 // send buffer, barrier (host: every rank has recorded its send event), pull the peer's buffer over
 // P2P, add both partials in rank order. Send buffers alternate so a rank only waits for the peer's
 // pull of the round before last.
-void QwenStage::residual_reduce(const float *zpart, int rows) {
+void QwenStage::residual_reduce(const float *zpart, int rows, bool decode) {
     const int H = cfg.hidden;
     if (tp_size == 1) {
         q_moe_residual_add(state.data(), zpart, rows, H, stream);
@@ -1033,12 +1115,12 @@ void QwenStage::residual_reduce(const float *zpart, int rows) {
     }
     // device-flag exchange through pinned host slots; prefill partials travel as bf16
     static const bool fp32_only = std::getenv("QWEN_AR_FP32") != nullptr;
-    const bool bf = rows > 8 && !fp32_only;
+    const bool bf = rows > 8 && !fp32_only && !decode;
     const long n = long(rows) * H;
     float *part = const_cast<float *>(zpart);
     static const bool dma_push = std::getenv("QWEN_AR_DMA_PUSH") != nullptr;
     const int hslot = int(ar_hseq % unsigned(AR_SLOTS));
-    if (dma_push && bf) {
+    if (dma_push && bf && !decode) {
         q_ar_round_bf16(part, zsend[1].data(), n, stream);
         HIP_CHECK(hipMemcpyAsync(ar_host + long(hslot) * ar_slot_bytes, zsend[1].data(), size_t(n) * 2,
                                  hipMemcpyDeviceToHost, stream));
@@ -1047,7 +1129,7 @@ void QwenStage::residual_reduce(const float *zpart, int rows) {
         q_ar_push(part, n, ar_host, ar_slot_bytes, bf, ar_flags, ar_ctr.data(), ar_ctr.data() + 1, AR_SLOTS, stream);
     }
     static const bool zero_copy = std::getenv("QWEN_AR_ZC") != nullptr;
-    if (rows <= 8 || zero_copy) {
+    if (rows <= 8 || zero_copy || decode) {
         q_ar_pull_add(state.data(), part, tp_peer->ar_host, ar_slot_bytes, bf, n, tp_rank, tp_peer->ar_flags,
                       ar_ctr.data(), ar_ctr.data() + 2, AR_SLOTS, stream);
     } else {  // prefill: DMA the peer slot (copy engines cope with the cross-socket latency far better)
@@ -1061,16 +1143,105 @@ void QwenStage::residual_reduce(const float *zpart, int rows) {
 }
 
 void QwenStage::reset() {
-    pos = 0;
-    for (auto &w : layers) {
-        if (w.ring.size()) HIP_CHECK(hipMemsetAsync(w.ring.data(), 0, w.ring.bytes(), stream));
-        if (w.dstate.size()) HIP_CHECK(hipMemsetAsync(w.dstate.data(), 0, w.dstate.bytes(), stream));
-        if (w.kc.size()) {
-            HIP_CHECK(hipMemsetAsync(w.kc.data(), 0, w.kc.bytes(), stream));
-            HIP_CHECK(hipMemsetAsync(w.vc.data(), 0, w.vc.bytes(), stream));
-        }
-    }
+    reset_slot(0);
     HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+// ------------------------------------------------------------------ batched decode (serving)
+void QwenStage::alloc_batch(int bm) {
+    bmax = bm;
+    const int H = cfg.hidden;
+    if (chunk < bm) {  // per-row scratch must cover a full decode bucket
+        state.resize(size_t(bm) * H);
+        h_norm.resize(size_t(bm) * H);
+    }
+    if (size_t(bm) * H > zsend[0].size()) zsend[0].resize(size_t(bm) * H);
+    meta_d.resize(size_t(3) * bm);
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&meta_h), size_t(3) * bm * 4, hipHostMallocDefault));
+    std::memset(meta_h, 0, size_t(3) * bm * 4);
+    bq.resize(size_t(bm) * cfg.nq * cfg.hd);
+    bG.resize(size_t(bm) * cfg.nq * cfg.hd);
+    battn.resize(size_t(bm) * cfg.nq * cfg.hd);
+    battn_scr.resize(q_attn_b_scratch(bm, cfg.nq, cfg.max_context));
+    if (logits_d.size() < size_t(bm) * cfg.vocab) logits_d.resize(size_t(bm) * cfg.vocab);
+    cand_v.resize(size_t(bm) * TOPK);
+    cand_i.resize(size_t(bm) * TOPK);
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&cand_vh), size_t(bm) * TOPK * 4, hipHostMallocDefault));
+    HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&cand_ih), size_t(bm) * TOPK * 4, hipHostMallocDefault));
+}
+
+void QwenStage::topk_rows(int nrows) {
+    q_topk(logits_d.data(), nrows, cfg.vocab, TOPK, voff, cand_v.data(), cand_i.data(), TOPK, stream);
+    HIP_CHECK(hipMemcpyAsync(cand_vh, cand_v.data(), size_t(nrows) * TOPK * 4, hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(cand_ih, cand_i.data(), size_t(nrows) * TOPK * 4, hipMemcpyDeviceToHost, stream));
+}
+
+// One decode step for rows [0, B) of meta (B <= bmax): fp8 W8A8 decode GEMMs, paged attention,
+// per-slot DeltaNet, fp32 zero-copy all-reduce, fp8 lm_head + top-k candidates -> pinned host.
+void QwenStage::decode_enqueue(int B) {
+    const QwenRuntimeConfig &c = cfg;
+    const int H = c.hidden, A = c.nq * c.hd, V = c.value_dim(), F = c.inter;
+    HIP_CHECK(hipMemcpyAsync(meta_d.data(), meta_h, size_t(3) * bmax * 4, hipMemcpyHostToDevice, stream));
+    q_embed_gather(embed.data(), meta_d.data(), state.data(), B, H, stream);
+    float *zr = zsend[0].data();
+    for (int L = l_begin; L < l_end; ++L) {
+        LayerW &w = layers[size_t(L)];
+        if (!w.fused) throw std::runtime_error("batched decode needs fp8 (fused) linears");
+        q_zc_norm_to(h_norm.data(), state.data(), B, H, w.ln_in.data(), c.eps, stream);
+        if (w.full) {
+            const int Wf = c.nq * 2 * c.hd + 2 * c.nkv * c.hd;
+            run_linear(w.f_qkv, h_norm.data(), H, B, z.data());
+            q_rope_b(z.data(), Wf, bq.data(), bG.data(), w.kc.data(), w.vc.data(), meta_d.data(), bmax, B, ptab_d.data(),
+                     maxpages, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(), w.k_norm.data(), c.eps, stream);
+            q_attn_b(bq.data(), w.kc.data(), w.vc.data(), bG.data(), battn.data(), meta_d.data(), bmax, B, ptab_d.data(),
+                     maxpages, c.nq, c.nkv, c.max_context, 1.0f / std::sqrt(float(c.hd)), battn_scr.data(), stream);
+            run_linear(w.lo, battn.data(), A, B, zr);
+        } else {
+            const int Wq = c.conv_dim(), nv = c.lin_nv, Wz = Wq + V + 2 * nv;
+            run_linear(w.f_qkvz, h_norm.data(), H, B, z.data(), Wz);
+            q_bf16_gemv_any(w.w_ba.data(), 2 * nv, H, h_norm.data(), H, B, z.data() + Wq + V, Wz, stream);
+            q_delta_b(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(), w.dstate.data(),
+                      o_in.data(), meta_d.data(), bmax, B, Wq, V, c.lin_nk, nv, c.conv_k, c.eps, stream);
+            run_linear(w.l_out, o_in.data(), V, B, zr);
+        }
+        residual_reduce(zr, B, true);
+        q_zc_norm_to(h_norm.data(), state.data(), B, H, w.ln_post.data(), c.eps, stream);
+        run_linear(w.f_gu, h_norm.data(), H, B, z.data());
+        q_gateup(z.data(), z.data() + F, ones_f.data(), ones_f.data(), gu.data(), B, F, 2 * F, stream);
+        run_linear(w.ldown, gu.data(), F, B, zr);
+        residual_reduce(zr, B, true);
+    }
+    q_zc_norm(state.data(), B, H, final_norm.data(), c.eps, stream);
+    if (lm8.fp8)
+        run_linear(lm8, state.data(), H, B, logits_d.data());
+    else
+        q_bf16_gemv_any(lm_head_w.size() ? lm_head_w.data() : embed.data(), c.vocab, H, state.data(), H, B,
+                        logits_d.data(), c.vocab, stream);
+    topk_rows(B);
+}
+
+void QwenStage::decode_launch(int B) {
+    static const bool no_graph = std::getenv("QWEN_NO_GRAPH") != nullptr;
+    if (no_graph) {
+        decode_enqueue(B);
+        return;
+    }
+    auto it = graphs.find(B);
+    if (it == graphs.end()) {
+        const unsigned h0 = ar_hseq;
+        hipGraph_t g;
+        HIP_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
+        decode_enqueue(B);
+        HIP_CHECK(hipStreamEndCapture(stream, &g));
+        Graph gr;
+        HIP_CHECK(hipGraphInstantiate(&gr.exec, g, nullptr, nullptr, 0));
+        HIP_CHECK(hipGraphDestroy(g));
+        gr.exchanges = ar_hseq - h0;
+        ar_hseq = h0;  // capture did not execute the exchanges
+        it = graphs.emplace(B, gr).first;
+    }
+    HIP_CHECK(hipGraphLaunch(it->second.exec, stream));
+    ar_hseq += it->second.exchanges;
 }
 
 // ------------------------------------------------------------------ pipeline (layer split over GPUs)
@@ -1079,15 +1250,23 @@ struct QwenModel::Impl {
     int chunk = 256;
     std::vector<std::unique_ptr<QwenStage>> st;
     std::vector<float> logits_h, logits_all;  // logits_all: [<=16][vocab] of the last lm_head_rows
-    int pos = 0;
+    int pos = 0;  // legacy single-sequence API: position of slot 0
     bool tp = false;
     std::unique_ptr<std::barrier<>> bar;
     QwenStage &tail() { return *st.back(); }
-    void run_chunk(const int *tokens, int rows) {
+    // ---- serving pools (host side; identical on every stage)
+    int n_slots = 1, maxpages = 0, max_seqs = 0;
+    std::vector<int> seq_len;                 // per slot
+    std::vector<std::vector<int>> seq_pages;  // per slot
+    std::vector<int> free_pages;
+    std::vector<int> ptab_h;                  // [n_slots][maxpages]
+    int dummy_page = 0;
+    void run_chunk(const int *tokens, int rows, int slot = 0, int pos0 = -1) {
+        if (pos0 < 0) pos0 = pos;
         if (!tp) {
             for (auto &s : st) {
                 HIP_CHECK(hipSetDevice(s->device));
-                s->forward_chunk(tokens, rows);
+                s->forward_chunk(tokens, rows, slot, pos0);
             }
         } else {  // one host thread per rank (ranks meet at the all-reduce barriers)
             std::vector<std::thread> th;
@@ -1097,7 +1276,7 @@ struct QwenModel::Impl {
                 th.emplace_back([&, i]() {
                     try {
                         HIP_CHECK(hipSetDevice(st[i]->device));
-                        st[i]->forward_chunk(tokens, rows);
+                        st[i]->forward_chunk(tokens, rows, slot, pos0);
                     } catch (...) {
                         std::lock_guard<std::mutex> g(mu);
                         err = std::current_exception();
@@ -1105,7 +1284,7 @@ struct QwenModel::Impl {
                 });
             try {
                 HIP_CHECK(hipSetDevice(st[0]->device));
-                st[0]->forward_chunk(tokens, rows);
+                st[0]->forward_chunk(tokens, rows, slot, pos0);
             } catch (...) {
                 std::lock_guard<std::mutex> g(mu);
                 err = std::current_exception();
@@ -1113,7 +1292,173 @@ struct QwenModel::Impl {
             for (auto &t : th) t.join();
             if (err) std::rethrow_exception(err);
         }
-        pos += rows;
+        if (slot == 0 && max_seqs == 0) pos += rows;
+    }
+    // page table entry -> every stage's device table
+    void set_page(int slot, int idx, int page) {
+        ptab_h[size_t(slot) * maxpages + idx] = page;
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            HIP_CHECK(hipMemcpy(s->ptab_d.data() + size_t(slot) * maxpages + idx, &page, 4, hipMemcpyHostToDevice));
+        }
+    }
+    bool ensure_pages(int slot, int len) {  // pages for positions [0, len)
+        const int need = (len + QwenStage::PAGE - 1) / QwenStage::PAGE;
+        if (need > maxpages) return false;
+        auto &pg = seq_pages[size_t(slot)];
+        if (need - int(pg.size()) > int(free_pages.size())) return false;
+        while (int(pg.size()) < need) {
+            const int p = free_pages.back();
+            free_pages.pop_back();
+            set_page(slot, int(pg.size()), p);
+            pg.push_back(p);
+        }
+        return true;
+    }
+    void setup_pools(int seqs, long kv_tokens, double reserve_gb) {
+        max_seqs = seqs;
+        const int mp = (cfg.max_context + QwenStage::PAGE - 1) / QwenStage::PAGE;
+        int pages = mp;
+        n_slots = 1;
+        if (seqs > 0) {
+            n_slots = seqs + 1;  // + dummy slot for bucket padding rows
+            for (auto &s : st) {
+                HIP_CHECK(hipSetDevice(s->device));
+                s->alloc_batch(std::min(64, seqs));
+            }
+            size_t minfree = SIZE_MAX;
+            for (auto &s : st) {
+                HIP_CHECK(hipSetDevice(s->device));
+                size_t fr = 0, tot = 0;
+                HIP_CHECK(hipMemGetInfo(&fr, &tot));
+                minfree = std::min(minfree, fr);
+            }
+            const size_t reserve = size_t(reserve_gb * 1e9);
+            const size_t sb = st[0]->slot_bytes(), pb = st[0]->page_bytes();
+            const size_t need_slots = sb * size_t(n_slots);
+            if (minfree < reserve + need_slots + pb * 64)
+                throw std::runtime_error("not enough GPU memory for " + std::to_string(seqs) + " sequence slots");
+            long avail_pages = long((minfree - reserve - need_slots) / pb);
+            if (kv_tokens > 0) avail_pages = std::min(avail_pages, long((kv_tokens + QwenStage::PAGE - 1) / QwenStage::PAGE) + 1);
+            pages = int(std::min<long>(avail_pages, long(mp) * seqs + 1));
+        }
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->alloc_pools(n_slots, pages, mp);
+        }
+        maxpages = mp;
+        ptab_h.assign(size_t(n_slots) * mp, 0);
+        seq_len.assign(size_t(n_slots), 0);
+        seq_pages.assign(size_t(n_slots), {});
+        free_pages.clear();
+        if (seqs == 0) {  // legacy: slot 0 owns every page in order
+            for (int i = 0; i < mp; ++i) {
+                ptab_h[size_t(i)] = i;
+                seq_pages[0].push_back(i);
+            }
+            for (auto &s : st) {
+                HIP_CHECK(hipSetDevice(s->device));
+                HIP_CHECK(hipMemcpy(s->ptab_d.data(), ptab_h.data(), size_t(mp) * 4, hipMemcpyHostToDevice));
+            }
+        } else {
+            dummy_page = pages - 1;  // padding rows write their K/V here
+            for (int p = pages - 2; p >= 0; --p) free_pages.push_back(p);
+            set_page(n_slots - 1, 0, dummy_page);
+        }
+    }
+    // ---- serving API
+    void seq_start(int slot) {
+        seq_free(slot);
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->reset_slot(slot);
+        }
+    }
+    void seq_free(int slot) {
+        for (int p : seq_pages[size_t(slot)]) free_pages.push_back(p);
+        seq_pages[size_t(slot)].clear();
+        seq_len[size_t(slot)] = 0;
+    }
+    void seq_fork(int src, int dst) {
+        seq_start(dst);
+        const int len = seq_len[size_t(src)];
+        if (!ensure_pages(dst, len)) throw std::runtime_error("seq_fork: out of KV pages");
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->copy_slot(src, dst, seq_pages[size_t(src)], seq_pages[size_t(dst)]);
+        }
+        seq_len[size_t(dst)] = len;
+    }
+    // merged top-K candidates of `rows` rows (sorted by logit desc, id asc)
+    void merge_cands(int rows, QwenCand *out) {
+        const int K = QwenStage::TOPK;
+        std::vector<QwenCand> tmp;
+        for (int r = 0; r < rows; ++r) {
+            tmp.clear();
+            for (auto &s : st)
+                for (int k = 0; k < K; ++k) tmp.push_back({s->cand_vh[size_t(r) * K + k], s->cand_ih[size_t(r) * K + k]});
+            std::partial_sort(tmp.begin(), tmp.begin() + K, tmp.end(), [](const QwenCand &a, const QwenCand &b) {
+                return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+            });
+            std::copy(tmp.begin(), tmp.begin() + K, out + size_t(r) * K);
+        }
+    }
+    bool seq_prefill(int slot, const int *tokens, size_t n, QwenCand *cand) {
+        const int p0 = seq_len[size_t(slot)];
+        if (!ensure_pages(slot, p0 + int(n))) return false;
+        for (size_t i = 0; i < n; i += size_t(chunk)) {
+            const int rows = int(std::min<size_t>(size_t(chunk), n - i));
+            run_chunk(tokens + i, rows, slot, p0 + int(i));
+            if (cand && i + size_t(rows) == n) {  // candidates of the last token
+                for (auto &s : st) {
+                    HIP_CHECK(hipSetDevice(s->device));
+                    s->lm_head_enqueue(rows - 1, 1);
+                    s->topk_rows(1);
+                }
+                for (auto &s : st) {
+                    HIP_CHECK(hipSetDevice(s->device));
+                    HIP_CHECK(hipStreamSynchronize(s->stream));
+                }
+            }
+        }
+        seq_len[size_t(slot)] = p0 + int(n);
+        if (cand) merge_cands(1, cand);
+        return true;
+    }
+    // one token for each of n sequences; false (nothing run) if a sequence cannot get a KV page
+    bool decode_batch(const int *slots, const int *tokens, int n, QwenCand *cand) {
+        const int bm = st[0]->bmax;
+        if (n < 1 || n > bm) throw std::runtime_error("decode_batch: 1..bmax sequences");
+        for (int i = 0; i < n; ++i)
+            if (seq_len[size_t(slots[i])] + 1 > cfg.max_context || !ensure_pages(slots[i], seq_len[size_t(slots[i])] + 1))
+                return false;
+        static const int buckets[] = {1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64};
+        int B = bm;
+        for (int b : buckets)
+            if (b >= n) {
+                B = std::min(b, bm);
+                break;
+            }
+        for (auto &s : st) {
+            int *m = s->meta_h;
+            for (int i = 0; i < B; ++i) {
+                const bool real = i < n;
+                m[i] = real ? tokens[i] : 0;
+                m[bm + i] = real ? slots[i] : n_slots - 1;
+                m[2 * bm + i] = real ? seq_len[size_t(slots[i])] : 0;
+            }
+        }
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->decode_launch(B);
+        }
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            HIP_CHECK(hipStreamSynchronize(s->stream));
+        }
+        for (int i = 0; i < n; ++i) seq_len[size_t(slots[i])] += 1;
+        if (cand) merge_cands(n, cand);
+        return true;
     }
     void lm_head_rows(int row0, int nrows) {
         if (!tp) {
@@ -1226,9 +1571,13 @@ QwenModel::QwenModel(const std::filesystem::path &dir, int device, int chunk, in
 
 QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &devices, int chunk,
                      int max_context, bool tensor_parallel)
+    : QwenModel(dir, devices, chunk, max_context, tensor_parallel, QwenServeOptions{}) {}
+
+QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &devices, int chunk,
+                     int max_context, bool tensor_parallel, const QwenServeOptions &opt)
     : impl_(std::make_unique<Impl>()) {
     if (devices.empty()) throw std::runtime_error("QwenModel: no devices");
-    impl_->chunk = std::max(1, chunk);
+    impl_->chunk = std::max(opt.max_seqs > 0 ? 64 : 1, chunk);
     impl_->cfg = QwenRuntimeConfig::read(dir);
     impl_->cfg.max_context = max_context;
     const int n = int(devices.size()), NL = impl_->cfg.layers;
@@ -1297,9 +1646,11 @@ QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &d
             HIP_CHECK(hipDeviceSynchronize());
         }
         impl_->logits_h.resize(size_t(impl_->cfg.vocab));
+        impl_->setup_pools(opt.max_seqs, opt.kv_tokens, opt.reserve_gb);
         impl_->reset();
         return;
     }
+    if (opt.max_seqs > 0 && n > 1) throw std::runtime_error("serving mode: single GPU or tensor parallel only");
     for (int s = 0; s < n; ++s) {
         HIP_CHECK(hipSetDevice(devices[size_t(s)]));
         auto stg = std::make_unique<QwenStage>();
@@ -1331,6 +1682,7 @@ QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &d
     HIP_CHECK(hipSetDevice(devices[0]));
     HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&impl_->st[0]->tok_pinned), 64));
     impl_->logits_h.resize(size_t(impl_->cfg.vocab));
+    impl_->setup_pools(opt.max_seqs, opt.kv_tokens, opt.reserve_gb);
     impl_->reset();
 }
 QwenModel::~QwenModel() {
@@ -1350,6 +1702,21 @@ std::vector<int> QwenModel::generate(const int *prompt, size_t n_prompt, size_t 
     return impl_->generate(prompt, n_prompt, n_new);
 }
 double QwenModel::perplexity(const int *tokens, size_t n) { return impl_->perplexity(tokens, n); }
+int QwenModel::max_seqs() const { return impl_->max_seqs; }
+long QwenModel::kv_pages_total() const { return impl_->st[0]->n_pages - 1; }
+long QwenModel::kv_pages_free() const { return long(impl_->free_pages.size()); }
+int QwenModel::page_tokens() const { return QwenStage::PAGE; }
+int QwenModel::topk() const { return QwenStage::TOPK; }
+int QwenModel::seq_len(int slot) const { return impl_->seq_len[size_t(slot)]; }
+void QwenModel::seq_start(int slot) { impl_->seq_start(slot); }
+void QwenModel::seq_free(int slot) { impl_->seq_free(slot); }
+bool QwenModel::seq_prefill(int slot, const int *tokens, size_t n, QwenCand *cand) {
+    return impl_->seq_prefill(slot, tokens, n, cand);
+}
+bool QwenModel::decode_batch(const int *slots, const int *tokens, int n, QwenCand *cand) {
+    return impl_->decode_batch(slots, tokens, n, cand);
+}
+void QwenModel::seq_fork(int src, int dst) { impl_->seq_fork(src, dst); }
 
 }  // namespace behemoth
 

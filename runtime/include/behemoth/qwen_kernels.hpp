@@ -37,7 +37,8 @@ void q_sum_slices(const float *partial, int slices, size_t n, float *out, hipStr
 // raw gate extraction, k/v append to the bf16 caches [maxctx][nkv][hd].
 void q_qk_norm_rope(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G, uint16_t *kc, uint16_t *vc,
                     int rows, int pos0, int nq, int nkv, int hd, int rot, float theta,
-                    const uint16_t *q_norm, const uint16_t *k_norm, float eps, hipStream_t s);
+                    const uint16_t *q_norm, const uint16_t *k_norm, float eps, hipStream_t s,
+                    const int *pt = nullptr);  // pt: page table of the sequence (64-token pages)
 // out[r][h*hd+d] = softmax(q·K/sqrt(hd)) · V, gated by sigmoid(G); one block per (row, head).
 void q_attn(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
             uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, hipStream_t s);
@@ -88,7 +89,7 @@ void q_fp8_dequant(const uint8_t *w, const float *ws, int m, int n, uint16_t *ou
 size_t q_attn_split_scratch(int rows, int nq, int nkv, int hd, int max_len);
 void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
                   uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, float *scratch,
-                  size_t scratch_floats, hipStream_t s);
+                  size_t scratch_floats, hipStream_t s, const int *pt = nullptr);
 
 // Whole-chunk Gated DeltaNet (same math as T calls of q_delta_step): causal conv of all T rows
 // (conv_scratch f32 [T][conv_dim]), ring update, then one kernel per v-head over the T tokens with

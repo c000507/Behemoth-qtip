@@ -1,5 +1,7 @@
 // Micro-benchmark of the W8A8 GEMMs (src/qwen_batch.hip) vs the fp8 GEMV, on TP2 shard shapes.
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 
@@ -8,7 +10,72 @@
 #include "behemoth/qwen_kernels.hpp"
 
 using namespace behemoth;
-int main() {
+// all-reduce microbenchmark between devices 0 and 1 (device-flag protocol, zero-copy vs DMA pull)
+static void ar_bench() {
+    const int H = 5120;
+    struct R {
+        hipStream_t s;
+        DeviceBuffer<float> part, recv;
+        DeviceBuffer<uint16_t> state;
+        DeviceBuffer<unsigned> ctr;
+        char *host = nullptr;
+        unsigned *flags = nullptr;
+    } r[2];
+    const long slot = 64L * H * 4;
+    for (int d = 0; d < 2; ++d) {
+        HIP_CHECK(hipSetDevice(d));
+        HIP_CHECK(hipStreamCreateWithFlags(&r[d].s, hipStreamNonBlocking));
+        r[d].part.resize(64 * H);
+        r[d].recv.resize(64 * H);
+        r[d].state.resize(64 * H);
+        r[d].ctr.resize(4);
+        HIP_CHECK(hipMemset(r[d].ctr.data(), 0, 16));
+        HIP_CHECK(hipMemset(r[d].part.data(), 0, r[d].part.bytes()));
+        HIP_CHECK(hipMemset(r[d].state.data(), 0, r[d].state.bytes()));
+    }
+    for (int d = 0; d < 2; ++d) {
+        HIP_CHECK(hipSetDevice(std::getenv("AR_LOCAL") ? d : 1 - d));
+        HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&r[d].host), size_t(slot) * 4,
+                                hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
+        HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&r[d].flags), 4 * 64, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
+        std::memset(r[d].flags, 0, 256);
+    }
+    for (int rows : {1, 8, 16, 32, 64})
+        for (int bf = 0; bf < 2; ++bf)
+            for (int dma = 0; dma < 2; ++dma) {
+                const long n = long(rows) * H;
+                const int it = 200;
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    for (int d = 0; d < 2; ++d) {
+                        HIP_CHECK(hipSetDevice(d));
+                        R &a = r[d], &b = r[1 - d];
+                        q_ar_push(a.part.data(), n, a.host, slot, bf, a.flags, a.ctr.data(), a.ctr.data() + 1, 4, a.s);
+                        if (!dma) {
+                            q_ar_pull_add(a.state.data(), a.part.data(), b.host, slot, bf, n, d, b.flags, a.ctr.data(),
+                                          a.ctr.data() + 2, 4, a.s);
+                        } else {
+                            q_ar_wait(b.flags, a.ctr.data(), 4, a.s);
+                            HIP_CHECK(hipMemcpyAsync(a.recv.data(), b.host + (i % 4) * slot, size_t(n) * (bf ? 2 : 4),
+                                                     hipMemcpyHostToDevice, a.s));
+                            q_ar_add_local(a.state.data(), a.part.data(), a.recv.data(), bf, n, d, a.ctr.data(),
+                                           a.ctr.data() + 2, a.s);
+                        }
+                    }
+                for (int d = 0; d < 2; ++d) {
+                    HIP_CHECK(hipSetDevice(d));
+                    HIP_CHECK(hipStreamSynchronize(r[d].s));
+                }
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+                std::printf("ar rows %2d %s %s: %.1f us/exchange\n", rows, bf ? "bf16" : "fp32", dma ? "dma " : "zc  ", us);
+            }
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "ar")) {
+        ar_bench();
+        return 0;
+    }
     struct Shape { int m, n; const char *name; };
     const Shape shapes[] = {{17408, 5120, "gateup"}, {5120, 8704, "down"}, {8192, 5120, "qkvz"}, {5120, 3072, "out"},
                             {7168, 5120, "qkv"}, {124160, 5120, "lm_head"}};

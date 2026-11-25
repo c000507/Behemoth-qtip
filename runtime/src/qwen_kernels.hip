@@ -24,6 +24,8 @@ __device__ __forceinline__ uint16_t f2bf(float f) {
     u += 0x7fffu + ((u >> 16) & 1u);
     return uint16_t(u >> 16);
 }
+// paged KV: position t of a sequence lives at row pt[t / 64] * 64 + t % 64 of the pool (pt null: row t)
+__device__ __forceinline__ long kvrow(const int *pt, int t) { return pt ? long(pt[t >> 6]) * 64 + (t & 63) : long(t); }
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : __logf(1.0f + __expf(x)); }
 
@@ -302,14 +304,14 @@ void q_sum_slices(const float *partial, int slices, size_t n, float *out, hipStr
 __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G,
                                       uint16_t *kc, uint16_t *vc, int rows, int pos0, int nq, int nkv,
                                       int hd, int rot, float theta, const uint16_t *q_norm,
-                                      const uint16_t *k_norm, float eps) {
+                                      const uint16_t *k_norm, float eps, const int *pt) {
     int r = blockIdx.x % rows;
     int h = blockIdx.x / rows;
     int d = threadIdx.x;
     if (h >= nq + nkv) {
         int hv = h - nq - nkv;
         uint16_t *vv = v + long(r) * nkv * hd + long(hv) * hd;
-        uint16_t *vdst = vc + (long(pos0 + r) * nkv + hv) * hd;
+        uint16_t *vdst = vc + (kvrow(pt, pos0 + r) * nkv + hv) * hd;
         vdst[d] = vv[d];
         return;
     }
@@ -338,16 +340,16 @@ __global__ void q_qk_norm_rope_kernel(uint16_t *q, uint16_t *k, uint16_t *v, uin
     }
     if (!is_q) {  // append k to cache (after ALL rope writes of this head: sync)
         __syncthreads();
-        uint16_t *kdst = kc + (long(pos0 + r) * nkv + long(h - nq)) * hd;
+        uint16_t *kdst = kc + (kvrow(pt, pos0 + r) * nkv + long(h - nq)) * hd;
         kdst[d] = vec[d];
     }
 }
 void q_qk_norm_rope(uint16_t *q, uint16_t *k, uint16_t *v, uint16_t *G, uint16_t *kc, uint16_t *vc,
                     int rows, int pos0, int nq, int nkv, int hd, int rot, float theta,
-                    const uint16_t *q_norm, const uint16_t *k_norm, float eps, hipStream_t s) {
+                    const uint16_t *q_norm, const uint16_t *k_norm, float eps, hipStream_t s, const int *pt) {
     q_qk_norm_rope_kernel<<<unsigned((nq + 2 * nkv) * rows), hd, 0, s>>>(q, k, v, G, kc, vc, rows,
                                                                          pos0, nq, nkv, hd, rot,
-                                                                         theta, q_norm, k_norm, eps);
+                                                                         theta, q_norm, k_norm, eps, pt);
     HIP_CHECK(hipGetLastError());
 }
 
@@ -749,7 +751,7 @@ __global__ __launch_bounds__(256) void q_attn_split_kernel(const uint16_t *__res
                                                            const uint16_t *__restrict__ vc, int rows,
                                                            int pos0, int nq, int nkv, int S, int nsplit,
                                                            float scale, float *__restrict__ pml,
-                                                           float *__restrict__ pacc) {
+                                                           float *__restrict__ pacc, const int *__restrict__ pt) {
     constexpr int HD = 256, DPL = HD / 32;
     const int split = int(blockIdx.x) % nsplit;
     const int kh = (int(blockIdx.x) / nsplit) % nkv;
@@ -779,7 +781,7 @@ __global__ __launch_bounds__(256) void q_attn_split_kernel(const uint16_t *__res
 #pragma unroll
         for (int g = 0; g < G; ++g) dot[g] = 0.f;
         if (ok) {
-            const uint4 *kp = reinterpret_cast<const uint4 *>(kc + long(t) * kstride + long(kh) * HD);
+            const uint4 *kp = reinterpret_cast<const uint4 *>(kc + kvrow(pt, t) * kstride + long(kh) * HD);
 #pragma unroll 4
             for (int c = 0; c < HD / 8; ++c) {
                 const uint4 kv = kp[c];
@@ -808,7 +810,7 @@ __global__ __launch_bounds__(256) void q_attn_split_kernel(const uint16_t *__res
         }
         const int nj = min(32, t_end - base);
         for (int j = 0; j < nj; ++j) {
-            const uint4 vv = *reinterpret_cast<const uint4 *>(vc + long(base + j) * kstride + long(kh) * HD +
+            const uint4 vv = *reinterpret_cast<const uint4 *>(vc + kvrow(pt, base + j) * kstride + long(kh) * HD +
                                                               lane * DPL);
             const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
             float v[DPL];
@@ -871,7 +873,7 @@ size_t q_attn_split_scratch(int rows, int nq, int nkv, int hd, int max_len) {
 
 void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
                   uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, float *scratch,
-                  size_t scratch_floats, hipStream_t s) {
+                  size_t scratch_floats, hipStream_t s, const int *pt) {
     if (hd != 256) throw std::runtime_error("q_attn_split: head_dim 256 only");
     const int len = pos0 + rows;
     const int want = std::max(1, 1024 / std::max(1, rows * nkv));
@@ -883,11 +885,11 @@ void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, con
     float *pml = scratch, *pacc = scratch + 2 * ne;
     const unsigned blocks = unsigned(rows * nkv * nsplit);
     switch (nq / nkv) {
-    case 1: q_attn_split_kernel<1><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
-    case 2: q_attn_split_kernel<2><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
-    case 4: q_attn_split_kernel<4><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
-    case 6: q_attn_split_kernel<6><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
-    case 8: q_attn_split_kernel<8><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    case 1: q_attn_split_kernel<1><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc, pt); break;
+    case 2: q_attn_split_kernel<2><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc, pt); break;
+    case 4: q_attn_split_kernel<4><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc, pt); break;
+    case 6: q_attn_split_kernel<6><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc, pt); break;
+    case 8: q_attn_split_kernel<8><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc, pt); break;
     default: throw std::runtime_error("q_attn_split: unsupported GQA group");
     }
     HIP_CHECK(hipGetLastError());

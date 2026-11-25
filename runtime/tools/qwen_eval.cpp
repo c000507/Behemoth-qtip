@@ -34,6 +34,9 @@ int main(int argc, char **argv) {
     std::string gpus;
     std::vector<int> bench;
     int bench_decode = 0;
+    int serve_seqs = 0, bench_ctx = 1024, bench_steps = 32, btest_n = 0, btest_gen = 32;
+    std::vector<int> bench_batch;
+    std::string btest_file;
     int greedy = 0, chunk = 256, device = 0, max_context = 8192, window = 0, stride = 0;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
@@ -49,6 +52,20 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--bench-prefill")) bench.push_back(std::atoi(next().c_str()));
         else if (!std::strcmp(argv[i], "--bench-decode")) bench_decode = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--max-context")) max_context = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--serve-seqs")) serve_seqs = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--bench-batch")) {
+            std::string v = next();
+            for (size_t p = 0; p < v.size();) {
+                size_t q = v.find(',', p);
+                if (q == std::string::npos) q = v.size();
+                bench_batch.push_back(std::atoi(v.substr(p, q - p).c_str()));
+                p = q + 1;
+            }
+        }
+        else if (!std::strcmp(argv[i], "--bench-ctx")) bench_ctx = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--bench-steps")) bench_steps = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--batch-test")) { btest_n = std::atoi(next().c_str()); btest_file = next(); }
+        else if (!std::strcmp(argv[i], "--batch-test-gen")) btest_gen = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--window")) window = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--stride")) stride = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
@@ -71,8 +88,113 @@ int main(int argc, char **argv) {
             }
         }
         double tl = behemoth_now();
-        behemoth::QwenModel m(model, devs, chunk, max_context, tp);
+        behemoth::QwenServeOptions so;
+        so.max_seqs = serve_seqs;
+        behemoth::QwenModel m(model, devs, chunk, max_context, tp, so);
         std::printf("load %.1f s on %zu gpu(s)\n", behemoth_now() - tl, devs.size());
+        if (serve_seqs > 0) {
+            const long pages = m.kv_pages_total();
+            std::printf("serving: %d slots, KV pool %ld pages = %ld tokens; max concurrent seqs @8k %ld, @32k %ld\n",
+                        m.max_seqs(), pages, pages * m.page_tokens(),
+                        std::min<long>(m.max_seqs(), pages / ((8192 + 63) / 64)),
+                        std::min<long>(m.max_seqs(), pages / ((32768 + 63) / 64)));
+            const int K = m.topk();
+            for (int B : bench_batch) {  // aggregate decode throughput: one prefilled context forked to B slots
+                if (B > m.max_seqs()) continue;
+                std::vector<int> ctx(static_cast<size_t>(bench_ctx));
+                for (int i = 0; i < bench_ctx; ++i) ctx[size_t(i)] = 1000 + (i * 7919) % 100000;
+                std::vector<behemoth::QwenCand> cand(size_t(B) * K);
+                m.seq_start(0);
+                double t0 = behemoth_now();
+                m.seq_prefill(0, ctx.data(), ctx.size(), cand.data());
+                double t1 = behemoth_now();
+                for (int b = 1; b < B; ++b) m.seq_fork(0, b);
+                std::vector<int> slots(static_cast<size_t>(B)), toks(static_cast<size_t>(B), 11);
+                for (int b = 0; b < B; ++b) slots[size_t(b)] = b;
+                m.decode_batch(slots.data(), toks.data(), B, cand.data());  // warm (graph capture)
+                double t2 = behemoth_now();
+                for (int i = 0; i < bench_steps; ++i) {
+                    for (int b = 0; b < B; ++b) toks[size_t(b)] = cand[size_t(b) * K].id;
+                    if (!m.decode_batch(slots.data(), toks.data(), B, cand.data())) throw std::runtime_error("out of pages");
+                }
+                double t3 = behemoth_now();
+                const double step = (t3 - t2) / bench_steps;
+                std::printf("batch %2d ctx %d: prefill %.2f s, step %.2f ms, %.1f tok/s/seq, aggregate %.1f tok/s\n", B,
+                            bench_ctx, t1 - t0, step * 1e3, 1.0 / step, B / step);
+                std::fflush(stdout);
+                for (int b = 0; b < B; ++b) m.seq_free(b);
+            }
+            if (greedy > 0 && !prompt_file.empty()) {  // greedy through the serving path (B = 1)
+                auto toks = load_tokens(prompt_file);
+                std::vector<behemoth::QwenCand> cand(static_cast<size_t>(K));
+                m.seq_start(0);
+                m.seq_prefill(0, toks.data(), toks.size(), cand.data());
+                int slot = 0;
+                std::printf("serve greedy %d:", greedy);
+                for (int g = 0; g < greedy; ++g) {
+                    int t = cand[0].id;
+                    std::printf(" %d", t);
+                    if (g + 1 < greedy) m.decode_batch(&slot, &t, 1, cand.data());
+                }
+                std::printf("\n");
+                m.seq_free(0);
+            }
+            if (btest_n > 0) {  // batch invariance: greedy alone vs together
+                auto src = load_tokens(btest_file);
+                std::vector<std::vector<int>> prompts;
+                size_t off = 0;
+                for (int i = 0; i < btest_n; ++i) {
+                    const size_t len = size_t(17 + (i * 97) % 900);
+                    if (off + len > src.size()) off = 0;
+                    prompts.emplace_back(src.begin() + long(off), src.begin() + long(off + len));
+                    off += len;
+                }
+                const int G = btest_gen;
+                std::vector<std::vector<int>> alone(prompts.size()), batch(prompts.size());
+                std::vector<std::vector<float>> gaps(prompts.size());
+                std::vector<behemoth::QwenCand> cand(size_t(btest_n) * K);
+                for (size_t i = 0; i < prompts.size(); ++i) {
+                    m.seq_start(0);
+                    m.seq_prefill(0, prompts[i].data(), prompts[i].size(), cand.data());
+                    int slot = 0;
+                    for (int g = 0; g < G; ++g) {
+                        int t = cand[0].id;
+                        alone[i].push_back(t);
+                        gaps[i].push_back(cand[0].logit - cand[1].logit);
+                        if (g + 1 < G) m.decode_batch(&slot, &t, 1, cand.data());
+                    }
+                }
+                double t0 = behemoth_now();
+                std::vector<int> slots, toks(prompts.size());
+                for (size_t i = 0; i < prompts.size(); ++i) {
+                    m.seq_start(int(i));
+                    m.seq_prefill(int(i), prompts[i].data(), prompts[i].size(), cand.data() + i * K);
+                    slots.push_back(int(i));
+                }
+                for (int g = 0; g < G; ++g) {
+                    for (size_t i = 0; i < prompts.size(); ++i) {
+                        toks[i] = cand[i * K].id;
+                        batch[i].push_back(toks[i]);
+                    }
+                    if (g + 1 < G) m.decode_batch(slots.data(), toks.data(), int(prompts.size()), cand.data());
+                }
+                int same = 0;
+                for (size_t i = 0; i < prompts.size(); ++i) {
+                    int d = -1;
+                    for (int g = 0; g < G; ++g)
+                        if (alone[i][size_t(g)] != batch[i][size_t(g)]) {
+                            d = g;
+                            break;
+                        }
+                    if (d < 0) ++same;
+                    else std::printf("  prompt %zu (len %zu): diverges at %d (alone top1-top2 gap %.4f)\n", i,
+                                     prompts[i].size(), d, gaps[i][size_t(d)]);
+                }
+                std::printf("batch test: %d prompts x %d greedy tokens: %d identical alone vs batched (%.1f s batched)\n",
+                            btest_n, G, same, behemoth_now() - t0);
+            }
+            return 0;
+        }
         const auto &c = m.config();
         std::printf("model: %d layers (hidden %d, %d full-attn), vocab %d, inter %d, rot %d\n", c.layers,
                     c.hidden, int(std::count(c.full_attn.begin(), c.full_attn.end(), 1)), c.vocab, c.inter,

@@ -30,6 +30,18 @@ struct QwenRuntimeConfig {
     static QwenRuntimeConfig read(const std::filesystem::path &model_dir);
 };
 
+// Batched serving (continuous batching): max_seqs sequence slots, KV in a shared page pool sized from
+// free GPU memory (kv_tokens > 0 caps it), reserve_gb left free per GPU.
+struct QwenServeOptions {
+    int max_seqs = 0;  // 0: legacy single-sequence model
+    long kv_tokens = 0;
+    double reserve_gb = 1.5;
+};
+struct QwenCand {
+    float logit;
+    int id;
+};
+
 class QwenModel {
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -43,6 +55,8 @@ class QwenModel {
     // tensor_parallel (2 GPUs): every layer sharded by heads / intermediate / vocab instead.
     QwenModel(const std::filesystem::path &model_dir, const std::vector<int> &devices, int chunk = 256,
               int max_context = 8192, bool tensor_parallel = false);
+    QwenModel(const std::filesystem::path &model_dir, const std::vector<int> &devices, int chunk, int max_context,
+              bool tensor_parallel, const QwenServeOptions &opt);
     ~QwenModel();
     QwenModel(const QwenModel &) = delete;
     QwenModel &operator=(const QwenModel &) = delete;
@@ -58,6 +72,24 @@ class QwenModel {
     std::vector<int> generate(const int *prompt, size_t n_prompt, size_t n_new);
     // Mean negative log-likelihood of the given tokens (assumes position 0; resets first).
     double perplexity(const int *tokens, size_t n);
+
+    // ---- serving API (QwenServeOptions::max_seqs > 0). Slots 0..max_seqs-1.
+    int max_seqs() const;
+    long kv_pages_total() const;
+    long kv_pages_free() const;
+    int page_tokens() const;
+    int topk() const;  // candidates per row
+    int seq_len(int slot) const;
+    void seq_start(int slot);  // fresh sequence in slot (state reset, pages released)
+    void seq_free(int slot);
+    // Appends n tokens (chunked prefill). cand: topk() candidates of the last token (sorted). false:
+    // not enough KV pages (nothing done).
+    bool seq_prefill(int slot, const int *tokens, size_t n, QwenCand *cand);
+    // One decode step for n sequences (token i appended to slots[i]); cand [n][topk()]. false: out
+    // of KV pages (nothing done).
+    bool decode_batch(const int *slots, const int *tokens, int n, QwenCand *cand);
+    // Copies sequence src (state + KV) into slot dst (benchmarks / prefix reuse).
+    void seq_fork(int src, int dst);
 };
 
 }  // namespace behemoth

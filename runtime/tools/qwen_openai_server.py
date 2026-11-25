@@ -2,15 +2,18 @@
 """Minimal OpenAI-compatible HTTP front-end for the Qwen3.5 runtime (tools/qwen_worker).
 
 The HF tokenizer renders the chat template (thinking models: the reasoning before </think> is
-returned as `reasoning_content`); generation runs in one qwen_worker process (single sequence,
-requests are serialised). Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,
-POST /v1/completions (both with optional "stream": true).
+returned as `reasoning_content`); generation runs in one qwen_worker process with continuous
+batching (concurrent requests share decode steps; a client disconnect cancels its request).
+Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions (both with
+optional "stream": true).
 
-usage: qwen_openai_server.py --worker build-rocm/qwen_worker --model DIR [--gpus 0,1]
-                             [--host 0.0.0.0] [--port 8027] [--max-context 32768] [--name NAME] [--tp]
+usage: qwen_openai_server.py --worker build-rocm/qwen_worker --model DIR [--gpus 0,1] [--tp]
+                             [--host 0.0.0.0] [--port 8027] [--max-context 32768] [--max-seqs 32]
+                             [--chunk 2048] [--name NAME]
 """
 import argparse
 import json
+import queue
 import subprocess
 import threading
 import time
@@ -21,30 +24,62 @@ from transformers import AutoTokenizer
 
 
 class Worker:
+    """One qwen_worker process; requests are multiplexed by id over its stdin/stdout."""
+
     def __init__(self, args):
-        cmd = [args.worker, "--model", args.model, "--gpus", args.gpus, "--max-context",
-               str(args.max_context), "--chunk", str(args.chunk)] + (["--tp"] if args.tp else [])
+        cmd = [args.worker, "--model", args.model, "--gpus", args.gpus, "--max-context", str(args.max_context),
+               "--chunk", str(args.chunk), "--max-seqs", str(args.max_seqs)] + (["--tp"] if args.tp else [])
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         ready = json.loads(self.p.stdout.readline())
         assert ready.get("ready"), ready
         self.max_context = ready["max_context"]
-        self.lock = threading.Lock()
+        self.info = ready
+        self.wlock = threading.Lock()
+        self.qlock = threading.Lock()
+        self.queues = {}
+        threading.Thread(target=self._reader, daemon=True).start()
 
-    def generate(self, req):
-        """Yields ("t", id) per token, then ("done", info)."""
-        with self.lock:
-            self.p.stdin.write(json.dumps(req) + "\n")
-            self.p.stdin.flush()
-            while True:
-                line = self.p.stdout.readline()
-                if not line:
-                    raise RuntimeError("worker exited")
+    def _reader(self):
+        for line in self.p.stdout:
+            try:
                 msg = json.loads(line)
+            except ValueError:
+                continue
+            with self.qlock:
+                q = self.queues.get(msg.get("id"))
+            if q is not None:
+                q.put(msg)
+        with self.qlock:  # worker died: wake everyone
+            for q in self.queues.values():
+                q.put(None)
+
+    def _send(self, obj):
+        with self.wlock:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+
+    def cancel(self, rid):
+        self._send({"cancel": rid})
+
+    def generate(self, rid, req):
+        """Yields ("t", id) per token, then ("done", info)."""
+        q = queue.Queue()
+        with self.qlock:
+            self.queues[rid] = q
+        try:
+            self._send(dict(req, id=rid))
+            while True:
+                msg = q.get()
+                if msg is None:
+                    raise RuntimeError("worker exited")
                 if "t" in msg:
                     yield "t", msg["t"]
                 else:
                     yield "done", msg
                     return
+        finally:
+            with self.qlock:
+                self.queues.pop(rid, None)
 
 
 def main():
@@ -55,7 +90,8 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8027)
     ap.add_argument("--max-context", type=int, default=32768)
-    ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument("--max-seqs", type=int, default=32, help="concurrent sequences (continuous batching, <= 64)")
     ap.add_argument("--tp", action="store_true", help="tensor parallel over the 2 GPUs (default: layer pipeline)")
     ap.add_argument("--name", default="qwen3.8-27b-fp8")
     args = ap.parse_args()
@@ -85,7 +121,8 @@ def main():
                 return self._json(200, {"status": "ok"})
             if self.path == "/v1/models":
                 return self._json(200, {"object": "list", "data": [
-                    {"id": args.name, "object": "model", "owned_by": "behemoth", "max_model_len": worker.max_context}]})
+                    {"id": args.name, "object": "model", "owned_by": "behemoth", "max_model_len": worker.max_context,
+                     "max_seqs": worker.info.get("max_seqs"), "kv_tokens": worker.info.get("kv_tokens")}]})
             self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
@@ -121,7 +158,7 @@ def main():
             stream = bool(body.get("stream"))
             rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
             created = int(time.time())
-            gen = worker.generate(req)
+            gen = worker.generate(rid, req)
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -170,14 +207,15 @@ def main():
                     if d:
                         chunk({"reasoning_content": d} if in_reason else {"content": d})
             except (BrokenPipeError, ConnectionResetError):
-                for _ in gen:  # drain the worker
+                worker.cancel(rid)  # client went away: free its slot
+                for _ in gen:  # until the worker confirms
                     pass
                 return
             finish = "stop" if info.get("done") == "stop" else "length"
             usage = {"prompt_tokens": len(ids), "completion_tokens": info.get("completion", len(out_ids)),
                      "total_tokens": len(ids) + info.get("completion", len(out_ids))}
             dec = info.get("decode_s", 0) or 1e-9
-            print(f"{rid}: prompt {len(ids)} tok prefill {info.get('prefill_s', 0):.2f}s, {usage['completion_tokens']} tok "
+            print(f"{rid}: prompt {len(ids)} tok ttft {info.get('ttft_s', 0):.2f}s, {usage['completion_tokens']} tok "
                   f"in {dec:.2f}s ({usage['completion_tokens'] / dec:.1f} tok/s), {finish}", flush=True)
             if stream:
                 chunk({}, finish)
@@ -204,7 +242,11 @@ def main():
                        "choices": [{"index": 0, "text": content, "finish_reason": finish}], "usage": usage}
             self._json(200, obj)
 
-    ThreadingHTTPServer((args.host, args.port), H).serve_forever()
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 256  # many clients connect at once (default backlog 5 resets them)
+        daemon_threads = True
+
+    Server((args.host, args.port), H).serve_forever()
 
 
 if __name__ == "__main__":
