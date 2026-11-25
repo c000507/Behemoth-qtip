@@ -981,7 +981,12 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
                                v.data() + size_t(sg.row0) * Wk, gate.data() + size_t(sg.row0) * A, w.kc.data(),
                                w.vc.data(), sg.n, sg.pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
                                w.k_norm.data(), c.eps, stream, spt);
-                if (c.hd == 256)
+                static const bool split_attn = std::getenv("QWEN_ATTN_SPLIT") != nullptr;
+                if (c.hd == 256 && sg.n >= 16 && !split_attn)  // bf16 WMMA flash attention
+                    q_flash_prefill(q.data() + size_t(sg.row0) * Wq, w.kc.data(), w.vc.data(),
+                                    gate.data() + size_t(sg.row0) * A, attn_out.data() + size_t(sg.row0) * A, sg.n,
+                                    sg.pos0, c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), spt, stream);
+                else if (c.hd == 256)
                     q_attn_split(q.data() + size_t(sg.row0) * Wq, w.kc.data(), w.vc.data(),
                                  gate.data() + size_t(sg.row0) * A, attn_out.data() + size_t(sg.row0) * A, sg.n,
                                  sg.pos0, c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
@@ -1219,6 +1224,11 @@ void QwenStage::topk_rows(int nrows) {
 // One decode step for rows [0, B) of meta (B <= bmax): fp8 W8A8 decode GEMMs, paged attention,
 // per-slot DeltaNet, fp32 zero-copy all-reduce, fp8 lm_head + top-k candidates -> pinned host.
 void QwenStage::decode_enqueue(int B) {
+    struct NoBig {  // decode GEMMs: the split-K decode kernel (prefill_big is for prefill passes)
+        bool &f, old;
+        explicit NoBig(bool &x) : f(x), old(x) { f = false; }
+        ~NoBig() { f = old; }
+    } nobig(prefill_big);
     const QwenRuntimeConfig &c = cfg;
     const int H = c.hidden, A = c.nq * c.hd, V = c.value_dim(), F = c.inter;
     HIP_CHECK(hipMemcpyAsync(meta_d.data(), meta_h, size_t(3) * bmax * 4, hipMemcpyHostToDevice, stream));

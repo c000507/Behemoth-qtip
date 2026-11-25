@@ -72,6 +72,29 @@ static void ar_bench() {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "add")) {  // q_ar_add_local at prefill size
+        const long n = (argc > 2 ? std::atol(argv[2]) : 2048L) * 5120;
+        DeviceBuffer<uint16_t> st(static_cast<size_t>(n)), pe(static_cast<size_t>(n) * 2);
+        DeviceBuffer<float> own(static_cast<size_t>(n));
+        DeviceBuffer<unsigned> ctr(4);
+        HIP_CHECK(hipMemset(st.data(), 0, st.bytes()));
+        HIP_CHECK(hipMemset(pe.data(), 0, pe.bytes()));
+        HIP_CHECK(hipMemset(own.data(), 0, own.bytes()));
+        HIP_CHECK(hipMemset(ctr.data(), 0, 16));
+        hipEvent_t a, b;
+        HIP_CHECK(hipEventCreate(&a));
+        HIP_CHECK(hipEventCreate(&b));
+        for (int bf = 1; bf >= 0; --bf) {
+            HIP_CHECK(hipEventRecord(a, nullptr));
+            for (int i = 0; i < 20; ++i) q_ar_add_local(st.data(), own.data(), pe.data(), bf, n, 0, ctr.data(), ctr.data() + 2, nullptr);
+            HIP_CHECK(hipEventRecord(b, nullptr));
+            HIP_CHECK(hipEventSynchronize(b));
+            float ms;
+            HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+            std::printf("add_local bf16 %d: %.3f ms\n", bf, ms / 20);
+        }
+        return 0;
+    }
     if (argc > 1 && !std::strcmp(argv[1], "ar")) {
         ar_bench();
         return 0;

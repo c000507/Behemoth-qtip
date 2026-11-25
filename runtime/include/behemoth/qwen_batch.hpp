@@ -50,7 +50,7 @@ namespace behemoth {
 // ------------------------------------------------------------------ TP all-reduce via host memory
 // Host slots: nslot slots of slot_bytes at hbase (pinned, coherent, mapped); flags: 16 unsigned per
 // slot (one cache line). seq / ctr: device counters (one pair per rank, zero-initialised).
-// n: float count (multiple of 4). Push: writes the rank's partial (bf16: also rounds `part` in place).
+// n: float count (multiple of 4). Push: writes the rank's partial (bf16: rounded; the pull rounds its own copy).
 void q_ar_push(float *part, long n, void *hbase, long slot_bytes, bool bf16, unsigned *hflag, const unsigned *seq,
                unsigned *ctr, int nslot, hipStream_t st);
 // Pull: waits for the peer's flag, state = bf16(state + (p0 + p1)), advances seq.
@@ -89,4 +89,12 @@ void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_nor
                float eps, hipStream_t st);
 // Top-K (unsorted, K <= 64) of each row of logits [rows][V]; ids offset by voff.
 void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st);
+}  // namespace behemoth
+
+namespace behemoth {
+// Causal gated attention of `rows` consecutive positions pos0.. of one sequence (prefill), bf16 WMMA
+// flash attention. Same contract as q_attn_split: q bf16 [rows][nq][2*hd] (q | gate), paged bf16 KV
+// (pt: page table, 64-token pages; null: contiguous), out bf16 [rows][nq*hd]. hd 256.
+void q_flash_prefill(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+                     int rows, int pos0, int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st);
 }  // namespace behemoth

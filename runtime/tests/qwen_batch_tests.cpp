@@ -9,6 +9,7 @@
 
 #include "behemoth/gpu.hpp"
 #include "behemoth/qwen_batch.hpp"
+#include "behemoth/qwen_kernels.hpp"
 
 using namespace behemoth;
 
@@ -106,6 +107,42 @@ static void test_gemm(int m, int n, int rows, std::mt19937 &rng) {
     }
 }
 
+// flash prefill attention vs the scalar split-K kernel (same paged bf16 cache)
+static void test_flash(int rows, int pos0, std::mt19937 &rng) {
+    const int nq = 12, nkv = 2, hd = 256, len = pos0 + rows;
+    const int pages = (len + 63) / 64 + 1;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<uint16_t> q(size_t(rows) * nq * 2 * hd), g(size_t(rows) * nq * hd), kc(size_t(pages) * 64 * nkv * hd),
+        vc(kc.size());
+    for (auto &x : q) x = f2bf(nd(rng));
+    for (auto &x : g) x = f2bf(nd(rng));
+    for (auto &x : kc) x = f2bf(nd(rng));
+    for (auto &x : vc) x = f2bf(nd(rng));
+    std::vector<int> pt;
+    for (int i = 0; i < pages; ++i) pt.push_back((i * 7 + 3) % pages);  // shuffled pages
+    DeviceBuffer<uint16_t> dq, dg, dk, dv, o1(size_t(rows) * nq * hd), o2(size_t(rows) * nq * hd);
+    DeviceBuffer<int> dpt;
+    DeviceBuffer<float> scr(q_attn_split_scratch(rows, nq, nkv, hd, len) + 16);
+    dq.upload(q);
+    dg.upload(g);
+    dk.upload(kc);
+    dv.upload(vc);
+    dpt.upload(pt);
+    const float sc = 1.0f / 16.0f;
+    q_attn_split(dq.data(), dk.data(), dv.data(), dg.data(), o1.data(), rows, pos0, nq, nkv, hd, sc, scr.data(), scr.size(),
+                 nullptr, dpt.data());
+    q_flash_prefill(dq.data(), dk.data(), dv.data(), dg.data(), o2.data(), rows, pos0, nq, nkv, hd, sc, dpt.data(), nullptr);
+    HIP_CHECK(hipDeviceSynchronize());
+    auto a = o1.download(), b = o2.download();
+    double md = 0, mm = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        md = std::max(md, double(std::fabs(bf2f(a[i]) - bf2f(b[i]))));
+        mm = std::max(mm, double(std::fabs(bf2f(a[i]))));
+    }
+    CHECK(md < 0.02 * mm + 1e-3, "flash rows %d pos0 %d: max diff %.4g (max |o| %.3g)", rows, pos0, md, mm);
+    std::printf("flash rows %d pos0 %d: max diff %.4g (max |o| %.3g)\n", rows, pos0, md, mm);
+}
+
 int main() {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
@@ -120,6 +157,9 @@ int main() {
     test_gemm(512, 384, 64, rng);
     test_gemm(256, 512, 100, rng);
     test_gemm(384, 768, 300, rng);
+    test_flash(16, 0, rng);
+    test_flash(37, 5, rng);
+    test_flash(200, 300, rng);
     std::printf(fails ? "%d FAILURES\n" : "all passed\n", fails);
     return fails ? 1 : 0;
 }

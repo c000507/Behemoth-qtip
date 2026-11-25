@@ -482,15 +482,20 @@ namespace {
 __device__ __forceinline__ unsigned ld_flag(const unsigned *p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
+// SYS: the block's writes went to host memory (push) and must be visible to the peer GPU before the
+// flag; otherwise (pull / add: device-local writes) a device-scope fence suffices — a system fence
+// here writes back the dirty L2 (5x slower add kernels)
+template <bool SYS>
 __device__ __forceinline__ void last_block(unsigned *ctr, unsigned *flag, unsigned flag_val, unsigned *seq,
                                            unsigned seq_val) {
-    __threadfence_system();
+    if (SYS) __threadfence_system();
+    else __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
         const unsigned done = atomicAdd(ctr, 1u);
         if (done == gridDim.x - 1) {
             *ctr = 0;
-            __threadfence_system();
+            if (SYS) __threadfence_system();
             if (flag) __hip_atomic_store(flag, flag_val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             if (seq) *seq = seq_val;
         }
@@ -506,16 +511,17 @@ __global__ void ar_push_kernel(float *__restrict__ part, long n4, char *hbase, l
         if (bf16) {
             const uint16_t a = f2bf(v.x), b = f2bf(v.y), c = f2bf(v.z), d = f2bf(v.w);
             reinterpret_cast<uint2 *>(dst)[i] = make_uint2(uint32_t(a) | (uint32_t(b) << 16), uint32_t(c) | (uint32_t(d) << 16));
-            reinterpret_cast<float4 *>(part)[i] = make_float4(bf2f(a), bf2f(b), bf2f(c), bf2f(d));
+            // (own copy is rounded by the pull/add kernel: no device writes here, so the system
+            // fence below does not have to write back dirty L2 lines)
         } else {
             reinterpret_cast<float4 *>(dst)[i] = v;
         }
     }
-    last_block(ctr, hflag + slot * 16, s + 1, nullptr, 0);
+    last_block<true>(ctr, hflag + slot * 16, s + 1, nullptr, 0);
 }
 __global__ void ar_pull_kernel(uint16_t *__restrict__ state, const float *__restrict__ own, const char *hbase,
                                long slot_bytes, int bf16, long n4, int rank, const unsigned *peer_flag,
-                               unsigned *seq, unsigned *ctr, int nslot) {
+                               unsigned *seq, unsigned *ctr, int nslot, int sysfence) {
     const unsigned s = *seq;
     const int slot = int(s % unsigned(nslot));
     if (peer_flag && threadIdx.x == 0)
@@ -523,9 +529,10 @@ __global__ void ar_pull_kernel(uint16_t *__restrict__ state, const float *__rest
     __syncthreads();
     const char *src = hbase + slot * slot_bytes;
     for (long i = long(blockIdx.x) * blockDim.x + threadIdx.x; i < n4; i += long(gridDim.x) * blockDim.x) {
-        const float4 o = reinterpret_cast<const float4 *>(own)[i];
+        float4 o = reinterpret_cast<const float4 *>(own)[i];
         float4 p;
         if (bf16) {
+            o = make_float4(bf2f(f2bf(o.x)), bf2f(f2bf(o.y)), bf2f(f2bf(o.z)), bf2f(f2bf(o.w)));
             const uint2 u = *reinterpret_cast<const uint2 *>(src + i * 8);
             p = make_float4(bf2f(uint16_t(u.x)), bf2f(uint16_t(u.x >> 16)), bf2f(uint16_t(u.y)), bf2f(uint16_t(u.y >> 16)));
         } else {
@@ -539,7 +546,8 @@ __global__ void ar_pull_kernel(uint16_t *__restrict__ state, const float *__rest
         st.y = uint32_t(f2bf(r2)) | (uint32_t(f2bf(r3)) << 16);
         reinterpret_cast<uint2 *>(state)[i] = st;
     }
-    last_block(ctr, nullptr, 0, seq, s + 1);
+    if (sysfence) last_block<true>(ctr, nullptr, 0, seq, s + 1);
+    else last_block<false>(ctr, nullptr, 0, seq, s + 1);
 }
 // bf16 round of the partial: dst bf16 copy for the DMA push, part rounded in place
 __global__ void ar_round_kernel(float *part, uint2 *dst, long n4) {
@@ -579,7 +587,7 @@ void q_ar_add_local(uint16_t *state, const float *own, const void *peer_dev, boo
     const long n4 = n / 4;
     const unsigned blocks = unsigned(std::min<long>(1024, (n4 + 255) / 256));
     ar_pull_kernel<<<blocks, 256, 0, st>>>(state, own, static_cast<const char *>(peer_dev), 0, bf16 ? 1 : 0, n4, rank,
-                                           nullptr, seq, ctr, 1);
+                                           nullptr, seq, ctr, 1, 0);
     HIP_CHECK(hipGetLastError());
 }
 
@@ -599,7 +607,8 @@ void q_ar_pull_add(uint16_t *state, const float *own, const void *peer_hbase, lo
     static const bool spin_all = std::getenv("QWEN_AR_SPIN_ALL") != nullptr;
     if (!spin_all) ar_wait_kernel<<<1, 1, 0, st>>>(peer_flag, seq, nslot);  // one spinner, not one per block
     ar_pull_kernel<<<blocks, 256, 0, st>>>(state, own, static_cast<const char *>(peer_hbase), slot_bytes, bf16 ? 1 : 0,
-                                           n4, rank, spin_all ? peer_flag : nullptr, seq, ctr, nslot);
+                                           n4, rank, spin_all ? peer_flag : nullptr, seq, ctr, nslot,
+                                           std::getenv("QWEN_AR_SYSFENCE") ? 1 : 0);
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth
@@ -1176,6 +1185,151 @@ void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_nor
 void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st) {
     if (K > 64 || K < 1) throw std::runtime_error("q_topk: K <= 64");
     topk_kernel<<<unsigned(rows), 1024, 0, st>>>(logits, V, K, voff, oval, oid, ostride);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ flash attention (prefill, bf16 WMMA)
+// One block per (16 query rows, kv head): GQ waves, wave g = q head kh*GQ+g. S = Q K^T and O += P V on
+// v_wmma_f32_16x16x16_bf16 (fp32 accumulators), online softmax in fp32 registers, causal, paged KV.
+// q: bf16 [rows][nq][2*hd] (q | gate per head), out: bf16 [rows][nq*hd] (* sigmoid(gate)).
+namespace behemoth {
+namespace {
+typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ v8f wmma_bf(uint4 a, uint4 b, v8f c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b), c);
+}
+constexpr int FK = 32;           // keys per LDS tile
+constexpr int FKP = 256 + 8;     // K tile row stride (bf16)
+constexpr int FVP = FK + 8;      // V^T tile row stride (bf16)
+template <int GQ>
+__global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *__restrict__ q,
+                                                                const uint16_t *__restrict__ kc,
+                                                                const uint16_t *__restrict__ vc,
+                                                                const uint16_t *__restrict__ G,
+                                                                uint16_t *__restrict__ out, int rows, int pos0, int nq,
+                                                                int nkv, float scale, const int *__restrict__ pt) {
+    constexpr int HD = 256, NT = 32 * GQ;
+    __shared__ __align__(16) uint16_t ks[FK][FKP];
+    __shared__ __align__(16) uint16_t vt[HD][FVP];
+    __shared__ __align__(16) uint16_t pl[GQ][16][24];
+    const int r0 = int(blockIdx.x) * 16, kh = blockIdx.y;
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, c = lane & 15, h = lane >> 4;
+    const int qh = kh * GQ + wave;
+    // Q fragments (A operand): lane (c, h) holds row r0+c, dims ks*16 + 8h .. +8
+    uint4 qa[16];
+    {
+        const int r = min(r0 + c, rows - 1);
+        const uint16_t *qr = q + (long(r) * nq + qh) * 2 * HD;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) qa[k] = *reinterpret_cast<const uint4 *>(qr + k * 16 + 8 * h);
+    }
+    float m[8], l[8];
+    v8f o[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        m[i] = -1e30f;
+        l[i] = 0.f;
+    }
+#pragma unroll
+    for (int t = 0; t < 16; ++t) o[t] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const int last = pos0 + min(r0 + 15, rows - 1);  // last key any row of the tile needs
+    const long kst = long(nkv) * HD;
+    for (int kt0 = 0; kt0 <= last; kt0 += FK) {
+        __syncthreads();
+        // K tile [32][256] and V^T tile [256][32] (keys past `last` zero-filled)
+        for (int i = threadIdx.x; i < FK * (HD / 8); i += NT) {
+            const int key = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
+            const int t = kt0 + key;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (t <= last) {
+                const long row = (pt ? long(pt[t >> 6]) * 64 + (t & 63) : long(t)) * kst + long(kh) * HD + d8;
+                kv = *reinterpret_cast<const uint4 *>(kc + row);
+                vv = *reinterpret_cast<const uint4 *>(vc + row);
+            }
+            *reinterpret_cast<uint4 *>(&ks[key][d8]) = kv;
+            const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                vt[d8 + 2 * e][key] = uint16_t(w4[e]);
+                vt[d8 + 2 * e + 1][key] = uint16_t(w4[e] >> 16);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int sub = 0; sub < FK / 16; ++sub) {
+            const int kb = kt0 + sub * 16;
+            if (kb > last) break;  // uniform over the block
+            v8f s = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int k = 0; k < 16; ++k)
+                s = wmma_bf(qa[k], *reinterpret_cast<const uint4 *>(&ks[sub * 16 + c][k * 16 + 8 * h]), s);
+            // s[i]: row r0 + 8h + i, key kb + c
+            const int key = kb + c;
+            float corr[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int pos = pos0 + r0 + 8 * h + i;
+                float v = key <= pos ? s[i] * scale : -1e30f;
+                float mx = v;
+                mx = fmaxf(mx, __shfl_xor(mx, 1, 32));
+                mx = fmaxf(mx, __shfl_xor(mx, 2, 32));
+                mx = fmaxf(mx, __shfl_xor(mx, 4, 32));
+                mx = fmaxf(mx, __shfl_xor(mx, 8, 32));
+                const float mn = fmaxf(m[i], mx);
+                corr[i] = __expf(m[i] - mn);
+                m[i] = mn;
+                const float p = key <= pos ? __expf(v - mn) : 0.f;
+                l[i] = l[i] * corr[i] + p;
+                pl[wave][8 * h + i][c] = f2bf(p);
+            }
+#pragma unroll
+            for (int t = 0; t < 16; ++t)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) o[t][i] *= corr[i];
+            __syncthreads();  // P tile visible to the wave's other lanes
+            const uint4 pa = *reinterpret_cast<const uint4 *>(&pl[wave][c][8 * h]);
+#pragma unroll
+            for (int t = 0; t < 16; ++t)
+                o[t] = wmma_bf(pa, *reinterpret_cast<const uint4 *>(&vt[t * 16 + c][sub * 16 + 8 * h]), o[t]);
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float lt = l[i];
+        lt += __shfl_xor(lt, 1, 32);
+        lt += __shfl_xor(lt, 2, 32);
+        lt += __shfl_xor(lt, 4, 32);
+        lt += __shfl_xor(lt, 8, 32);
+        l[i] = 1.0f / lt;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = r0 + 8 * h + i;
+        if (r >= rows) continue;
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+            const long idx = long(r) * nq * HD + long(qh) * HD + t * 16 + c;
+            const float gt = bf2f(G[idx]);
+            out[idx] = f2bf(o[t][i] * l[i] / (1.0f + __expf(-gt)));
+        }
+    }
+}
+}  // namespace
+
+void q_flash_prefill(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G, uint16_t *out,
+                     int rows, int pos0, int nq, int nkv, int hd, float scale, const int *pt, hipStream_t st) {
+    if (hd != 256) throw std::runtime_error("q_flash_prefill: head dim 256 only");
+    const dim3 grid{unsigned((rows + 15) / 16), unsigned(nkv), 1u};
+    switch (nq / nkv) {
+    case 1: flash_prefill_kernel<1><<<grid, 32, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 2: flash_prefill_kernel<2><<<grid, 64, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 4: flash_prefill_kernel<4><<<grid, 128, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 6: flash_prefill_kernel<6><<<grid, 192, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    case 8: flash_prefill_kernel<8><<<grid, 256, 0, st>>>(q, kc, vc, G, out, rows, pos0, nq, nkv, scale, pt); break;
+    default: throw std::runtime_error("q_flash_prefill: unsupported GQA group");
+    }
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth
