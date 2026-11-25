@@ -1,0 +1,70 @@
+#pragma once
+// Qwen3.5 batched-serving kernels (src/qwen_batch.hip): W8A8 FP8 WMMA GEMMs (gfx12) with dynamic
+// per-token x 128-column activation scales, paged KV gated attention, per-slot Gated DeltaNet decode
+// step, device-flag tensor-parallel all-reduce through pinned host memory, top-k candidates.
+#include "gpu.hpp"
+#include <cstddef>
+#include <cstdint>
+
+namespace behemoth {
+
+// ------------------------------------------------------------------ FP8 activations
+// q[r][c] = e4m3(x[r][c] / s[r][c/128]), s = amax(block) / 448 (1 when the block is zero).
+// x bf16 rows (row stride ldx), n % 128 == 0; q row stride n, s row stride n/128.
+void q_act_quant(const uint16_t *x, int ldx, int rows, int n, uint8_t *q, float *s, hipStream_t st);
+// Same from f32 rows.
+void q_act_quant_f32(const float *x, int ldx, int rows, int n, uint8_t *q, float *s, hipStream_t st);
+
+// ------------------------------------------------------------------ W8A8 GEMMs
+// y[r][j] = sum_k (q[r][k] * xs[r][k/128]) * (w[j][k] * ws[j/128][k/128])   (fp32 out, row stride ldy)
+// w: e4m3 [m][n], ws: f32 [m/128][n/128] (m, n multiples of 128).
+// Decode-sized (rows <= 64): split-K with deterministic partials. The number of K splits depends on
+// (m, n) only, so every row's result is independent of the batch size (batch invariance).
+int q_w8a8_splits(int m, int n);
+size_t q_w8a8_small_scratch(int m, int n, int rows);  // floats of partials (0 when one split)
+// x8/xs must hold ceil16(rows) readable rows. partial: q_w8a8_small_scratch floats (or null if 0).
+void q_w8a8_small(const uint8_t *w, const float *ws, int m, int n, const uint8_t *x8, const float *xs, int rows,
+                  float *y, int ldy, float *partial, hipStream_t st);
+// Same, but the partials are only written (no reduction): for q_splitk_reduce_push consumers.
+// Prefill-sized GEMM (128x128 tiles); x8/xs: rows readable rows.
+void q_w8a8_big(const uint8_t *w, const float *ws, int m, int n, const uint8_t *x8, const float *xs, int rows,
+                float *y, int ldy, hipStream_t st);
+// Picks small (rows <= 64) or big.
+void q_w8a8(const uint8_t *w, const float *ws, int m, int n, const uint8_t *x8, const float *xs, int rows,
+            float *y, int ldy, float *partial, hipStream_t st);
+
+// bf16 weights [m][n] GEMV for any row count (weights shared through L2 across row groups);
+// deterministic per row (same order for every batch size).
+void q_bf16_gemv_any(const uint16_t *w, int m, int n, const uint16_t *x, int ldx, int rows, float *y, int ldy,
+                     hipStream_t st);
+// fp32 -> fp8 128x128 block quantisation of a bf16 [m][n] matrix (load time; m padded to 128 rows of
+// zeros by the caller when needed). ws [ceil(m/128)][n/128].
+void q_quant_weight_bf16(const uint16_t *w, int m, int n, uint8_t *w8, float *ws, hipStream_t st);
+
+}  // namespace behemoth
+
+namespace behemoth {
+// ------------------------------------------------------------------ TP all-reduce via host memory
+// Host slots: nslot slots of slot_bytes at hbase (pinned, coherent, mapped); flags: 16 unsigned per
+// slot (one cache line). seq / ctr: device counters (one pair per rank, zero-initialised).
+// n: float count (multiple of 4). Push: writes the rank's partial (bf16: also rounds `part` in place).
+void q_ar_push(float *part, long n, void *hbase, long slot_bytes, bool bf16, unsigned *hflag, const unsigned *seq,
+               unsigned *ctr, int nslot, hipStream_t st);
+// Pull: waits for the peer's flag, state = bf16(state + (p0 + p1)), advances seq.
+void q_ar_pull_add(uint16_t *state, const float *own, const void *peer_hbase, long slot_bytes, bool bf16, long n,
+                   int rank, const unsigned *peer_flag, unsigned *seq, unsigned *ctr, int nslot, hipStream_t st);
+
+// DMA variant of the pull: wait kernel (spins on the peer flag of exchange *seq), the caller copies
+// the peer slot to device memory (hipMemcpyAsync), then the add (advances seq).
+void q_ar_round_bf16(float *part, void *dst, long n, hipStream_t st);  // DMA push: bf16 copy + round own
+void q_ar_flag(unsigned *hflag, const unsigned *seq, int nslot, hipStream_t st);  // raise flag of exchange *seq
+void q_ar_wait(const unsigned *peer_flag, const unsigned *seq, int nslot, hipStream_t st);
+void q_ar_add_local(uint16_t *state, const float *own, const void *peer_dev, bool bf16, long n, int rank, unsigned *seq,
+                    unsigned *ctr, hipStream_t st);
+
+// Whole-chunk Gated DeltaNet v2 (kd == vd == 128), same math / contract as q_delta_chunk; modifies
+// the qkvz b|a columns in place (beta / decay). conv scratch f32 [T][conv_dim].
+void q_delta_chunk2(float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring,
+                    float *S, uint16_t *out, float *conv, int T, int pos0, int conv_dim, int value_dim, int nk, int nv,
+                    int K, float eps, hipStream_t st);
+}  // namespace behemoth

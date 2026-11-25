@@ -21,6 +21,7 @@
 #include "behemoth/qtip.hpp"
 #include "behemoth/qtip_gpu.hpp"
 #include "behemoth/qwen_kernels.hpp"
+#include "behemoth/qwen_batch.hpp"
 
 namespace behemoth {
 // Minimal safetensors-directory reader for the qwen path (behemoth::Checkpoint validates the
@@ -192,6 +193,9 @@ struct QwenStage {
         bool moe = false;
         Linear lq, lk, lv, lo, lgate, lup, ldown;   // full attention + dense mlp
         Linear l_in_qkv, l_in_z, l_out;                 // linear attention (b/a stay bf16)
+        // fp8 checkpoints: input-sharing linears fused row-wise (one W8A8 GEMM): q|k|v, qkv|z, gate|up
+        Linear f_qkv, f_qkvz, f_gu;
+        bool fused = false;
         std::vector<Linear> e_gate, e_up, e_down;       // MoE routed experts
         Linear sh_gate, sh_up, sh_down;                 // MoE shared expert
         DeviceBuffer<uint16_t> w_router;                // MoE router bf16 [E][H]
@@ -215,7 +219,17 @@ struct QwenStage {
     hipEvent_t done_ev{}, took_ev{};
     bool p2p = false;            // this device can read the peer / previous stage's memory
     int *tok_pinned = nullptr;   // pinned host staging for decode tokens
-    DeviceBuffer<uint16_t> wtmp;  // fp8 prefill: dequantised weight of the current linear
+    DeviceBuffer<uint16_t> wtmp;  // fp8 prefill (legacy path): dequantised weight of the current linear
+    DeviceBuffer<uint8_t> xq8;    // W8A8: fp8 activations [chunk][max in] + per-128 scales
+    DeviceBuffer<float> xqs, gpart;
+    Linear lm8;                   // fp8 lm_head (block-quantised at load) unless QWEN_LMHEAD_BF16
+    // device-flag all-reduce (q_ar_push / q_ar_pull_add)
+    char *ar_host = nullptr;      // [AR_SLOTS][ar_slot_bytes] pinned
+    unsigned *ar_flags = nullptr; // [AR_SLOTS][16] pinned
+    DeviceBuffer<unsigned> ar_ctr;  // [0] seq, [1] push ctr, [2] pull ctr
+    long ar_slot_bytes = 0;
+    unsigned ar_hseq = 0;         // host mirror of the device exchange counter (slot of DMA pulls)
+    static constexpr int AR_SLOTS = 4;
     hipStream_t stream{};
     qtip::DenseMatmul dense;
     qtip::GpuCodebook codebook;
@@ -240,6 +254,29 @@ struct QwenStage {
     void load(const std::filesystem::path &dir);
     qtip::HostLinear load_host(const QwenCheckpoint &ck, int layer, const std::string &name, int in, int out);
     void upload_linear(Linear &L, const qtip::HostLinear &h);
+    // dst = row-wise concatenation of fp8 linears sharing the input (parts released)
+    static void fuse_fp8(Linear &dst, std::initializer_list<Linear *> parts) {
+        size_t wb = 0, sb = 0;
+        dst.bf16 = dst.fp8 = true;
+        dst.m = 0;
+        dst.n = (*parts.begin())->n;
+        for (Linear *p : parts) {
+            if (!p->fp8 || p->n != dst.n || p->m % 128) throw std::runtime_error("fuse_fp8: incompatible parts");
+            wb += p->w8.size();
+            sb += p->ws.size();
+            dst.m += p->m;
+        }
+        dst.w8.resize(wb);
+        dst.ws.resize(sb);
+        size_t ow = 0, os = 0;
+        for (Linear *p : parts) {
+            HIP_CHECK(hipMemcpy(dst.w8.data() + ow, p->w8.data(), p->w8.bytes(), hipMemcpyDeviceToDevice));
+            HIP_CHECK(hipMemcpy(dst.ws.data() + os, p->ws.data(), p->ws.bytes(), hipMemcpyDeviceToDevice));
+            ow += p->w8.size();
+            os += p->ws.size();
+            *p = Linear{};
+        }
+    }
     void load_linear(Linear &L, const QwenCheckpoint &ck, int layer, const std::string &name, int in,
                      int out, const Slice &sl = Slice{});  // trellis, fp8 or bf16; in/out: full dims
     // tensor parallel: rank tp_rank of tp_size holds a head / intermediate / vocab shard of every
@@ -253,17 +290,25 @@ struct QwenStage {
     unsigned ar_round = 0;
     int voff = 0;  // first vocab row of this rank's lm_head shard
     void residual_reduce(const float *zpart, int rows);  // state += sum over ranks of zpart
+    // pinned host slots of the all-reduce, allocated while the PEER device is current: the runtime
+    // places them on the peer's NUMA node, so the latency-bound zero-copy reads stay socket-local
+    void alloc_ar_host() {
+        HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&ar_host), size_t(ar_slot_bytes) * AR_SLOTS,
+                                hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
+        HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&ar_flags), AR_SLOTS * 16 * sizeof(unsigned),
+                                hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
+        std::memset(ar_flags, 0, AR_SLOTS * 16 * sizeof(unsigned));
+    }
     // output buffer for a row-parallel linear whose result goes to residual_reduce (TP: the round's
     // send buffer, after the peer finished reading it two rounds ago)
     float *rr_buf(float *fallback, int rows) {
         if (tp_size == 1) return fallback;
-        const int k = int(ar_round & 1u);
-        HIP_CHECK(hipStreamWaitEvent(stream, tp_peer->pulled_ev[k], 0));
-        return (!p2p && rows <= 8) ? hsend[k] : zsend[k].data();
+        (void)rows;
+        return zsend[0].data();
     }
     float *hsend[2]{};  // no P2P: pinned coherent host buffers both ranks' kernels read directly
     void lm_head_enqueue(int row0, int nrows);
-    void run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *out);
+    void run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *out, int ldy = 0);
     void forward_chunk(const int *tokens_h, int rows);
     void moe_block(LayerW &w, int rows);
     void lm_head_rows(int row0, int nrows);  // logits_all[row0..] from state rows
@@ -354,21 +399,27 @@ void QwenStage::load_linear(Linear &L, const QwenCheckpoint &ck, int layer, cons
 
 // y[rows][out] = x[rows][ldx] . L^T (fp32 out, contiguous rows; trellis slice-summed or dense bf16
 // GEMM).
-void QwenStage::run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *y) {
-    if (L.fp8) {
+void QwenStage::run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *y, int ldy_override) {
+    const int ldy = ldy_override ? ldy_override : L.m;
+    static const bool legacy = std::getenv("QWEN_FP8_LEGACY") != nullptr;
+    if (L.fp8 && !legacy) {
+        q_act_quant(x, ldx, rows, L.n, xq8.data(), xqs.data(), stream);
+        q_w8a8(L.w8.data(), L.ws.data(), L.m, L.n, xq8.data(), xqs.data(), rows, y, ldy,
+               gpart.data(), stream);
+    } else if (L.fp8) {
         if (rows <= 8) {
-            q_fp8_gemv(L.w8.data(), L.ws.data(), L.m, L.n, x, ldx, rows, y, L.m, stream);
+            q_fp8_gemv(L.w8.data(), L.ws.data(), L.m, L.n, x, ldx, rows, y, ldy, stream);
         } else {
             if (wtmp.size() < size_t(L.m) * L.n) throw std::runtime_error("fp8 scratch too small");
             q_fp8_dequant(L.w8.data(), L.ws.data(), L.m, L.n, wtmp.data(), stream);
-            dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, L.m,
+            dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, ldy,
                        reinterpret_cast<const BFloat16 *>(wtmp.data()), stream);
         }
     } else if (L.bf16) {
         if (rows <= 8)
-            q_bf16_gemv(L.w.data(), L.m, L.n, x, ldx, rows, y, L.m, stream);
+            q_bf16_gemv(L.w.data(), L.m, L.n, x, ldx, rows, y, ldy, stream);
         else
-            dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, L.m,
+            dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, ldy,
                        reinterpret_cast<const BFloat16 *>(L.w.data()), stream);
     } else {
         int slices = qtip::matmul_slices(L.lin.view(), rows);
@@ -482,6 +533,13 @@ void QwenStage::load(const std::filesystem::path &dir) {
         }
         up16(w.ln_in, "input_layernorm.weight");
         up16(w.ln_post, "post_attention_layernorm.weight");
+        if (!w.moe && w.lgate.fp8 && w.ldown.fp8 && (w.full ? (w.lq.fp8 && w.lk.fp8 && w.lv.fp8 && w.lo.fp8)
+                                                            : (w.l_in_qkv.fp8 && w.l_in_z.fp8 && w.l_out.fp8))) {
+            w.fused = true;
+            if (w.full) fuse_fp8(w.f_qkv, {&w.lq, &w.lk, &w.lv});
+            else fuse_fp8(w.f_qkvz, {&w.l_in_qkv, &w.l_in_z});
+            fuse_fp8(w.f_gu, {&w.lgate, &w.lup});
+        }
     }
     std::string embed_name, norm_name;
     for (std::string nm : {"model.language_model.embed_tokens.weight", "model.embed_tokens.weight"})
@@ -497,6 +555,16 @@ void QwenStage::load(const std::filesystem::path &dir) {
             throw std::runtime_error("tie_word_embeddings=false but no lm_head.weight");
         auto lw = bf16_raw(ck, "lm_head.weight");
         lm_head_w.upload(tp_size > 1 ? slice2d(lw.data(), G.vocab, H, rows1(voff, cfg.vocab)) : lw);
+    }
+    if (last && lm_head_w.size() && !std::getenv("QWEN_LMHEAD_BF16") && cfg.vocab % 128 == 0 && cfg.hidden % 128 == 0) {
+        lm8.bf16 = lm8.fp8 = true;
+        lm8.m = cfg.vocab;
+        lm8.n = cfg.hidden;
+        lm8.w8.resize(size_t(cfg.vocab) * cfg.hidden);
+        lm8.ws.resize(size_t(cfg.vocab / 128) * (cfg.hidden / 128));
+        q_quant_weight_bf16(lm_head_w.data(), cfg.vocab, cfg.hidden, lm8.w8.data(), lm8.ws.data(), stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
+        lm_head_w = DeviceBuffer<uint16_t>{};
     }
     // scratch
     const int R = chunk;
@@ -548,18 +616,30 @@ void QwenStage::load(const std::filesystem::path &dir) {
     }
     partial.resize(max_slices * size_t(R) * Wz);
     {
-        size_t wmax = 0;
+        size_t wmax = 0, nmax = 0, pmax = 0;
         for (auto &w : layers)
             for (const Linear *gv : {&w.lq, &w.lk, &w.lv, &w.lo, &w.lgate, &w.lup, &w.ldown, &w.l_in_qkv,
-                                     &w.l_in_z, &w.l_out})
-                if (gv->fp8) wmax = std::max(wmax, size_t(gv->m) * gv->n);
-        if (R > 8) wtmp.resize(wmax);
+                                     &w.l_in_z, &w.l_out, &w.f_qkv, &w.f_qkvz, &w.f_gu, &lm8})
+                if (gv->fp8) {
+                    wmax = std::max(wmax, size_t(gv->m) * gv->n);
+                    nmax = std::max<size_t>(nmax, size_t(gv->n));
+                    pmax = std::max(pmax, q_w8a8_small_scratch(gv->m, gv->n, 64));
+                }
+        if (R > 8 && std::getenv("QWEN_FP8_LEGACY")) wtmp.resize(wmax);
+        if (nmax) {
+            const size_t rr = size_t(std::max(R, 64));
+            xq8.resize(rr * nmax);
+            xqs.resize(rr * (nmax / 128));
+            gpart.resize(std::max<size_t>(pmax, 1));
+        }
+    }
+    if (tp_size > 1) {
+        ar_slot_bytes = long(std::max(R, 64)) * H * 4;  // host slots: alloc_ar_host() (reader's NUMA node)
+        ar_ctr.resize(4);
+        HIP_CHECK(hipMemset(ar_ctr.data(), 0, ar_ctr.bytes()));
     }
     if (tp_size > 1) {
         for (auto &b : zsend) b.resize(size_t(R) * H);
-        for (auto &h : hsend)
-            HIP_CHECK(hipHostMalloc(reinterpret_cast<void **>(&h), size_t(R) * H * 4,
-                                    hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
         zrecv.resize(size_t(R) * H);
         for (int i = 0; i < 2; ++i) {
             HIP_CHECK(hipEventCreateWithFlags(&send_ev[i], hipEventDisableTiming));
@@ -605,7 +685,9 @@ void QwenStage::lm_head_enqueue(int row0, int nrows) {
     q_zc_norm(state.data() + size_t(row0) * H, nrows, H, final_norm.data(), cfg.eps, stream);
     for (int r0 = 0; r0 < nrows; r0 += 16) {
         int nr = std::min(16, nrows - r0);
-        if (nr <= 8)
+        if (lm8.fp8)
+            run_linear(lm8, state.data() + size_t(row0 + r0) * H, H, nr, logits_d.data() + size_t(r0) * cfg.vocab);
+        else if (nr <= 8)
             q_bf16_gemv(head, cfg.vocab, H, state.data() + size_t(row0 + r0) * H, H, nr,
                         logits_d.data() + size_t(r0) * cfg.vocab, cfg.vocab, stream);
         else
@@ -747,7 +829,7 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
     };
     for (int L = l_begin; L < l_end; ++L) {
         LayerW &w = layers[size_t(L)];
-        const bool lin16 = w.full ? w.lq.bf16 : w.l_in_qkv.bf16;  // bf16 (unquantized) checkpoint
+        const bool lin16 = w.fused || (w.full ? w.lq.bf16 : w.l_in_qkv.bf16);  // bf16 / fp8 (non-trellis) linears
         auto zc_hidden = [&]() {  // h_norm = zc-norm(state, ln_in): plain input of bf16 linears
             q_zc_norm_to(h_norm.data(), state.data(), rows, H, w.ln_in.data(), c.eps, stream);
         };
@@ -765,6 +847,13 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
                 proj(w.lv, H, z.data());
                 q_hadamard_rows(z.data(), rows, Wk, Wk, false, stream);
                 q_sv_cast(z.data(), w.lv.sv.data(), v.data(), rows, Wk, Wk, stream);
+            } else if (w.fused) {
+                zc_hidden();
+                const int Wf = Wq + 2 * Wk;
+                run_linear(w.f_qkv, h_norm.data(), H, rows, z.data());
+                q_sv_cast(z.data(), ones_f.data(), q.data(), rows, Wq, Wf, stream);
+                q_sv_cast(z.data() + Wq, ones_f.data(), k.data(), rows, Wk, Wf, stream);
+                q_sv_cast(z.data() + Wq + Wk, ones_f.data(), v.data(), rows, Wk, Wf, stream);
             } else {
                 zc_hidden();
                 run_linear(w.lq, h_norm.data(), H, rows, z.data());
@@ -809,6 +898,9 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
                 };
                 proj_scatter(w.l_in_qkv, H, 0);
                 proj_scatter(w.l_in_z, H, Wq);
+            } else if (w.fused) {
+                zc_hidden();
+                run_linear(w.f_qkvz, h_norm.data(), H, rows, z.data(), Wz);
             } else {
                 zc_hidden();
                 run_linear(w.l_in_qkv, h_norm.data(), H, rows, z2.data());
@@ -830,7 +922,12 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
                            reinterpret_cast<const BFloat16 *>(w.w_ba.data()) + size_t(cfg.lin_nv) * H,
                            stream);
             }
-            if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))
+            static const bool delta_v1 = std::getenv("QWEN_DELTA_V1") != nullptr;
+            if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP") && !delta_v1)
+                q_delta_chunk2(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
+                               w.dstate.data(), o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_nk, nv, c.conv_k, c.eps,
+                               stream);
+            else if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))
                 q_delta_chunk(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
                               w.dstate.data(), o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_kd, c.lin_vd,
                               c.lin_nk, nv, c.conv_k, c.eps, stream);
@@ -865,7 +962,7 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
         }
         if (w.moe) {
             moe_block(w, rows);
-        } else if (!w.lgate.bf16) {
+        } else if (!w.fused && !w.lgate.bf16) {
             q_input_transform(state.data(), rows, H, w.ln_post.data(), c.eps, w.lgate.su.data(), H,
                               u.data(), H, stream);
             proj(w.lgate, H, z.data());
@@ -878,6 +975,13 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
             proj(w.ldown, F, z.data());
             q_hadamard_rows(z.data(), rows, H, H, false, stream);
             q_sv_add(z.data(), w.ldown.sv.data(), state.data(), rows, H, H, H, stream);
+        } else if (w.fused) {
+            q_zc_norm_to(h_norm.data(), state.data(), rows, H, w.ln_post.data(), c.eps, stream);
+            run_linear(w.f_gu, h_norm.data(), H, rows, z.data());
+            q_gateup(z.data(), z.data() + F, ones_f.data(), ones_f.data(), gu.data(), rows, F, 2 * F, stream);
+            float *zr = rr_buf(z.data(), rows);
+            run_linear(w.ldown, gu.data(), F, rows, zr);
+            residual_reduce(zr, rows);
         } else {
             q_zc_norm_to(h_norm.data(), state.data(), rows, H, w.ln_post.data(), c.eps, stream);
             run_linear(w.lgate, h_norm.data(), H, rows, z.data());
@@ -927,22 +1031,33 @@ void QwenStage::residual_reduce(const float *zpart, int rows) {
         q_moe_residual_add(state.data(), zpart, rows, H, stream);
         return;
     }
-    // zpart is zsend[k] (rr_buf() handed it to the linear); peer partial read over P2P when possible
-    const int k = int(ar_round++ & 1u);
-    const size_t bytes = size_t(rows) * H * 4;
-    if (zpart != zsend[k].data() && zpart != hsend[k])
-        throw std::logic_error("residual_reduce: partial not in the send buffer");
-    if (!p2p && zpart == zsend[k].data())  // prefill: stage the partial in pinned host memory
-        HIP_CHECK(hipMemcpyAsync(hsend[k], zsend[k].data(), bytes, hipMemcpyDeviceToHost, stream));
-    HIP_CHECK(hipEventRecord(send_ev[k], stream));
-    tp_bar->arrive_and_wait();
-    HIP_CHECK(hipStreamWaitEvent(stream, tp_peer->send_ev[k], 0));
-    const float *own = p2p ? zsend[k].data() : hsend[k];
-    const float *peer_part = p2p ? tp_peer->zsend[k].data() : tp_peer->hsend[k];
-    const float *a = tp_rank == 0 ? own : peer_part;
-    const float *b = tp_rank == 0 ? peer_part : own;
-    q_residual_add2(state.data(), a, b, rows, H, stream);
-    HIP_CHECK(hipEventRecord(pulled_ev[k], stream));
+    // device-flag exchange through pinned host slots; prefill partials travel as bf16
+    static const bool fp32_only = std::getenv("QWEN_AR_FP32") != nullptr;
+    const bool bf = rows > 8 && !fp32_only;
+    const long n = long(rows) * H;
+    float *part = const_cast<float *>(zpart);
+    static const bool dma_push = std::getenv("QWEN_AR_DMA_PUSH") != nullptr;
+    const int hslot = int(ar_hseq % unsigned(AR_SLOTS));
+    if (dma_push && bf) {
+        q_ar_round_bf16(part, zsend[1].data(), n, stream);
+        HIP_CHECK(hipMemcpyAsync(ar_host + long(hslot) * ar_slot_bytes, zsend[1].data(), size_t(n) * 2,
+                                 hipMemcpyDeviceToHost, stream));
+        q_ar_flag(ar_flags, ar_ctr.data(), AR_SLOTS, stream);
+    } else {
+        q_ar_push(part, n, ar_host, ar_slot_bytes, bf, ar_flags, ar_ctr.data(), ar_ctr.data() + 1, AR_SLOTS, stream);
+    }
+    static const bool zero_copy = std::getenv("QWEN_AR_ZC") != nullptr;
+    if (rows <= 8 || zero_copy) {
+        q_ar_pull_add(state.data(), part, tp_peer->ar_host, ar_slot_bytes, bf, n, tp_rank, tp_peer->ar_flags,
+                      ar_ctr.data(), ar_ctr.data() + 2, AR_SLOTS, stream);
+    } else {  // prefill: DMA the peer slot (copy engines cope with the cross-socket latency far better)
+        q_ar_wait(tp_peer->ar_flags, ar_ctr.data(), AR_SLOTS, stream);
+        HIP_CHECK(hipMemcpyAsync(zrecv.data(), tp_peer->ar_host + long(hslot) * ar_slot_bytes, size_t(n) * (bf ? 2 : 4),
+                                 hipMemcpyHostToDevice, stream));
+        q_ar_add_local(state.data(), part, zrecv.data(), bf, n, tp_rank, ar_ctr.data(), ar_ctr.data() + 2, stream);
+    }
+    ++ar_hseq;
+
 }
 
 void QwenStage::reset() {
@@ -1164,6 +1279,10 @@ QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &d
         }
         impl_->st[0]->tp_peer = impl_->st[1].get();
         impl_->st[1]->tp_peer = impl_->st[0].get();
+        for (int a = 0; a < n; ++a) {
+            HIP_CHECK(hipSetDevice(devices[size_t(1 - a)]));
+            impl_->st[size_t(a)]->alloc_ar_host();
+        }
         for (int a = 0; a < n; ++a) {
             HIP_CHECK(hipSetDevice(devices[size_t(a)]));
             int can = 0;
