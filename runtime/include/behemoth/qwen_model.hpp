@@ -38,6 +38,10 @@ class QwenModel {
     // device: HIP device index. chunk: max prefill tokens per pass (>=1).
     QwenModel(const std::filesystem::path &model_dir, int device, int chunk = 256,
               int max_context = 8192);
+    // Pipeline split over several GPUs: contiguous layer ranges per device (even split, or
+    // QWEN_SPLIT="k1,k2,..": first layer of each later stage); hidden state handed off per chunk.
+    QwenModel(const std::filesystem::path &model_dir, const std::vector<int> &devices, int chunk = 256,
+              int max_context = 8192);
     ~QwenModel();
     QwenModel(const QwenModel &) = delete;
     QwenModel &operator=(const QwenModel &) = delete;

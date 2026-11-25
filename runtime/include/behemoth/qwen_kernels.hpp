@@ -75,4 +75,12 @@ void q_scatter_f32(float *dst, int ldd, int col0, const float *src, int lds, lon
 void q_moe_sv_add_gated(const float *z, const float *sv, const float *sg, uint16_t *state, long rows,
                         int n, hipStream_t s);
 
+// FP8 E4M3 weights w [m][n] with 128x128 block scales ws f32 [ceil(m/128)][ceil(n/128)]
+// (HF `weight_scale_inv`, multiplied on dequant). y[r][j] = sum_d x[r][d] * w[j][d] * ws[...]
+// (fp32 out, row stride ldy), bandwidth-bound GEMV for small row counts.
+void q_fp8_gemv(const uint8_t *w, const float *ws, int m, int n, const uint16_t *x, int ldx, int rows,
+                float *y, int ldy, hipStream_t s);
+// out bf16 [m][n] = dequantised weights (prefill: dequant + bf16 GEMM).
+void q_fp8_dequant(const uint8_t *w, const float *ws, int m, int n, uint16_t *out, hipStream_t s);
+
 }  // namespace behemoth

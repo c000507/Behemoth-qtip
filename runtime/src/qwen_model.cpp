@@ -127,7 +127,7 @@ QwenRuntimeConfig QwenRuntimeConfig::read(const std::filesystem::path &dir) {
 }
 
 // ------------------------------------------------------------------ impl
-struct QwenModel::Impl {
+struct QwenStage {
     // One linear: either a QTIP trellis (rotate -> matmul -> slice sum -> hadU -> SV epilogue) or a
     // plain bf16 [out][in] weight (unquantized checkpoints; the bf16-vs-quantized comparison then
     // runs the identical surrounding code).
@@ -138,6 +138,9 @@ struct QwenModel::Impl {
         int m = 0, n = 0;               // bf16 dims
         DeviceBuffer<uint16_t> w;       // bf16 weights [m][n]
         DeviceBuffer<float> su;         // trellis: input SU (per-Hessian-group shared)
+        bool fp8 = false;               // E4M3 [m][n] + 128x128 block scales (bf16 flag also set)
+        DeviceBuffer<uint8_t> w8;
+        DeviceBuffer<float> ws;
         int rows() const { return bf16 ? m : lin.rows; }
         int in_dim() const { return bf16 ? n : lin.in; }
     };
@@ -160,6 +163,11 @@ struct QwenModel::Impl {
     };
     QwenRuntimeConfig cfg;
     int device = 0, chunk = 256;
+    // pipeline stage: layers [l_begin, l_end); first stage embeds, last stage owns norm + lm_head
+    int l_begin = 0, l_end = 0;
+    bool first = true, last = true;
+    QwenStage *prev = nullptr;
+    DeviceBuffer<uint16_t> wtmp;  // fp8 prefill: dequantised weight of the current linear
     hipStream_t stream{};
     qtip::DenseMatmul dense;
     qtip::GpuCodebook codebook;
@@ -190,13 +198,9 @@ struct QwenModel::Impl {
     void moe_block(LayerW &w, int rows);
     void lm_head_rows(int row0, int nrows);  // logits_all[row0..] from state rows
     void reset();
-    void prefill(const int *tokens, size_t n, float *last_logits);
-    void decode(int token, float *logits);
-    std::vector<int> generate(const int *prompt, size_t n_prompt, size_t n_new);
-    double perplexity(const int *tokens, size_t n);
 };
 
-qtip::HostLinear QwenModel::Impl::load_host(const QwenCheckpoint &ck, int layer, const std::string &name,
+qtip::HostLinear QwenStage::load_host(const QwenCheckpoint &ck, int layer, const std::string &name,
                                             int in, int out) {
     const std::string base = layer_prefix + std::to_string(layer) + "." + name + ".";
     ck.tensor(base + "trellis");  // existence + index check
@@ -222,14 +226,14 @@ qtip::HostLinear QwenModel::Impl::load_host(const QwenCheckpoint &ck, int layer,
     return l;
 }
 
-void QwenModel::Impl::upload_linear(Linear &L, const qtip::HostLinear &h) {
+void QwenStage::upload_linear(Linear &L, const qtip::HostLinear &h) {
     L.lin.upload({std::span<const uint16_t>(h.trellis)}, h.in);
     L.sv.upload(h.sv);
 }
 
 // Loads `model.layers.<layer>.<name>.` as a QTIP trellis linear, or — when the checkpoint stores a
 // plain BF16 `weight` tensor there instead (unquantized model) — as a bf16 linear.
-void QwenModel::Impl::load_linear(Linear &L, const QwenCheckpoint &ck, int layer, const std::string &name,
+void QwenStage::load_linear(Linear &L, const QwenCheckpoint &ck, int layer, const std::string &name,
                                   int in, int out) {
     const std::string base = layer_prefix + std::to_string(layer) + "." + name + ".";
     if (ck.index.count(base + "trellis")) {
@@ -243,6 +247,25 @@ void QwenModel::Impl::load_linear(Linear &L, const QwenCheckpoint &ck, int layer
         L.bf16 = false;
         L.m = out;
         L.n = in;
+    } else if (ck.index.count(base + "weight_scale_inv")) {
+        const SafeTensorFile &f = ck.tensor(base + "weight");
+        if (f.dtype(base + "weight") != "F8_E4M3")
+            throw std::runtime_error("expected F8_E4M3 weight for " + base);
+        auto shp = f.shape(base + "weight");
+        if (shp.size() != 2 || int(shp[0]) != out || int(shp[1]) != in)
+            throw std::runtime_error("fp8 linear dims mismatch for " + base);
+        L.bf16 = L.fp8 = true;
+        L.m = out;
+        L.n = in;
+        auto raw = f.bytes(base + "weight");
+        L.w8.upload(std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(raw.data()), raw.size()));
+        const SafeTensorFile &fs = ck.tensor(base + "weight_scale_inv");
+        auto sv = fs.floats(base + "weight_scale_inv");
+        const size_t want = size_t((out + 127) / 128) * size_t((in + 127) / 128);
+        if (sv.size() != want) throw std::runtime_error("fp8 scale dims mismatch for " + base);
+        std::vector<float> sc(want);
+        for (size_t i = 0; i < want; ++i) sc[i] = sv[i];
+        L.ws.upload(sc);
     } else if (ck.index.count(base + "weight")) {
         L.bf16 = true;
         L.m = out;
@@ -255,8 +278,17 @@ void QwenModel::Impl::load_linear(Linear &L, const QwenCheckpoint &ck, int layer
 
 // y[rows][out] = x[rows][ldx] . L^T (fp32 out, contiguous rows; trellis slice-summed or dense bf16
 // GEMM).
-void QwenModel::Impl::run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *y) {
-    if (L.bf16) {
+void QwenStage::run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *y) {
+    if (L.fp8) {
+        if (rows <= 8) {
+            q_fp8_gemv(L.w8.data(), L.ws.data(), L.m, L.n, x, ldx, rows, y, L.m, stream);
+        } else {
+            if (wtmp.size() < size_t(L.m) * L.n) throw std::runtime_error("fp8 scratch too small");
+            q_fp8_dequant(L.w8.data(), L.ws.data(), L.m, L.n, wtmp.data(), stream);
+            dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, L.m,
+                       reinterpret_cast<const BFloat16 *>(wtmp.data()), stream);
+        }
+    } else if (L.bf16) {
         dense.gemm(L.m, L.n, reinterpret_cast<const BFloat16 *>(x), ldx, rows, y, L.m,
                    reinterpret_cast<const BFloat16 *>(L.w.data()), stream);
     } else {
@@ -267,7 +299,7 @@ void QwenModel::Impl::run_linear(const Linear &L, const uint16_t *x, int ldx, in
     }
 }
 
-void QwenModel::Impl::load(const std::filesystem::path &dir) {
+void QwenStage::load(const std::filesystem::path &dir) {
     QwenCheckpoint ck(dir);
     const int max_context = cfg.max_context;  // set by the constructor; read() would reset it
     cfg = QwenRuntimeConfig::read(dir);
@@ -287,7 +319,7 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
     }
     const int H = cfg.hidden, V = cfg.value_dim(), A = cfg.nq * cfg.hd;
     layers.resize(size_t(cfg.layers));
-    for (int L = 0; L < cfg.layers; ++L) {
+    for (int L = l_begin; L < l_end; ++L) {
         LayerW &w = layers[size_t(L)];
         w.full = cfg.is_full(L);
         w.moe = cfg.num_experts > 0;
@@ -358,9 +390,9 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
         if (ck.index.count(nm)) norm_name = nm;
     if (embed_name.empty() || norm_name.empty())
         throw std::runtime_error("cannot find embed_tokens / final norm in the checkpoint index");
-    embed.upload(bf16_raw(ck, embed_name));
-    final_norm.upload(bf16_raw(ck, norm_name));
-    if (!cfg.tied) {
+    if (first || (last && cfg.tied)) embed.upload(bf16_raw(ck, embed_name));
+    if (last) final_norm.upload(bf16_raw(ck, norm_name));
+    if (last && !cfg.tied) {
         if (!ck.index.count("lm_head.weight"))
             throw std::runtime_error("tie_word_embeddings=false but no lm_head.weight");
         lm_head_w.upload(bf16_raw(ck, "lm_head.weight"));
@@ -413,13 +445,22 @@ void QwenModel::Impl::load(const std::filesystem::path &dir) {
                 max_slices = std::max<size_t>(max_slices, qtip::matmul_slices(gv->lin.view(), R));
     }
     partial.resize(max_slices * size_t(R) * Wz);
+    {
+        size_t wmax = 0;
+        for (auto &w : layers)
+            for (const Linear *gv : {&w.lq, &w.lk, &w.lv, &w.lo, &w.lgate, &w.lup, &w.ldown, &w.l_in_qkv,
+                                     &w.l_in_z, &w.l_out})
+                if (gv->fp8) wmax = std::max(wmax, size_t(gv->m) * gv->n);
+        if (R > 8) wtmp.resize(wmax);
+    }
+    if (!last) return;
     logits_all.resize(size_t(std::min(R, 16)) * cfg.vocab);
     logits_d.resize(size_t(std::min(R, 16)) * cfg.vocab);
     logits_h.resize(size_t(cfg.vocab));
 }
 
 // logits of state rows [row0, row0+nrows) -> logits_all (sub-batches of <= 16 rows)
-void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
+void QwenStage::lm_head_rows(int row0, int nrows) {
     const int H = cfg.hidden;
     const uint16_t *head = lm_head_w.size() ? lm_head_w.data() : embed.data();
     q_zc_norm(state.data() + size_t(row0) * H, nrows, H, final_norm.data(), cfg.eps, stream);
@@ -457,7 +498,7 @@ void QwenModel::Impl::lm_head_rows(int row0, int nrows) {
 
 // MoE MLP block: router (softmax -> top-k -> renorm), routed experts on compact per-expert token
 // lists, sigmoid-gated shared expert. Experts are QTIP trellis linears or plain bf16 (same Linear).
-void QwenModel::Impl::moe_block(LayerW &w, int rows) {
+void QwenStage::moe_block(LayerW &w, int rows) {
     const QwenRuntimeConfig &c = cfg;
     const int H = c.hidden, E = c.num_experts, K = c.topk, F = c.moe_inter, S = c.shared_inter;
     const bool e16 = !w.e_gate.empty() && w.e_gate[0].bf16;
@@ -547,12 +588,18 @@ void QwenModel::Impl::moe_block(LayerW &w, int rows) {
     q_moe_residual_add(state.data(), y_moe.data(), rows, H, stream);
 }
 
-void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
+void QwenStage::forward_chunk(const int *tokens_h, int rows) {
     const QwenRuntimeConfig &c = cfg;
     const int H = c.hidden, A = c.nq * c.hd, V = c.value_dim(), F = c.inter;
     const int pos0 = pos;
-    HIP_CHECK(hipMemcpyAsync(tokens_d.data(), tokens_h, size_t(rows) * 4, hipMemcpyHostToDevice, stream));
-    q_embed_gather(embed.data(), tokens_d.data(), state.data(), rows, H, stream);
+    if (first) {
+        HIP_CHECK(hipMemcpyAsync(tokens_d.data(), tokens_h, size_t(rows) * 4, hipMemcpyHostToDevice, stream));
+        q_embed_gather(embed.data(), tokens_d.data(), state.data(), rows, H, stream);
+    } else {  // hidden state from the previous pipeline stage (other GPU)
+        HIP_CHECK(hipStreamSynchronize(prev->stream));
+        HIP_CHECK(hipMemcpyPeerAsync(state.data(), device, prev->state.data(), prev->device,
+                                     size_t(rows) * H * 2, stream));
+    }
     if (std::getenv("QWEN_RT_DBG")) {
         HIP_CHECK(hipStreamSynchronize(stream));  // download() is a null-stream copy
         std::vector<uint16_t> h = state.download();
@@ -567,7 +614,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
                      rows, partial.data(), slices, stream);
         q_sum_slices(partial.data(), slices, size_t(rows) * lin.lin.rows, zdst, stream);
     };
-    for (int L = 0; L < c.layers; ++L) {
+    for (int L = l_begin; L < l_end; ++L) {
         LayerW &w = layers[size_t(L)];
         const bool lin16 = w.full ? w.lq.bf16 : w.l_in_qkv.bf16;  // bf16 (unquantized) checkpoint
         auto zc_hidden = [&]() {  // h_norm = zc-norm(state, ln_in): plain input of bf16 linears
@@ -728,7 +775,7 @@ void QwenModel::Impl::forward_chunk(const int *tokens_h, int rows) {
     pos += rows;
 }
 
-void QwenModel::Impl::reset() {
+void QwenStage::reset() {
     pos = 0;
     for (auto &w : layers) {
         if (w.ring.size()) HIP_CHECK(hipMemsetAsync(w.ring.data(), 0, w.ring.bytes(), stream));
@@ -741,84 +788,151 @@ void QwenModel::Impl::reset() {
     HIP_CHECK(hipStreamSynchronize(stream));
 }
 
-void QwenModel::Impl::prefill(const int *tokens, size_t n, float *last_logits) {
-    for (size_t i = 0; i < n; i += size_t(chunk)) {
-        int rows = int(std::min<size_t>(chunk, n - i));
-        forward_chunk(tokens + i, rows);
-        if (last_logits && i + size_t(rows) == n) {
-            lm_head_rows(rows - 1, 1);
-            std::memcpy(last_logits, logits_all.data(), size_t(cfg.vocab) * 4);
+// ------------------------------------------------------------------ pipeline (layer split over GPUs)
+struct QwenModel::Impl {
+    QwenRuntimeConfig cfg;
+    int chunk = 256;
+    std::vector<std::unique_ptr<QwenStage>> st;
+    std::vector<float> logits_h;
+    int pos = 0;
+    QwenStage &tail() { return *st.back(); }
+    void run_chunk(const int *tokens, int rows) {
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->forward_chunk(tokens, rows);
         }
+        pos += rows;
     }
-}
-
-void QwenModel::Impl::decode(int token, float *logits) {
-    forward_chunk(&token, 1);
-    if (logits) {
-        lm_head_rows(0, 1);
-        std::memcpy(logits, logits_all.data(), size_t(cfg.vocab) * 4);
+    void lm_head_rows(int row0, int nrows) {
+        HIP_CHECK(hipSetDevice(tail().device));
+        tail().lm_head_rows(row0, nrows);
     }
-}
-
-std::vector<int> QwenModel::Impl::generate(const int *prompt, size_t n_prompt, size_t n_new) {
-    reset();
-    std::vector<int> out;
-    prefill(prompt, n_prompt, logits_h.data());
-    int next = 0;
-    for (size_t i = 0; i < size_t(cfg.vocab); ++i)
-        if (logits_h[size_t(i)] > logits_h[size_t(next)]) next = i;
-    for (size_t g = 0; g < n_new; ++g) {
-        out.push_back(next);
-        decode(next, logits_h.data());
-        next = 0;
-        for (size_t i = 0; i < size_t(cfg.vocab); ++i)
-            if (logits_h[size_t(i)] > logits_h[size_t(next)]) next = i;
+    void reset() {
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            s->reset();
+        }
+        pos = 0;
     }
-    return out;
-}
-
-double QwenModel::Impl::perplexity(const int *tokens, size_t n) {
-    if (n < 2) throw std::runtime_error("perplexity needs at least 2 tokens");
-    reset();
-    double nll = 0;
-    long count = 0;
-    // chunk [i, i+rows): logits of row r (position i+r) predict token at i+r+1
-    for (size_t i = 0; i + 1 < n; i += size_t(chunk)) {
-        int rows = int(std::min<size_t>(size_t(chunk), n - i));
-        forward_chunk(tokens + i, rows);
-        int nrows_log = int(std::min<size_t>(size_t(rows) - 1 + 1, n - 1 - i));  // rows with a target
-        for (int r0 = 0; r0 < nrows_log; r0 += 16) {
-            int nr = std::min(16, nrows_log - r0);
-            lm_head_rows(r0, nr);
-            for (int r = 0; r < nr; ++r) {
-                size_t predict_at = i + size_t(r0 + r) + 1;
-                const float *row = logits_all.data() + size_t(r) * cfg.vocab;
-                float mx = -INFINITY;
-                for (long v = 0; v < cfg.vocab; ++v) mx = std::max(mx, row[size_t(v)]);
-                double lse = 0;
-                for (long v = 0; v < cfg.vocab; ++v) lse += std::exp(double(row[size_t(v)]) - mx);
-                lse = std::log(lse) + mx;
-                nll += lse - row[size_t(tokens[predict_at])];
-                count++;
+    void prefill(const int *tokens, size_t n, float *last_logits) {
+        for (size_t i = 0; i < n; i += size_t(chunk)) {
+            int rows = int(std::min<size_t>(chunk, n - i));
+            run_chunk(tokens + i, rows);
+            if (last_logits && i + size_t(rows) == n) {
+                lm_head_rows(rows - 1, 1);
+                std::memcpy(last_logits, tail().logits_all.data(), size_t(cfg.vocab) * 4);
             }
         }
     }
-    return std::exp(nll / double(count));
-}
+    void decode(int token, float *logits) {
+        run_chunk(&token, 1);
+        if (logits) {
+            lm_head_rows(0, 1);
+            std::memcpy(logits, tail().logits_all.data(), size_t(cfg.vocab) * 4);
+        }
+    }
+    int argmax() const {
+        int next = 0;
+        for (size_t i = 0; i < size_t(cfg.vocab); ++i)
+            if (logits_h[i] > logits_h[size_t(next)]) next = int(i);
+        return next;
+    }
+    std::vector<int> generate(const int *prompt, size_t n_prompt, size_t n_new) {
+        reset();
+        std::vector<int> out;
+        prefill(prompt, n_prompt, logits_h.data());
+        int next = argmax();
+        for (size_t g = 0; g < n_new; ++g) {
+            out.push_back(next);
+            decode(next, logits_h.data());
+            next = argmax();
+        }
+        return out;
+    }
+    double perplexity(const int *tokens, size_t n) {
+        if (n < 2) throw std::runtime_error("perplexity needs at least 2 tokens");
+        reset();
+        double nll = 0;
+        long count = 0;
+        // chunk [i, i+rows): logits of row r (position i+r) predict token at i+r+1
+        for (size_t i = 0; i + 1 < n; i += size_t(chunk)) {
+            int rows = int(std::min<size_t>(size_t(chunk), n - i));
+            run_chunk(tokens + i, rows);
+            int nrows_log = int(std::min<size_t>(size_t(rows), n - 1 - i));  // rows with a target
+            for (int r0 = 0; r0 < nrows_log; r0 += 16) {
+                int nr = std::min(16, nrows_log - r0);
+                lm_head_rows(r0, nr);
+                for (int r = 0; r < nr; ++r) {
+                    size_t predict_at = i + size_t(r0 + r) + 1;
+                    const float *row = tail().logits_all.data() + size_t(r) * cfg.vocab;
+                    float mx = -INFINITY;
+                    for (long v = 0; v < cfg.vocab; ++v) mx = std::max(mx, row[size_t(v)]);
+                    double lse = 0;
+                    for (long v = 0; v < cfg.vocab; ++v) lse += std::exp(double(row[size_t(v)]) - mx);
+                    lse = std::log(lse) + mx;
+                    nll += lse - row[size_t(tokens[predict_at])];
+                    count++;
+                }
+            }
+        }
+        return std::exp(nll / double(count));
+    }
+};
 
 // ------------------------------------------------------------------ public
 QwenModel::QwenModel(const std::filesystem::path &dir, int device, int chunk, int max_context)
+    : QwenModel(dir, std::vector<int>{device}, chunk, max_context) {}
+
+QwenModel::QwenModel(const std::filesystem::path &dir, const std::vector<int> &devices, int chunk,
+                     int max_context)
     : impl_(std::make_unique<Impl>()) {
-    impl_->device = device;
+    if (devices.empty()) throw std::runtime_error("QwenModel: no devices");
     impl_->chunk = std::max(1, chunk);
-    HIP_CHECK(hipSetDevice(device));
-    HIP_CHECK(hipStreamCreateWithFlags(&impl_->stream, hipStreamNonBlocking));
     impl_->cfg = QwenRuntimeConfig::read(dir);
     impl_->cfg.max_context = max_context;
-    impl_->load(dir);
+    const int n = int(devices.size()), NL = impl_->cfg.layers;
+    // even layer split; QWEN_SPLIT=a,b,... (first layer of each later stage) overrides
+    std::vector<int> bounds;
+    for (int s = 0; s <= n; ++s) bounds.push_back(NL * s / n);
+    if (const char *sp = std::getenv("QWEN_SPLIT")) {
+        std::string str(sp);
+        size_t p = 0;
+        for (int s = 1; s < n; ++s) {
+            size_t q = str.find(',', p);
+            bounds[size_t(s)] = std::stoi(str.substr(p, q == std::string::npos ? std::string::npos : q - p));
+            p = q == std::string::npos ? str.size() : q + 1;
+        }
+    }
+    for (int s = 0; s < n; ++s) {
+        HIP_CHECK(hipSetDevice(devices[size_t(s)]));
+        auto stg = std::make_unique<QwenStage>();
+        stg->device = devices[size_t(s)];
+        stg->chunk = impl_->chunk;
+        stg->l_begin = bounds[size_t(s)];
+        stg->l_end = bounds[size_t(s) + 1];
+        stg->first = s == 0;
+        stg->last = s == n - 1;
+        stg->prev = s ? impl_->st.back().get() : nullptr;
+        HIP_CHECK(hipStreamCreateWithFlags(&stg->stream, hipStreamNonBlocking));
+        stg->cfg = impl_->cfg;
+        stg->load(dir);
+        impl_->st.push_back(std::move(stg));
+        if (s) {  // peer access for the hidden-state hand-off (fall back to staged copies if absent)
+            int can = 0;
+            (void)hipDeviceCanAccessPeer(&can, devices[size_t(s)], devices[size_t(s) - 1]);
+            if (can) (void)hipDeviceEnablePeerAccess(devices[size_t(s) - 1], 0);
+            (void)hipGetLastError();
+        }
+    }
+    impl_->logits_h.resize(size_t(impl_->cfg.vocab));
     impl_->reset();
 }
-QwenModel::~QwenModel() { (void)hipStreamDestroy(impl_->stream); }
+QwenModel::~QwenModel() {
+    for (auto &s : impl_->st) {
+        (void)hipSetDevice(s->device);
+        (void)hipStreamDestroy(s->stream);
+    }
+}
 const QwenRuntimeConfig &QwenModel::config() const { return impl_->cfg; }
 void QwenModel::reset() { impl_->reset(); }
 int QwenModel::position() const { return impl_->pos; }

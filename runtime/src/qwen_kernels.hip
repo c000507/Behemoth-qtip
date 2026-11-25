@@ -2,6 +2,8 @@
 // SU + hadUt), epilogues (SV cast / residual add / gate-up), gated full attention (norm + partial rope +
 // output gate, bf16 KV cache) and the Gated DeltaNet recurrent step.
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp8.h>
+#include <stdexcept>
 
 #include <map>
 #include <mutex>
@@ -624,4 +626,111 @@ void q_moe_sv_add_gated(const float *z, const float *sv, const float *sg, uint16
     HIP_CHECK(hipGetLastError());
 }
 
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ FP8 (E4M3, 128x128 block scales)
+namespace behemoth {
+namespace {
+__device__ __forceinline__ float e4m3(uint32_t b) {
+    __hip_fp8_e4m3 f;
+    f.__x = uint8_t(b);
+    return float(f);
+}
+// One wave per output feature, 8 waves per block. Each lane streams 16 consecutive weight bytes per
+// 512-wide step (one 128-bit load); the 16 bytes lie inside one 128-column scale block.
+template <int R>
+__global__ __launch_bounds__(256) void q_fp8_gemv_kernel(const uint8_t *__restrict__ w,
+                                                         const float *__restrict__ ws, int m, int n,
+                                                         const uint16_t *__restrict__ x, int ldx,
+                                                         int rows, float *__restrict__ y, int ldy) {
+    const int lane = threadIdx.x & 31;
+    const int j = int(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const int row0 = int(blockIdx.y) * R;
+    if (j >= m) return;
+    const int live = min(R, rows - row0);
+    const int nb = (n + 127) / 128;
+    const uint8_t *wr = w + size_t(j) * n;
+    const float *sr = ws + size_t(j / 128) * nb;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+    for (int d = lane * 16; d < n; d += 512) {
+        const uint4 pk = *reinterpret_cast<const uint4 *>(wr + d);
+        const float s = sr[d >> 7];
+        float wv[16];
+        const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            wv[4 * q] = e4m3(pw[q]);
+            wv[4 * q + 1] = e4m3(pw[q] >> 8);
+            wv[4 * q + 2] = e4m3(pw[q] >> 16);
+            wv[4 * q + 3] = e4m3(pw[q] >> 24);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r < live) {
+                const uint4 *xp = reinterpret_cast<const uint4 *>(x + size_t(row0 + r) * ldx + d);
+                const uint4 xa = xp[0], xb = xp[1];
+                const uint32_t px[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+                float part = 0.f;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    part = fmaf(bf2f(uint16_t(px[q])), wv[2 * q], part);
+                    part = fmaf(bf2f(uint16_t(px[q] >> 16)), wv[2 * q + 1], part);
+                }
+                acc[r] = fmaf(part, s, acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float v = acc[r];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+        if (lane == 0 && r < live) y[size_t(row0 + r) * ldy + j] = v;
+    }
+}
+__global__ void q_fp8_dequant_kernel(const uint8_t *__restrict__ w, const float *__restrict__ ws, int m,
+                                     int n, uint16_t *__restrict__ out) {
+    const size_t i = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16;
+    if (i >= size_t(m) * n) return;
+    const int j = int(i / n), d = int(i % n);
+    const int nb = (n + 127) / 128;
+    const float s = ws[size_t(j / 128) * nb + (d >> 7)];
+    const uint4 pk = *reinterpret_cast<const uint4 *>(w + i);
+    const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+    uint32_t o[8];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        uint32_t b = pw[q];
+        o[2 * q] = uint32_t(f2bf(e4m3(b) * s)) | (uint32_t(f2bf(e4m3(b >> 8) * s)) << 16);
+        o[2 * q + 1] = uint32_t(f2bf(e4m3(b >> 16) * s)) | (uint32_t(f2bf(e4m3(b >> 24) * s)) << 16);
+    }
+    uint4 *op = reinterpret_cast<uint4 *>(out + i);
+    op[0] = make_uint4(o[0], o[1], o[2], o[3]);
+    op[1] = make_uint4(o[4], o[5], o[6], o[7]);
+}
+}  // namespace
+
+void q_fp8_gemv(const uint8_t *w, const float *ws, int m, int n, const uint16_t *x, int ldx, int rows,
+                float *y, int ldy, hipStream_t s) {
+    if (n % 16 || ldx % 8) throw std::runtime_error("q_fp8_gemv: n must be a multiple of 16");
+    const unsigned gx = unsigned((m + 7) / 8);
+    if (rows == 1) {
+        q_fp8_gemv_kernel<1><<<dim3(gx, 1), 256, 0, s>>>(w, ws, m, n, x, ldx, rows, y, ldy);
+    } else if (rows == 2) {
+        q_fp8_gemv_kernel<2><<<dim3(gx, 1), 256, 0, s>>>(w, ws, m, n, x, ldx, rows, y, ldy);
+    } else if (rows <= 4) {
+        q_fp8_gemv_kernel<4><<<dim3(gx, 1), 256, 0, s>>>(w, ws, m, n, x, ldx, rows, y, ldy);
+    } else {
+        q_fp8_gemv_kernel<8><<<dim3(gx, unsigned((rows + 7) / 8)), 256, 0, s>>>(w, ws, m, n, x, ldx, rows,
+                                                                              y, ldy);
+    }
+    HIP_CHECK(hipGetLastError());
+}
+void q_fp8_dequant(const uint8_t *w, const float *ws, int m, int n, uint16_t *out, hipStream_t s) {
+    if (n % 16) throw std::runtime_error("q_fp8_dequant: n must be a multiple of 16");
+    const size_t total = size_t(m) * n / 16;
+    q_fp8_dequant_kernel<<<unsigned((total + 255) / 256), 256, 0, s>>>(w, ws, m, n, out);
+    HIP_CHECK(hipGetLastError());
+}
 }  // namespace behemoth
