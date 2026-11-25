@@ -260,24 +260,35 @@ int main(int argc, char **argv) {
             for (auto &kv : running)
                 if (!kv.second->decoding) pre.push_back(kv.first);
             std::sort(pre.begin(), pre.end(), [&](int a, int b) { return running[a]->t_arrive < running[b]->t_arrive; });
-            bool first_chunk = true;
+            // pack the next piece of several prompts into one forward pass (<= chunk rows); each
+            // prompt is still split at the same chunk boundaries as when prefilled alone
+            std::vector<behemoth::QwenModel::PrefillPart> parts;
+            std::vector<int> part_slot;
+            long rows = 0;
             for (int slot : pre) {
                 Req &r = *running[slot];
                 const size_t n = std::min<size_t>(size_t(chunk), r.toks.size() - r.prefilled);
-                if (!first_chunk && long(n) > budget) break;
-                first_chunk = false;
-                const bool last = r.prefilled + n == r.toks.size();
-                if (!m.seq_prefill(slot, r.toks.data() + r.prefilled, n, last ? cand.data() : nullptr)) {
-                    retire(slot, "error");  // no KV pages even for the prompt
-                    continue;
-                }
+                if (!parts.empty() && (rows + long(n) > chunk || long(n) > budget)) break;
+                parts.push_back({slot, r.toks.data() + r.prefilled, n, r.prefilled + n == r.toks.size()});
+                part_slot.push_back(slot);
+                rows += long(n);
                 budget -= long(n);
-                r.prefilled += n;
-                if (last) {
-                    r.decoding = true;
-                    const int t = sample(cand.data(), K, r.temperature, r.top_p, r.top_k, r.rng);
-                    const std::string why = accept(r, t);
-                    if (!why.empty()) retire(slot, why);
+            }
+            if (!parts.empty()) {
+                if (!m.prefill_multi(parts, cand.data())) {
+                    retire(part_slot.back(), "error");  // no KV pages for the prompt
+                } else {
+                    int ci = 0;
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        Req &r = *running[part_slot[i]];
+                        r.prefilled += parts[i].n;
+                        if (!parts[i].want) continue;
+                        r.decoding = true;
+                        const int t = sample(cand.data() + size_t(ci++) * K, K, r.temperature, r.top_p, r.top_k, r.rng);
+                        const std::string why = accept(r, t);
+                        if (!why.empty()) retire(part_slot[i], why);
+                    }
+                    flush_out();
                 }
             }
             // batched decode of every decoding sequence

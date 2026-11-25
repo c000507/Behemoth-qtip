@@ -314,6 +314,13 @@ struct QwenStage {
         q_w8a8(L.w8.data(), L.ws.data(), L.m, L.n, xq8.data(), xqs.data(), rows, y, ldy ? ldy : L.m, gpart.data(), stream);
     }
     void forward_chunk(const int *tokens_h, int rows, int slot, int pos0);
+    // multi-sequence prefill: rows [row0, row0 + n) belong to (slot, positions pos0..). Empty: one
+    // segment (slot, pos0) of all rows. Linears / all-reduce run over all rows at once.
+    struct Seg {
+        int slot, pos0, row0, n;
+    };
+    std::vector<Seg> segs;
+    bool prefill_big = false;  // serving prefill: always the 128x128-tile GEMM + bf16 all-reduce (row-count invariant)
     // ---- sequence pools: KV in 64-token pages (pool rows [n_pages * 64]), DeltaNet ring / state per slot
     static constexpr int PAGE = 64;
     int n_slots = 1, n_pages = 0, maxpages = 0;
@@ -399,6 +406,19 @@ struct QwenStage {
     void decode_enqueue(int B);
     void decode_launch(int B);  // graph per bucket (captured on first use) unless QWEN_NO_GRAPH
     void topk_rows(int nrows);  // logits_d rows -> cand (device) -> host
+    // candidates of the given state rows (gathered into eX): final norm, lm_head, top-k -> host
+    void cand_rows(const std::vector<int> &rows) {
+        const int H = cfg.hidden;
+        for (size_t i = 0; i < rows.size(); ++i)
+            HIP_CHECK(hipMemcpyAsync(eX.data() + i * H, state.data() + size_t(rows[i]) * H, size_t(H) * 2,
+                                     hipMemcpyDeviceToDevice, stream));
+        const int nr = int(rows.size());
+        q_zc_norm(eX.data(), nr, H, final_norm.data(), cfg.eps, stream);
+        if (lm8.fp8) run_linear(lm8, eX.data(), H, nr, logits_d.data());
+        else q_bf16_gemv_any(lm_head_w.size() ? lm_head_w.data() : embed.data(), cfg.vocab, H, eX.data(), H, nr,
+                             logits_d.data(), cfg.vocab, stream);
+        topk_rows(nr);
+    }
     void moe_block(LayerW &w, int rows);
     void lm_head_rows(int row0, int nrows);  // logits_all[row0..] from state rows
     void reset();
@@ -491,7 +511,10 @@ void QwenStage::load_linear(Linear &L, const QwenCheckpoint &ck, int layer, cons
 void QwenStage::run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *y, int ldy_override) {
     const int ldy = ldy_override ? ldy_override : L.m;
     static const bool legacy = std::getenv("QWEN_FP8_LEGACY") != nullptr;
-    if (L.fp8 && !legacy) {
+    if (L.fp8 && !legacy && prefill_big) {
+        q_act_quant(x, ldx, rows, L.n, xq8.data(), xqs.data(), stream);
+        q_w8a8_big(L.w8.data(), L.ws.data(), L.m, L.n, xq8.data(), xqs.data(), rows, y, ldy, stream);
+    } else if (L.fp8 && !legacy) {
         q_act_quant(x, ldx, rows, L.n, xq8.data(), xqs.data(), stream);
         q_w8a8(L.w8.data(), L.ws.data(), L.m, L.n, xq8.data(), xqs.data(), rows, y, ldy,
                gpart.data(), stream);
@@ -879,7 +902,9 @@ void QwenStage::moe_block(LayerW &w, int rows) {
 void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0) {
     const QwenRuntimeConfig &c = cfg;
     const int H = c.hidden, A = c.nq * c.hd, V = c.value_dim(), F = c.inter;
-    const int *pt = ptab_d.data() + size_t(slot) * maxpages;
+    const std::vector<Seg> sv = segs.empty() ? std::vector<Seg>{{slot, pos0, 0, rows}} : segs;
+    if (sv.size() > 1 && (c.hd != 256 || std::getenv("QWEN_DELTA_V1") || std::getenv("QWEN_DELTA_STEP")))
+        throw std::runtime_error("multi-sequence prefill needs the split attention + DeltaNet v2 kernels");
     const size_t ring_off = size_t(slot) * c.conv_dim() * c.conv_k;
     const size_t st_off = size_t(slot) * c.lin_nv * c.lin_kd * c.lin_vd;
     if (next) HIP_CHECK(hipStreamWaitEvent(stream, next->took_ev, 0));  // state free to overwrite
@@ -950,14 +975,19 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
                 run_linear(w.lv, h_norm.data(), H, rows, z.data());
                 q_sv_cast(z.data(), ones_f.data(), v.data(), rows, Wk, Wk, stream);
             }
-            q_qk_norm_rope(q.data(), k.data(), v.data(), gate.data(), w.kc.data(), w.vc.data(), rows,
-                           pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
-                           w.k_norm.data(), c.eps, stream, pt);
-            if (c.hd == 256)
-                q_attn_split(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0,
-                             c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
-                             attn_part.size(), stream, pt);
-            else  // contiguous-cache fallback: single sequence only (identity page table)
+            for (const Seg &sg : sv) {
+                const int *spt = ptab_d.data() + size_t(sg.slot) * maxpages;
+                q_qk_norm_rope(q.data() + size_t(sg.row0) * Wq, k.data() + size_t(sg.row0) * Wk,
+                               v.data() + size_t(sg.row0) * Wk, gate.data() + size_t(sg.row0) * A, w.kc.data(),
+                               w.vc.data(), sg.n, sg.pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
+                               w.k_norm.data(), c.eps, stream, spt);
+                if (c.hd == 256)
+                    q_attn_split(q.data() + size_t(sg.row0) * Wq, w.kc.data(), w.vc.data(),
+                                 gate.data() + size_t(sg.row0) * A, attn_out.data() + size_t(sg.row0) * A, sg.n,
+                                 sg.pos0, c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
+                                 attn_part.size(), stream, spt);
+            }
+            if (c.hd != 256)  // contiguous-cache fallback: single sequence only (identity page table)
                 q_attn(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0, c.nq,
                        c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), stream);
             if (!w.lo.bf16) {
@@ -999,7 +1029,9 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
             if (!lin16) {
                 q_zc_norm_to(h_norm.data(), state.data(), rows, H, w.ln_in.data(), c.eps, stream);
             }
-            if (rows <= 8) {  // b|a rows are contiguous [2nv][H] -> one GEMV into cols Wq+V..
+            if (prefill_big) {  // row-count invariant (serving: packed prompts == alone)
+                q_bf16_gemv_any(w.w_ba.data(), 2 * nv, H, h_norm.data(), H, rows, z.data() + Wq + V, Wz, stream);
+            } else if (rows <= 8) {  // b|a rows are contiguous [2nv][H] -> one GEMV into cols Wq+V..
                 q_bf16_gemv(w.w_ba.data(), 2 * nv, H, h_norm.data(), H, rows, z.data() + Wq + V, Wz, stream);
             } else {
                 dense.gemm(nv, H, reinterpret_cast<const BFloat16 *>(h_norm.data()), H, rows,
@@ -1011,9 +1043,12 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
             }
             static const bool delta_v1 = std::getenv("QWEN_DELTA_V1") != nullptr;
             if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP") && !delta_v1)
-                q_delta_chunk2(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data() + ring_off,
-                               w.dstate.data() + st_off, o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_nk, nv, c.conv_k, c.eps,
-                               stream);
+                for (const Seg &sg : sv)
+                    q_delta_chunk2(z.data() + size_t(sg.row0) * Wz, w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(),
+                                   w.ring.data() + size_t(sg.slot) * c.conv_dim() * c.conv_k,
+                                   w.dstate.data() + size_t(sg.slot) * c.lin_nv * c.lin_kd * c.lin_vd,
+                                   o_in.data() + size_t(sg.row0) * V, z2.data(), sg.n, sg.pos0, Wq, V, c.lin_nk, nv,
+                                   c.conv_k, c.eps, stream);
             else if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))
                 q_delta_chunk(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data() + ring_off,
                               w.dstate.data() + st_off, o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_kd, c.lin_vd,
@@ -1120,7 +1155,7 @@ void QwenStage::residual_reduce(const float *zpart, int rows, bool decode) {
     // device-flag exchange through pinned host slots; prefill partials travel as bf16
     static const bool fp32_only = std::getenv("QWEN_AR_FP32") != nullptr;
     static const bool dec_bf16 = std::getenv("QWEN_AR_DECODE_BF16") != nullptr;
-    const bool bf = !fp32_only && (decode ? dec_bf16 : rows > 8);
+    const bool bf = !fp32_only && (decode ? dec_bf16 : (rows > 8 || prefill_big));
     const long n = long(rows) * H;
     float *part = const_cast<float *>(zpart);
     static const bool dma_push = std::getenv("QWEN_AR_DMA_PUSH") != nullptr;
@@ -1134,7 +1169,7 @@ void QwenStage::residual_reduce(const float *zpart, int rows, bool decode) {
         q_ar_push(part, n, ar_host, ar_slot_bytes, bf, ar_flags, ar_ctr.data(), ar_ctr.data() + 1, AR_SLOTS, stream);
     }
     static const bool zero_copy = std::getenv("QWEN_AR_ZC") != nullptr;
-    if (rows <= 8 || zero_copy || decode) {
+    if ((rows <= 8 && !prefill_big) || zero_copy || decode) {
         q_ar_pull_add(state.data(), part, tp_peer->ar_host, ar_slot_bytes, bf, n, tp_rank, tp_peer->ar_flags,
                       ar_ctr.data(), ar_ctr.data() + 2, AR_SLOTS, stream);
     } else {  // prefill: DMA the peer slot (copy engines cope with the cross-socket latency far better)
@@ -1330,6 +1365,7 @@ struct QwenModel::Impl {
             for (auto &s : st) {
                 HIP_CHECK(hipSetDevice(s->device));
                 s->alloc_batch(std::min(64, seqs));
+                s->prefill_big = true;
             }
             size_t minfree = SIZE_MAX;
             for (auto &s : st) {
@@ -1428,6 +1464,42 @@ struct QwenModel::Impl {
         }
         seq_len[size_t(slot)] = p0 + int(n);
         if (cand) merge_cands(1, cand);
+        return true;
+    }
+    // several sequences' prompt pieces in one forward pass (rows <= chunk); cand: [parts][K] for the
+    // parts with want (packed in order); false: out of KV pages (nothing run)
+    bool prefill_multi(const std::vector<QwenModel::PrefillPart> &parts, QwenCand *cand) {
+        std::vector<int> toks;
+        std::vector<QwenStage::Seg> sg;
+        std::vector<int> want_rows;
+        for (auto &p : parts) {
+            const int len = seq_len[size_t(p.slot)];
+            if (!ensure_pages(p.slot, len + int(p.n))) return false;
+            sg.push_back({p.slot, len, int(toks.size()), int(p.n)});
+            toks.insert(toks.end(), p.tokens, p.tokens + p.n);
+            if (p.want) want_rows.push_back(int(toks.size()) - 1);
+        }
+        if (int(toks.size()) > chunk) throw std::runtime_error("prefill_multi: more rows than the chunk");
+        for (auto &s : st) s->segs = sg;
+        try {
+            run_chunk(toks.data(), int(toks.size()), sg[0].slot, sg[0].pos0);
+        } catch (...) {
+            for (auto &s : st) s->segs.clear();
+            throw;
+        }
+        for (auto &s : st) s->segs.clear();
+        if (!want_rows.empty()) {
+            for (auto &s : st) {
+                HIP_CHECK(hipSetDevice(s->device));
+                s->cand_rows(want_rows);
+            }
+        }
+        for (auto &s : st) {
+            HIP_CHECK(hipSetDevice(s->device));
+            HIP_CHECK(hipStreamSynchronize(s->stream));
+        }
+        for (auto &p : parts) seq_len[size_t(p.slot)] += int(p.n);
+        if (!want_rows.empty() && cand) merge_cands(int(want_rows.size()), cand);
         return true;
     }
     // one token for each of n sequences; false (nothing run) if a sequence cannot get a KV page
@@ -1722,6 +1794,10 @@ bool QwenModel::decode_batch(const int *slots, const int *tokens, int n, QwenCan
     return impl_->decode_batch(slots, tokens, n, cand);
 }
 void QwenModel::seq_fork(int src, int dst) { impl_->seq_fork(src, dst); }
+bool QwenModel::prefill_multi(const std::vector<PrefillPart> &parts, QwenCand *cand) {
+    return impl_->prefill_multi(parts, cand);
+}
+int QwenModel::chunk() const { return impl_->chunk; }
 
 }  // namespace behemoth
 

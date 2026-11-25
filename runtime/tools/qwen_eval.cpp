@@ -166,10 +166,36 @@ int main(int argc, char **argv) {
                 }
                 double t0 = behemoth_now();
                 std::vector<int> slots, toks(prompts.size());
-                for (size_t i = 0; i < prompts.size(); ++i) {
-                    m.seq_start(int(i));
-                    m.seq_prefill(int(i), prompts[i].data(), prompts[i].size(), cand.data() + i * K);
-                    slots.push_back(int(i));
+                {  // prefill packed several prompts per pass (prefill_multi), as the worker does
+                    size_t i = 0;
+                    std::vector<size_t> done(prompts.size(), 0);
+                    for (size_t p = 0; p < prompts.size(); ++p) {
+                        m.seq_start(int(p));
+                        slots.push_back(int(p));
+                    }
+                    std::vector<behemoth::QwenCand> pc(prompts.size() * K);
+                    while (i < prompts.size()) {
+                        std::vector<behemoth::QwenModel::PrefillPart> parts;
+                        std::vector<size_t> who;
+                        long rows = 0;
+                        for (size_t p = i; p < prompts.size(); ++p) {
+                            const size_t n = std::min<size_t>(size_t(m.chunk()), prompts[p].size() - done[p]);
+                            if (!parts.empty() && rows + long(n) > m.chunk()) break;
+                            parts.push_back({int(p), prompts[p].data() + done[p], n, done[p] + n == prompts[p].size()});
+                            who.push_back(p);
+                            rows += long(n);
+                        }
+                        m.prefill_multi(parts, pc.data());
+                        int ci = 0;
+                        for (size_t q = 0; q < parts.size(); ++q) {
+                            done[who[q]] += parts[q].n;
+                            if (parts[q].want) {
+                                std::copy(pc.begin() + long(ci) * K, pc.begin() + long(ci + 1) * K, cand.begin() + long(who[q]) * K);
+                                ++ci;
+                            }
+                        }
+                        while (i < prompts.size() && done[i] == prompts[i].size()) ++i;
+                    }
                 }
                 for (int g = 0; g < G; ++g) {
                     for (size_t i = 0; i < prompts.size(); ++i) {

@@ -88,6 +88,16 @@ class QwenModel {
     // One decode step for n sequences (token i appended to slots[i]); cand [n][topk()]. false: out
     // of KV pages (nothing done).
     bool decode_batch(const int *slots, const int *tokens, int n, QwenCand *cand);
+    // Several sequences' prompt pieces in ONE forward pass (sum of n <= chunk()): shares the weight
+    // reads among short prompts. cand: [number of parts with want][topk()], in order.
+    struct PrefillPart {
+        int slot;
+        const int *tokens;
+        size_t n;
+        bool want;  // candidates of the piece's last token (the prompt's final piece)
+    };
+    bool prefill_multi(const std::vector<PrefillPart> &parts, QwenCand *cand);
+    int chunk() const;
     // Copies sequence src (state + KV) into slot dst (benchmarks / prefix reuse).
     void seq_fork(int src, int dst);
 };
