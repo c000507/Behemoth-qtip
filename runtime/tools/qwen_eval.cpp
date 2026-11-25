@@ -204,6 +204,14 @@ int main(int argc, char **argv) {
                     }
                     if (g + 1 < G) m.decode_batch(slots.data(), toks.data(), int(prompts.size()), cand.data());
                 }
+                if (const char *dp = std::getenv("QWEN_BTEST_DUMP")) {
+                    FILE *f = std::fopen(dp, "w");
+                    for (auto &v : alone) {
+                        for (int t : v) std::fprintf(f, "%d ", t);
+                        std::fprintf(f, "\n");
+                    }
+                    std::fclose(f);
+                }
                 int same = 0;
                 for (size_t i = 0; i < prompts.size(); ++i) {
                     int d = -1;

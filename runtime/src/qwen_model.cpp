@@ -363,7 +363,8 @@ struct QwenStage {
             if (w.full) continue;
             const size_t rn = size_t(cfg.conv_dim()) * cfg.conv_k, sn = size_t(cfg.lin_nv) * cfg.lin_kd * cfg.lin_vd;
             HIP_CHECK(hipMemsetAsync(w.ring.data() + slot * rn, 0, rn * 4, stream));
-            HIP_CHECK(hipMemsetAsync(w.dstate.data() + slot * sn, 0, sn * 4, stream));
+            const size_t es = std::getenv("QWEN_DSTATE_BF16") ? 2 : 4;  // bf16 state: slot s at byte s * sn * 2
+            HIP_CHECK(hipMemsetAsync(reinterpret_cast<char *>(w.dstate.data()) + slot * sn * es, 0, sn * es, stream));
         }
     }
     void copy_slot(int src, int dst, const std::vector<int> &sp, const std::vector<int> &dp) {
@@ -381,8 +382,9 @@ struct QwenStage {
             } else {
                 HIP_CHECK(hipMemcpyAsync(w.ring.data() + dst * rn, w.ring.data() + src * rn, rn * 4,
                                          hipMemcpyDeviceToDevice, stream));
-                HIP_CHECK(hipMemcpyAsync(w.dstate.data() + dst * sn, w.dstate.data() + src * sn, sn * 4,
-                                         hipMemcpyDeviceToDevice, stream));
+                const size_t es = std::getenv("QWEN_DSTATE_BF16") ? 2 : 4;
+                char *db = reinterpret_cast<char *>(w.dstate.data());
+                HIP_CHECK(hipMemcpyAsync(db + dst * sn * es, db + src * sn * es, sn * es, hipMemcpyDeviceToDevice, stream));
             }
         }
         HIP_CHECK(hipStreamSynchronize(stream));
@@ -1051,7 +1053,9 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows, int slot, int pos0)
                 for (const Seg &sg : sv)
                     q_delta_chunk2(z.data() + size_t(sg.row0) * Wz, w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(),
                                    w.ring.data() + size_t(sg.slot) * c.conv_dim() * c.conv_k,
-                                   w.dstate.data() + size_t(sg.slot) * c.lin_nv * c.lin_kd * c.lin_vd,
+                                   reinterpret_cast<float *>(reinterpret_cast<char *>(w.dstate.data()) +
+                                                             size_t(sg.slot) * c.lin_nv * c.lin_kd * c.lin_vd *
+                                                                 (std::getenv("QWEN_DSTATE_BF16") ? 2 : 4)),
                                    o_in.data() + size_t(sg.row0) * V, z2.data(), sg.n, sg.pos0, Wq, V, c.lin_nk, nv,
                                    c.conv_k, c.eps, stream);
             else if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))

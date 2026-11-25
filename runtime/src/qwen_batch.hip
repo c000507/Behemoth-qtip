@@ -678,15 +678,18 @@ __global__ void dprep_kernel(float *conv, float *qkvz, long W, int conv_dim, int
 constexpr int DT = 16;
 // grid (nv, 4 column groups), block 64: thread (col = 32 * group + tid / 2, half = tid & 1) owns
 // S[64 * half .. +64][col]; the two halves of a dot product meet through one lane shuffle.
+template <bool BF>
 __global__ __launch_bounds__(64) void dseq_kernel(float *__restrict__ conv, const float *__restrict__ qkvz, long W,
                                                   float *__restrict__ S, int T, int conv_dim, int value_dim, int nk,
                                                   int nv) {
     const int hv = blockIdx.x, col = int(blockIdx.y) * 32 + (threadIdx.x >> 1), half = threadIdx.x & 1;
     const int kh = hv / (nv / nk), key_dim = nk * 128;
     float s[64];
-    float *Sh = S + long(hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    const long sbase = long(hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    float *Sh = S + sbase;
+    uint16_t *Sb = reinterpret_cast<uint16_t *>(S) + sbase;  // bf16 state (QWEN_DSTATE_BF16)
 #pragma unroll
-    for (int i = 0; i < 64; ++i) s[i] = Sh[long(i) * 128];
+    for (int i = 0; i < 64; ++i) s[i] = BF ? bf2f(Sb[long(i) * 128]) : Sh[long(i) * 128];
     __shared__ float4 sq[DT][32], sk[DT][32];
     __shared__ float sb[DT], sd[DT];
     for (int t0 = 0; t0 < T; t0 += DT) {
@@ -743,7 +746,10 @@ __global__ __launch_bounds__(64) void dseq_kernel(float *__restrict__ conv, cons
         }
     }
 #pragma unroll
-    for (int i = 0; i < 64; ++i) Sh[long(i) * 128] = s[i];
+    for (int i = 0; i < 64; ++i) {
+        if (BF) Sb[long(i) * 128] = f2bf(s[i]);
+        else Sh[long(i) * 128] = s[i];
+    }
 }
 // grid (T, nv), block 128: out = bf16(o * rsqrt(mean(o^2)+eps) * w * silu(z))
 __global__ __launch_bounds__(128) void dnorm_kernel(const float *conv, const float *qkvz, long W, const uint16_t *dn_norm,
@@ -772,7 +778,8 @@ void q_delta_chunk2(float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm
     HIP_CHECK(hipGetLastError());
     dprep_kernel<<<unsigned(T), unsigned(32 * nk), 0, st>>>(conv, qkvz, W, conv_dim, value_dim, nk, nv, a_dt);
     HIP_CHECK(hipGetLastError());
-    dseq_kernel<<<dim3(unsigned(nv), 4), 64, 0, st>>>(conv, qkvz, W, S, T, conv_dim, value_dim, nk, nv);
+    static const bool bf = std::getenv("QWEN_DSTATE_BF16") != nullptr;
+    (bf ? dseq_kernel<true> : dseq_kernel<false>)<<<dim3(unsigned(nv), 4), 64, 0, st>>>(conv, qkvz, W, S, T, conv_dim, value_dim, nk, nv);
     HIP_CHECK(hipGetLastError());
     dnorm_kernel<<<dim3(unsigned(T), unsigned(nv)), 128, 0, st>>>(conv, qkvz, W, dn_norm, out, conv_dim, value_dim, nk,
                                                                   eps);
@@ -984,6 +991,7 @@ __global__ __launch_bounds__(256) void attn_b_combine_kernel(const float *pml, c
 }
 
 // grid (nv, B), block 256: thread (col = tid / 2, half = tid & 1)
+template <bool BF>
 __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ qkvz, long W,
                                                       const uint16_t *__restrict__ conv_w,
                                                       const uint16_t *__restrict__ dn_norm,
@@ -1035,10 +1043,12 @@ __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ 
     const float beta = 1.0f / (1.0f + __expf(-row[conv_dim + value_dim + hv]));
     const float decay = __expf(-__expf(a_dt[hv]) * softplus_d(row[conv_dim + value_dim + nv + hv] + a_dt[nv + hv]));
     const int col = tid >> 1, half = tid & 1;
-    float *Sh = S + (long(slot) * nv + hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    const long sbase = (long(slot) * nv + hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    float *Sh = S + sbase;
+    uint16_t *Sb = reinterpret_cast<uint16_t *>(S) + sbase;
     float s[64];
 #pragma unroll
-    for (int i = 0; i < 64; ++i) s[i] = Sh[long(i) * 128] * decay;
+    for (int i = 0; i < 64; ++i) s[i] = (BF ? bf2f(Sb[long(i) * 128]) : Sh[long(i) * 128]) * decay;
     float m0 = 0, m1 = 0, m2 = 0, m3 = 0;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -1064,7 +1074,10 @@ __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ 
         o3 = fmaf(s[4 * i + 3], sq[half * 64 + 4 * i + 3], o3);
     }
 #pragma unroll
-    for (int i = 0; i < 64; ++i) Sh[long(i) * 128] = s[i];
+    for (int i = 0; i < 64; ++i) {
+        if (BF) Sb[long(i) * 128] = f2bf(s[i]);
+        else Sh[long(i) * 128] = s[i];
+    }
     float o = (o0 + o1) + (o2 + o3);
     const float oo = __shfl_xor(o, 1, 32);
     o = half ? oo + o : o + oo;
@@ -1178,7 +1191,8 @@ void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_nor
                uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
                float eps, hipStream_t st) {
     const long W = long(conv_dim) + value_dim + 2 * nv;
-    delta_b_kernel<<<dim3(unsigned(nv), unsigned(B)), 256, 0, st>>>(qkvz, W, conv_w, dn_norm, a_dt, ring, S, out, meta, bmax,
+    static const bool bf = std::getenv("QWEN_DSTATE_BF16") != nullptr;
+    (bf ? delta_b_kernel<true> : delta_b_kernel<false>)<<<dim3(unsigned(nv), unsigned(B)), 256, 0, st>>>(qkvz, W, conv_w, dn_norm, a_dt, ring, S, out, meta, bmax,
                                                                    conv_dim, value_dim, nk, nv, K, eps);
     HIP_CHECK(hipGetLastError());
 }
