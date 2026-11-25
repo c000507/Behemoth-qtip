@@ -62,12 +62,14 @@ static int sample(const std::vector<float> &logits, float temperature, float top
 }
 
 int main(int argc, char **argv) {
+    bool tp = false;
     std::string model, gpus = "0";
     int chunk = 512, max_context = 32768;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
         if (!std::strcmp(argv[i], "--model")) model = next();
         else if (!std::strcmp(argv[i], "--gpus")) gpus = next();
+        else if (!std::strcmp(argv[i], "--tp")) tp = true;
         else if (!std::strcmp(argv[i], "--chunk")) chunk = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--max-context")) max_context = std::atoi(next().c_str());
         else {
@@ -84,7 +86,7 @@ int main(int argc, char **argv) {
     }
     try {
         double t0 = now_s();
-        behemoth::QwenModel m(model, devs, chunk, max_context);
+        behemoth::QwenModel m(model, devs, chunk, max_context, tp);
         std::fprintf(stderr, "qwen_worker: loaded in %.1f s on %zu gpu(s), max_context %d\n", now_s() - t0,
                      devs.size(), max_context);
         std::cout << json{{"ready", true}, {"max_context", max_context}}.dump() << std::endl;

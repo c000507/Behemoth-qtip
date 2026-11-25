@@ -97,4 +97,17 @@ void q_delta_chunk(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn
                    float *ring, float *S, uint16_t *out, float *conv_scratch, int T, int pos0, int conv_dim,
                    int value_dim, int kd, int vd, int nk, int nv, int K, float eps, hipStream_t s);
 
+// state = bf16(state + (a + b)) (tensor-parallel reduction of two rank partials, fixed order so
+// every rank computes identical bits).
+void q_residual_add2(uint16_t *state, const float *a, const float *b, long rows, int n, hipStream_t s);
+
+// dst rows = zc-norm(src rows) (out of place).
+void q_zc_norm_to(uint16_t *dst, const uint16_t *src, long rows, int n, const uint16_t *w, float eps,
+                  hipStream_t s);
+// y[r][j] = sum_d x[r][d] * w[j][d], bf16 weights [m][n], rows <= 8 (decode GEMV, fp32 out).
+void q_bf16_gemv(const uint16_t *w, int m, int n, const uint16_t *x, int ldx, int rows, float *y, int ldy,
+                 hipStream_t s);
+// element copy kernel (src may be peer-device memory with P2P access enabled)
+void q_copy_u16(uint16_t *dst, const uint16_t *src, long n, hipStream_t s);
+
 }  // namespace behemoth

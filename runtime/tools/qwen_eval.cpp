@@ -29,6 +29,7 @@ static std::vector<int> load_tokens(const std::string &path) {
 }
 
 int main(int argc, char **argv) {
+    bool tp = false;
     std::string model, prompt_file, tokens_file, ppl_file;
     std::string gpus;
     std::vector<int> bench;
@@ -44,6 +45,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--chunk")) chunk = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--device")) device = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--gpus")) gpus = next();
+        else if (!std::strcmp(argv[i], "--tp")) tp = true;
         else if (!std::strcmp(argv[i], "--bench-prefill")) bench.push_back(std::atoi(next().c_str()));
         else if (!std::strcmp(argv[i], "--bench-decode")) bench_decode = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--max-context")) max_context = std::atoi(next().c_str());
@@ -69,7 +71,7 @@ int main(int argc, char **argv) {
             }
         }
         double tl = behemoth_now();
-        behemoth::QwenModel m(model, devs, chunk, max_context);
+        behemoth::QwenModel m(model, devs, chunk, max_context, tp);
         std::printf("load %.1f s on %zu gpu(s)\n", behemoth_now() - tl, devs.size());
         const auto &c = m.config();
         std::printf("model: %d layers (hidden %d, %d full-attn), vocab %d, inter %d, rot %d\n", c.layers,

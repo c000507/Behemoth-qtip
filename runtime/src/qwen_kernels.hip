@@ -1003,3 +1003,95 @@ void q_delta_chunk(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth
+
+namespace behemoth {
+namespace {
+__global__ void q_residual_add2_kernel(uint16_t *state, const float *a, const float *b, long total) {
+    const long i = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < total) state[i] = f2bf(bf2f(state[i]) + (a[i] + b[i]));
+}
+}  // namespace
+void q_residual_add2(uint16_t *state, const float *a, const float *b, long rows, int n, hipStream_t s) {
+    const long total = rows * n;
+    q_residual_add2_kernel<<<unsigned((total + 255) / 256), 256, 0, s>>>(state, a, b, total);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ decode helpers (fewer host ops)
+namespace behemoth {
+namespace {
+__global__ __launch_bounds__(256) void q_zc_norm_to_kernel(uint16_t *dst, const uint16_t *src, int n,
+                                                           const uint16_t *w, float eps) {
+    const uint16_t *xr = src + long(blockIdx.x) * n;
+    uint16_t *yr = dst + long(blockIdx.x) * n;
+    float ss = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = bf2f(xr[i]);
+        ss += v * v;
+    }
+    ss = block_sum(ss);
+    __shared__ float inv;
+    if (threadIdx.x == 0) inv = rsqrtf(ss / n + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = f2bf(bf2f(xr[i]) * inv * (1.0f + bf2f(w[i])));
+}
+// bf16 weights [m][n], same wave-per-feature layout as q_fp8_gemv (8 bf16 per 128-bit load).
+template <int R>
+__global__ __launch_bounds__(256) void q_bf16_gemv_kernel(const uint16_t *__restrict__ w, int m, int n,
+                                                          const uint16_t *__restrict__ x, int ldx, int rows,
+                                                          float *__restrict__ y, int ldy) {
+    const int lane = threadIdx.x & 31;
+    const int j = int(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (j >= m) return;
+    const uint16_t *wr = w + size_t(j) * n;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+    for (int d = lane * 8; d < n; d += 256) {
+        const uint4 pk = *reinterpret_cast<const uint4 *>(wr + d);
+        const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r < rows) {
+                const uint4 xa = *reinterpret_cast<const uint4 *>(x + size_t(r) * ldx + d);
+                const uint32_t px[4] = {xa.x, xa.y, xa.z, xa.w};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    acc[r] = fmaf(bf2f(uint16_t(px[q])), bf2f(uint16_t(pw[q])), acc[r]);
+                    acc[r] = fmaf(bf2f(uint16_t(px[q] >> 16)), bf2f(uint16_t(pw[q] >> 16)), acc[r]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float v = acc[r];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+        if (lane == 0 && r < rows) y[size_t(r) * ldy + j] = v;
+    }
+}
+__global__ void q_copy_u16_kernel(uint16_t *dst, const uint16_t *src, long n) {
+    const long i = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+}  // namespace
+void q_zc_norm_to(uint16_t *dst, const uint16_t *src, long rows, int n, const uint16_t *w, float eps,
+                  hipStream_t s) {
+    q_zc_norm_to_kernel<<<unsigned(rows), 256, 0, s>>>(dst, src, n, w, eps);
+    HIP_CHECK(hipGetLastError());
+}
+void q_bf16_gemv(const uint16_t *w, int m, int n, const uint16_t *x, int ldx, int rows, float *y, int ldy,
+                 hipStream_t s) {
+    if (n % 8 || ldx % 8 || rows > 8) throw std::runtime_error("q_bf16_gemv: n % 8, rows <= 8");
+    const unsigned gx = unsigned((m + 7) / 8);
+    if (rows == 1) q_bf16_gemv_kernel<1><<<gx, 256, 0, s>>>(w, m, n, x, ldx, rows, y, ldy);
+    else if (rows <= 4) q_bf16_gemv_kernel<4><<<gx, 256, 0, s>>>(w, m, n, x, ldx, rows, y, ldy);
+    else q_bf16_gemv_kernel<8><<<gx, 256, 0, s>>>(w, m, n, x, ldx, rows, y, ldy);
+    HIP_CHECK(hipGetLastError());
+}
+void q_copy_u16(uint16_t *dst, const uint16_t *src, long n, hipStream_t s) {
+    q_copy_u16_kernel<<<unsigned((n + 255) / 256), 256, 0, s>>>(dst, src, n);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth

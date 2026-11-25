@@ -7,7 +7,7 @@ requests are serialised). Endpoints: GET /health, GET /v1/models, POST /v1/chat/
 POST /v1/completions (both with optional "stream": true).
 
 usage: qwen_openai_server.py --worker build-rocm/qwen_worker --model DIR [--gpus 0,1]
-                             [--host 0.0.0.0] [--port 8027] [--max-context 32768] [--name NAME]
+                             [--host 0.0.0.0] [--port 8027] [--max-context 32768] [--name NAME] [--tp]
 """
 import argparse
 import json
@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 class Worker:
     def __init__(self, args):
         cmd = [args.worker, "--model", args.model, "--gpus", args.gpus, "--max-context",
-               str(args.max_context), "--chunk", str(args.chunk)]
+               str(args.max_context), "--chunk", str(args.chunk)] + (["--tp"] if args.tp else [])
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         ready = json.loads(self.p.stdout.readline())
         assert ready.get("ready"), ready
@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--port", type=int, default=8027)
     ap.add_argument("--max-context", type=int, default=32768)
     ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--tp", action="store_true", help="tensor parallel over the 2 GPUs (default: layer pipeline)")
     ap.add_argument("--name", default="qwen3.8-27b-fp8")
     args = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(args.model)

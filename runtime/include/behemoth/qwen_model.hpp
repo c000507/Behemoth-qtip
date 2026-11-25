@@ -40,8 +40,9 @@ class QwenModel {
               int max_context = 8192);
     // Pipeline split over several GPUs: contiguous layer ranges per device (even split, or
     // QWEN_SPLIT="k1,k2,..": first layer of each later stage); hidden state handed off per chunk.
+    // tensor_parallel (2 GPUs): every layer sharded by heads / intermediate / vocab instead.
     QwenModel(const std::filesystem::path &model_dir, const std::vector<int> &devices, int chunk = 256,
-              int max_context = 8192);
+              int max_context = 8192, bool tensor_parallel = false);
     ~QwenModel();
     QwenModel(const QwenModel &) = delete;
     QwenModel &operator=(const QwenModel &) = delete;
