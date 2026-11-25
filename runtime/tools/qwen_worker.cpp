@@ -274,10 +274,10 @@ int main(int argc, char **argv) {
         // verify+draft / plain step-time ratio: measured (both modes seen at n) or the TP2 R9700 table
         auto step_ratio = [&](int n) -> double {
             if (t_plain[size_t(n)] > 0 && t_spec[size_t(n)] > 0) return t_spec[size_t(n)] / t_plain[size_t(n)];
-            static const int bn[] = {1, 4, 8, 16, 32};
-            static const double br[] = {1.09, 1.145, 1.20, 1.27, 1.56};
+            static const int bn[] = {1, 4, 8, 16, 24, 32};  // qwen_eval --bench-batch, ctx 1k / 8k mean
+            static const double br[] = {1.10, 1.155, 1.21, 1.29, 1.49, 1.55};
             if (n <= 1) return br[0];
-            for (int i = 1; i < 5; ++i)
+            for (int i = 1; i < 6; ++i)
                 if (n <= bn[i]) return br[i - 1] + (br[i] - br[i - 1]) * double(n - bn[i - 1]) / double(bn[i] - bn[i - 1]);
             return 1e9;
         };

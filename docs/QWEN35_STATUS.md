@@ -161,8 +161,41 @@ KV pool / max concurrency (max-context 131072): 32 slots 400k -> 789k tokens (@8
 Server e2e (64 slots, fp8): 64x256 702 tok/s aggregate (TTFT p50 0.93 s; 559 with 32 slots + queue),
 32x512 562 tok/s (TTFT p50 0.39 s).
 
+### MTP speculative decoding (`--mtp`, draft k = 1)
+The checkpoint's MTP head (`mtp.fc` on `[enorm(embed(t+1)) | hnorm(h_t)]` with h_t the post-final-norm
+hidden, as vLLM's qwen3_next_mtp; one gated full-attention layer + dense MLP; `mtp.norm`; shared
+embed / fp8 lm_head) is loaded as an extra TP-sharded layer with its own fp8 KV pages. Its K/V is
+written during prefill (shifted prompt tokens) and by every plain decode step, so MTP can be switched
+per step. Verify = one batched decode graph with 2 rows per sequence `[last, draft]`; `q_delta_bt`
+runs both DeltaNet steps per sequence (bit-identical to two `q_delta_b` steps) and stores the state
+after row 1 in a spare state entry; a rejected draft just switches the slot's state entry (conv ring /
+KV are positional and get overwritten). Then one MTP pass (1-2 rows per sequence) drafts the next
+token. Worker: greedy = exact match, sampling = speculative acceptance rule `min(1, p/q)` + residual
+`max(0, p-q)` on the sampler's top-64 distributions; adaptive on/off from the measured
+verify/plain step ratio and an acceptance EMA (`--mtp-max N` for a fixed threshold).
+
+Correctness: greedy MTP == plain greedy token-identical: `qwen_eval --mtp-test` 16 pg19 + 16 wiki
+prompts x 64 tokens, alone and batched (32/32 each); through the server (1x400 thinking/answer,
+8x300 concurrent) identical text MTP on vs off.
+
+Acceptance (k = 1): wiki 0.82, pg19 0.75; chat (768 tokens, T=0 / 0.7): code 0.89 / 0.87, code +
+thinking 0.79 / 0.76, essay 0.81 / 0.83, explanation + thinking 0.79, math + thinking 0.81.
+
+Decode (qwen_eval --bench-batch, pg19 context, acceptance 0.80), aggregate tok/s plain -> MTP:
+
+| ctx | B=1 | 4 | 8 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|
+| 1k | 30.8 -> 50.9 (1.65x) | 113 -> 178 | 206 -> 310 | 352 -> 498 | 462 -> 559 | 552 -> 639 (1.16x) |
+| 8k | 30.6 -> 50.1 (1.64x) | 106 -> 164 | 185 -> 273 | 298 -> 410 | 374 -> 452 | 433 -> 505 (1.17x) |
+
+Step cost (verify + draft vs plain): 1.09x at B=1 ... 1.55x at B=32 (verify rows = 2B, > 64 rows not
+supported -> B > 32 always plain). Server e2e (64 slots, temp 0.7, no thinking): 1x256 31.3 -> 50.8
+tok/s, 4x512 114 -> 175, 8x512 207 -> 310, 16x512 358 -> 495, 32x512 563 -> 643, 64x256 709 -> 707.
+Cost: KV pool 629k -> 430k tokens with 64 slots (32 spare DeltaNet state entries x 72 MB per GPU +
+the MTP layer's KV); `--mtp-seqs 16` halves the spare entries (MTP then only up to 16 sequences).
+
 Server: `qwen_openai_server.py --worker qwen_worker --model Qwen3.8-27B-FP8 --gpus 0,1 --tp --port 8027
---max-context 131072 --max-seqs 64 --kv fp8 --chunk 2048`.
+--max-context 131072 --max-seqs 64 --kv fp8 --chunk 2048 --mtp --mtp-seqs 32 --mtp-max 0`.
 
 ## Pending / open issues
 
