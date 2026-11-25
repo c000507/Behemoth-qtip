@@ -92,7 +92,7 @@ def main():
     ap.add_argument("--max-context", type=int, default=32768)
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--max-seqs", type=int, default=32, help="concurrent sequences (continuous batching, <= 64)")
-    ap.add_argument("--kv", default="bf16", choices=["bf16", "k8v16", "fp8"], help="KV cache element type")
+    ap.add_argument("--kv", default="fp8", choices=["bf16", "k8v16", "fp8"], help="KV cache element type")
     ap.add_argument("--tp", action="store_true", help="tensor parallel over the 2 GPUs (default: layer pipeline)")
     ap.add_argument("--name", default="qwen3.8-27b-fp8")
     args = ap.parse_args()

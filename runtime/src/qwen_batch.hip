@@ -1247,7 +1247,10 @@ typedef __bf16 bf16x8 __attribute__((ext_vector_type(8)));
 __device__ __forceinline__ v8f wmma_bf(uint4 a, uint4 b, v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b), c);
 }
-__device__ __forceinline__ uint32_t pack_bf2(float a, float b) { return uint32_t(f2bf(a)) | (uint32_t(f2bf(b)) << 16); }
+// two floats that are exact in bf16 (dequantised e4m3) -> packed bf16 pair
+__device__ __forceinline__ uint32_t trunc_bf2(float a, float b) {
+    return (__float_as_uint(a) >> 16) | (__float_as_uint(b) & 0xffff0000u);
+}
 constexpr int FK = 32;           // keys per LDS tile
 constexpr int FKP = 256 + 8;     // K tile row stride (bf16)
 constexpr int FVP = FK + 8;      // V^T tile row stride (bf16)
@@ -1260,6 +1263,7 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
     __shared__ __align__(16) uint16_t ks[FK][FKP];
     __shared__ __align__(16) uint16_t vt[HD][FVP];
     __shared__ __align__(16) uint16_t pl[GQ][16][24];
+    __shared__ float kss[K8 ? FK : 1], vss[V8 ? FK : 1];  // per-key scales of the e4m3 tiles
     const int r0 = int(blockIdx.x) * 16, kh = blockIdx.y;
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, c = lane & 15, h = lane >> 4;
     const int qh = kh * GQ + wave;
@@ -1289,24 +1293,26 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
             const int key = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
             const int t = kt0 + key;
             uint4 kq = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (d8 == 0) {
+                if constexpr (K8) kss[key] = 0.f;
+                if constexpr (V8) vss[key] = 0.f;
+            }
             if (t <= last) {  // e4m3 caches: dequantised (x scale) into the bf16 tiles
                 const long prow = pt ? long(pt[t >> 6]) * 64 + (t & 63) : long(t);
                 const long row = prow * kst + long(kh) * HD + d8;
-                if constexpr (K8) {
+                if constexpr (K8) {  // e4m3 -> bf16 is exact; the scale multiplies S (column = key)
                     float f[8];
                     kvd::ld8<true>(kv.k, row, f);
-                    const float sc = kv.ks[prow * nkv + kh];
-                    kq = make_uint4(pack_bf2(f[0] * sc, f[1] * sc), pack_bf2(f[2] * sc, f[3] * sc),
-                                    pack_bf2(f[4] * sc, f[5] * sc), pack_bf2(f[6] * sc, f[7] * sc));
+                    kq = make_uint4(trunc_bf2(f[0], f[1]), trunc_bf2(f[2], f[3]), trunc_bf2(f[4], f[5]), trunc_bf2(f[6], f[7]));
+                    if (d8 == 0) kss[key] = kv.ks[prow * nkv + kh];
                 } else {
                     kq = *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(kv.k) + row);
                 }
-                if constexpr (V8) {
+                if constexpr (V8) {  // exact bf16; the scale multiplies P (row of V^T = key)
                     float f[8];
                     kvd::ld8<true>(kv.v, row, f);
-                    const float sc = kv.vs[prow * nkv + kh];
-                    vv = make_uint4(pack_bf2(f[0] * sc, f[1] * sc), pack_bf2(f[2] * sc, f[3] * sc),
-                                    pack_bf2(f[4] * sc, f[5] * sc), pack_bf2(f[6] * sc, f[7] * sc));
+                    vv = make_uint4(trunc_bf2(f[0], f[1]), trunc_bf2(f[2], f[3]), trunc_bf2(f[4], f[5]), trunc_bf2(f[6], f[7]));
+                    if (d8 == 0) vss[key] = kv.vs[prow * nkv + kh];
                 } else {
                     vv = *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(kv.v) + row);
                 }
@@ -1330,11 +1336,14 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
                 s = wmma_bf(qa[k], *reinterpret_cast<const uint4 *>(&ks[sub * 16 + c][k * 16 + 8 * h]), s);
             // s[i]: row r0 + 8h + i, key kb + c
             const int key = kb + c;
+            float ksl = 1.f, vsl = 1.f;
+            if constexpr (K8) ksl = kss[sub * 16 + c];
+            if constexpr (V8) vsl = vss[sub * 16 + c];
             float corr[8];
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int pos = pos0 + r0 + 8 * h + i;
-                float v = key <= pos ? s[i] * scale : -1e30f;
+                float v = key <= pos ? s[i] * (K8 ? ksl * scale : scale) : -1e30f;
                 float mx = v;
                 mx = fmaxf(mx, __shfl_xor(mx, 1, 32));
                 mx = fmaxf(mx, __shfl_xor(mx, 2, 32));
@@ -1345,7 +1354,7 @@ __global__ __launch_bounds__(32 * GQ) void flash_prefill_kernel(const uint16_t *
                 m[i] = mn;
                 const float p = key <= pos ? __expf(v - mn) : 0.f;
                 l[i] = l[i] * corr[i] + p;
-                pl[wave][8 * h + i][c] = f2bf(p);
+                pl[wave][8 * h + i][c] = f2bf(V8 ? p * vsl : p);
             }
 #pragma unroll
             for (int t = 0; t < 16; ++t)

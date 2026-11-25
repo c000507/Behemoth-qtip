@@ -9,7 +9,7 @@
 //                       "decode_s":s}
 // usage  : qwen_worker --model DIR [--gpus 0,1] [--tp] [--chunk N] [--max-context N] [--max-seqs N]
 //          [--kv-tokens N] [--prefill-tokens N (prompt tokens per decode step, default chunk)]
-//          [--kv bf16|k8v16|fp8 (KV cache element type; sets QWEN_KV)]
+//          [--kv bf16|k8v16|fp8 (KV cache element type; sets QWEN_KV, default fp8)]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -126,6 +126,7 @@ int main(int argc, char **argv) {
         p = q + 1;
     }
     max_seqs = std::max(1, std::min(64, max_seqs));
+    setenv("QWEN_KV", "fp8", 0);  // serving default: e4m3 K+V (2x KV pool, ppl within noise of bf16)
     if (prefill_tokens < 0) prefill_tokens = chunk;
     try {
         double t0 = now_s();

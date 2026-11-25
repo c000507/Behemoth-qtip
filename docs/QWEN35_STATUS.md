@@ -118,6 +118,52 @@ the Kingdom of France", fibonacci code correct, "Water boils at ... 20°C").
 4. Loader: HF checkpoints use `model.language_model.layers.*`; codebook only built when a trellis
    exists; `max_context` no longer reset by `load()`; debug dumps sync the stream first.
 
+## Qwen3.8-27B-FP8 serving (branch qwen27-fp8, .229: 2x R9700 gfx1201, TP2, 2026-11-25)
+
+FP8 block-scaled checkpoint served natively: W8A8 FP8 WMMA GEMMs (128x128 weight block scales,
+dynamic per-token x 128-column activation scales), tensor parallel over both GPUs (heads /
+intermediate / vocab shards, device-flag all-reduce through pinned host memory, no P2P on this box),
+paged KV (64-token pages) + per-slot DeltaNet state, continuous batching with HIP-graph decode steps,
+packed multi-sequence prefill, bf16 WMMA flash attention for prefill, OpenAI front-end
+(`runtime/tools/qwen_openai_server.py` -> `qwen_worker`).
+
+### FP8 KV cache (`--kv bf16 | k8v16 | fp8`, env `QWEN_KV`; serving default `fp8`)
+Layout: e4m3 (OCP) bytes `[pool row][kv head][256]` + one fp32 scale per (pool row, kv head),
+scale = amax / 448, written by the K/V append kernels (`q_qk_norm_rope`, `q_rope_b`). Readers:
+decode `attn_b` and split-K fold the K scale into the q.k dot and the V scale into the
+probabilities; flash prefill converts e4m3 -> bf16 exactly into the LDS tiles and applies the K
+scale to S and the V scale to P. 260 B per head-row vs 512 B bf16 (K+V fp8: 2x KV tokens).
+
+Quality (TP2, chunk 2048; ppl noise between equivalent runs is ~0.1-0.2%):
+
+| KV | wiki 512-win | pg19 512-win | wiki514 | decode-path ppl (wiki) | batch test 16x48 | needles 16k-32k |
+|---|---|---|---|---|---|---|
+| bf16 | 8.2104 | 8.8522 | 3.7322 | 7.7149 | 16/16 | 4/4 |
+| k8v16 | 8.2287 (+0.22%) | 8.8570 | 3.7153 | 7.7187 | 16/16 | 4/4 |
+| fp8 (K+V) | 8.2279 (+0.21%) | 8.8473 (-0.06%) | 3.7269 | 7.7192 (+0.06%) | 16/16 | 4/4 |
+
+Greedy (serving path, 64 tokens) vs bf16 KV: prompts 1/3/4 identical, 0 and 2 diverge at 47 / 60
+(near-ties); needle answers (passphrase at 10-85% depth of 16k/20k/24k/32k pg19 prompts) identical.
+
+Decode aggregate tok/s (`qwen_eval --serve-seqs 64 --bench-batch`, forked context):
+
+| ctx | B | bf16 | fp8 |
+|---|---|---|---|
+| 1k | 1 / 16 / 32 / 64 | 31.0 / 354 / 554 / 702 | 31.0 / 355 / 558 / 711 |
+| 8k | 1 / 16 / 32 / 64 | 30.7 / 298 / 431 / (no room) | 30.8 / 317 / 469 / 572 |
+| 32k | 1 / 8 / 16 | 27.4 / 111 / (no room) | 29.6 / 157 / 231 |
+
+Prefill (single sequence, warm): 2k 1784 vs 1778 tok/s, 8k 2650 vs 2630 (-0.7%, flash +3%),
+32k 2022 vs 2004.
+
+KV pool / max concurrency (max-context 131072): 32 slots 400k -> 789k tokens (@8k 32 -> 32,
+@32k 12 -> 24); 64 slots 320k -> 629k tokens (@8k 39 -> 64, @32k 9 -> 19).
+Server e2e (64 slots, fp8): 64x256 702 tok/s aggregate (TTFT p50 0.93 s; 559 with 32 slots + queue),
+32x512 562 tok/s (TTFT p50 0.39 s).
+
+Server: `qwen_openai_server.py --worker qwen_worker --model Qwen3.8-27B-FP8 --gpus 0,1 --tp --port 8027
+--max-context 131072 --max-seqs 64 --kv fp8 --chunk 2048`.
+
 ## Pending / open issues
 
 1. **2-bit quality on 0.8B**: +62% wiki / +51% pg19 ppl over bf16 with 4M general calibration tokens
