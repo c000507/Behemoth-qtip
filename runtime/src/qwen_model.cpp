@@ -309,6 +309,10 @@ struct QwenStage {
     float *hsend[2]{};  // no P2P: pinned coherent host buffers both ranks' kernels read directly
     void lm_head_enqueue(int row0, int nrows);
     void run_linear(const Linear &L, const uint16_t *x, int ldx, int rows, float *out, int ldy = 0);
+    // W8A8 linear on activations already quantised into xq8 / xqs (q_norm_quant)
+    void run_linear_q(const Linear &L, int rows, float *y, int ldy = 0) {
+        q_w8a8(L.w8.data(), L.ws.data(), L.m, L.n, xq8.data(), xqs.data(), rows, y, ldy ? ldy : L.m, gpart.data(), stream);
+    }
     void forward_chunk(const int *tokens_h, int rows, int slot, int pos0);
     // ---- sequence pools: KV in 64-token pages (pool rows [n_pages * 64]), DeltaNet ring / state per slot
     static constexpr int PAGE = 64;
@@ -1115,7 +1119,8 @@ void QwenStage::residual_reduce(const float *zpart, int rows, bool decode) {
     }
     // device-flag exchange through pinned host slots; prefill partials travel as bf16
     static const bool fp32_only = std::getenv("QWEN_AR_FP32") != nullptr;
-    const bool bf = rows > 8 && !fp32_only && !decode;
+    static const bool dec_bf16 = std::getenv("QWEN_AR_DECODE_BF16") != nullptr;
+    const bool bf = !fp32_only && (decode ? dec_bf16 : rows > 8);
     const long n = long(rows) * H;
     float *part = const_cast<float *>(zpart);
     static const bool dma_push = std::getenv("QWEN_AR_DMA_PUSH") != nullptr;
@@ -1187,10 +1192,10 @@ void QwenStage::decode_enqueue(int B) {
     for (int L = l_begin; L < l_end; ++L) {
         LayerW &w = layers[size_t(L)];
         if (!w.fused) throw std::runtime_error("batched decode needs fp8 (fused) linears");
-        q_zc_norm_to(h_norm.data(), state.data(), B, H, w.ln_in.data(), c.eps, stream);
+        q_norm_quant(state.data(), B, H, w.ln_in.data(), c.eps, h_norm.data(), xq8.data(), xqs.data(), stream);
         if (w.full) {
             const int Wf = c.nq * 2 * c.hd + 2 * c.nkv * c.hd;
-            run_linear(w.f_qkv, h_norm.data(), H, B, z.data());
+            run_linear_q(w.f_qkv, B, z.data());
             q_rope_b(z.data(), Wf, bq.data(), bG.data(), w.kc.data(), w.vc.data(), meta_d.data(), bmax, B, ptab_d.data(),
                      maxpages, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(), w.k_norm.data(), c.eps, stream);
             q_attn_b(bq.data(), w.kc.data(), w.vc.data(), bG.data(), battn.data(), meta_d.data(), bmax, B, ptab_d.data(),
@@ -1198,15 +1203,15 @@ void QwenStage::decode_enqueue(int B) {
             run_linear(w.lo, battn.data(), A, B, zr);
         } else {
             const int Wq = c.conv_dim(), nv = c.lin_nv, Wz = Wq + V + 2 * nv;
-            run_linear(w.f_qkvz, h_norm.data(), H, B, z.data(), Wz);
+            run_linear_q(w.f_qkvz, B, z.data(), Wz);
             q_bf16_gemv_any(w.w_ba.data(), 2 * nv, H, h_norm.data(), H, B, z.data() + Wq + V, Wz, stream);
             q_delta_b(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(), w.dstate.data(),
                       o_in.data(), meta_d.data(), bmax, B, Wq, V, c.lin_nk, nv, c.conv_k, c.eps, stream);
             run_linear(w.l_out, o_in.data(), V, B, zr);
         }
         residual_reduce(zr, B, true);
-        q_zc_norm_to(h_norm.data(), state.data(), B, H, w.ln_post.data(), c.eps, stream);
-        run_linear(w.f_gu, h_norm.data(), H, B, z.data());
+        q_norm_quant(state.data(), B, H, w.ln_post.data(), c.eps, h_norm.data(), xq8.data(), xqs.data(), stream);
+        run_linear_q(w.f_gu, B, z.data());
         q_gateup(z.data(), z.data() + F, ones_f.data(), ones_f.data(), gu.data(), B, F, 2 * F, stream);
         run_linear(w.ldown, gu.data(), F, B, zr);
         residual_reduce(zr, B, true);

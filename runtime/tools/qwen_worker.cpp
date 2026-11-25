@@ -8,7 +8,7 @@
 //                      {"id":"r1","done":"stop|length|cancelled|error","prompt":n,"completion":n,"ttft_s":s,
 //                       "decode_s":s}
 // usage  : qwen_worker --model DIR [--gpus 0,1] [--tp] [--chunk N] [--max-context N] [--max-seqs N]
-//          [--kv-tokens N] [--prefill-per-step N]
+//          [--kv-tokens N] [--prefill-tokens N (prompt tokens per decode step, default chunk)]
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -97,7 +97,8 @@ static void flush_out() {
 int main(int argc, char **argv) {
     bool tp = false;
     std::string model, gpus = "0";
-    int chunk = 2048, max_context = 32768, max_seqs = 32, prefill_per_step = 1;
+    int chunk = 2048, max_context = 32768, max_seqs = 32;
+    long prefill_tokens = -1;
     long kv_tokens = 0;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
@@ -108,7 +109,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--max-context")) max_context = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--max-seqs")) max_seqs = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--kv-tokens")) kv_tokens = std::atol(next().c_str());
-        else if (!std::strcmp(argv[i], "--prefill-per-step")) prefill_per_step = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--prefill-tokens")) prefill_tokens = std::atol(next().c_str());
         else {
             std::fprintf(stderr, "unknown arg %s\n", argv[i]);
             return 1;
@@ -122,6 +123,7 @@ int main(int argc, char **argv) {
         p = q + 1;
     }
     max_seqs = std::max(1, std::min(64, max_seqs));
+    if (prefill_tokens < 0) prefill_tokens = chunk;
     try {
         double t0 = now_s();
         behemoth::QwenServeOptions so;
@@ -248,24 +250,28 @@ int main(int argc, char **argv) {
                 running[r.slot] = std::move(waiting.front());
                 waiting.pop_front();
             }
-            // prefill: oldest prefilling sequences, prefill_per_step chunks per decode step
+            // prefill: oldest prefilling sequences first; while sequences are decoding, at most
+            // prefill_tokens prompt tokens (whole chunks, >= 1 chunk) between two decode steps, so
+            // short prompts are admitted several per step and a long one cannot stall the batch
             bool any_decoding = false;
             for (auto &kv : running) any_decoding |= kv.second->decoding;
-            int budget = any_decoding ? prefill_per_step : 1;
+            long budget = any_decoding ? prefill_tokens : long(chunk);
             std::vector<int> pre;
             for (auto &kv : running)
                 if (!kv.second->decoding) pre.push_back(kv.first);
             std::sort(pre.begin(), pre.end(), [&](int a, int b) { return running[a]->t_arrive < running[b]->t_arrive; });
+            bool first_chunk = true;
             for (int slot : pre) {
-                if (budget <= 0) break;
                 Req &r = *running[slot];
                 const size_t n = std::min<size_t>(size_t(chunk), r.toks.size() - r.prefilled);
+                if (!first_chunk && long(n) > budget) break;
+                first_chunk = false;
                 const bool last = r.prefilled + n == r.toks.size();
                 if (!m.seq_prefill(slot, r.toks.data() + r.prefilled, n, last ? cand.data() : nullptr)) {
                     retire(slot, "error");  // no KV pages even for the prompt
                     continue;
                 }
-                --budget;
+                budget -= long(n);
                 r.prefilled += n;
                 if (last) {
                     r.decoding = true;

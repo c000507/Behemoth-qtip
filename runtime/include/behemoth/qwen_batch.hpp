@@ -12,6 +12,9 @@ namespace behemoth {
 // q[r][c] = e4m3(x[r][c] / s[r][c/128]), s = amax(block) / 448 (1 when the block is zero).
 // x bf16 rows (row stride ldx), n % 128 == 0; q row stride n, s row stride n/128.
 void q_act_quant(const uint16_t *x, int ldx, int rows, int n, uint8_t *q, float *s, hipStream_t st);
+// Fused zero-centred rmsnorm (h = bf16(x * rsqrt(mean(x^2)+eps) * (1+w))) + q_act_quant(h).
+void q_norm_quant(const uint16_t *x, int rows, int n, const uint16_t *w, float eps, uint16_t *h, uint8_t *q, float *s,
+                  hipStream_t st);
 // Same from f32 rows.
 void q_act_quant_f32(const float *x, int ldx, int rows, int n, uint8_t *q, float *s, hipStream_t st);
 

@@ -69,14 +69,61 @@ __global__ __launch_bounds__(256) void act_quant_kernel(const T *__restrict__ x,
     if (lane == 0) s[long(r) * nb + b] = sc;
 }
 
+// zero-centred rmsnorm + fp8 quantisation in one pass: h = bf16(x * rsqrt(mean(x^2)+eps) * (1+w)),
+// q / s = act_quant(h). grid rows, block 1024 (wave per 128-column block, strided).
+__global__ __launch_bounds__(1024) void norm_quant_kernel(const uint16_t *__restrict__ x, int n,
+                                                          const uint16_t *__restrict__ w, float eps,
+                                                          uint16_t *__restrict__ h, uint8_t *__restrict__ q,
+                                                          float *__restrict__ s) {
+    const int r = blockIdx.x, wave = threadIdx.x >> 5, lane = threadIdx.x & 31, nb = n / 128;
+    const uint16_t *xr = x + long(r) * n;
+    float ss = 0.f;
+    for (int b = wave; b < nb; b += 32) {
+        float v[4];
+        load4<uint16_t>(xr + b * 128 + lane * 4, v);
+        ss += v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+    }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+    __shared__ float red[32];
+    if (lane == 0) red[wave] = ss;
+    __syncthreads();
+    float tot = 0.f;
+    for (int i = 0; i < 32; ++i) tot += red[i];
+    const float inv = rsqrtf(tot / n + eps);
+    for (int b = wave; b < nb; b += 32) {
+        const int c0 = b * 128 + lane * 4;
+        float v[4], g[4];
+        load4<uint16_t>(xr + c0, v);
+        load4<uint16_t>(w + c0, g);
+        uint16_t hb[4];
+        float am = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            hb[i] = f2bf(v[i] * inv * (1.0f + g[i]));
+            v[i] = bf2f(hb[i]);
+            am = fmaxf(am, fabsf(v[i]));
+        }
+        *reinterpret_cast<uint2 *>(h + long(r) * n + c0) =
+            make_uint2(uint32_t(hb[0]) | (uint32_t(hb[1]) << 16), uint32_t(hb[2]) | (uint32_t(hb[3]) << 16));
+        for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
+        const float sc = am > 0.f ? am / 448.0f : 1.0f;
+        float o[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = fminf(448.f, fmaxf(-448.f, v[i] / sc));
+        *reinterpret_cast<uint32_t *>(q + long(r) * n + c0) = pack_fp8x4(o[0], o[1], o[2], o[3]);
+        if (lane == 0) s[long(r) * nb + b] = sc;
+    }
+}
+
 // ---------------------------------------------------------------- decode-sized W8A8 GEMM
 // Block = 8 waves = 128 output features (wave: 16 features, A operand = weights straight from global
 // into registers), all 16*MT tokens of the K window staged in LDS (B operand). K split over
 // gridDim.y; split s writes raw sums of its K blocks to y + s * split_stride.
 // WMMA operand layout (gfx12 wave32): lane l -> A row (feature) l%16 / B column (token) l%16; k
 // slots 8*(l/16)..+8. For the k-step pair j of a 128-column block lane half h holds the 16 bytes
-// [32j + 16h, +16): the first 8 feed the even step, the last 8 the odd step (same k mapping for A
-// and B). D: lane holds features 8*(l/16)+i (i < 8) of token l%16.
+// [64h + 16j, +16) (decode kernel: each lane streams 64 contiguous weight bytes per K block; the
+// prefill kernel uses [32j + 16h, +16) from LDS): the first 8 feed the even step, the last 8 the odd
+// step (same k mapping for A and B). D: lane holds features 8*(l/16)+i (i < 8) of token l%16.
 constexpr int XS_PAD = 144;  // LDS row stride (bytes) of 128-byte token rows
 template <int MT, bool G>
 __global__ __launch_bounds__(256) void w8a8_small_kernel(const uint8_t *__restrict__ w, const float *__restrict__ ws,
@@ -91,7 +138,7 @@ __global__ __launch_bounds__(256) void w8a8_small_kernel(const uint8_t *__restri
     const int f0 = int(blockIdx.x) * 128 + wave * 16;
     const int kb0 = int(blockIdx.y) * kbps, kb1 = min(nkb, kb0 + kbps);
     const bool active = f0 < m;
-    const uint8_t *wr = w + size_t(active ? f0 + c : 0) * n + 16 * h;
+    const uint8_t *wr = w + size_t(active ? f0 + c : 0) * n + 64 * h;  // lane half h streams the 64 contiguous bytes [64h, 64h + 64) of each K block
     const float *wsr = ws + size_t(active ? f0 / 128 : 0) * nkb;
     v8f acc[MT];
 #pragma unroll
@@ -99,9 +146,9 @@ __global__ __launch_bounds__(256) void w8a8_small_kernel(const uint8_t *__restri
     uint4 wc[4], wn[4];
     const int kl = kb1 - 1;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) wc[j] = *reinterpret_cast<const uint4 *>(wr + size_t(kb0) * 128 + 32 * j);
+    for (int j = 0; j < 4; ++j) wc[j] = *reinterpret_cast<const uint4 *>(wr + size_t(kb0) * 128 + 16 * j);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) wn[j] = *reinterpret_cast<const uint4 *>(wr + size_t(min(kb0 + 1, kl)) * 128 + 32 * j);
+    for (int j = 0; j < 4; ++j) wn[j] = *reinterpret_cast<const uint4 *>(wr + size_t(min(kb0 + 1, kl)) * 128 + 16 * j);
     for (int kb = kb0; kb < kb1; ++kb) {
         if (!G) {
         __syncthreads();
@@ -116,7 +163,7 @@ __global__ __launch_bounds__(256) void w8a8_small_kernel(const uint8_t *__restri
         uint4 wn2[4];  // two K blocks of weight loads in flight
         const int kn = min(kb + 2, kl);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) wn2[j] = *reinterpret_cast<const uint4 *>(wr + size_t(kn) * 128 + 32 * j);
+        for (int j = 0; j < 4; ++j) wn2[j] = *reinterpret_cast<const uint4 *>(wr + size_t(kn) * 128 + 16 * j);
         const float sw = wsr[kb];
         v8f tmp[MT];
 #pragma unroll
@@ -125,8 +172,8 @@ __global__ __launch_bounds__(256) void w8a8_small_kernel(const uint8_t *__restri
         for (int j = 0; j < 4; ++j) {
 #pragma unroll
             for (int t = 0; t < MT; ++t) {
-                const uint4 b = G ? *reinterpret_cast<const uint4 *>(x + size_t(16 * t + c) * n + size_t(kb) * 128 + 32 * j + 16 * h)
-                                  : *reinterpret_cast<const uint4 *>(&xt[16 * t + c][32 * j + 16 * h]);
+                const uint4 b = G ? *reinterpret_cast<const uint4 *>(x + size_t(16 * t + c) * n + size_t(kb) * 128 + 64 * h + 16 * j)
+                                  : *reinterpret_cast<const uint4 *>(&xt[16 * t + c][64 * h + 16 * j]);
                 tmp[t] = wmma8(wc[j].x, wc[j].y, b.x, b.y, tmp[t]);
                 tmp[t] = wmma8(wc[j].z, wc[j].w, b.z, b.w, tmp[t]);
             }
@@ -262,10 +309,10 @@ __global__ __launch_bounds__(256) void w8a8_big_kernel(const uint8_t *__restrict
 
 // ---------------------------------------------------------------- bf16 GEMV, any row count
 // grid (row groups of 8, feature groups of 8): consecutive blocks share a weight tile (L2 reuse).
+template <int R>
 __global__ __launch_bounds__(256) void bf16_gemv_any_kernel(const uint16_t *__restrict__ w, int m, int n,
                                                             const uint16_t *__restrict__ x, int ldx, int rows,
                                                             float *__restrict__ y, int ldy) {
-    constexpr int R = 8;
     const int lane = threadIdx.x & 31;
     const int j = int(blockIdx.y) * 8 + (threadIdx.x >> 5);
     const int row0 = int(blockIdx.x) * R;
@@ -331,6 +378,12 @@ void q_act_quant(const uint16_t *x, int ldx, int rows, int n, uint8_t *q, float 
     if (n % 128 || ldx % 4) throw std::runtime_error("q_act_quant: n % 128");
     const long waves = long(rows) * (n / 128);
     act_quant_kernel<uint16_t><<<unsigned((waves + 7) / 8), 256, 0, st>>>(x, ldx, rows, n, q, s);
+    HIP_CHECK(hipGetLastError());
+}
+void q_norm_quant(const uint16_t *x, int rows, int n, const uint16_t *w, float eps, uint16_t *h, uint8_t *q, float *s,
+                  hipStream_t st) {
+    if (n % 128) throw std::runtime_error("q_norm_quant: n % 128");
+    norm_quant_kernel<<<unsigned(rows), 1024, 0, st>>>(x, n, w, eps, h, q, s);
     HIP_CHECK(hipGetLastError());
 }
 void q_act_quant_f32(const float *x, int ldx, int rows, int n, uint8_t *q, float *s, hipStream_t st) {
@@ -401,8 +454,13 @@ void q_w8a8(const uint8_t *w, const float *ws, int m, int n, const uint8_t *x8, 
 void q_bf16_gemv_any(const uint16_t *w, int m, int n, const uint16_t *x, int ldx, int rows, float *y, int ldy,
                      hipStream_t st) {
     if (n % 256 || ldx % 8) throw std::runtime_error("q_bf16_gemv_any: n % 256");
-    const dim3 grid(unsigned((rows + 7) / 8), unsigned((m + 7) / 8));
-    bf16_gemv_any_kernel<<<grid, 256, 0, st>>>(w, m, n, x, ldx, rows, y, ldy);
+    if (m < 2048) {  // few features (DeltaNet b|a): more row groups for parallelism
+        const dim3 grid(unsigned((rows + 1) / 2), unsigned((m + 7) / 8));
+        bf16_gemv_any_kernel<2><<<grid, 256, 0, st>>>(w, m, n, x, ldx, rows, y, ldy);
+    } else {
+        const dim3 grid(unsigned((rows + 7) / 8), unsigned((m + 7) / 8));
+        bf16_gemv_any_kernel<8><<<grid, 256, 0, st>>>(w, m, n, x, ldx, rows, y, ldy);
+    }
     HIP_CHECK(hipGetLastError());
 }
 void q_quant_weight_bf16(const uint16_t *w, int m, int n, uint8_t *w8, float *ws, hipStream_t st) {
