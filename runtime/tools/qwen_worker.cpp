@@ -259,7 +259,17 @@ int main(int argc, char **argv) {
             std::vector<int> pre;
             for (auto &kv : running)
                 if (!kv.second->decoding) pre.push_back(kv.first);
-            std::sort(pre.begin(), pre.end(), [&](int a, int b) { return running[a]->t_arrive < running[b]->t_arrive; });
+            // alternate shortest-remaining-first (short prompts are not stuck behind a long one) and
+            // oldest-first (a long prompt still progresses under a stream of short ones)
+            static unsigned iter = 0;
+            if (++iter & 1u)
+                std::sort(pre.begin(), pre.end(), [&](int a, int b) {
+                    const size_t ra = running[a]->toks.size() - running[a]->prefilled;
+                    const size_t rb = running[b]->toks.size() - running[b]->prefilled;
+                    return ra != rb ? ra < rb : running[a]->t_arrive < running[b]->t_arrive;
+                });
+            else
+                std::sort(pre.begin(), pre.end(), [&](int a, int b) { return running[a]->t_arrive < running[b]->t_arrive; });
             // pack the next piece of several prompts into one forward pass (<= chunk rows); each
             // prompt is still split at the same chunk boundaries as when prefilled alone
             std::vector<behemoth::QwenModel::PrefillPart> parts;
