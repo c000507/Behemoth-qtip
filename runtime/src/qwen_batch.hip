@@ -1003,7 +1003,7 @@ __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ 
                                                       const int *__restrict__ meta, int bmax, int conv_dim,
                                                       int value_dim, int nk, int nv, int K, float eps) {
     const int hv = blockIdx.x, b = blockIdx.y, tid = threadIdx.x;
-    const int slot = meta[bmax + b], pos = meta[2 * bmax + b];
+    const int slot = meta[bmax + b], pos = meta[2 * bmax + b], sidx = meta[3 * bmax + b];
     const int kh = hv / (nv / nk), key_dim = nk * 128;
     const float *row = qkvz + long(b) * W;
     float *rg = ring + long(slot) * conv_dim * K;
@@ -1046,7 +1046,7 @@ __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ 
     const float beta = 1.0f / (1.0f + __expf(-row[conv_dim + value_dim + hv]));
     const float decay = __expf(-__expf(a_dt[hv]) * softplus_d(row[conv_dim + value_dim + nv + hv] + a_dt[nv + hv]));
     const int col = tid >> 1, half = tid & 1;
-    const long sbase = (long(slot) * nv + hv) * 128 * 128 + long(half) * 64 * 128 + col;
+    const long sbase = (long(sidx) * nv + hv) * 128 * 128 + long(half) * 64 * 128 + col;
     float *Sh = S + sbase;
     uint16_t *Sb = reinterpret_cast<uint16_t *>(S) + sbase;
     float s[64];
@@ -1089,6 +1089,125 @@ __global__ __launch_bounds__(256) void delta_b_kernel(const float *__restrict__ 
         const float zz = row[conv_dim + hv * 128 + col];
         out[long(b) * value_dim + hv * 128 + col] = f2bf(o * rsqrtf(os / 128.f + eps) * bf2f(dn_norm[col]) * silu_d(zz));
     }
+}
+
+// Speculative verify: T consecutive rows per sequence (rows g*T .. g*T+T-1 of one slot, positions
+// pos, pos+1, ..). Same arithmetic per step as delta_b_kernel (bit-identical to T single steps).
+// Conv pass: one thread per (channel, sequence), the T steps in order (ring per slot as delta_b);
+// conv outputs (silu) -> cv [rows][conv_dim].
+__global__ __launch_bounds__(256) void delta_conv_t_kernel(const float *__restrict__ qkvz, long W,
+                                                           const uint16_t *__restrict__ conv_w, float *__restrict__ ring,
+                                                           float *__restrict__ cv, const int *__restrict__ meta, int bmax,
+                                                           int T, int conv_dim, int K) {
+    const int c = blockIdx.x * 256 + threadIdx.x, g = blockIdx.y;
+    if (c >= conv_dim) return;
+    const int slot = meta[bmax + g * T];
+    float *rg = ring + long(slot) * conv_dim * K;
+    for (int t = 0; t < T; ++t) {
+        const int b = g * T + t, pos = meta[2 * bmax + b];
+        const float x = qkvz[long(b) * W + c];
+        float a = 0.f;
+        for (int k = 0; k < K - 1; ++k) {
+            const int p = pos - K + 1 + k;
+            a += (p >= 0 ? rg[long(c) * K + (p % K)] : 0.f) * bf2f(conv_w[long(c) * K + k]);
+        }
+        a += x * bf2f(conv_w[long(c) * K + K - 1]);
+        cv[long(b) * conv_dim + c] = silu_d(a);
+        rg[long(c) * K + (pos % K)] = x;
+    }
+}
+// Recurrence: grid (nv, sequences). State read once from S[meta[3*bmax + g*T]] (f32), kept in
+// registers; after step t < T-1 written to S[meta[4*bmax + g*T + t]] (snapshot), after the last step
+// back to S[meta[3*bmax + g*T]].
+__global__ __launch_bounds__(256) void delta_rec_t_kernel(const float *__restrict__ qkvz, long W,
+                                                          const float *__restrict__ cv,
+                                                          const uint16_t *__restrict__ dn_norm,
+                                                          const float *__restrict__ a_dt, float *__restrict__ S,
+                                                          uint16_t *__restrict__ out, const int *__restrict__ meta,
+                                                          int bmax, int T, int conv_dim, int value_dim, int nk, int nv,
+                                                          float eps) {
+    const int hv = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
+    const int kh = hv / (nv / nk), key_dim = nk * 128;
+    __shared__ float sq[128], sk[128], sv[128], red[8];
+    const int col = tid >> 1, half = tid & 1;
+    const long soff = long(half) * 64 * 128 + col;
+    float s[64];
+    for (int t = 0; t < T; ++t) {
+        const int b = g * T + t;
+        const float *row = qkvz + long(b) * W;
+        const float *cr = cv + long(b) * conv_dim;
+        float cq, ck = 0.f;
+        {
+            const int i = tid & 127;
+            cq = cr[tid < 128 ? kh * 128 + i : 2 * key_dim + hv * 128 + i];
+            if (tid < 128) ck = cr[key_dim + kh * 128 + i];
+        }
+        const float qs = bsum256(tid < 128 ? cq * cq : 0.f, red);
+        const float ks = bsum256(tid < 128 ? ck * ck : 0.f, red);
+        if (tid < 128) {
+            sq[tid] = cq * rsqrtf(qs + 1e-6f) * rsqrtf(128.f);
+            sk[tid] = ck * rsqrtf(ks + 1e-6f);
+        } else {
+            sv[tid - 128] = cq;
+        }
+        __syncthreads();
+        const float beta = 1.0f / (1.0f + __expf(-row[conv_dim + value_dim + hv]));
+        const float decay = __expf(-__expf(a_dt[hv]) * softplus_d(row[conv_dim + value_dim + nv + hv] + a_dt[nv + hv]));
+        if (t == 0) {
+            const float *Sh = S + (long(meta[3 * bmax + g * T]) * nv + hv) * 128 * 128 + soff;
+#pragma unroll
+            for (int i = 0; i < 64; ++i) s[i] = Sh[long(i) * 128] * decay;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 64; ++i) s[i] = s[i] * decay;
+        }
+        float m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            m0 = fmaf(s[4 * i], sk[half * 64 + 4 * i], m0);
+            m1 = fmaf(s[4 * i + 1], sk[half * 64 + 4 * i + 1], m1);
+            m2 = fmaf(s[4 * i + 2], sk[half * 64 + 4 * i + 2], m2);
+            m3 = fmaf(s[4 * i + 3], sk[half * 64 + 4 * i + 3], m3);
+        }
+        float mem = (m0 + m1) + (m2 + m3);
+        const float mo = __shfl_xor(mem, 1, 32);
+        mem = half ? mo + mem : mem + mo;
+        const float delta = (sv[col] - mem) * beta;
+        float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            s[4 * i] = fmaf(sk[half * 64 + 4 * i], delta, s[4 * i]);
+            s[4 * i + 1] = fmaf(sk[half * 64 + 4 * i + 1], delta, s[4 * i + 1]);
+            s[4 * i + 2] = fmaf(sk[half * 64 + 4 * i + 2], delta, s[4 * i + 2]);
+            s[4 * i + 3] = fmaf(sk[half * 64 + 4 * i + 3], delta, s[4 * i + 3]);
+            o0 = fmaf(s[4 * i], sq[half * 64 + 4 * i], o0);
+            o1 = fmaf(s[4 * i + 1], sq[half * 64 + 4 * i + 1], o1);
+            o2 = fmaf(s[4 * i + 2], sq[half * 64 + 4 * i + 2], o2);
+            o3 = fmaf(s[4 * i + 3], sq[half * 64 + 4 * i + 3], o3);
+        }
+        {
+            const int dst = t + 1 < T ? meta[4 * bmax + g * T + t] : meta[3 * bmax + g * T];
+            float *Sh = S + (long(dst) * nv + hv) * 128 * 128 + soff;
+#pragma unroll
+            for (int i = 0; i < 64; ++i) Sh[long(i) * 128] = s[i];
+        }
+        float o = (o0 + o1) + (o2 + o3);
+        const float oo = __shfl_xor(o, 1, 32);
+        o = half ? oo + o : o + oo;
+        const float os = bsum256(half ? 0.f : o * o, red);
+        if (!half) {
+            const float zz = row[conv_dim + hv * 128 + col];
+            out[long(b) * value_dim + hv * 128 + col] = f2bf(o * rsqrtf(os / 128.f + eps) * bf2f(dn_norm[col]) * silu_d(zz));
+        }
+        __syncthreads();
+    }
+}
+__global__ void rows_scatter_kernel(const uint16_t *__restrict__ src, int n, const int *__restrict__ idx,
+                                    uint16_t *__restrict__ dst, long total) {
+    const long i = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int r = int(i / n), c = int(i % n);
+    dst[long(idx[r]) * n + c] = src[i];
 }
 
 // Top-K (K <= 64) of each row: 4-pass 8-bit radix select of the K-th largest key, then collect.
@@ -1228,6 +1347,23 @@ void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_nor
     static const bool bf = std::getenv("QWEN_DSTATE_BF16") != nullptr;
     (bf ? delta_b_kernel<true> : delta_b_kernel<false>)<<<dim3(unsigned(nv), unsigned(B)), 256, 0, st>>>(qkvz, W, conv_w, dn_norm, a_dt, ring, S, out, meta, bmax,
                                                                    conv_dim, value_dim, nk, nv, K, eps);
+    HIP_CHECK(hipGetLastError());
+}
+void q_delta_bt(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
+                uint16_t *out, float *cv, const int *meta, int bmax, int nseq, int T, int conv_dim, int value_dim, int nk,
+                int nv, int K, float eps, hipStream_t st) {
+    if (std::getenv("QWEN_DSTATE_BF16")) throw std::runtime_error("q_delta_bt: fp32 DeltaNet state only");
+    const long W = long(conv_dim) + value_dim + 2 * nv;
+    delta_conv_t_kernel<<<dim3(unsigned((conv_dim + 255) / 256), unsigned(nseq)), 256, 0, st>>>(qkvz, W, conv_w, ring, cv,
+                                                                                               meta, bmax, T, conv_dim, K);
+    HIP_CHECK(hipGetLastError());
+    delta_rec_t_kernel<<<dim3(unsigned(nv), unsigned(nseq)), 256, 0, st>>>(qkvz, W, cv, dn_norm, a_dt, S, out, meta, bmax, T,
+                                                                          conv_dim, value_dim, nk, nv, eps);
+    HIP_CHECK(hipGetLastError());
+}
+void q_rows_scatter(const uint16_t *src, int n, const int *idx, uint16_t *dst, int rows, hipStream_t st) {
+    const long total = long(rows) * n;
+    rows_scatter_kernel<<<unsigned((total + 255) / 256), 256, 0, st>>>(src, n, idx, dst, total);
     HIP_CHECK(hipGetLastError());
 }
 void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st) {

@@ -394,6 +394,87 @@ static void test_kv_write_fp8(std::mt19937 &rng) {
     check_quant_rows(vb.download(), v8.download(), dvs.download(), hd, idx, "qk_norm_rope V e4m3");
 }
 
+// speculative verify DeltaNet: q_delta_bt (T rows per sequence, snapshots) is bit-identical to T
+// single q_delta_b steps (outputs, ring, final state and the intermediate snapshot states)
+static void test_delta_bt(int nseq, int T, std::mt19937 &rng) {
+    const int nk = 8, nv = 24, conv_dim = 2 * nk * 128 + nv * 128, value_dim = nv * 128, K = 4;
+    const long W = long(conv_dim) + value_dim + 2 * nv;
+    const int slots = nseq + 2, entries = slots + nseq * (T - 1) + 1, bmax = 64;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> qkvz(size_t(nseq) * T * W), ring(size_t(slots) * conv_dim * K), S(size_t(entries) * nv * 128 * 128),
+        adt(size_t(2 * nv));
+    for (auto &x : qkvz) x = nd(rng);
+    for (auto &x : ring) x = nd(rng);
+    for (auto &x : S) x = nd(rng) * 0.05f;
+    for (auto &x : adt) x = nd(rng) * 0.5f;
+    std::vector<uint16_t> cw(size_t(conv_dim) * K), dn(128);
+    for (auto &x : cw) x = f2bf(nd(rng) * 0.5f);
+    for (auto &x : dn) x = f2bf(1.f + nd(rng) * 0.1f);
+    // sequence g: slot g + 1, state entry g + 1, snapshots slots + g*(T-1) + t; positions start at 1 (conv
+    // taps before position 0) or later
+    std::vector<int> meta(size_t(8) * bmax, 0);
+    for (int g = 0; g < nseq; ++g)
+        for (int t = 0; t < T; ++t) {
+            const int b = g * T + t;
+            meta[size_t(bmax + b)] = g + 1;
+            meta[size_t(2 * bmax + b)] = (g == 0 ? 1 : 17 * g + 3) + t;
+            meta[size_t(3 * bmax + b)] = g + 1;
+            meta[size_t(4 * bmax + b)] = slots + g * (T - 1) + t;
+        }
+    DeviceBuffer<float> dq, dring, dS, dadt, cv(size_t(nseq) * T * conv_dim);
+    DeviceBuffer<uint16_t> dcw, ddn, out(size_t(nseq) * T * value_dim);
+    DeviceBuffer<int> dmeta;
+    dq.upload(qkvz);
+    dcw.upload(cw);
+    ddn.upload(dn);
+    dadt.upload(adt);
+    dring.upload(ring);
+    dS.upload(S);
+    dmeta.upload(meta);
+    q_delta_bt(dq.data(), dcw.data(), ddn.data(), dadt.data(), dring.data(), dS.data(), out.data(), cv.data(), dmeta.data(),
+               bmax, nseq, T, conv_dim, value_dim, nk, nv, K, 1e-6f, nullptr);
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto o_bt = out.download();
+    const auto r_bt = dring.download();
+    const auto s_bt = dS.download();
+    // reference: step t of every sequence as one q_delta_b call (rows = sequences); after each step the
+    // state of entry g+1 is copied aside (the snapshot the T kernel writes)
+    dring.upload(ring);
+    dS.upload(S);
+    std::vector<uint16_t> o_ref(size_t(nseq) * T * value_dim);
+    std::vector<float> s_ref = S;
+    DeviceBuffer<float> dqt(size_t(nseq) * W);
+    DeviceBuffer<uint16_t> ot(size_t(nseq) * value_dim);
+    for (int t = 0; t < T; ++t) {
+        std::vector<int> m1(size_t(8) * bmax, 0);
+        std::vector<float> qt(size_t(nseq) * W);
+        for (int g = 0; g < nseq; ++g) {
+            const int b = g * T + t;
+            for (int c = 0; c < 3; ++c) m1[size_t(c * bmax + g)] = meta[size_t(c * bmax + b)];
+            m1[size_t(3 * bmax + g)] = g + 1;
+            std::copy(qkvz.begin() + long(b) * W, qkvz.begin() + long(b + 1) * W, qt.begin() + long(g) * W);
+        }
+        dmeta.upload(m1);
+        dqt.upload(qt);
+        q_delta_b(dqt.data(), dcw.data(), ddn.data(), dadt.data(), dring.data(), dS.data(), ot.data(), dmeta.data(), bmax,
+                  nseq, conv_dim, value_dim, nk, nv, K, 1e-6f, nullptr);
+        HIP_CHECK(hipDeviceSynchronize());
+        const auto o = ot.download();
+        const auto sn = dS.download();
+        for (int g = 0; g < nseq; ++g) {
+            std::copy(o.begin() + long(g) * value_dim, o.begin() + long(g + 1) * value_dim,
+                      o_ref.begin() + long(g * T + t) * value_dim);
+            const size_t E = size_t(nv) * 128 * 128;
+            const size_t dst = t + 1 < T ? size_t(slots + g * (T - 1) + t) : size_t(g + 1);
+            std::copy(sn.begin() + long(size_t(g + 1) * E), sn.begin() + long(size_t(g + 2) * E), s_ref.begin() + long(dst * E));
+        }
+    }
+    const auto r_ref = dring.download();
+    CHECK(std::memcmp(o_bt.data(), o_ref.data(), o_ref.size() * 2) == 0, "delta_bt T %d out != q_delta_b steps", T);
+    CHECK(std::memcmp(r_bt.data(), r_ref.data(), r_ref.size() * 4) == 0, "delta_bt T %d ring != q_delta_b steps", T);
+    CHECK(std::memcmp(s_bt.data(), s_ref.data(), s_ref.size() * 4) == 0, "delta_bt T %d states != q_delta_b steps", T);
+    std::printf("delta_bt nseq %d T %d: bit-identical to %d q_delta_b steps\n", nseq, T, T);
+}
 int main() {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
@@ -418,6 +499,8 @@ int main() {
     test_attn_b_fp8(7, false, rng);
     test_attn_b_fp8(16, true, rng);
     test_kv_write_fp8(rng);
+    test_delta_bt(3, 2, rng);
+    test_delta_bt(5, 3, rng);
     std::printf(fails ? "%d FAILURES\n" : "all passed\n", fails);
     return fails ? 1 : 0;
 }

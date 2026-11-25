@@ -36,6 +36,8 @@ struct QwenServeOptions {
     int max_seqs = 0;  // 0: legacy single-sequence model
     long kv_tokens = 0;
     double reserve_gb = 1.5;
+    bool mtp = false;   // load the checkpoint's MTP head (mtp.*) for speculative decoding
+    int mtp_seqs = 16;  // max sequences per verify pass (one extra DeltaNet state entry each)
 };
 struct QwenCand {
     float logit;
@@ -95,11 +97,26 @@ class QwenModel {
         const int *tokens;
         size_t n;
         bool want;  // candidates of the piece's last token (the prompt's final piece)
+        int next = -1;  // !want: the prompt token after the piece (MTP K/V of its last row)
     };
     bool prefill_multi(const std::vector<PrefillPart> &parts, QwenCand *cand);
     int chunk() const;
     // Copies sequence src (state + KV) into slot dst (benchmarks / prefix reuse).
     void seq_fork(int src, int dst);
+
+    // ---- MTP speculative decoding (QwenServeOptions::mtp and an mtp.* head in the checkpoint).
+    // Per sequence: last = newest sampled token (position seq_len, not in the KV yet), draft = MTP
+    // guess for the token after it. Step: decode_verify (main model on [last, draft]) -> caller
+    // accepts / rejects the draft from cand -> spec_accept -> mtp_draft for the next draft. decode_batch
+    // stays usable (it keeps the MTP K/V complete), e.g. above a batch-size threshold.
+    bool has_mtp() const;
+    int mtp_seqs() const;  // max sequences per decode_verify
+    // cand [2n][topk()]: row 2i = candidates after last (verifies drafts[i]), 2i+1 = after the draft.
+    bool decode_verify(const int *slots, const int *tokens, const int *drafts, int n, QwenCand *cand);
+    // accepted[i] (i over the last decode_verify's sequences): 1 commits last + draft, 0 commits last only.
+    void spec_accept(const int *accepted);
+    // cand [n][topk()]: MTP candidates for the token after last[i] (draft distribution).
+    bool mtp_draft(const int *slots, const int *last, int n, QwenCand *cand);
 };
 
 }  // namespace behemoth

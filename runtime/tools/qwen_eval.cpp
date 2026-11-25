@@ -28,8 +28,65 @@ static std::vector<int> load_tokens(const std::string &path) {
     return t;
 }
 
+// Greedy speculative decoding (MTP draft k = 1) of n prefilled sequences: last[i] = the token sampled
+// from the prefill, generates until every sequence has >= G tokens (out[i] starts with last[i]).
+struct SpecStats {
+    long verified = 0, accepted = 0, steps = 0;
+};
+static void spec_greedy(behemoth::QwenModel &m, const std::vector<int> &slots, std::vector<int> last, int G,
+                        std::vector<std::vector<int>> &out, SpecStats &ss) {
+    const int K = m.topk();
+    const size_t n = slots.size();
+    out.assign(n, {});
+    for (size_t i = 0; i < n; ++i) out[i].push_back(last[i]);
+    std::vector<behemoth::QwenCand> dc(n * K), vc(2 * n * K);
+    std::vector<int> draft(n);
+    m.mtp_draft(slots.data(), last.data(), int(n), dc.data());
+    for (size_t i = 0; i < n; ++i) draft[i] = dc[i * K].id;
+    while (true) {
+        std::vector<size_t> act;
+        for (size_t i = 0; i < n; ++i)
+            if (int(out[i].size()) < G) act.push_back(i);
+        if (act.empty()) break;
+        std::vector<int> s, t, d, acc, l;
+        for (size_t i : act) {
+            s.push_back(slots[i]);
+            t.push_back(last[i]);
+            d.push_back(draft[i]);
+        }
+        const int na = int(act.size());
+        for (int j0 = 0; j0 < na; j0 += m.mtp_seqs()) {  // verify passes of <= mtp_seqs sequences
+            const int nj = std::min(m.mtp_seqs(), na - j0);
+            if (!m.decode_verify(s.data() + j0, t.data() + j0, d.data() + j0, nj, vc.data()))
+                throw std::runtime_error("decode_verify: out of KV pages");
+            std::vector<int> a(static_cast<size_t>(nj));
+            for (int j = 0; j < nj; ++j) {
+                const size_t i = act[size_t(j0 + j)];
+                const int t1 = vc[size_t(2 * j) * K].id;
+                a[size_t(j)] = t1 == draft[i];
+                ++ss.verified;
+                if (a[size_t(j)]) {
+                    ++ss.accepted;
+                    out[i].push_back(draft[i]);
+                    last[i] = vc[size_t(2 * j + 1) * K].id;
+                } else {
+                    last[i] = t1;
+                }
+                out[i].push_back(last[i]);
+            }
+            m.spec_accept(a.data());
+        }
+        ++ss.steps;
+        for (size_t i : act) l.push_back(last[i]);
+        m.mtp_draft(s.data(), l.data(), na, dc.data());
+        for (int j = 0; j < na; ++j) draft[act[size_t(j)]] = dc[size_t(j) * K].id;
+    }
+}
+
 int main(int argc, char **argv) {
-    bool tp = false;
+    bool tp = false, mtp = false;
+    int mtp_test = 0, mtp_seqs = 16;
+    std::string mtp_file, bench_file;
     std::string model, prompt_file, tokens_file, ppl_file;
     std::string gpus;
     std::vector<int> bench;
@@ -71,6 +128,10 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--stride")) stride = std::atoi(next().c_str());
         else if (!std::strcmp(argv[i], "--kv")) setenv("QWEN_KV", next().c_str(), 1);
         else if (!std::strcmp(argv[i], "--decode-ppl")) decode_ppl = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--mtp")) mtp = true;
+        else if (!std::strcmp(argv[i], "--mtp-seqs")) mtp_seqs = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--mtp-test")) { mtp_test = std::atoi(next().c_str()); mtp_file = next(); }
+        else if (!std::strcmp(argv[i], "--bench-file")) bench_file = next();
         else { std::fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
     if (model.empty()) {
@@ -93,7 +154,10 @@ int main(int argc, char **argv) {
         double tl = behemoth_now();
         behemoth::QwenServeOptions so;
         so.max_seqs = serve_seqs;
+        so.mtp = mtp;
+        so.mtp_seqs = mtp_seqs;
         behemoth::QwenModel m(model, devs, chunk, max_context, tp, so);
+        if (mtp) std::printf("MTP head %s (verify <= %d seqs)\n", m.has_mtp() ? "loaded" : "NOT FOUND", m.mtp_seqs());
         std::printf("load %.1f s on %zu gpu(s)\n", behemoth_now() - tl, devs.size());
         if (serve_seqs > 0) {
             const long pages = m.kv_pages_total();
@@ -111,6 +175,10 @@ int main(int argc, char **argv) {
                 }
                 std::vector<int> ctx(static_cast<size_t>(bench_ctx));
                 for (int i = 0; i < bench_ctx; ++i) ctx[size_t(i)] = 1000 + (i * 7919) % 100000;
+                if (!bench_file.empty()) {  // real text context (meaningful MTP acceptance)
+                    auto bt = load_tokens(bench_file);
+                    for (int i = 0; i < bench_ctx; ++i) ctx[size_t(i)] = bt[size_t(i) % bt.size()];
+                }
                 std::vector<behemoth::QwenCand> cand(size_t(B) * K);
                 m.seq_start(0);
                 double t0 = behemoth_now();
@@ -131,6 +199,30 @@ int main(int argc, char **argv) {
                             bench_ctx, t1 - t0, step * 1e3, 1.0 / step, B / step);
                 std::fflush(stdout);
                 for (int b = 0; b < B; ++b) m.seq_free(b);
+                if (m.has_mtp()) {  // same context, speculative greedy decoding
+                    m.seq_start(0);
+                    m.seq_prefill(0, ctx.data(), ctx.size(), cand.data());
+                    for (int b = 1; b < B; ++b) m.seq_fork(0, b);
+                    std::vector<int> last(size_t(B), cand[0].id);
+                    std::vector<std::vector<int>> out;
+                    SpecStats warm, ss;
+                    spec_greedy(m, slots, last, 4, out, warm);  // graph capture
+                    for (int b = 0; b < B; ++b) last[size_t(b)] = out[size_t(b)].back();
+                    // continue from where the warm-up stopped: rebuild drafts inside spec_greedy
+                    const double t4 = behemoth_now();
+                    spec_greedy(m, slots, last, bench_steps, out, ss);
+                    const double t5 = behemoth_now();
+                    long toks_out = 0;
+                    for (auto &o : out) toks_out += long(o.size()) - 1;
+                    const double sstep = (t5 - t4) / double(ss.steps);
+                    std::printf("batch %2d ctx %d MTP: step %.2f ms, accept %.3f (%.2f tok/step/seq), %.1f tok/s/seq, "
+                                "aggregate %.1f tok/s (%.2fx)\n",
+                                B, bench_ctx, sstep * 1e3, double(ss.accepted) / double(std::max(1L, ss.verified)),
+                                double(toks_out) / double(B) / double(ss.steps), double(toks_out) / B / (t5 - t4),
+                                double(toks_out) / (t5 - t4), double(toks_out) / (t5 - t4) / (B / step));
+                    std::fflush(stdout);
+                    for (int b = 0; b < B; ++b) m.seq_free(b);
+                }
             }
             // greedy through the serving path (B = 1); --prompt a,b,c: one line per file
             for (size_t p0 = 0; greedy > 0 && p0 < prompt_file.size();) {
@@ -240,6 +332,99 @@ int main(int argc, char **argv) {
                 }
                 std::printf("batch test: %d prompts x %d greedy tokens: %d identical alone vs batched (%.1f s batched)\n",
                             btest_n, G, same, behemoth_now() - t0);
+            }
+            if (mtp_test > 0 && m.has_mtp()) {  // greedy MTP speculative == greedy plain (alone and batched)
+                std::vector<behemoth::QwenCand> cand(static_cast<size_t>(K));
+                auto src = load_tokens(mtp_file);
+                std::vector<std::vector<int>> prompts;
+                size_t off = 0;
+                for (int i = 0; i < mtp_test; ++i) {
+                    const size_t len = size_t(17 + (i * 97) % 900);
+                    if (off + len > src.size()) off = 0;
+                    prompts.emplace_back(src.begin() + long(off), src.begin() + long(off + len));
+                    off += len;
+                }
+                const int G = btest_gen;
+                std::vector<std::vector<int>> plain(prompts.size());
+                for (size_t i = 0; i < prompts.size(); ++i) {
+                    m.seq_start(0);
+                    m.seq_prefill(0, prompts[i].data(), prompts[i].size(), cand.data());
+                    int slot = 0;
+                    for (int g = 0; g < G; ++g) {
+                        int t = cand[0].id;
+                        plain[i].push_back(t);
+                        if (g + 1 < G) m.decode_batch(&slot, &t, 1, cand.data());
+                    }
+                    m.seq_free(0);
+                }
+                auto compare = [&](const std::vector<std::vector<int>> &spec, const char *what, const SpecStats &ss, double dt) {
+                    int same = 0;
+                    for (size_t i = 0; i < prompts.size(); ++i) {
+                        int d = -1;
+                        for (int g = 0; g < G; ++g)
+                            if (plain[i][size_t(g)] != spec[i][size_t(g)]) {
+                                d = g;
+                                break;
+                            }
+                        if (d < 0) ++same;
+                        else std::printf("  %s prompt %zu: MTP diverges from plain at %d\n", what, i, d);
+                    }
+                    std::printf("mtp test (%s): %zu prompts x %d greedy tokens: %d identical to plain decode; accept %.3f "
+                                "(%ld / %ld), %.2f tok/step (%.1f s)\n",
+                                what, prompts.size(), G, same, double(ss.accepted) / double(std::max(1L, ss.verified)),
+                                ss.accepted, ss.verified, double(ss.verified + ss.accepted) / double(std::max(1L, ss.verified)), dt);
+                };
+                {  // alone: one sequence at a time
+                    std::vector<std::vector<int>> spec(prompts.size());
+                    SpecStats ss;
+                    const double t0 = behemoth_now();
+                    for (size_t i = 0; i < prompts.size(); ++i) {
+                        m.seq_start(0);
+                        m.seq_prefill(0, prompts[i].data(), prompts[i].size(), cand.data());
+                        std::vector<std::vector<int>> o;
+                        spec_greedy(m, {0}, {cand[0].id}, G, o, ss);
+                        spec[i] = o[0];
+                        m.seq_free(0);
+                    }
+                    compare(spec, "alone", ss, behemoth_now() - t0);
+                }
+                {  // batched: packed prefill (next tokens set), all sequences speculative together
+                    const int n = int(prompts.size());
+                    std::vector<int> slots(static_cast<size_t>(n)), first(static_cast<size_t>(n));
+                    std::vector<behemoth::QwenCand> pc(static_cast<size_t>(n) * K);
+                    std::vector<size_t> done(static_cast<size_t>(n), 0);
+                    for (int p = 0; p < n; ++p) {
+                        m.seq_start(p);
+                        slots[size_t(p)] = p;
+                    }
+                    const double t0 = behemoth_now();
+                    size_t i = 0;
+                    while (i < size_t(n)) {
+                        std::vector<behemoth::QwenModel::PrefillPart> parts;
+                        std::vector<size_t> who;
+                        long rows = 0;
+                        for (size_t p = i; p < size_t(n); ++p) {
+                            const size_t len = std::min<size_t>(size_t(m.chunk()), prompts[p].size() - done[p]);
+                            if (!parts.empty() && rows + long(len) > m.chunk()) break;
+                            const bool fin = done[p] + len == prompts[p].size();
+                            parts.push_back({int(p), prompts[p].data() + done[p], len, fin, fin ? -1 : prompts[p][done[p] + len]});
+                            who.push_back(p);
+                            rows += long(len);
+                        }
+                        m.prefill_multi(parts, pc.data());
+                        int ci = 0;
+                        for (size_t q = 0; q < parts.size(); ++q) {
+                            done[who[q]] += parts[q].n;
+                            if (parts[q].want) first[who[q]] = pc[size_t(ci++) * K].id;
+                        }
+                        while (i < size_t(n) && done[i] == prompts[i].size()) ++i;
+                    }
+                    std::vector<std::vector<int>> spec;
+                    SpecStats ss;
+                    spec_greedy(m, slots, first, G, spec, ss);
+                    compare(spec, "batched", ss, behemoth_now() - t0);
+                    for (int p = 0; p < n; ++p) m.seq_free(p);
+                }
             }
             return 0;
         }

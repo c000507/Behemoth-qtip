@@ -29,6 +29,8 @@ class Worker:
     def __init__(self, args):
         cmd = [args.worker, "--model", args.model, "--gpus", args.gpus, "--max-context", str(args.max_context),
                "--chunk", str(args.chunk), "--max-seqs", str(args.max_seqs), "--kv", args.kv] + (["--tp"] if args.tp else [])
+        if args.mtp:
+            cmd += ["--mtp", "--mtp-seqs", str(args.mtp_seqs), "--mtp-max", str(args.mtp_max)]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
         ready = json.loads(self.p.stdout.readline())
         assert ready.get("ready"), ready
@@ -94,6 +96,9 @@ def main():
     ap.add_argument("--max-seqs", type=int, default=32, help="concurrent sequences (continuous batching, <= 64)")
     ap.add_argument("--kv", default="fp8", choices=["bf16", "k8v16", "fp8"], help="KV cache element type")
     ap.add_argument("--tp", action="store_true", help="tensor parallel over the 2 GPUs (default: layer pipeline)")
+    ap.add_argument("--mtp", action="store_true", help="MTP speculative decoding (checkpoint mtp.* head)")
+    ap.add_argument("--mtp-seqs", type=int, default=32, help="max sequences per MTP verify pass")
+    ap.add_argument("--mtp-max", type=int, default=0, help="MTP only while <= N sequences decode (0: adaptive)")
     ap.add_argument("--name", default="qwen3.8-27b-fp8")
     args = ap.parse_args()
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -217,7 +222,8 @@ def main():
                      "total_tokens": len(ids) + info.get("completion", len(out_ids))}
             dec = info.get("decode_s", 0) or 1e-9
             print(f"{rid}: prompt {len(ids)} tok ttft {info.get('ttft_s', 0):.2f}s, {usage['completion_tokens']} tok "
-                  f"in {dec:.2f}s ({usage['completion_tokens'] / dec:.1f} tok/s), {finish}", flush=True)
+                  f"in {dec:.2f}s ({usage['completion_tokens'] / dec:.1f} tok/s), {finish}"
+                  + (f", mtp accepted {info['mtp'][0]}/{info['mtp'][1]}" if "mtp" in info else ""), flush=True)
             if stream:
                 chunk({}, finish)
                 self.wfile.write(b"data: [DONE]\n\n")

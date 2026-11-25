@@ -10,6 +10,12 @@
 // usage  : qwen_worker --model DIR [--gpus 0,1] [--tp] [--chunk N] [--max-context N] [--max-seqs N]
 //          [--kv-tokens N] [--prefill-tokens N (prompt tokens per decode step, default chunk)]
 //          [--kv bf16|k8v16|fp8 (KV cache element type; sets QWEN_KV, default fp8)]
+//          [--mtp (MTP speculative decoding, draft k = 1)] [--mtp-seqs N (max sequences per verify pass,
+//           default 32)] [--mtp-max N (use MTP only while <= N sequences decode; 0 = adaptive, default)]
+// MTP: per step either a verify pass ([last, draft] per sequence; greedy: exact-match acceptance,
+// sampling: the speculative acceptance rule min(1, p/q) with residual resampling, so the output
+// distribution is the plain sampler's) + an MTP draft pass, or a plain decode pass. Adaptive mode
+// picks MTP while (1 + acceptance) beats the measured verify/plain step-time ratio of the batch size.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -66,6 +72,49 @@ static int sample(const QwenCand *c, int K, float temperature, float top_p, int 
     return c[keep - 1].id;
 }
 
+// The sampler's distribution over the sorted candidates (the same keep set / weights as sample()).
+static std::vector<std::pair<int, double>> sampler_dist(const QwenCand *c, int K, float temperature, float top_p, int top_k) {
+    std::vector<std::pair<int, double>> d;
+    if (temperature <= 0) {
+        d.push_back({c[0].id, 1.0});
+        return d;
+    }
+    const int k = top_k > 0 ? std::min(top_k, K) : K;
+    std::vector<double> p(static_cast<size_t>(k));
+    double sum = 0;
+    for (int i = 0; i < k; ++i) sum += p[size_t(i)] = std::exp(double(c[i].logit - c[0].logit) / temperature);
+    int keep = k;
+    if (top_p > 0 && top_p < 1) {
+        double acc = 0;
+        for (int i = 0; i < k; ++i) {
+            acc += p[size_t(i)] / sum;
+            if (acc >= top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    double tot = 0;
+    for (int i = 0; i < keep; ++i) tot += p[size_t(i)];
+    for (int i = 0; i < keep; ++i) d.push_back({c[i].id, p[size_t(i)] / tot});
+    return d;
+}
+static double prob_of(const std::vector<std::pair<int, double>> &d, int id) {
+    for (auto &e : d)
+        if (e.first == id) return e.second;
+    return 0.0;
+}
+static int draw(const std::vector<std::pair<int, double>> &d, std::mt19937_64 &rng) {
+    double tot = 0;
+    for (auto &e : d) tot += e.second;
+    double u = std::uniform_real_distribution<double>(0, tot)(rng);
+    for (auto &e : d) {
+        u -= e.second;
+        if (u <= 0) return e.first;
+    }
+    return d.back().first;
+}
+
 struct Req {
     std::string id;
     std::vector<int> toks, stop;
@@ -76,6 +125,9 @@ struct Req {
     size_t prefilled = 0;
     int ngen = 0, last = -1;
     bool decoding = false;
+    int draft = -1;                           // MTP draft for the token after `last` (-1: none)
+    std::vector<std::pair<int, double>> qd;   // its draft distribution
+    long nver = 0, nacc = 0;                  // verified / accepted drafts
     double t_arrive = 0, t_first = 0;
 };
 
@@ -102,6 +154,8 @@ int main(int argc, char **argv) {
     int chunk = 2048, max_context = 32768, max_seqs = 32;
     long prefill_tokens = -1;
     long kv_tokens = 0;
+    bool use_mtp = false;
+    int mtp_seqs = 32, mtp_max = 0;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> std::string { return argv[++i]; };
         if (!std::strcmp(argv[i], "--model")) model = next();
@@ -113,6 +167,9 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--kv-tokens")) kv_tokens = std::atol(next().c_str());
         else if (!std::strcmp(argv[i], "--prefill-tokens")) prefill_tokens = std::atol(next().c_str());
         else if (!std::strcmp(argv[i], "--kv")) setenv("QWEN_KV", next().c_str(), 1);
+        else if (!std::strcmp(argv[i], "--mtp")) use_mtp = true;
+        else if (!std::strcmp(argv[i], "--mtp-seqs")) mtp_seqs = std::atoi(next().c_str());
+        else if (!std::strcmp(argv[i], "--mtp-max")) mtp_max = std::atoi(next().c_str());
         else {
             std::fprintf(stderr, "unknown arg %s\n", argv[i]);
             return 1;
@@ -133,14 +190,18 @@ int main(int argc, char **argv) {
         behemoth::QwenServeOptions so;
         so.max_seqs = max_seqs;
         so.kv_tokens = kv_tokens;
+        so.mtp = use_mtp;
+        so.mtp_seqs = mtp_seqs;
         behemoth::QwenModel m(model, devs, chunk, max_context, tp, so);
+        const bool spec_on = use_mtp && m.has_mtp();
+        if (use_mtp && !spec_on) std::fprintf(stderr, "qwen_worker: --mtp but the checkpoint has no MTP head\n");
         const int K = m.topk(), PT = m.page_tokens();
         const long pages = m.kv_pages_total();
         std::fprintf(stderr,
                      "qwen_worker: loaded in %.1f s on %zu gpu(s); %d slots, KV pool %ld tokens (%s), max_context %d, "
-                     "chunk %d\n",
+                     "chunk %d, MTP %s\n",
                      now_s() - t0, devs.size(), max_seqs, pages * PT, std::getenv("QWEN_KV") ? std::getenv("QWEN_KV") : "bf16",
-                     max_context, chunk);
+                     max_context, chunk, spec_on ? "on" : "off");
         emit(json{{"ready", true}, {"max_context", max_context}, {"max_seqs", max_seqs}, {"kv_tokens", pages * PT}});
         flush_out();
 
@@ -175,9 +236,11 @@ int main(int argc, char **argv) {
 
         auto finish = [&](Req &r, const std::string &reason) {
             const double t = now_s();
-            emit(json{{"id", r.id}, {"done", reason}, {"prompt", r.toks.size()}, {"completion", r.ngen},
-                      {"ttft_s", r.t_first > 0 ? r.t_first - r.t_arrive : 0.0},
-                      {"decode_s", r.t_first > 0 ? t - r.t_first : 0.0}});
+            json j{{"id", r.id}, {"done", reason}, {"prompt", r.toks.size()}, {"completion", r.ngen},
+                   {"ttft_s", r.t_first > 0 ? r.t_first - r.t_arrive : 0.0},
+                   {"decode_s", r.t_first > 0 ? t - r.t_first : 0.0}};
+            if (r.nver > 0) j["mtp"] = {r.nacc, r.nver};
+            emit(j);
         };
         auto retire = [&](int slot, const std::string &reason) {
             auto it = running.find(slot);
@@ -196,6 +259,27 @@ int main(int argc, char **argv) {
             if (r.ngen >= r.max_new) return "length";
             if (m.seq_len(r.slot) + 1 >= max_context) return "length";
             return "";
+        };
+        // MTP bookkeeping: acceptance EMA, measured step times per batch size (plain / verify+draft)
+        std::vector<QwenCand> vcand, dcand;
+        double acc_ema = 0.7;
+        long mtp_ver = 0, mtp_acc = 0, mtp_steps = 0;
+        unsigned probe = 0;
+        std::vector<double> t_plain(65, 0.0), t_spec(65, 0.0);
+        auto note_step = [&](int n, bool sp, double dt) {
+            if (n < 1 || n > 64) return;
+            double &e = (sp ? t_spec : t_plain)[size_t(n)];
+            e = e > 0 ? 0.9 * e + 0.1 * dt : dt;
+        };
+        // verify+draft / plain step-time ratio: measured (both modes seen at n) or the TP2 R9700 table
+        auto step_ratio = [&](int n) -> double {
+            if (t_plain[size_t(n)] > 0 && t_spec[size_t(n)] > 0) return t_spec[size_t(n)] / t_plain[size_t(n)];
+            static const int bn[] = {1, 4, 8, 16, 32};
+            static const double br[] = {1.09, 1.145, 1.20, 1.27, 1.56};
+            if (n <= 1) return br[0];
+            for (int i = 1; i < 5; ++i)
+                if (n <= bn[i]) return br[i - 1] + (br[i] - br[i - 1]) * double(n - bn[i - 1]) / double(bn[i] - bn[i - 1]);
+            return 1e9;
         };
         bool eof = false;
         while (true) {
@@ -284,7 +368,8 @@ int main(int argc, char **argv) {
                 Req &r = *running[slot];
                 const size_t n = std::min<size_t>(size_t(chunk), r.toks.size() - r.prefilled);
                 if (!parts.empty() && (rows + long(n) > chunk || long(n) > budget)) break;
-                parts.push_back({slot, r.toks.data() + r.prefilled, n, r.prefilled + n == r.toks.size()});
+                const bool fin = r.prefilled + n == r.toks.size();
+                parts.push_back({slot, r.toks.data() + r.prefilled, n, fin, fin ? -1 : r.toks[r.prefilled + n]});
                 part_slot.push_back(slot);
                 rows += long(n);
                 budget -= long(n);
@@ -313,6 +398,105 @@ int main(int argc, char **argv) {
                     slots.push_back(kv.first);
                     toks.push_back(kv.second->last);
                 }
+            const int nd = int(slots.size());
+            bool spec = spec_on && nd > 0 && nd <= m.mtp_seqs() && (mtp_max <= 0 || nd <= mtp_max);
+            for (int s : slots) spec = spec && m.seq_len(s) + 3 < max_context;
+            if (spec && mtp_max <= 0) {  // adaptive: expected tokens per step vs the verify / plain time ratio
+                const double ratio = step_ratio(nd);
+                spec = (1.0 + acc_ema) > ratio * 1.03 || (++probe % 64) == 0;
+            }
+            if (spec) {
+                const double ts0 = now_s();
+                std::vector<int> vs, vt, vd;
+                for (int s : slots) {
+                    Req &r = *running[s];
+                    if (r.draft >= 0) {
+                        vs.push_back(s);
+                        vt.push_back(r.last);
+                        vd.push_back(r.draft);
+                    }
+                }
+                std::vector<std::pair<int, std::string>> done_now;
+                if (!vs.empty()) {
+                    const int nv = int(vs.size());
+                    vcand.resize(size_t(2 * nv) * K);
+                    if (!m.decode_verify(vs.data(), vt.data(), vd.data(), nv, vcand.data())) {
+                        spec = false;  // out of KV pages: plain step below retires a victim
+                    } else {
+                        std::vector<int> acc(static_cast<size_t>(nv));
+                        std::vector<std::vector<int>> emitted(static_cast<size_t>(nv));
+                        for (int i = 0; i < nv; ++i) {
+                            Req &r = *running[vs[size_t(i)]];
+                            const QwenCand *c0 = vcand.data() + size_t(2 * i) * K, *c1 = c0 + K;
+                            auto p = sampler_dist(c0, K, r.temperature, r.top_p, r.top_k);
+                            const double pd = prob_of(p, r.draft), qd = std::max(prob_of(r.qd, r.draft), 1e-300);
+                            bool ok;
+                            if (r.temperature <= 0) ok = p[0].first == r.draft;
+                            else ok = std::uniform_real_distribution<double>(0, 1)(r.rng) < std::min(1.0, pd / qd);
+                            acc[size_t(i)] = ok;
+                            ++r.nver;
+                            ++mtp_ver;
+                            if (ok) {
+                                ++r.nacc;
+                                ++mtp_acc;
+                                emitted[size_t(i)] = {r.draft, sample(c1, K, r.temperature, r.top_p, r.top_k, r.rng)};
+                            } else {  // residual max(0, p - q)
+                                std::vector<std::pair<int, double>> res;
+                                if (r.temperature <= 0) {
+                                    res = p;
+                                } else {
+                                    for (auto &e : p) {
+                                        const double v = e.second - prob_of(r.qd, e.first);
+                                        if (v > 0) res.push_back({e.first, v});
+                                    }
+                                    if (res.empty()) res = p;
+                                }
+                                emitted[size_t(i)] = {draw(res, r.rng)};
+                            }
+                            acc_ema = 0.98 * acc_ema + 0.02 * double(ok);
+                        }
+                        m.spec_accept(acc.data());
+                        for (int i = 0; i < nv; ++i) {
+                            Req &r = *running[vs[size_t(i)]];
+                            r.draft = -1;
+                            for (int t : emitted[size_t(i)]) {
+                                const std::string why = accept(r, t);
+                                if (!why.empty()) {
+                                    done_now.push_back({vs[size_t(i)], why});
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (spec) {
+                    for (auto &d : done_now) retire(d.first, d.second);
+                    std::vector<int> ds, dl;  // next drafts of every sequence still decoding
+                    for (int s : slots)
+                        if (running.count(s)) {
+                            ds.push_back(s);
+                            dl.push_back(running[s]->last);
+                        }
+                    if (!ds.empty()) {
+                        dcand.resize(ds.size() * size_t(K));
+                        m.mtp_draft(ds.data(), dl.data(), int(ds.size()), dcand.data());
+                        for (size_t i = 0; i < ds.size(); ++i) {
+                            Req &r = *running[ds[i]];
+                            r.qd = sampler_dist(dcand.data() + i * K, K, r.temperature, r.top_p, r.top_k);
+                            r.draft = r.temperature <= 0 ? r.qd[0].first : draw(r.qd, r.rng);
+                        }
+                    }
+                    if (!vs.empty()) note_step(int(vs.size()), true, now_s() - ts0);
+                    if (++mtp_steps % 500 == 0)
+                        std::fprintf(stderr, "qwen_worker: MTP %ld spec steps, acceptance %.3f (ema %.3f)\n", mtp_steps,
+                                     double(mtp_acc) / double(std::max(1L, mtp_ver)), acc_ema);
+                    flush_out();
+                    continue;
+                }
+            }
+            for (int s : slots)
+                if (running.count(s)) running[s]->draft = -1;
+            const double tp0 = now_s();
             if (!slots.empty()) {
                 if (!m.decode_batch(slots.data(), toks.data(), int(slots.size()), cand.data())) {
                     // out of KV pages: finish the longest sequence and retry next iteration
@@ -321,6 +505,7 @@ int main(int argc, char **argv) {
                         if (m.seq_len(s) > m.seq_len(victim)) victim = s;
                     retire(victim, "length");
                 } else {
+                    note_step(nd, false, now_s() - tp0);
                     for (size_t i = 0; i < slots.size(); ++i) {
                         Req &r = *running[slots[i]];
                         const int t = sample(cand.data() + i * K, K, r.temperature, r.top_p, r.top_k, r.rng);

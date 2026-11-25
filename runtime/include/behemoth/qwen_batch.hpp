@@ -90,10 +90,21 @@ void q_attn_b(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const u
 void q_attn_b(const uint16_t *q, const QKvCache &kv, const uint16_t *G, uint16_t *out, const int *meta, int bmax, int B,
               const int *ptab, int maxpages, int nq, int nkv, int max_context, float scale, float *scratch,
               hipStream_t st);
-// One DeltaNet step per row; ring [slots][conv_dim][K], S [slots][nv][128][128] (f32).
+// meta rows used by the decode kernels (QwenStage, NMETA x bmax ints): 0 tokens, 1 slots, 2 positions,
+// 3 DeltaNet state index (physical S entry), 4 snapshot S index (q_delta_bt), 5 / 6 spare (row maps).
+// One DeltaNet step per row; ring [slots][conv_dim][K] (by slot), S [entries][nv][128][128] (f32,
+// entry meta[3*bmax + b]).
 void q_delta_b(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
                uint16_t *out, const int *meta, int bmax, int B, int conv_dim, int value_dim, int nk, int nv, int K,
                float eps, hipStream_t st);
+// T consecutive DeltaNet steps per sequence (rows g*T + t, t < T, one slot, consecutive positions):
+// bit-identical to T q_delta_b steps. The state after step t < T-1 goes to entry meta[4*bmax + g*T + t]
+// (speculative verify snapshots), the final one back to meta[3*bmax + g*T]. cv: f32 [nseq*T][conv_dim].
+void q_delta_bt(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt, float *ring, float *S,
+                uint16_t *out, float *cv, const int *meta, int bmax, int nseq, int T, int conv_dim, int value_dim, int nk,
+                int nv, int K, float eps, hipStream_t st);
+// dst[idx[r]][:] = src[r][:] (bf16 rows of n)
+void q_rows_scatter(const uint16_t *src, int n, const int *idx, uint16_t *dst, int rows, hipStream_t st);
 // Top-K (unsorted, K <= 64) of each row of logits [rows][V]; ids offset by voff.
 void q_topk(const float *logits, int rows, int V, int K, int voff, float *oval, int *oid, int ostride, hipStream_t st);
 }  // namespace behemoth
