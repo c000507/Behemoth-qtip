@@ -83,4 +83,18 @@ void q_fp8_gemv(const uint8_t *w, const float *ws, int m, int n, const uint16_t 
 // out bf16 [m][n] = dequantised weights (prefill: dequant + bf16 GEMM).
 void q_fp8_dequant(const uint8_t *w, const float *ws, int m, int n, uint16_t *out, hipStream_t s);
 
+// Split-K (flash-decoding style) gated attention, same contract as q_attn (hd 256, GQA group
+// nq/nkv in {1,2,4,6,8}); scratch f32 of at least q_attn_split_scratch(rows, ...) floats.
+size_t q_attn_split_scratch(int rows, int nq, int nkv, int hd, int max_len);
+void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
+                  uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, float *scratch,
+                  size_t scratch_floats, hipStream_t s);
+
+// Whole-chunk Gated DeltaNet (same math as T calls of q_delta_step): causal conv of all T rows
+// (conv_scratch f32 [T][conv_dim]), ring update, then one kernel per v-head over the T tokens with
+// the state in registers. kd == vd == 128.
+void q_delta_chunk(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt,
+                   float *ring, float *S, uint16_t *out, float *conv_scratch, int T, int pos0, int conv_dim,
+                   int value_dim, int kd, int vd, int nk, int nv, int K, float eps, hipStream_t s);
+
 }  // namespace behemoth

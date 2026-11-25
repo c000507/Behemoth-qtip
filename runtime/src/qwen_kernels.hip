@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp8.h>
 #include <stdexcept>
+#include <algorithm>
 
 #include <map>
 #include <mutex>
@@ -731,6 +732,274 @@ void q_fp8_dequant(const uint8_t *w, const float *ws, int m, int n, uint16_t *ou
     if (n % 16) throw std::runtime_error("q_fp8_dequant: n must be a multiple of 16");
     const size_t total = size_t(m) * n / 16;
     q_fp8_dequant_kernel<<<unsigned((total + 255) / 256), 256, 0, s>>>(w, ws, m, n, out);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ split-K gated attention
+namespace behemoth {
+namespace {
+// Block = 8 waves for (row r, kv head kh, split). Each wave owns 32-position chunks: lane = one
+// position (full hd-dim dots for all G = nq/nkv q heads of the group, q in LDS), then the 32
+// probabilities are broadcast and every lane accumulates hd/32 output dims. One partial (m, l,
+// acc[hd]) per (row, q head, split, wave); q_attn_combine merges them.
+template <int G>
+__global__ __launch_bounds__(256) void q_attn_split_kernel(const uint16_t *__restrict__ q,
+                                                           const uint16_t *__restrict__ kc,
+                                                           const uint16_t *__restrict__ vc, int rows,
+                                                           int pos0, int nq, int nkv, int S, int nsplit,
+                                                           float scale, float *__restrict__ pml,
+                                                           float *__restrict__ pacc) {
+    constexpr int HD = 256, DPL = HD / 32;
+    const int split = int(blockIdx.x) % nsplit;
+    const int kh = (int(blockIdx.x) / nsplit) % nkv;
+    const int r = int(blockIdx.x) / nsplit / nkv;
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float qs[G][HD];
+    for (int i = threadIdx.x; i < G * HD; i += 256) {
+        const int g = i / HD, d = i % HD;
+        qs[g][d] = bf2f(q[long(r) * nq * 2 * HD + long(kh * G + g) * 2 * HD + d]) * scale;
+    }
+    __syncthreads();
+    const int len = pos0 + r + 1;
+    const int t_beg = split * S, t_end = min(len, (split + 1) * S);
+    float m[G], l[G], acc[G][DPL];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -1e30f;
+        l[g] = 0.f;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f;
+    }
+    const long kstride = long(nkv) * HD;
+    for (int base = t_beg + wave * 32; base < t_end; base += 8 * 32) {
+        const int t = base + lane;
+        const bool ok = t < t_end;
+        float dot[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) dot[g] = 0.f;
+        if (ok) {
+            const uint4 *kp = reinterpret_cast<const uint4 *>(kc + long(t) * kstride + long(kh) * HD);
+#pragma unroll 4
+            for (int c = 0; c < HD / 8; ++c) {
+                const uint4 kv = kp[c];
+                const uint32_t w4[4] = {kv.x, kv.y, kv.z, kv.w};
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float k0 = bf2f(uint16_t(w4[e])), k1 = bf2f(uint16_t(w4[e] >> 16));
+#pragma unroll
+                    for (int g = 0; g < G; ++g)
+                        dot[g] = fmaf(qs[g][c * 8 + 2 * e + 1], k1, fmaf(qs[g][c * 8 + 2 * e], k0, dot[g]));
+                }
+            }
+        }
+        float p[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float cm = ok ? dot[g] : -1e30f;
+            for (int off = 16; off > 0; off >>= 1) cm = fmaxf(cm, __shfl_xor(cm, off, 32));
+            const float mn = fmaxf(m[g], cm);
+            const float corr = __expf(m[g] - mn);
+            m[g] = mn;
+            p[g] = ok ? __expf(dot[g] - mn) : 0.f;
+            l[g] = l[g] * corr + p[g];
+#pragma unroll
+            for (int i = 0; i < DPL; ++i) acc[g][i] *= corr;
+        }
+        const int nj = min(32, t_end - base);
+        for (int j = 0; j < nj; ++j) {
+            const uint4 vv = *reinterpret_cast<const uint4 *>(vc + long(base + j) * kstride + long(kh) * HD +
+                                                              lane * DPL);
+            const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
+            float v[DPL];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                v[2 * e] = bf2f(uint16_t(w4[e]));
+                v[2 * e + 1] = bf2f(uint16_t(w4[e] >> 16));
+            }
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float pg = __shfl(p[g], j, 32);
+#pragma unroll
+                for (int i = 0; i < DPL; ++i) acc[g][i] = fmaf(pg, v[i], acc[g][i]);
+            }
+        }
+    }
+    const int NS = nsplit * 8, s = split * 8 + wave;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        float ls = l[g];
+        for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor(ls, off, 32);
+        const long e = (long(r) * nq + kh * G + g) * NS + s;
+        if (lane == 0) {
+            pml[2 * e] = m[g];
+            pml[2 * e + 1] = ls;
+        }
+        float4 *ap = reinterpret_cast<float4 *>(pacc + e * HD + lane * DPL);
+        ap[0] = make_float4(acc[g][0], acc[g][1], acc[g][2], acc[g][3]);
+        ap[1] = make_float4(acc[g][4], acc[g][5], acc[g][6], acc[g][7]);
+    }
+}
+// one block (hd threads) per (row, q head): merge NS partials, * sigmoid(gate)
+__global__ void q_attn_combine_kernel(const float *pml, const float *pacc, int NS, const uint16_t *G,
+                                      uint16_t *out, int nq, int hd) {
+    const long rh = blockIdx.x;
+    const int d = threadIdx.x;
+    float M = -1e30f;
+    for (int s = 0; s < NS; ++s) M = fmaxf(M, pml[2 * (rh * NS + s)]);
+    float num = 0.f, den = 0.f;
+    for (int s = 0; s < NS; ++s) {
+        const long e = rh * NS + s;
+        const float l = pml[2 * e + 1];
+        if (l <= 0.f) continue;
+        const float w = __expf(pml[2 * e] - M);
+        den += w * l;
+        num += w * pacc[e * hd + d];
+    }
+    const long r = rh / nq, h = rh % nq;
+    const float gt = bf2f(G[r * nq * hd + h * hd + d]);
+    out[r * nq * hd + h * hd + d] = f2bf(num / den / (1.0f + __expf(-gt)));
+}
+}  // namespace
+
+size_t q_attn_split_scratch(int rows, int nq, int nkv, int hd, int max_len) {
+    int nsplit = 1;
+    const int want = std::max(1, 1024 / std::max(1, rows * nkv));
+    nsplit = std::max(1, std::min(want, (max_len + 255) / 256));
+    return size_t(rows) * nq * nsplit * 8 * size_t(hd + 2);
+}
+
+void q_attn_split(const uint16_t *q, const uint16_t *kc, const uint16_t *vc, const uint16_t *G,
+                  uint16_t *out, int rows, int pos0, int nq, int nkv, int hd, float scale, float *scratch,
+                  size_t scratch_floats, hipStream_t s) {
+    if (hd != 256) throw std::runtime_error("q_attn_split: head_dim 256 only");
+    const int len = pos0 + rows;
+    const int want = std::max(1, 1024 / std::max(1, rows * nkv));
+    const int nsplit = std::max(1, std::min(want, (len + 255) / 256));
+    const int S = ((len + nsplit - 1) / nsplit + 255) / 256 * 256;
+    const int NS = nsplit * 8;
+    const size_t ne = size_t(rows) * nq * NS;
+    if (ne * size_t(hd + 2) > scratch_floats) throw std::runtime_error("q_attn_split: scratch too small");
+    float *pml = scratch, *pacc = scratch + 2 * ne;
+    const unsigned blocks = unsigned(rows * nkv * nsplit);
+    switch (nq / nkv) {
+    case 1: q_attn_split_kernel<1><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    case 2: q_attn_split_kernel<2><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    case 4: q_attn_split_kernel<4><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    case 6: q_attn_split_kernel<6><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    case 8: q_attn_split_kernel<8><<<blocks, 256, 0, s>>>(q, kc, vc, rows, pos0, nq, nkv, S, nsplit, scale, pml, pacc); break;
+    default: throw std::runtime_error("q_attn_split: unsupported GQA group");
+    }
+    HIP_CHECK(hipGetLastError());
+    q_attn_combine_kernel<<<unsigned(rows * nq), unsigned(hd), 0, s>>>(pml, pacc, NS, G, out, nq, hd);
+    HIP_CHECK(hipGetLastError());
+}
+}  // namespace behemoth
+
+// ------------------------------------------------------------------ Gated DeltaNet, whole chunk
+namespace behemoth {
+namespace {
+// conv[t][c] = silu(sum_i w[c][i] * x(pos0 + t - K + 1 + i)); x(p) = qkvz row p - pos0 (this chunk)
+// or the ring (raw inputs of earlier positions, ring[c][p % K]).
+__global__ void q_delta_conv_kernel(const float *qkvz, long W, const uint16_t *conv_w, const float *ring,
+                                    int T, int pos0, int conv_dim, int K, float *conv) {
+    const long i = long(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= long(T) * conv_dim) return;
+    const int t = int(i / conv_dim), c = int(i % conv_dim);
+    const int tp = pos0 + t;
+    float a = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const int p = tp - K + 1 + k;
+        float x = 0.f;
+        if (p >= pos0) x = qkvz[long(p - pos0) * W + c];
+        else if (p >= 0) x = ring[long(c) * K + (p % K)];
+        a += x * bf2f(conv_w[long(c) * K + k]);
+    }
+    conv[i] = silu_f(a);
+}
+__global__ void q_delta_ring_kernel(const float *qkvz, long W, float *ring, int T, int pos0, int conv_dim,
+                                    int K) {
+    const int c = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    for (int p = max(pos0, pos0 + T - K); p < pos0 + T; ++p) ring[long(c) * K + (p % K)] = qkvz[long(p - pos0) * W + c];
+}
+// block-wide sum returned to every thread (KD/32 waves)
+template <int NW>
+__device__ __forceinline__ float bsum_all(float v, float *red) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float r = 0.f;
+#pragma unroll
+    for (int i = 0; i < NW; ++i) r += red[i];
+    __syncthreads();
+    return r;
+}
+// One block per v-head (KD threads), all T tokens sequentially with the state column S[:, d] in
+// registers (thread d = value dim d).
+template <int KD>
+__global__ __launch_bounds__(KD) void q_delta_seq_kernel(const float *__restrict__ qkvz, long W,
+                                                         const float *__restrict__ conv,
+                                                         const uint16_t *__restrict__ dn_norm,
+                                                         const float *__restrict__ a_dt, float *__restrict__ S,
+                                                         uint16_t *__restrict__ out, int T, int conv_dim,
+                                                         int value_dim, int nk, int nv, float eps) {
+    const int hv = blockIdx.x, d = threadIdx.x;
+    const int kh = hv / (nv / nk), key_dim = nk * KD;
+    float s[KD];
+    float *Sh = S + long(hv) * KD * KD;
+#pragma unroll
+    for (int dk = 0; dk < KD; ++dk) s[dk] = Sh[long(dk) * KD + d];
+    __shared__ float sh_q[KD], sh_k[KD];
+    const float A = __expf(a_dt[hv]), dtb = a_dt[nv + hv], nw = bf2f(dn_norm[d]);
+    for (int t = 0; t < T; ++t) {
+        const float *cr = conv + long(t) * conv_dim;
+        const float *row = qkvz + long(t) * W;
+        const float qv = cr[kh * KD + d], kv = cr[key_dim + kh * KD + d], vv = cr[2 * key_dim + hv * KD + d];
+        __shared__ float red[KD / 32];
+        const float qs = bsum_all<KD / 32>(qv * qv, red);
+        const float ks = bsum_all<KD / 32>(kv * kv, red);
+        sh_q[d] = qv * rsqrtf(qs + 1e-6f) * rsqrtf(float(KD));
+        sh_k[d] = kv * rsqrtf(ks + 1e-6f);
+        __syncthreads();
+        const float beta = 1.0f / (1.0f + __expf(-row[conv_dim + value_dim + hv]));
+        const float decay = __expf(-A * softplus_f(row[conv_dim + value_dim + nv + hv] + dtb));
+        float kv_mem = 0.f;
+#pragma unroll
+        for (int dk = 0; dk < KD; ++dk) {
+            s[dk] *= decay;
+            kv_mem = fmaf(s[dk], sh_k[dk], kv_mem);
+        }
+        const float delta = (vv - kv_mem) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int dk = 0; dk < KD; ++dk) {
+            s[dk] = fmaf(sh_k[dk], delta, s[dk]);
+            o = fmaf(s[dk], sh_q[dk], o);
+        }
+        const float os = bsum_all<KD / 32>(o * o, red);
+        const float z = row[conv_dim + long(hv) * KD + d];
+        out[long(t) * value_dim + long(hv) * KD + d] = f2bf(o * rsqrtf(os / KD + eps) * nw * silu_f(z));
+        __syncthreads();
+    }
+#pragma unroll
+    for (int dk = 0; dk < KD; ++dk) Sh[long(dk) * KD + d] = s[dk];
+}
+}  // namespace
+
+void q_delta_chunk(const float *qkvz, const uint16_t *conv_w, const uint16_t *dn_norm, const float *a_dt,
+                   float *ring, float *S, uint16_t *out, float *conv_scratch, int T, int pos0, int conv_dim,
+                   int value_dim, int kd, int vd, int nk, int nv, int K, float eps, hipStream_t s) {
+    if (kd != 128 || vd != 128) throw std::runtime_error("q_delta_chunk: kd == vd == 128 only");
+    const long W = long(conv_dim) + value_dim + 2 * nv;
+    const long n = long(T) * conv_dim;
+    q_delta_conv_kernel<<<unsigned((n + 255) / 256), 256, 0, s>>>(qkvz, W, conv_w, ring, T, pos0, conv_dim, K,
+                                                                  conv_scratch);
+    HIP_CHECK(hipGetLastError());
+    q_delta_ring_kernel<<<unsigned((conv_dim + 255) / 256), 256, 0, s>>>(qkvz, W, ring, T, pos0, conv_dim, K);
+    HIP_CHECK(hipGetLastError());
+    q_delta_seq_kernel<128><<<unsigned(nv), 128, 0, s>>>(qkvz, W, conv_scratch, dn_norm, a_dt, S, out, T,
+                                                         conv_dim, value_dim, nk, nv, eps);
     HIP_CHECK(hipGetLastError());
 }
 }  // namespace behemoth

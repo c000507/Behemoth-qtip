@@ -176,6 +176,7 @@ struct QwenStage {
     // scratch (sized for chunk rows)
     DeviceBuffer<uint16_t> state, h_norm, u, q, k, v, gate, attn_out, o_in, gu, eX;
     DeviceBuffer<float> partial, z, z2, logits_d;
+    DeviceBuffer<float> attn_part;  // split-K attention partials
     DeviceBuffer<float> ones_f;  // all-1 "SV" for every bf16 linear epilogue (widest output, incl. q_proj)
     // MoE scratch
     DeviceBuffer<float> rlog, rwts, y_moe, sg_logit, slot_w;
@@ -416,6 +417,7 @@ void QwenStage::load(const std::filesystem::path &dir) {
     z.resize(size_t(R) * Wz);
     z2.resize(size_t(R) * Wz);
     tokens_d.resize(size_t(R));
+    attn_part.resize(size_t(std::max(R, 1024 / std::max(1, cfg.nkv) + 1)) * cfg.nq * 8 * size_t(cfg.hd + 2));
     // bf16 linears reuse the trellis epilogues with SV = 1: must cover the widest output row, which
     // is q_proj (nq * 2 * hd = 4096 on 0.8B) -- sizing by max(inter, hidden) read past the end
     ones_f.resize(size_t(std::max({FS, H, cfg.nq * 2 * cfg.hd, cfg.nkv * cfg.hd, cfg.conv_dim(), V})));
@@ -648,8 +650,13 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
             q_qk_norm_rope(q.data(), k.data(), v.data(), gate.data(), w.kc.data(), w.vc.data(), rows,
                            pos0, c.nq, c.nkv, c.hd, c.rot_dim, c.theta, w.q_norm.data(),
                            w.k_norm.data(), c.eps, stream);
-            q_attn(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0, c.nq,
-                   c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), stream);
+            if (c.hd == 256 && !std::getenv("QWEN_ATTN_SCALAR"))
+                q_attn_split(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0,
+                             c.nq, c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), attn_part.data(),
+                             attn_part.size(), stream);
+            else
+                q_attn(q.data(), w.kc.data(), w.vc.data(), gate.data(), attn_out.data(), rows, pos0, c.nq,
+                       c.nkv, c.hd, 1.0f / std::sqrt(float(c.hd)), stream);
             if (!w.lo.bf16) {
                 q_input_transform(attn_out.data(), rows, A, nullptr, 0, w.lo.su.data(), A, u.data(), A,
                                   stream);
@@ -693,7 +700,11 @@ void QwenStage::forward_chunk(const int *tokens_h, int rows) {
                        z.data() + Wq + V + nv, Wz,
                        reinterpret_cast<const BFloat16 *>(w.w_ba.data()) + size_t(cfg.lin_nv) * H,
                        stream);
-            for (int t = 0; t < rows; ++t)
+            if (c.lin_kd == 128 && c.lin_vd == 128 && !std::getenv("QWEN_DELTA_STEP"))
+                q_delta_chunk(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
+                              w.dstate.data(), o_in.data(), z2.data(), rows, pos0, Wq, V, c.lin_kd, c.lin_vd,
+                              c.lin_nk, nv, c.conv_k, c.eps, stream);
+            else for (int t = 0; t < rows; ++t)
                 q_delta_step(z.data(), w.conv_w.data(), w.dn_norm.data(), w.a_dt.data(), w.ring.data(),
                              w.dstate.data(), o_in.data(), rows, t, pos0, Wq, V, c.lin_kd, c.lin_vd,
                              c.lin_nk, nv, c.conv_k, c.eps, stream);
